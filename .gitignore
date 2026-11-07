@@ -666,3 +666,10 @@ result-*
 
 # direnv
 .direnv
+.swarm/events.jsonl
+.swarm/otel/
+.swarm/tickets/
+.swarm/active
+.swarm/worktrees/
+.swarm/msg/
+.cargo-target/
