@@ -649,6 +649,12 @@ impl MediaController {
         }
     }
 
+    /// The AirPods' sink name, if the sound server has one (#40).
+    pub(crate) async fn airpods_sink(&self) -> Option<String> {
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        get_sink_name_by_mac(&mac).await
+    }
+
     pub async fn start_playback_listener(
         &self,
         aacp_manager: AACPManager,

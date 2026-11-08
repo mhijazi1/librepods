@@ -174,6 +174,12 @@ pub(crate) enum Command {
     /// Runs alongside the core; a pause, a release or a dropped session
     /// stops it.
     ResumeA2dp,
+    /// Make the AirPods the default sink, remembering the previous one
+    /// (#40). Only with `with_default_sink_routing(true)`.
+    RouteToAirPods,
+    /// Give the default sink back to the one `RouteToAirPods` replaced, if
+    /// the AirPods are still default (#40).
+    RouteAway,
     /// Stop the probe.
     Exit,
     /// Stop the probe with this error.
@@ -276,6 +282,11 @@ pub(crate) struct Handoff {
     audio: Option<AudioSource>,
     owner: Option<Vec<u8>>,
     lines: Vec<String>,
+    /// Emit `RouteToAirPods`/`RouteAway` (#40).
+    default_sink_routing: bool,
+    /// This take already sent `RouteAway`; the next take clears it, so a
+    /// timed-out remote release's later loss sends no second one.
+    routed_away: bool,
 }
 
 impl Handoff {
@@ -317,7 +328,16 @@ impl Handoff {
             audio: None,
             owner: None,
             lines: Vec::new(),
+            default_sink_routing: false,
+            routed_away: false,
         }
+    }
+
+    /// Route the default sink to the AirPods on a take's ACK and away on
+    /// losing the take (#40); off by default.
+    pub(crate) fn with_default_sink_routing(mut self, enabled: bool) -> Self {
+        self.default_sink_routing = enabled;
+        self
     }
 
     /// Use `mode` for "Connect to this computer" (#16); the default is
@@ -444,7 +464,13 @@ impl Handoff {
                     {
                         out.push(Command::PauseMedia);
                     }
+                    // A remote request joining a release Linux sent while
+                    // holding a take loses it (#40); `route_away` runs once
+                    // per take.
                     p.cause = Cause::Remote;
+                    if self.requested_take {
+                        self.route_away(out);
+                    }
                     self.play_during_release = false;
                     self.last_owner_linux = false;
                     self.say("REMOTE requested ownership; release already pending");
@@ -469,6 +495,9 @@ impl Handoff {
                 self.last_owner_linux = false;
                 if self.automatic && self.requested_take {
                     out.push(Command::PauseMedia);
+                }
+                if self.requested_take {
+                    self.route_away(out);
                 }
                 if self.owner.as_deref() == Some(&[0]) && !self.requested_take {
                     self.say("REMOTE requested ownership; Linux already yielded");
@@ -773,17 +802,17 @@ impl Handoff {
             // stop playing here as upstream does.
             out.push(Command::PauseMedia);
         }
-        // A take that found the transport idle gets its audio back (#200),
-        // unless the reconcile just released it. Not during a call: the card
-        // is on HFP, so the idle A2DP transport says nothing.
-        if pending.desired
-            && self.automatic
-            && self.live()
-            && self.requested_take
-            && !self.local_call
-            && self.pending.is_none()
-            && self.a2dp_active == Some(false)
-        {
+        // The take holds unless the reconcile just released it.
+        let held = pending.desired && self.live() && self.requested_take && self.pending.is_none();
+        // Before the resume, so its audible check finds the stream on the
+        // AirPods sink (#40).
+        if held && self.default_sink_routing {
+            out.push(Command::RouteToAirPods);
+        }
+        // A take that found the transport idle gets its audio back (#200).
+        // Not during a call: the card is on HFP, so the idle A2DP transport
+        // says nothing.
+        if held && self.automatic && !self.local_call && self.a2dp_active == Some(false) {
             self.resume_until = Some(now + A2DP_RESUME_WINDOW);
             out.push(Command::ResumeA2dp);
             self.say("A2DP transport idle after the take; resuming it");
@@ -806,6 +835,7 @@ impl Handoff {
         if self.automatic {
             out.push(Command::PauseMedia);
         }
+        self.route_away(out);
         self.say(format!(
             "YIELD owner=not-linux; another host has the AirPods; Linux gave up its {}take{}",
             if dropped { "pending " } else { "" },
@@ -815,6 +845,13 @@ impl Handoff {
                 ""
             },
         ));
+    }
+
+    /// `RouteAway`, once per take (#40).
+    fn route_away(&mut self, out: &mut Vec<Command>) {
+        if self.default_sink_routing && !std::mem::replace(&mut self.routed_away, true) {
+            out.push(Command::RouteAway);
+        }
     }
 
     /// The pending request settled (acknowledged or timed out): act on a
@@ -1006,6 +1043,7 @@ impl Handoff {
     fn request(&mut self, now: Instant, desired: bool, cause: Cause, out: &mut Vec<Command>) {
         if desired {
             self.requested_take = true;
+            self.routed_away = false;
         }
         self.pending = Some(Pending {
             desired,
@@ -3524,5 +3562,180 @@ mod tests {
         );
         assert_eq!(p.feed(window_end() - 1, Input::Tick), []);
         assert_eq!(p.feed(window_end(), Input::Tick), [SendOwnership(false)]);
+    }
+
+    // #40: default sink routing.
+
+    /// `Probe::ready` with default sink routing on.
+    fn routed() -> Probe {
+        let mut p = Probe::ready();
+        p.core.default_sink_routing = true;
+        p
+    }
+
+    /// `routed`, then a take for playback acknowledged at 600 ms.
+    fn routed_take() -> Probe {
+        let mut p = routed();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), [RouteToAirPods]);
+        p
+    }
+
+    #[test]
+    fn take_ack_routes_to_airpods_once() {
+        let mut p = routed_take();
+        // A duplicate [1] acknowledges nothing.
+        assert_eq!(p.feed(700, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1000, true), []);
+
+        // A manual take routes too.
+        let mut p = Probe::new(false, true);
+        p.core.default_sink_routing = true;
+        p.routing(ready_facts());
+        assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
+        assert_eq!(p.feed(200, Input::Ownership(vec![1])), [RouteToAirPods]);
+        assert_eq!(p.feed(300, Input::Ownership(vec![1])), []);
+        // A release ACK routes nothing.
+        assert_eq!(p.feed(400, Input::Release), [SendOwnership(false)]);
+        assert_eq!(p.feed(500, Input::Ownership(vec![0])), []);
+    }
+
+    #[test]
+    fn take_ack_routes_before_a2dp_resume() {
+        let mut p = routed();
+        assert_eq!(p.feed(20, idle_transport()), []);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        p.core.take_lines();
+        assert_eq!(
+            p.feed(600, Input::Ownership(vec![1])),
+            [RouteToAirPods, ResumeA2dp]
+        );
+        // No new line for the route.
+        let lines = p.core.take_lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+
+    #[test]
+    fn stop_during_take_release_does_not_route() {
+        let mut p = routed();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.play(550, false), []);
+        assert_eq!(
+            p.feed(600, Input::Ownership(vec![1])),
+            [SendOwnership(false)]
+        );
+        assert_eq!(p.feed(700, Input::Ownership(vec![0])), []);
+    }
+
+    #[test]
+    fn genuine_loss_routes_away_once() {
+        let mut p = routed_take();
+        p.core.take_lines();
+        assert_eq!(
+            p.feed(1100, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(1300, Input::RemoteOwnershipRequest), []);
+    }
+
+    #[test]
+    fn remote_request_routes_away_once() {
+        // A fresh yield: pause, route away, then "not owning".
+        let mut p = routed_take();
+        assert_eq!(
+            p.feed(1100, Input::RemoteOwnershipRequest),
+            [PauseMedia, RouteAway, SendOwnership(false)]
+        );
+        // A repeat joins the remote release; its ACK routes nothing more.
+        assert_eq!(p.feed(1150, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(1300, Input::RemoteOwnershipRequest), []);
+
+        // Joining a pending playback-stop release loses the take too.
+        let mut p = routed_take();
+        assert_eq!(p.play(1000, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1100, Input::RemoteOwnershipRequest), [RouteAway]);
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+
+        // Refused during a local call: Linux keeps the AirPods.
+        let mut p = routed_take();
+        assert_eq!(p.feed(700, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.feed(1100, Input::RemoteOwnershipRequest), []);
+    }
+
+    #[test]
+    fn timed_out_remote_release_then_loss_routes_away_once() {
+        let mut p = routed_take();
+        assert_eq!(
+            p.feed(1100, Input::RemoteOwnershipRequest),
+            [PauseMedia, RouteAway, SendOwnership(false)]
+        );
+        assert_eq!(p.play(1500, false), []);
+        assert_eq!(p.feed(6200, Input::Tick), []);
+        // Past LATE_ACK_WINDOW: a genuine loss of the same take.
+        assert_eq!(p.feed(11101, Input::Ownership(vec![0])), [PauseMedia]);
+        // The next take routes and can route away again.
+        assert_eq!(p.play(12000, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(12100, Input::Ownership(vec![1])), [RouteToAirPods]);
+        assert_eq!(
+            p.feed(12500, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
+    }
+
+    #[test]
+    fn retake_lost_before_ack_routes_away() {
+        let mut p = routed_take();
+        assert_eq!(
+            p.feed(1100, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
+        assert_eq!(p.play(1500, false), []);
+        assert_eq!(p.play(2000, true), [SendOwnership(true)]);
+        // Lost before its ACK: this take routes away too.
+        assert_eq!(
+            p.feed(2100, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
+    }
+
+    #[test]
+    fn playback_stop_release_does_not_route_away() {
+        let mut p = routed_take();
+        assert_eq!(p.play(1000, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1100, Input::Ownership(vec![0])), []);
+        // Linux already yielded: nothing to route.
+        assert_eq!(p.feed(1200, Input::RemoteOwnershipRequest), []);
+        // The next play retakes and routes again.
+        assert_eq!(p.play(1500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(1600, Input::Ownership(vec![1])), [RouteToAirPods]);
+    }
+
+    #[test]
+    fn routing_disabled_emits_no_route_commands() {
+        // Take with an idle transport, then a genuine loss.
+        let mut p = Probe::ready();
+        let mut all = p.feed(20, idle_transport());
+        all.extend(p.play(500, true));
+        all.extend(p.feed(600, Input::Ownership(vec![1])));
+        all.extend(p.feed(1100, Input::Ownership(vec![0])));
+        assert_eq!(all, [SendOwnership(true), ResumeA2dp, PauseMedia]);
+        // Take, remote request, its ACK.
+        let mut p = Probe::ready();
+        let mut all = p.play(500, true);
+        all.extend(p.feed(600, Input::Ownership(vec![1])));
+        all.extend(p.feed(1100, Input::RemoteOwnershipRequest));
+        all.extend(p.feed(1200, Input::Ownership(vec![0])));
+        assert_eq!(all, [SendOwnership(true), PauseMedia, SendOwnership(false)]);
+        // Take, playback-stop release joined by a remote request, its ACK.
+        let mut p = Probe::ready();
+        let mut all = p.play(500, true);
+        all.extend(p.feed(600, Input::Ownership(vec![1])));
+        all.extend(p.play(1000, false));
+        all.extend(p.feed(1100, Input::RemoteOwnershipRequest));
+        all.extend(p.feed(1200, Input::Ownership(vec![0])));
+        assert_eq!(all, [SendOwnership(true), SendOwnership(false)]);
     }
 }
