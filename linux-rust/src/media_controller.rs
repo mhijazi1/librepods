@@ -1027,7 +1027,7 @@ impl MediaController {
             )
             .await;
         if outcome == Err(DeadlineExceeded) {
-            warn!("A2DP activation gave up after {A2DP_ACTIVATION_DEADLINE:?}: the sound server is too slow");
+            warn!("A2DP activation gave up: not done within {A2DP_ACTIVATION_DEADLINE:?}");
         }
     }
 
@@ -1136,8 +1136,7 @@ impl MediaController {
         };
 
         info!("Activating A2DP profile for AirPods: {}", preferred_profile);
-        let profile_name = preferred_profile.clone();
-        if before_deadline(deadline, || set(idx, profile_name)).await? {
+        if before_deadline(deadline, || set(idx, preferred_profile.clone())).await? {
             info!("Successfully activated A2DP profile: {}", preferred_profile);
         } else {
             warn!("Failed to activate A2DP profile: {}", preferred_profile);
