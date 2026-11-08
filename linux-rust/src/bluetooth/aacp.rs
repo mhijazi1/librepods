@@ -1025,6 +1025,7 @@ impl AACPManager {
             .await
     }
 
+    // Caller arrives with #17 (Undo notification).
     pub async fn send_hijack_reversed(&self, target_mac_address: &str) -> Result<()> {
         self.send_data_packet(&encode_hijack_reversed(target_mac_address))
             .await
@@ -1204,6 +1205,7 @@ pub(crate) fn encode_smart_routing_show_ui(target_mac_address: &str) -> Vec<u8> 
     [opcode.as_slice(), buffer.as_slice()].concat()
 }
 
+// Caller arrives with #17 (Undo notification).
 pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> Vec<u8> {
     let opcode = [opcodes::SMART_ROUTING, 0x00];
     let mut buffer = Vec::with_capacity(97);
