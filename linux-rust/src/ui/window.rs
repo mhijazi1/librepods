@@ -9,7 +9,10 @@ use crate::devices::enums::{
 use crate::ui::airpods::airpods_view;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
-use crate::utils::{MyTheme, PreferredCodec, get_app_settings_path, get_devices_path};
+use crate::utils::{
+    ConnectMode, MyTheme, PreferredCodec, get_app_settings_path, get_devices_path,
+    get_preferences_path,
+};
 use bluer::{Address};
 use iced::border::Radius;
 use iced::overlay::menu;
@@ -122,6 +125,27 @@ fn battery_tab_label(battery: &[BatteryInfo]) -> String {
     )
 }
 
+/// The preferences JSON `prefs` (None: no file yet) with `[mac].connectMode`
+/// set to `mode` and every other key kept. None when `prefs` is not a JSON
+/// object or the device's entry is not one: the caller then writes nothing,
+/// so the user's file is never replaced.
+fn with_connect_mode(
+    prefs: Option<&str>,
+    mac: &str,
+    mode: ConnectMode,
+) -> Option<serde_json::Value> {
+    let mut root = match prefs {
+        Some(content) => serde_json::from_str(content).ok()?,
+        None => serde_json::json!({}),
+    };
+    root.as_object_mut()?
+        .entry(mac)
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()?
+        .insert("connectMode".to_string(), serde_json::json!(mode));
+    Some(root)
+}
+
 pub fn start_ui(
     ui_rx: UnboundedReceiver<BluetoothUIMessage>,
     start_minimized: bool,
@@ -172,6 +196,9 @@ pub struct App {
     tray_text_mode: bool,
     stem_control: bool,
     preferred_codec: PreferredCodec,
+    /// Each AirPods' "Connect to this computer" (#16), read from
+    /// preferences.json when the device connects.
+    connect_modes: HashMap<String, ConnectMode>,
 }
 
 pub struct BluetoothState {
@@ -205,6 +232,7 @@ pub enum Message {
     TrayTextModeChanged(bool), // yes, I know I should add all settings to a struct, but I'm lazy
     StemControlChanged(bool),
     PreferredCodecChanged(PreferredCodec),
+    ConnectModeChanged(String, ConnectMode), // AirPods MAC
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -316,6 +344,7 @@ impl App {
                 tray_text_mode,
                 stem_control,
                 preferred_codec,
+                connect_modes: HashMap::new(),
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -444,6 +473,8 @@ impl App {
                                         .map(|d| d.name.clone())
                                         .unwrap_or_else(|| "Unknown Device".to_string())
                                 };
+                                self.connect_modes
+                                    .insert(mac.clone(), crate::utils::load_connect_mode(&mac));
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
                                     battery: state.battery_info.clone(),
@@ -758,6 +789,37 @@ impl App {
                 std::fs::write(app_settings_path, settings.to_string()).ok();
                 Task::none()
             }
+            Message::ConnectModeChanged(mac, mode) => {
+                let path = get_preferences_path();
+                // Only a missing file counts as empty: any other read error
+                // must not replace the user's preferences.
+                let current = match std::fs::read_to_string(&path) {
+                    Ok(content) => Some(content),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        error!("Not saving connectMode: failed to read {}: {}", path.display(), e);
+                        return Task::none();
+                    }
+                };
+                let Some(prefs) = with_connect_mode(current.as_deref(), &mac, mode) else {
+                    error!(
+                        "Not saving connectMode: {} is not a JSON object with an object per device",
+                        path.display()
+                    );
+                    return Task::none();
+                };
+                let saved = path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(&path, format!("{prefs:#}")));
+                match saved {
+                    Ok(()) => {
+                        self.connect_modes.insert(mac, mode);
+                    }
+                    Err(e) => error!("Failed to write {}: {}", path.display(), e),
+                }
+                Task::none()
+            }
             Message::StemControlChanged(is_enabled) => {
                 self.stem_control = is_enabled;
                 let app_settings_path = get_app_settings_path();
@@ -962,12 +1024,32 @@ impl App {
                                             match state {
                                                 DeviceState::AirPods(state) => {
                                                     device_managers.get(id).and_then(|managers| {
-                                                        managers.get_aacp().map(|aacp_manager| airpods_view(
+                                                        managers.get_aacp().map(|aacp_manager| container(column![
+                                                            container(
+                                                                row![
+                                                                    text("Connect to this computer").size(16).width(Length::Fill),
+                                                                    pick_list(
+                                                                        [ConnectMode::Automatically, ConnectMode::WhenLastConnected],
+                                                                        Some(self.connect_modes.get(id).copied().unwrap_or_default()),
+                                                                        move |mode| Message::ConnectModeChanged(id.clone(), mode),
+                                                                    )
+                                                                ]
+                                                                    .align_y(Center)
+                                                                    .spacing(12)
+                                                            )
+                                                                .padding(Padding {
+                                                                    top: 20.0,
+                                                                    bottom: 0.0,
+                                                                    left: 38.0,
+                                                                    right: 38.0,
+                                                                }),
+                                                            airpods_view(
                                                                     id,
                                                                     &devices_list,
                                                                     state,
                                                                     aacp_manager.clone()
-                                                                ))
+                                                                )
+                                                        ]))
                                                     })
                                                 }
                                                 _ => None,
@@ -1767,6 +1849,80 @@ mod tests {
             battery_tab_label(&[]),
             "\u{1018E5} -- \u{1018E8} -- \u{100E6C} --"
         );
+    }
+
+    const MAC: &str = "AA:BB:CC:DD:EE:FF";
+
+    #[test]
+    fn connect_mode_write_preserves_other_keys() {
+        let prefs = r#"{"switching":"legacy","exportBattery":false,
+            "AA:BB:CC:DD:EE:FF":{"autoConnect":false},
+            "11:22:33:44:55:66":{"connectMode":"when_last_connected"}}"#;
+        assert_eq!(
+            with_connect_mode(Some(prefs), MAC, ConnectMode::WhenLastConnected),
+            Some(serde_json::json!({
+                "switching": "legacy",
+                "exportBattery": false,
+                MAC: {"autoConnect": false, "connectMode": "when_last_connected"},
+                "11:22:33:44:55:66": {"connectMode": "when_last_connected"},
+            }))
+        );
+        // A device without an entry gets one; an existing value is replaced.
+        let prefs = r#"{"switching":"off","AA:BB:CC:DD:EE:FF":{"connectMode":"when_last_connected"}}"#;
+        assert_eq!(
+            with_connect_mode(Some(prefs), MAC, ConnectMode::Automatically),
+            Some(serde_json::json!({"switching": "off", MAC: {"connectMode": "automatically"}}))
+        );
+        assert_eq!(
+            with_connect_mode(Some(r#"{"switching":"off"}"#), MAC, ConnectMode::Automatically),
+            Some(serde_json::json!({"switching": "off", MAC: {"connectMode": "automatically"}}))
+        );
+    }
+
+    #[test]
+    fn connect_mode_write_creates_missing_file() {
+        assert_eq!(
+            with_connect_mode(None, MAC, ConnectMode::WhenLastConnected),
+            Some(serde_json::json!({MAC: {"connectMode": "when_last_connected"}}))
+        );
+    }
+
+    #[test]
+    fn connect_mode_write_refuses_invalid_file() {
+        for prefs in [
+            "",
+            "not json",
+            "[]",
+            "3",
+            "null",
+            r#"{"AA:BB:CC:DD:EE:FF":3}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":null}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":"off"}"#,
+        ] {
+            assert_eq!(
+                with_connect_mode(Some(prefs), MAC, ConnectMode::WhenLastConnected),
+                None,
+                "{prefs}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_mode_round_trips() {
+        for mode in [ConnectMode::Automatically, ConnectMode::WhenLastConnected] {
+            for prefs in [None, Some(r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":true}}"#)] {
+                let written = with_connect_mode(prefs, MAC, mode).unwrap();
+                assert_eq!(
+                    crate::utils::connect_mode_from_value(Some(&written), MAC),
+                    mode
+                );
+                // Through the text the arm writes, too.
+                assert_eq!(
+                    crate::utils::parse_connect_mode(&format!("{written:#}"), MAC),
+                    mode
+                );
+            }
+        }
     }
 }
 

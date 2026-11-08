@@ -34,7 +34,7 @@ use crate::stream_monitor::{
     self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PulsePeaks,
     PulsePlaybackStreams,
 };
-use crate::utils::SwitchingMode;
+use crate::utils::{self, ConnectMode, SwitchingMode};
 use futures::future::BoxFuture;
 use log::{error, info};
 use std::collections::HashMap;
@@ -319,6 +319,22 @@ static HANDOFF_TASKS: LazyLock<StdMutex<HashMap<String, HandoffTask>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
+// Whether Linux was the last owner of each AirPods MAC (#16). Outlives the
+// handoff task, which a reconnect replaces; forgotten when the app quits.
+static LAST_OWNER_LINUX: LazyLock<StdMutex<HashMap<String, bool>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn last_owner_linux(mac: &str) -> bool {
+    LAST_OWNER_LINUX.lock().unwrap().get(mac) == Some(&true)
+}
+
+fn remember_last_owner_linux(mac: &str, value: bool) {
+    LAST_OWNER_LINUX
+        .lock()
+        .unwrap()
+        .insert(mac.to_string(), value);
+}
+
 /// Stop the handoff task of this AirPods MAC, if one runs.
 pub(crate) fn stop_handoff_task(mac: &str) {
     if let Some(task) = HANDOFF_TASKS.lock().unwrap().remove(mac) {
@@ -393,6 +409,8 @@ struct Shell {
     call_rx: CallSamples,
     /// Where the core's lines go after they are logged, if anywhere.
     lines: Option<LineSink>,
+    /// The device's "Connect to this computer" (#16).
+    connect_mode: ConnectMode,
 }
 
 /// Receives each line the handoff core emits, in order, right after it is
@@ -474,6 +492,7 @@ impl Shell {
 async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     let now = Instant::now();
     let commands = core.handle(now, input);
+    remember_last_owner_linux(&shell.mac, core.last_owner_linux());
     // Before any command is awaited, so a stream debouncing at the reset
     // can't reach the minimum while SendOwnership or Announce wait (#90); a
     // stream reaching it between `now` and this request still counts.
@@ -560,7 +579,9 @@ async fn run_handoff(mut shell: Shell) {
         }
         (session_facts(&state), backlog)
     };
-    let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true);
+    let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true)
+        .with_connect_mode(shell.connect_mode)
+        .with_last_owner_linux(last_owner_linux(&shell.mac));
     for input in seed_inputs(facts) {
         if step(&mut core, &mut shell, input).await {
             return;
@@ -636,6 +657,8 @@ pub(crate) struct Switching {
     policy: Policy,
     /// Given to the handoff task's `Shell`; `start_with_calls` sets none.
     lines: Option<LineSink>,
+    /// Given to the handoff core; `start_with_calls` keeps the default.
+    connect_mode: ConnectMode,
 }
 
 enum Policy {
@@ -676,8 +699,11 @@ impl Switching {
             .then(handoff_log::app_log)
             .flatten();
         let mac = setup.airpods_mac.clone();
+        // shortcut: connect mode is read once at start; a live update is tracked in (#153)
         let switching =
-            Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller).await;
+            Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller)
+                .await
+                .with_connect_mode(utils::load_connect_mode(&mac));
         match log {
             Some(log) => switching.with_line_sink(log.sink(mac)),
             None => switching,
@@ -732,7 +758,14 @@ impl Switching {
             airpods_mac,
             policy,
             lines: None,
+            connect_mode: ConnectMode::default(),
         }
+    }
+
+    /// Run the handoff core in `mode` ("Connect to this computer", #16).
+    pub(crate) fn with_connect_mode(mut self, mode: ConnectMode) -> Self {
+        self.connect_mode = mode;
+        self
     }
 
     /// Also hand every line of the handoff core to `sink`, after it is
@@ -784,6 +817,7 @@ impl Switching {
                     play_rx,
                     call_rx,
                     lines: self.lines,
+                    connect_mode: self.connect_mode,
                 };
                 spawn_handoff_task(self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
@@ -3126,5 +3160,18 @@ mod tests {
             }
             assert_eq!(p.takes(), [vec![SendOwnership(true)]]);
         }
+    }
+
+    #[test]
+    fn last_owner_store_is_per_mac() {
+        // MACs no other test uses: the store is process-wide.
+        const A: &str = "16:16:16:16:16:0A";
+        const B: &str = "16:16:16:16:16:0B";
+        assert!(!last_owner_linux(A));
+        remember_last_owner_linux(A, true);
+        assert!(last_owner_linux(A));
+        assert!(!last_owner_linux(B));
+        remember_last_owner_linux(A, false);
+        assert!(!last_owner_linux(A));
     }
 }

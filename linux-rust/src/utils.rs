@@ -190,6 +190,68 @@ pub fn load_auto_connect(mac: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Apple's per-device "Connect to this computer", from the device's
+/// `connectMode` in preferences.json (written by the UI; read by matching
+/// the strings in `connect_mode_from_value`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectMode {
+    /// The handoff core takes the AirPods for new playback as before.
+    #[default]
+    Automatically,
+    /// Automatic takes only while Linux was the last owner.
+    WhenLastConnected,
+}
+
+impl std::fmt::Display for ConnectMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Automatically => "Automatically",
+            Self::WhenLastConnected => "When last connected to this computer",
+        })
+    }
+}
+
+/// Reads a device's `connectMode` from already-parsed preferences. Missing
+/// preferences, device, key or null give the default (automatically); an
+/// unknown name or a value of the wrong type logs a warning and gives the
+/// default too.
+pub fn connect_mode_from_value(preferences: Option<&serde_json::Value>, mac: &str) -> ConnectMode {
+    let Some(value) = preferences
+        .and_then(|p| p.get(mac))
+        .and_then(|device| device.get("connectMode"))
+    else {
+        return ConnectMode::default();
+    };
+    // Match the strings: serde would also take {"when_last_connected": null}.
+    match value.as_str() {
+        Some("automatically") => ConnectMode::Automatically,
+        Some("when_last_connected") => ConnectMode::WhenLastConnected,
+        _ if value.is_null() => ConnectMode::default(),
+        _ => {
+            log::warn!(
+                "Unknown connectMode preference {value} for {mac}; expected \"automatically\" or \"when_last_connected\". Using automatically."
+            );
+            ConnectMode::default()
+        }
+    }
+}
+
+/// Extracts a device's `connectMode` from the preferences JSON (see
+/// `connect_mode_from_value`). Split from the file read for tests.
+pub fn parse_connect_mode(preferences: &str, mac: &str) -> ConnectMode {
+    let value = serde_json::from_str::<serde_json::Value>(preferences).ok();
+    connect_mode_from_value(value.as_ref(), mac)
+}
+
+/// Reads a device's `connectMode` from preferences.json, defaulting to
+/// automatically.
+pub fn load_connect_mode(mac: &str) -> ConnectMode {
+    std::fs::read_to_string(get_preferences_path())
+        .map(|s| parse_connect_mode(&s, mac))
+        .unwrap_or_default()
+}
+
 /// Reads the top-level `exportBattery` (export the AirPods battery to BlueZ,
 /// see battery_provider.rs) from already-parsed preferences. Missing
 /// preferences, a missing key or null give the default (true); a bool is used
@@ -537,6 +599,86 @@ mod tests {
         assert_eq!(
             preferred_codec_from_value(Some(&serde_json::json!({"preferred_codec": "SbcXq"}))),
             PreferredCodec::SbcXq
+        );
+    }
+
+    const MAC: &str = "AA:BB:CC:DD:EE:FF";
+
+    #[test]
+    fn connect_mode_defaults_to_automatically() {
+        assert_eq!(ConnectMode::default(), ConnectMode::Automatically);
+        assert_eq!(
+            connect_mode_from_value(None, MAC),
+            ConnectMode::Automatically
+        );
+        for prefs in [
+            "",
+            "not json",
+            "[]",
+            "{}",
+            r#"{"AA:BB:CC:DD:EE:FF":{}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":3}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":null}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":"bogus"}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":"WhenLastConnected"}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":3}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":true}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":["when_last_connected"]}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":{"when_last_connected":null}}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":{"automatically":null}}}"#,
+        ] {
+            assert_eq!(
+                parse_connect_mode(prefs, MAC),
+                ConnectMode::Automatically,
+                "{prefs}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_mode_reads_each_value() {
+        assert_eq!(
+            parse_connect_mode(
+                r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":"automatically"}}"#,
+                MAC
+            ),
+            ConnectMode::Automatically
+        );
+        assert_eq!(
+            parse_connect_mode(
+                r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":false,"connectMode":"when_last_connected"}}"#,
+                MAC
+            ),
+            ConnectMode::WhenLastConnected
+        );
+        assert_eq!(
+            connect_mode_from_value(
+                Some(&serde_json::json!({MAC: {"connectMode": "when_last_connected"}})),
+                MAC
+            ),
+            ConnectMode::WhenLastConnected
+        );
+    }
+
+    #[test]
+    fn connect_mode_is_per_device() {
+        let prefs =
+            r#"{"switching":"handoff","11:22:33:44:55:66":{"connectMode":"when_last_connected"}}"#;
+        assert_eq!(parse_connect_mode(prefs, MAC), ConnectMode::Automatically);
+        assert_eq!(
+            parse_connect_mode(prefs, "11:22:33:44:55:66"),
+            ConnectMode::WhenLastConnected
+        );
+        assert_eq!(
+            parse_connect_mode(r#"{"connectMode":"when_last_connected"}"#, MAC),
+            ConnectMode::Automatically
+        );
+        assert_eq!(
+            parse_connect_mode(
+                r#"{"connectMode":"when_last_connected","AA:BB:CC:DD:EE:FF":{"autoConnect":false}}"#,
+                MAC
+            ),
+            ConnectMode::Automatically
         );
     }
 }
