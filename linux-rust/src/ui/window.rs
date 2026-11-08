@@ -88,6 +88,40 @@ fn battery_label(entry: Option<&BatteryInfo>) -> String {
     )
 }
 
+/// The charging marker appended after a component's level, only for status Charging.
+fn charging_marker(entry: Option<&BatteryInfo>) -> &'static str {
+    match entry {
+        Some(x) if x.status == BatteryStatus::Charging => "\u{1002E6}",
+        _ => "",
+    }
+}
+
+/// Text under a connected AirPods tab. If a Headphone entry exists (any status) only
+/// that is shown; otherwise Left, Right and Case. Every level goes through
+/// `battery_label`, so a missing or Disconnected entry is `--`, never its raw byte.
+fn battery_tab_label(battery: &[BatteryInfo]) -> String {
+    let find = |component: BatteryComponent| battery.iter().find(|x| x.component == component);
+    if let Some(headphone) = find(BatteryComponent::Headphone) {
+        return format!(
+            "\u{100EB9} {}{}",
+            battery_label(Some(headphone)),
+            charging_marker(Some(headphone))
+        );
+    }
+    let left = find(BatteryComponent::Left);
+    let right = find(BatteryComponent::Right);
+    let case = find(BatteryComponent::Case);
+    format!(
+        "\u{1018E5} {}{} \u{1018E8} {}{} \u{100E6C} {}{}",
+        battery_label(left),
+        charging_marker(left),
+        battery_label(right),
+        charging_marker(right),
+        battery_label(case),
+        charging_marker(case)
+    )
+}
+
 pub fn start_ui(
     ui_rx: UnboundedReceiver<BluetoothUIMessage>,
     start_minimized: bool,
@@ -771,32 +805,7 @@ impl App {
 
                                     match self.device_states.get(mac) {
                                         Some(DeviceState::AirPods(state)) => {
-                                            let b = &state.battery;
-                                            let headphone = b.iter().find(|x| x.component == BatteryComponent::Headphone)
-                                                .map(|x| x.level);
-                                            // if headphones is not None, use only that
-                                            if let Some(level) = headphone {
-                                                let charging = b.iter().find(|x| x.component == BatteryComponent::Headphone)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                format!(
-                                                    "􀺹 {}%{}",
-                                                    level, if charging {"\u{1002E6}"} else {""}
-                                                )
-                                            } else {
-                                                let left  = battery_label(b.iter().find(|x| x.component == BatteryComponent::Left));
-                                                let right = battery_label(b.iter().find(|x| x.component == BatteryComponent::Right));
-                                                let case  = battery_label(b.iter().find(|x| x.component == BatteryComponent::Case));
-                                                let left_charging = b.iter().find(|x| x.component == BatteryComponent::Left)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                let right_charging = b.iter().find(|x| x.component == BatteryComponent::Right)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                let case_charging = b.iter().find(|x| x.component == BatteryComponent::Case)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                format!(
-                                                    "\u{1018E5} {}{} \u{1018E8} {}{} \u{100E6C} {}{}",
-                                                    left, if left_charging {"\u{1002E6}"} else {""}, right, if right_charging {"\u{1002E6}"} else {""}, case, if case_charging {"\u{1002E6}"} else {""}
-                                                )
-                                            }
+                                            battery_tab_label(&state.battery)
                                         }
                                         _ => "Connected".to_string(),
                                     }
@@ -1707,6 +1716,57 @@ mod tests {
         assert_eq!(battery_label(Some(&not_charging)), "85%");
         let charging = info(BatteryComponent::Case, 85, BatteryStatus::Charging);
         assert_eq!(battery_label(Some(&charging)), "85%");
+    }
+
+    #[test]
+    fn battery_tab_label_headphone_disconnected_shows_dashes() {
+        let battery = vec![info(BatteryComponent::Headphone, 85, BatteryStatus::Disconnected)];
+        assert_eq!(battery_tab_label(&battery), "\u{100EB9} --");
+    }
+
+    #[test]
+    fn battery_tab_label_headphone_known_level() {
+        let battery = vec![info(BatteryComponent::Headphone, 85, BatteryStatus::NotCharging)];
+        assert_eq!(battery_tab_label(&battery), "\u{100EB9} 85%");
+    }
+
+    #[test]
+    fn battery_tab_label_headphone_charging() {
+        // Headphone wins over any Left/Right/Case entries present.
+        let battery = vec![
+            info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+            info(BatteryComponent::Headphone, 85, BatteryStatus::Charging),
+            info(BatteryComponent::Right, 75, BatteryStatus::Charging),
+            info(BatteryComponent::Case, 60, BatteryStatus::NotCharging),
+        ];
+        assert_eq!(battery_tab_label(&battery), "\u{100EB9} 85%\u{1002E6}");
+    }
+
+    #[test]
+    fn battery_tab_label_buds_form() {
+        let battery = vec![
+            info(BatteryComponent::Left, 80, BatteryStatus::Charging),
+            case_disconnected(30),
+        ];
+        assert_eq!(
+            battery_tab_label(&battery),
+            "\u{1018E5} 80%\u{1002E6} \u{1018E8} -- \u{100E6C} --"
+        );
+
+        let battery = vec![
+            info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+            info(BatteryComponent::Right, 75, BatteryStatus::Charging),
+            info(BatteryComponent::Case, 60, BatteryStatus::Charging),
+        ];
+        assert_eq!(
+            battery_tab_label(&battery),
+            "\u{1018E5} 80% \u{1018E8} 75%\u{1002E6} \u{100E6C} 60%\u{1002E6}"
+        );
+
+        assert_eq!(
+            battery_tab_label(&[]),
+            "\u{1018E5} -- \u{1018E8} -- \u{100E6C} --"
+        );
     }
 }
 
