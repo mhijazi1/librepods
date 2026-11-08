@@ -342,7 +342,6 @@ pub struct AACPManagerState {
     pub old_ear_detection_status: Vec<EarDetectionStatus>,
     pub ear_detection_status: Vec<EarDetectionStatus>,
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
-    pub devices: HashMap<String, DeviceData>,
     pub airpods_mac: Option<Address>,
 }
 
@@ -359,10 +358,6 @@ impl AACPManagerState {
     }
 
     fn new() -> Self {
-        let devices: HashMap<String, DeviceData> = std::fs::read_to_string(get_devices_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
         AACPManagerState {
             sender: None,
             control_command_status_list: Vec::new(),
@@ -376,7 +371,6 @@ impl AACPManagerState {
             old_ear_detection_status: Vec::new(),
             ear_detection_status: Vec::new(),
             event_tx: None,
-            devices,
             airpods_mac: None,
         }
     }
@@ -778,14 +772,12 @@ impl AACPManager {
                         enc_key: "".to_string(),
                     },
                 };
-                let mut state = self.state.lock().await;
+                let state = self.state.lock().await;
                 if let Some(mac) = state.airpods_mac {
                     let mac = mac.to_string();
-                    if let Some(devices) =
-                        update_devices_file(|d| devices_with_information(d, &mac, &info))
-                    {
-                        state.devices = devices;
-                    }
+                    update_devices_file(&get_devices_path(), |d| {
+                        devices_with_information(d, &mac, &info)
+                    });
                 }
                 info!("Received Information: {:?}", info);
             }
@@ -830,14 +822,12 @@ impl AACPManager {
                         .map(|(kt, kd)| (kt, hex::encode(kd)))
                         .collect::<Vec<_>>()
                 );
-                let mut state = self.state.lock().await;
+                let state = self.state.lock().await;
                 if let Some(mac) = state.airpods_mac {
                     let mac = mac.to_string();
-                    if let Some(devices) =
-                        update_devices_file(|d| devices_with_proximity_keys(d, &mac, &keys))
-                    {
-                        state.devices = devices;
-                    }
+                    update_devices_file(&get_devices_path(), |d| {
+                        devices_with_proximity_keys(d, &mac, &keys)
+                    });
                 }
             }
             opcodes::STEM_PRESS => {
@@ -1438,32 +1428,36 @@ fn devices_with_proximity_keys(
     devices
 }
 
-/// Applies `update` to a fresh read of devices.json and writes the result back
-/// atomically, so devices saved since connect are kept. Returns the written
-/// map; on any error logs it and writes nothing.
+/// Applies `update` to a fresh read of the devices file at `path` and writes
+/// the result back atomically, so devices saved since connect are kept.
+/// Returns whether it was written; on any error logs it and writes nothing.
 fn update_devices_file(
+    path: &std::path::Path,
     update: impl FnOnce(HashMap<String, DeviceData>) -> HashMap<String, DeviceData>,
-) -> Option<HashMap<String, DeviceData>> {
-    let path = get_devices_path();
-    let devices = match parse_devices(std::fs::read_to_string(&path)) {
+) -> bool {
+    let devices = match parse_devices(std::fs::read_to_string(path)) {
         Ok(devices) => update(devices),
         Err(e) => {
-            error!("Not saving devices, failed to read {}: {}", path.display(), e);
-            return None;
+            error!(
+                "Not saving devices, failed to read {}: {}",
+                path.display(),
+                e
+            );
+            return false;
         }
     };
     let json = match serde_json::to_string(&devices) {
         Ok(json) => json,
         Err(e) => {
             error!("Failed to serialize devices: {}", e);
-            return None;
+            return false;
         }
     };
-    if let Err(e) = write_settings_file(&path, &json) {
+    if let Err(e) = write_settings_file(path, &json) {
         error!("Failed to save devices: {}", e);
-        return None;
+        return false;
     }
-    Some(devices)
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3126,5 +3120,39 @@ mod tests {
         assert_eq!(airpods.name, AIRPODS_MAC);
         assert!(matches!(airpods.type_, DeviceType::AirPods));
         assert!(airpods.information.is_none());
+    }
+
+    /// A fresh directory under the system temp dir.
+    fn devices_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "librepods-aacp-devices-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn update_devices_file_leaves_unparseable_file_unchanged() {
+        let path = devices_dir("unparseable").join("devices.json");
+        std::fs::write(&path, "{").unwrap();
+
+        let written = update_devices_file(&path, |_| panic!("update must not run"));
+
+        assert!(!written);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{");
+    }
+
+    #[test]
+    fn update_devices_file_creates_missing_file_with_only_update() {
+        let path = devices_dir("missing").join("devices.json");
+
+        assert!(update_devices_file(&path, |d| {
+            devices_with_proximity_keys(d, AIRPODS_MAC, &[(0x01, vec![0x11])])
+        }));
+        let written: HashMap<String, DeviceData> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.keys().collect::<Vec<_>>(), [AIRPODS_MAC]);
     }
 }
