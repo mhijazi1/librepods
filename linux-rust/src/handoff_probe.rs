@@ -8,7 +8,7 @@ use crate::media_controller::{
     decide_takeover, routing_snapshot_of,
 };
 use crate::switching::{
-    advertise_call, announce, event_input, session_facts, spawn_playback_poller,
+    PlaybackSamples, advertise_call, announce, event_input, session_facts, spawn_playback_poller,
 };
 use bluer::Address;
 use std::time::{Duration, Instant};
@@ -204,7 +204,7 @@ struct Io {
     media: MediaController,
     manager: AACPManager,
     events: tokio::sync::mpsc::UnboundedReceiver<AACPEvent>,
-    play_rx: tokio::sync::mpsc::Receiver<(Instant, bool)>,
+    play_rx: PlaybackSamples,
     retry: Option<tokio::task::JoinHandle<Result<Reconnection>>>,
     /// Session made by the last reconnect, until the core adopts or cancels it.
     candidate: Option<Reconnection>,
@@ -305,7 +305,7 @@ impl Io {
                     }
                     self.adapter.device(self.address)?.disconnect().await?;
                 }
-                Command::DrainPlayback => while self.play_rx.try_recv().is_ok() {},
+                Command::DrainPlayback => self.play_rx.drain(),
                 Command::Exit => return Ok(true),
                 Command::Fail(reason) => return Err(reason.into()),
             }

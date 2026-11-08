@@ -39,7 +39,7 @@ use futures::future::BoxFuture;
 use log::{error, info};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -60,7 +60,24 @@ type FlushRequest = oneshot::Sender<()>;
 /// Playback samples: whether any local MPRIS player was playing, or a
 /// takeover-worthy audio stream had been playing for the minimum duration,
 /// at the instant.
-pub(crate) type PlaybackSamples = mpsc::Receiver<(Instant, bool)>;
+pub(crate) struct PlaybackSamples {
+    rx: mpsc::Receiver<(Instant, bool)>,
+    /// Asks the stream monitor to re-baseline (#90).
+    rebaseline: Arc<AtomicBool>,
+}
+
+impl PlaybackSamples {
+    pub(crate) async fn recv(&mut self) -> Option<(Instant, bool)> {
+        self.rx.recv().await
+    }
+
+    /// `Command::DrainPlayback`: re-baseline the stream monitor before it
+    /// observes its next listing, and drop the samples already taken.
+    pub(crate) fn drain(&mut self) {
+        self.rebaseline.store(true, Ordering::SeqCst);
+        while self.rx.try_recv().is_ok() {}
+    }
+}
 
 /// The media side effects the handoff core can ask for, injected so tests
 /// need no D-Bus or PipeWire.
@@ -151,7 +168,8 @@ pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
 /// (`stream_monitor::spawn_stream_playback`), so a sound server that never
 /// answers leaves the stream state as it was but never holds up the MPRIS
 /// samples. Only edges reach the handoff core (`Input::Playback`), which
-/// keeps every takeover decision.
+/// keeps every takeover decision; `PlaybackSamples::drain` re-baselines the
+/// stream monitor when the core resets its baseline (#90).
 fn spawn_playback_poller_with<M, S, P>(
     mpris: M,
     streams: S,
@@ -164,8 +182,15 @@ where
     S: PlaybackSource + 'static,
     P: PeakSource + 'static,
 {
-    let (play_tx, play_rx) = mpsc::channel(1);
-    let streams = stream_monitor::spawn_stream_playback(streams, peaks, min_stream, interval);
+    let (play_tx, rx) = mpsc::channel(1);
+    let rebaseline = Arc::new(AtomicBool::new(false));
+    let streams = stream_monitor::spawn_stream_playback(
+        streams,
+        peaks,
+        min_stream,
+        interval,
+        rebaseline.clone(),
+    );
     let mpris = Arc::new(mpris);
     tokio::spawn(async move {
         loop {
@@ -181,7 +206,7 @@ where
             tokio::time::sleep(interval).await;
         }
     });
-    play_rx
+    PlaybackSamples { rx, rebaseline }
 }
 
 /// Copy a session's routing, wear and ownership state for the core. The
@@ -426,7 +451,7 @@ impl Shell {
                 }
                 Command::AdoptSession => info!("Handoff: no reconnect session to adopt"),
                 Command::CancelReconnect => info!("Handoff: no reconnect to cancel"),
-                Command::DrainPlayback => while self.play_rx.try_recv().is_ok() {},
+                Command::DrainPlayback => self.play_rx.drain(),
                 Command::Exit => return true,
                 Command::Fail(reason) => {
                     error!("Handoff: {reason}");
@@ -1209,7 +1234,10 @@ mod tests {
                 media,
                 records,
                 handler,
-                (play_tx, move || play_rx),
+                (play_tx, move || PlaybackSamples {
+                    rx: play_rx,
+                    rebaseline: Default::default(),
+                }),
             )
             .await
         }
@@ -1521,7 +1549,10 @@ mod tests {
                 command_tx,
             },
             media,
-            move || play_rx,
+            move || PlaybackSamples {
+                rx: play_rx,
+                rebaseline: Default::default(),
+            },
             move |_: &str| call_rx,
         )
         .await
@@ -2368,6 +2399,114 @@ mod tests {
         drop(release);
     }
 
+    /// Every playback sample's value for `period`.
+    async fn samples_for(rx: &mut PlaybackSamples, period: Duration) -> Vec<bool> {
+        let end = tokio::time::Instant::now() + period;
+        let mut seen = Vec::new();
+        while let Ok((_, playing)) = tokio::time::timeout_at(end, next_sample(rx)).await {
+            seen.push(playing);
+        }
+        seen
+    }
+
+    /// A stream-only poller over `streams` (no MPRIS) past its empty
+    /// baseline listing.
+    async fn stream_poller<S: PlaybackSource + 'static>(
+        streams: &LiveStreams,
+        source: S,
+    ) -> PlaybackSamples {
+        let rx = spawn_playback_poller_with(
+            || false,
+            source,
+            AllAudible,
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+        );
+        streams.settle().await;
+        rx
+    }
+
+    #[tokio::test]
+    async fn playback_poller_rebaseline_debouncing_stream_never_plays() {
+        let streams = LiveStreams::default();
+        let mut rx = stream_poller(&streams, streams.clone()).await;
+        streams.set(vec![music(2)]);
+        streams.settle().await;
+        tokio::time::sleep(STREAM_TEST_MIN / 5).await;
+        // The core resets its baseline while the stream debounces.
+        rx.drain();
+        let seen = samples_for(&mut rx, STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|playing| !playing), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn playback_poller_rebaseline_later_stream_plays_after_min() {
+        let streams = LiveStreams::default();
+        let mut rx = stream_poller(&streams, streams.clone()).await;
+        rx.drain();
+        streams.settle().await;
+        let started = Instant::now();
+        streams.set(vec![music(3)]);
+        let playing_at = sample_until(&mut rx, true).await;
+        assert!(playing_at.duration_since(started) >= STREAM_TEST_MIN);
+    }
+
+    /// `LiveStreams` whose listings wait while the test holds `hold`;
+    /// `started` counts the listings begun.
+    struct HeldStreams {
+        streams: LiveStreams,
+        hold: Arc<StdMutex<()>>,
+        started: Arc<AtomicUsize>,
+    }
+
+    impl PlaybackSource for HeldStreams {
+        fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            drop(self.hold.lock());
+            self.streams.playback_streams()
+        }
+    }
+
+    #[tokio::test]
+    async fn playback_poller_rebaseline_during_listing_never_plays() {
+        let streams = LiveStreams::default();
+        let hold = Arc::new(StdMutex::new(()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let source = HeldStreams {
+            streams: streams.clone(),
+            hold: hold.clone(),
+            started: started.clone(),
+        };
+        let mut rx = stream_poller(&streams, source).await;
+        streams.set(vec![music(4)]);
+        streams.settle().await;
+        // Hold the next listing; once it returns the stream has lasted the
+        // minimum, so it would count.
+        let held = hold.lock().unwrap();
+        let begun = started.load(Ordering::SeqCst) + 1;
+        wait_until("a held listing", || started.load(Ordering::SeqCst) >= begun).await;
+        tokio::time::sleep(STREAM_TEST_MIN + STREAM_TEST_MIN / 5).await;
+        rx.drain();
+        drop(held);
+        let seen = samples_for(&mut rx, STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|playing| !playing), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn playback_poller_rebaseline_keeps_counted_stream() {
+        let streams = LiveStreams::default();
+        let mut rx = stream_poller(&streams, streams.clone()).await;
+        streams.set(vec![music(5)]);
+        sample_until(&mut rx, true).await;
+        // The ReconnectedForPlayback case: the take is for this stream.
+        rx.drain();
+        let seen = samples_for(&mut rx, STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|playing| *playing), "{seen:?}");
+    }
+
     #[tokio::test]
     async fn handoff_stream_playback_takes() {
         let mac = "5A:00:00:00:00:0D";
@@ -2577,6 +2716,10 @@ mod tests {
 
             fn feed(&mut self, ms: u64, input: Input) -> Vec<Command> {
                 let commands = self.core.handle(self.t0 + Duration::from_millis(ms), input);
+                // As the shells' `PlaybackSamples::drain` (#90).
+                if commands.contains(&Command::DrainPlayback) {
+                    self.tracker.rebaseline();
+                }
                 self.log.push(commands.clone());
                 commands
             }
@@ -2688,9 +2831,9 @@ mod tests {
         const RECONNECT_MS: u64 = DISCONNECT_MS + POLL_MS + MIN_MS + POLL_MS;
 
         /// The session drops while worn (recovery Immediate) and a new one
-        /// comes at `RECONNECT_MS`; the player (MPRIS and a music stream)
-        /// plays from `start` ms on.
-        fn reconnect_case(start: u64) -> Pipeline {
+        /// comes at `RECONNECT_MS`; the player (a music stream, with MPRIS
+        /// when `mpris`) plays from `start` ms on.
+        fn reconnect_case(start: u64, mpris: bool) -> Pipeline {
             let mut p = Pipeline::ready();
             assert_eq!(
                 p.feed(DISCONNECT_MS, Input::Disconnected),
@@ -2706,22 +2849,79 @@ mod tests {
                     );
                 }
                 if ms == RECONNECT_MS {
-                    // The tracker counts a stream started before the drop.
-                    assert_eq!(p.streams_playing, start < ms);
+                    // The tracker counts a stream that lasted the minimum.
+                    assert_eq!(p.streams_playing, start + MIN_MS < ms);
                     p.feed(ms, Input::Reconnected(facts()));
                 }
                 let playing = ms >= start;
                 let streams: &[StreamProps] = if playing { &player } else { &[] };
-                p.step(ms, playing, streams);
+                p.step(ms, mpris && playing, streams);
             }
             p
         }
 
         #[test]
         fn non_event_playback_already_running_on_reconnect() {
-            assert_eq!(reconnect_case(DISCONNECT_MS + POLL_MS).takes(), NO_TAKE);
             assert_eq!(
-                reconnect_case(RECONNECT_MS + POLL_MS).takes(),
+                reconnect_case(DISCONNECT_MS + POLL_MS, true).takes(),
+                NO_TAKE
+            );
+            assert_eq!(
+                reconnect_case(RECONNECT_MS + POLL_MS, true).takes(),
+                [vec![SendOwnership(true)]]
+            );
+        }
+
+        /// #90: a stream (no MPRIS) still in its debounce at the reconnect's
+        /// baseline reset is no new start.
+        #[test]
+        fn non_event_stream_started_before_reconnect_reset() {
+            assert_eq!(
+                reconnect_case(RECONNECT_MS - POLL_MS, false).takes(),
+                NO_TAKE
+            );
+            assert_eq!(
+                reconnect_case(RECONNECT_MS + POLL_MS, false).takes(),
+                [vec![SendOwnership(true)]]
+            );
+        }
+
+        /// Under the minimum after `EVENT_MS`.
+        const RESET_MS: u64 = EVENT_MS + 3 * POLL_MS;
+
+        /// `ready`, then a live `Input::Auto` (answered) at `RESET_MS`; a
+        /// music stream with no MPRIS player plays from `start` ms on.
+        fn auto_reset_case(start: u64) -> Pipeline {
+            let mut p = Pipeline::ready();
+            let stream = [music(1)];
+            for ms in (EVENT_MS..=RESET_MS + 2 * MIN_MS + POLL_MS).step_by(POLL_MS as usize) {
+                if ms == RESET_MS {
+                    assert!(!p.streams_playing);
+                    assert_eq!(
+                        p.feed(ms, Input::Auto),
+                        [
+                            Command::ConnectA2dp,
+                            SendOwnership(false),
+                            Command::Announce,
+                            Command::DrainPlayback
+                        ]
+                    );
+                    // The reply to Auto's "not owning" (#54).
+                    assert_eq!(p.feed(ms, Input::Ownership(vec![0])), []);
+                }
+                let streams: &[StreamProps] = if ms >= start { &stream } else { &[] };
+                p.step(ms, false, streams);
+            }
+            p
+        }
+
+        /// #90: a stream (no MPRIS) still in its debounce when Auto resets
+        /// the baseline is no new start.
+        #[test]
+        fn non_event_stream_started_before_auto_reset() {
+            assert_eq!(auto_reset_case(EVENT_MS).takes(), NO_TAKE);
+            assert_eq!(
+                auto_reset_case(RESET_MS + POLL_MS).takes(),
                 [vec![SendOwnership(true)]]
             );
         }
