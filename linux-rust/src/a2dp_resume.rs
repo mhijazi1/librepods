@@ -189,8 +189,8 @@ pub(crate) trait A2dpResumeIo: Send + Sync {
 /// steps, including during a step's audio check.
 pub(crate) async fn run(io: impl A2dpResumeIo, until: Instant, mut cancel: oneshot::Receiver<()>) {
     // Tokio's clock, so tests can pause it; the same as std's otherwise.
-    let now = || tokio::time::Instant::now().into_std();
-    let mut chain = Chain::new(now(), until, io.playing().await);
+    let clock = || tokio::time::Instant::now().into_std();
+    let mut chain = Chain::new(clock(), until, io.playing().await);
     loop {
         let (due, senses) = (chain.due(), chain.senses());
         // The audio check gives way to a cancel too, so a yield during it
@@ -212,7 +212,7 @@ pub(crate) async fn run(io: impl A2dpResumeIo, until: Instant, mut cancel: onesh
             }
             sensed = sensed => sensed,
         };
-        let now = now();
+        let now = clock();
         let Some(actions) = chain.step(now, audible, &playing) else {
             let left = until.saturating_duration_since(now);
             info!("A2DP resume: done (audible: {audible}, window left: {left:?})");
