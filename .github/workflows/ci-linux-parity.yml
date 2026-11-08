@@ -1,0 +1,53 @@
+name: Linux CI (parity)
+
+# Build and test linux-rust inside the flake's Nix dev shell, mirroring the
+# swarm check in .swarm/config.json, for every change aimed at linux-parity.
+on:
+  pull_request:
+    branches:
+      - linux-parity
+  push:
+    branches:
+      - linux-parity
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-linux-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            linux-rust/target
+          key: ${{ runner.os }}-nix-cargo-${{ hashFiles('flake.lock', 'linux-rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-nix-cargo-
+
+      - name: cargo build --locked
+        working-directory: linux-rust
+        run: nix develop .. -c cargo build --locked
+
+      - name: cargo test --locked
+        working-directory: linux-rust
+        run: nix develop .. -c cargo test --locked
+
+      - name: nix flake check --no-build
+        run: nix flake check --no-build
