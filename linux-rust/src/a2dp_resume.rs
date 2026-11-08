@@ -15,6 +15,7 @@ use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use futures::future::BoxFuture;
 use log::{info, warn};
+use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -355,24 +356,62 @@ fn device_fragment(airpods_mac: &str) -> String {
     format!("/dev_{}/", airpods_mac.to_uppercase().replace(':', "_"))
 }
 
-/// One blocking read of whether the AirPods' A2DP transport is active. None
-/// for no MAC (never idle: "/dev_/" matches no transport) or when BlueZ
-/// can't be read in `TRANSPORT_READ_TIMEOUT`: the chain stops waiting then,
-/// and this blocking read can't be aborted.
+/// The fresh reads' one system bus connection, shared by `read_shared`.
+static FRESH_BUS: Mutex<Option<Connection>> = Mutex::new(None);
+
+/// One blocking read of whether the AirPods' A2DP transport is active, on
+/// the shared `FRESH_BUS` connection. None for no MAC (never idle: "/dev_/"
+/// matches no transport), when another read holds the connection (a stuck
+/// open or call), or when BlueZ can't be read in `TRANSPORT_READ_TIMEOUT`:
+/// the chain stops waiting then, and this blocking read can't be aborted.
 pub(crate) fn read_transport_once(airpods_mac: &str) -> Option<bool> {
     // The budget counts the connection's opening too.
     let deadline = Instant::now() + TRANSPORT_READ_TIMEOUT;
     if airpods_mac.is_empty() {
         return None;
     }
-    let bus = Connection::new_system().ok()?;
     let device = device_fragment(airpods_mac);
-    read_within(
-        deadline,
-        Instant::now,
-        |timeout| transport_paths(&bus, &device, timeout),
-        |path, timeout| transport_state(&bus, path, timeout),
+    read_shared(
+        &FRESH_BUS,
+        || Connection::new_system().ok(),
+        |bus| {
+            read_within(
+                deadline,
+                Instant::now,
+                |timeout| transport_paths(bus, &device, timeout),
+                |path, timeout| transport_state(bus, path, timeout),
+            )
+        },
     )
+}
+
+/// `read` on the bus in `slot`, opened by `open` only when the slot is
+/// empty. None at once when another read holds the slot, so a stalled bus
+/// pins one thread, not one per read. A None read drops the bus, so the
+/// next read reopens; a poisoned slot is cleared and reopened.
+fn read_shared<B>(
+    slot: &Mutex<Option<B>>,
+    open: impl FnOnce() -> Option<B>,
+    read: impl FnOnce(&B) -> Option<bool>,
+) -> Option<bool> {
+    let mut bus = match slot.try_lock() {
+        Ok(bus) => bus,
+        Err(TryLockError::WouldBlock) => return None,
+        Err(TryLockError::Poisoned(poisoned)) => {
+            slot.clear_poison();
+            let mut bus = poisoned.into_inner();
+            *bus = None;
+            bus
+        }
+    };
+    if bus.is_none() {
+        *bus = open();
+    }
+    let active = bus.as_ref().and_then(read);
+    if active.is_none() {
+        *bus = None;
+    }
+    active
 }
 
 /// A fresh `TransportReader` read that makes no bus call after `deadline`:
@@ -1058,6 +1097,92 @@ mod tests {
     #[test]
     fn read_transport_once_empty_mac_is_unknown() {
         assert_eq!(read_transport_once(""), None);
+    }
+
+    /// A `read_shared` opener that counts its calls and opens bus `n`.
+    fn opener(opens: &Cell<usize>, n: u32) -> impl FnOnce() -> Option<u32> {
+        move || {
+            opens.set(opens.get() + 1);
+            Some(n)
+        }
+    }
+
+    #[test]
+    fn shared_bus_reads_reuse_one_open() {
+        let (slot, opens) = (Mutex::new(None), Cell::new(0));
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 1), |_| Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 2), |bus| Some(*bus != 1)),
+            Some(false)
+        );
+        assert_eq!(opens.get(), 1);
+    }
+
+    #[test]
+    fn shared_bus_unknown_read_reopens() {
+        let (slot, opens) = (Mutex::new(None), Cell::new(0));
+        assert_eq!(read_shared(&slot, opener(&opens, 1), |_| None), None);
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 2), |bus| Some(*bus == 2)),
+            Some(true)
+        );
+        assert_eq!(opens.get(), 2);
+        // A failed open reads unknown without reading.
+        let failed = read_shared(&Mutex::new(None::<u32>), || None, |_| panic!("read"));
+        assert_eq!(failed, None);
+    }
+
+    #[test]
+    fn shared_bus_busy_is_unknown() {
+        let slot = Mutex::new(None);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let busy_opens = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                let open = move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some(1)
+                };
+                read_shared(&slot, open, |_| Some(true))
+            });
+            entered_rx.recv().unwrap();
+            let start = Instant::now();
+            let open = || {
+                busy_opens.fetch_add(1, Ordering::SeqCst);
+                Some(2)
+            };
+            let busy = read_shared(&slot, open, |_| Some(false));
+            let took = start.elapsed();
+            // Release before asserting, so a failure can't hang the scope.
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), Some(true));
+            assert_eq!(busy, None);
+            assert!(took < ms(50), "busy read took {took:?}");
+            assert_eq!(busy_opens.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn shared_bus_poisoned_slot_reopens() {
+        let (slot, opens) = (Mutex::new(None), Cell::new(0));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_shared(&slot, opener(&opens, 1), |_| panic!("read"))
+        }));
+        assert!(panicked.is_err() && slot.is_poisoned());
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 2), |bus| Some(*bus == 2)),
+            Some(true)
+        );
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 3), |bus| Some(*bus == 2)),
+            Some(true)
+        );
+        assert_eq!(opens.get(), 2);
     }
 
     #[test]
