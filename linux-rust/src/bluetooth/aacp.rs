@@ -5,7 +5,7 @@ use bluer::{
     Address, AddressType, Error, Result,
     l2cap::{SeqPacket, Socket, SocketAddr},
 };
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
@@ -40,6 +40,18 @@ pub mod opcodes {
     pub const SEND_CONNECTED_MAC: u8 = 0x14;
     pub const HEADTRACKING: u8 = 0x17;
     pub const TIPI_3: u8 = 0x0C;
+    // Seen from AirPods Pro in practice; no known name or meaning, so unhandled.
+    pub const UNKNOWN_0X02: u8 = 0x02;
+    pub const UNKNOWN_0X2B: u8 = 0x2B;
+    pub const UNKNOWN_0X4C: u8 = 0x4C;
+}
+
+/// Opcodes we receive routinely but deliberately ignore (logged at trace, not debug).
+pub(crate) fn is_known_ignored_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        opcodes::UNKNOWN_0X02 | opcodes::UNKNOWN_0X2B | opcodes::UNKNOWN_0X4C
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -942,6 +954,12 @@ impl AACPManager {
             }
             opcodes::EQ_DATA => {
                 debug!("Received EQ Data");
+            }
+            op if is_known_ignored_opcode(op) => {
+                trace!(
+                    "Ignoring packet with opcode {op:#04x}, len {}",
+                    payload.len()
+                );
             }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
@@ -2743,6 +2761,16 @@ mod tests {
             parse_control_command(&[0x09, 0x00, 0x99, 0x01, 0x00, 0x00, 0x00]),
             Some(ParsedControlCommand::Unknown { identifier: 0x99 })
         );
+    }
+
+    #[test]
+    fn seen_unhandled_opcodes_are_known_ignored() {
+        for op in [0x02, 0x2B, 0x4C] {
+            assert!(is_known_ignored_opcode(op), "{op:#04x}");
+        }
+        for op in [0x00, 0x7F, 0xFF, opcodes::BATTERY_INFO, opcodes::EQ_DATA] {
+            assert!(!is_known_ignored_opcode(op), "{op:#04x}");
+        }
     }
 
     #[test]

@@ -636,6 +636,8 @@ impl App {
                                         });
                                     }
                                 }
+                                // The handoff path (switching.rs) owns connection ownership.
+                                ControlCommandIdentifiers::OwnsConnection => {}
                                 _ => {
                                     debug!("Unhandled Control Command Status: {:?}", status);
                                 }
