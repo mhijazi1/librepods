@@ -177,18 +177,29 @@ impl Log {
         make_private(&file, 0o600, path);
         let measured = file.metadata()?;
         if measured.len() > MAX_LOG_BYTES {
-            let mut rotated = path.as_os_str().to_owned();
-            rotated.push(".1");
-            let rotated = PathBuf::from(rotated);
-            // The directory lock (dropped, so released, after the reopen)
-            // makes check, rename and reopen one step for other openers.
+            let suffixed = |suffix: &str| {
+                let mut name = path.as_os_str().to_owned();
+                name.push(suffix);
+                PathBuf::from(name)
+            };
+            let (rotated, lock_path) = (suffixed(".1"), suffixed(".lock"));
+            // The lock on `<path>.lock` (dropped, so released, after the reopen)
+            // makes check, rename and reopen one step for other openers. A
+            // writable file, not the directory: NFS emulates flock with fcntl.
             // Ok holds whether the rename happened and the reopen's result.
-            let fresh = File::open(path.parent().unwrap_or(Path::new("."))).and_then(|dir| {
+            let lock_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .open(&lock_path);
+            let fresh = lock_file.and_then(|lock| {
+                make_private(&lock, 0o600, &lock_path);
                 #[cfg(test)]
                 if let Some(hook) = tests::BEFORE_LOCK.take() {
                     hook();
                 }
-                dir.lock()?;
+                lock.lock()?;
                 // Move only the file measured above: a process that lost a race
                 // with another rotator must not move that one's fresh log over .1.
                 let moved = std::fs::metadata(path).and_then(|now| {
@@ -220,7 +231,7 @@ impl Log {
                     }
                 }
             });
-            // An error before the rename (dir open, lock, metadata) moved nothing.
+            // An error before the rename (lock file, lock, metadata) moved nothing.
             match fresh.unwrap_or_else(|e| (false, Err(e))) {
                 (_, Ok(fresh)) => file = fresh,
                 (renamed, Err(e)) => warn!("{}", rotation_warning(path, &rotated, renamed, &e)),
@@ -637,6 +648,54 @@ mod tests {
     }
 
     #[test]
+    fn handoff_log_rotation_lock_file_is_private() {
+        let dir = temp_dir("lock-file");
+        let path = dir.join("handoff.jsonl");
+        let lock = dir.join("handoff.jsonl.lock");
+        Log::open(&path, Source::App).unwrap();
+        assert!(!lock.exists(), "a normal open created the lock file");
+        for preexisting in [false, true] {
+            if preexisting {
+                std::fs::remove_file(&lock).unwrap();
+                std::fs::write(&lock, b"").unwrap();
+                std::fs::set_permissions(&lock, Permissions::from_mode(0o644)).unwrap();
+            }
+            std::fs::write(&path, vec![b'x'; MAX_LOG_BYTES as usize + 1]).unwrap();
+            Log::open(&path, Source::App).unwrap();
+            assert!(std::fs::metadata(&lock).unwrap().is_file());
+            assert_eq!(mode(&lock), 0o600, "preexisting={preexisting}");
+            let message = report_message(Some(&path));
+            assert!(message.starts_with("Last handoff session:"), "{message}");
+            let fresh = report(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(message, fresh.to_string());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_open_keeps_oversized_log_when_lock_fails() {
+        let dir = temp_dir("lock-fails");
+        let path = dir.join("handoff.jsonl");
+        let mut old = vec![b'x'; MAX_LOG_BYTES as usize + 1];
+        *old.last_mut().unwrap() = b'\n';
+        std::fs::write(&path, &old).unwrap();
+        // A directory cannot be opened read+write (EISDIR).
+        std::fs::create_dir_all(dir.join("handoff.jsonl.lock/full")).unwrap();
+        Log::open(&path, Source::App).unwrap();
+        let text = std::fs::read(&path).unwrap();
+        let tail = text
+            .strip_prefix(old.as_slice())
+            .expect("the oversized log was truncated");
+        assert!(matches!(
+            serde_json::from_slice(tail),
+            Ok(Record::SessionStart { .. })
+        ));
+        assert_eq!(tail.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert!(!dir.join("handoff.jsonl.1").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn handoff_log_rotation_keeps_running_writer() {
         let dir = temp_dir("rotate-running");
         let path = dir.join("handoff.jsonl");
@@ -681,7 +740,7 @@ mod tests {
 
     thread_local! {
         /// Runs in Log::open's rotation branch after the size measurement,
-        /// just before the directory lock is taken.
+        /// just before the `<path>.lock` lock is taken.
         pub(super) static BEFORE_LOCK: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
         /// Runs in Log::open between the inode check and the rename.
         pub(super) static BEFORE_RENAME: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
@@ -781,7 +840,7 @@ mod tests {
             // Sanity only: with the lock held, the rival cannot finish.
             assert!(
                 rival_done.recv_timeout(Duration::from_millis(50)).is_err(),
-                "the rival rotated while the probe held the directory lock"
+                "the rival rotated while the probe held the rotation lock"
             );
         })));
         let _probe = Log::open(&path, Source::Probe).unwrap();
