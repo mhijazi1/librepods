@@ -149,8 +149,9 @@ fn with_connect_mode(
 /// Replaces the settings file at `path` with `contents` without ever leaving it
 /// half-written: a temp file next to the target is written, fsynced and renamed
 /// over it. An existing target is resolved first, so a symlink stays a symlink,
-/// and its permission bits are kept. A missing parent directory is created. On
-/// error the temp file is removed and the target is untouched.
+/// and its permission bits are kept; a new file is created 0600. A missing
+/// parent directory is created. On error the temp file is removed and the
+/// target is untouched.
 fn write_settings_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     write_settings_file_with(path, contents, |_| Ok(()))
 }
@@ -163,6 +164,7 @@ fn write_settings_file_with(
     before_rename: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     static NEXT_TMP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     let target = match std::fs::canonicalize(path) {
@@ -193,9 +195,11 @@ fn write_settings_file_with(
         std::process::id(),
         NEXT_TMP.fetch_add(1, Ordering::Relaxed)
     ));
+    // Private until the target's mode is copied: devices.json holds keys.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&tmp)?;
     let result = (|| {
         file.write_all(contents.as_bytes())?;
@@ -1755,6 +1759,24 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
         assert_eq!(dir_names(target.parent().unwrap()), ["preferences.json"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_write_new_file_is_private() {
+        let dir = settings_dir("private");
+        let target = dir.join("devices.json");
+
+        // The temp file is already private while it holds the contents.
+        write_settings_file_with(&target, "{}", |tmp| {
+            let mode = std::fs::metadata(tmp)?.permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            Ok(())
+        })
+        .unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
