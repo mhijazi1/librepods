@@ -260,7 +260,7 @@ pub(crate) fn decide_takeover(inputs: TakeoverInputs) -> TakeoverDecision {
 }
 
 /// What a blocking MPRIS pause did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PauseOutcome {
     /// Players that reported `Playing` and paused.
     pub(crate) paused: usize,
