@@ -58,6 +58,15 @@ The Linux version runs as a system tray app. Connect your AirPods and enjoy:
 
 For installation and detailed info, see the [Linux README](/linux/README.md).
 
+#### Automatic switching
+
+While an iPhone or Mac owns the AirPods, Linux takes them only for players
+that report playback over MPRIS (most browsers, Spotify, mpv with an MPRIS
+plugin, ...). Apps without MPRIS (games, plain mpv, many Electron apps) can't
+take them: Linux's A2DP stream stays idle until Linux owns the AirPods, so
+there is no audio to detect. Follow-up:
+[#198](https://github.com/mhijazi1/librepods/issues/198).
+
 #### Desktop battery (BlueZ BatteryProvider)
 
 LibrePods exports the AirPods battery to BlueZ as a battery provider, so it

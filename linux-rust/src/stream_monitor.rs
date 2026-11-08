@@ -12,6 +12,11 @@
 //! injected clock, and `spawn_stream_playback` publishes its state for
 //! `switching::spawn_playback_poller`, which combines it with MPRIS. Tests
 //! use fake sources, so no sound server is needed.
+//!
+//! Limit (#197): this stream path (`PlaybackTracker` and the peak gate) can't
+//! take the AirPods from an Apple owner: their A2DP transport stays idle, so
+//! the peak gate only sees silence and only MPRIS takes from an Apple owner
+//! (follow-up spike #198).
 
 use crate::call_detect::{
     StreamDirection, StreamProps, airpods_card_profile, call_active, is_takeover_worthy,
