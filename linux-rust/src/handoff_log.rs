@@ -161,6 +161,7 @@ impl Log {
             kind: classify(line),
             line: line.to_string(),
         };
+        // shortcut: the append runs synchronously on the handoff task, so a hung state filesystem (e.g. a stale NFS home) would stall switching; move it to a writer thread if that is ever seen (#TBD)
         let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(open) = file.as_mut()
             && let Err(e) = write_record(open, &record)
