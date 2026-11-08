@@ -481,6 +481,18 @@ async fn sync_session(core: &mut Handoff, shell: &mut Shell) -> bool {
     step(core, shell, Input::Disconnected).await
 }
 
+/// The event stream closed: no event can reach the core any more, so it
+/// stops through SessionLost and Disconnected whether or not the session is
+/// still alive.
+async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
+    if core.live() && step(core, shell, Input::SessionLost).await {
+        return;
+    }
+    if core.connected() {
+        step(core, shell, Input::Disconnected).await;
+    }
+}
+
 async fn run_handoff(mut shell: Shell) {
     // The event channel is set after connect and handshake, so the earlier
     // reports exist only in the state.
@@ -518,6 +530,7 @@ async fn run_handoff(mut shell: Shell) {
                 }
                 None => {
                     info!("Handoff: event stream of {} closed", shell.mac);
+                    end_stream(&mut core, &mut shell).await;
                     true
                 }
             },
@@ -1278,6 +1291,11 @@ mod tests {
             self.events.send(event).expect("event channel open");
         }
 
+        /// Drop the harness's sender of the primary event channel.
+        fn close_events(&mut self) {
+            self.events = mpsc::unbounded_channel().0;
+        }
+
         /// A call state change from the call monitor.
         async fn call(&self, in_call: bool) {
             let _ = self.call_tx.send((Instant::now(), in_call)).await;
@@ -1646,6 +1664,47 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(h.pauses(), 1);
         assert_eq!(h.activations(), 1);
+    }
+
+    #[tokio::test]
+    async fn handoff_closed_event_stream_feeds_session_lost_then_disconnected() {
+        let mac = "5A:00:00:00:00:12";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let mut h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        let task = handoff_task(mac).expect("handoff task");
+        expect_startup(&h, &mut rx).await;
+        expect_take(&h, &mut rx).await;
+        h.emit(owns(1));
+        wait_until("the take's ACK", || {
+            traced(mac)
+                .iter()
+                .any(|line| line.starts_with("ACK owner=linux"))
+        })
+        .await;
+        let before = traced(mac).len();
+
+        // Every sender of the primary channel goes; the session stays alive.
+        h.close_events();
+        manager.set_event_channel(mpsc::unbounded_channel().0).await;
+        wait_until("the task to end", || task.is_finished()).await;
+        assert!(handoff_task(mac).is_none());
+
+        let trace = traced(mac)[before..].to_vec();
+        assert!(
+            trace.len() >= 2
+                && trace[0].starts_with("SESSION lost")
+                && trace[1].starts_with("DISCONNECTED"),
+            "{trace:#?}"
+        );
+        // Disconnected owes the pause for the automatic take.
+        assert_eq!(h.pauses(), 1);
+
+        // Nothing is sent afterwards, even though the session is alive.
+        h.play(false).await;
+        h.play(true).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(h.pauses(), 1);
     }
 
     #[tokio::test]
