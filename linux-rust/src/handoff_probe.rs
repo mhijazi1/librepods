@@ -340,7 +340,7 @@ impl Io {
 /// Feed one input to the core, print its protocol lines and execute its
 /// commands. Ok(true) when the probe should stop.
 async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
-    // The daemon's order (#90, #146): the re-baseline is requested at the
+    // The daemon's order (#90): the re-baseline is requested at the
     // core's now, under the stream worker's lock.
     let (_, commands) = io.play_rx.handle(|now| core.handle(now, input));
     for line in core.take_lines() {

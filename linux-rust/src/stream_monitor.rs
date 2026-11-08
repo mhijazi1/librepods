@@ -376,7 +376,7 @@ pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 /// flight (#90).
 ///
 /// `rebaseline`'s lock is the serialization point with the core's step
-/// (`switching::PlaybackSamples::handle`, #146): once the listing and the
+/// (`switching::PlaybackSamples::handle`): once the listing and the
 /// levels have returned (never across that I/O, so a stalled sound server
 /// never blocks a step), the worker holds it from its clock read through
 /// the request, the observe and the publish. Each observe so falls wholly

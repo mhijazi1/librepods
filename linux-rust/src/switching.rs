@@ -85,7 +85,7 @@ impl PlaybackSamples {
     /// Run the core's step at now, `core_step(now)`, under the re-baseline
     /// lock, and when it asks for `DrainPlayback` request the stream
     /// monitor's re-baseline at that now before the lock is released, so
-    /// before any command is awaited (#90, #146). The stream worker holds
+    /// before any command is awaited (#90). The stream worker holds
     /// the same lock from its clock read to its publish, so each of its
     /// observes falls wholly before now, published before it (a poller
     /// sample stamped at or after now reads it), or wholly after the
@@ -245,7 +245,7 @@ where
     let mpris = Arc::new(mpris);
     tokio::spawn(async move {
         loop {
-            // Stamped before the stream state is read (#146): a sample
+            // Stamped before the stream state is read: a sample
             // stamped at or after a step's reset reads every state the
             // stream monitor published before that reset.
             let sampled_at = Instant::now();
@@ -3072,7 +3072,7 @@ mod tests {
         seen.iter().map(|&(_, playing)| playing).collect()
     }
 
-    /// #146's synchronous gap: the core resets while the worker samples a
+    /// The synchronous gap: the core resets while the worker samples a
     /// stream debouncing since before the reset, and the worker's clock,
     /// read after the reset, completes the minimum before the core's step
     /// has returned. The stream still never plays.
@@ -3106,7 +3106,7 @@ mod tests {
         assert!(seen.iter().all(|playing| !playing), "{seen:?}");
     }
 
-    /// #146's publish latency: the worker completes a stream's minimum
+    /// The publish latency: the worker completes a stream's minimum
     /// before the core's reset and publishes only after it. The core sees
     /// no new start: every sample from the reset on plays.
     #[tokio::test]
