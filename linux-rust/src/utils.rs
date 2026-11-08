@@ -191,8 +191,9 @@ pub fn load_auto_connect(mac: &str) -> bool {
 }
 
 /// Apple's per-device "Connect to this computer", from the device's
-/// `connectMode` in preferences.json.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// `connectMode` in preferences.json (written by the UI; read by matching
+/// the strings in `connect_mode_from_value`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectMode {
     /// The handoff core takes the AirPods for new playback as before.
