@@ -1,9 +1,11 @@
 mod battery_provider;
 mod bluetooth;
+mod call_detect;
 mod devices;
 mod handoff;
 mod handoff_probe;
 mod media_controller;
+mod stream_monitor;
 mod switching;
 mod ui;
 mod utils;

@@ -3,8 +3,9 @@
 //!
 //! - `Handoff` (default) runs the pure #841 core (`handoff.rs`) in one task
 //!   per AirPods MAC. The task only feeds the core (the session snapshot, the
-//!   AACP events, playback samples and ticks) and executes the commands it
-//!   returns; every decision is the core's (DECISIONS #8).
+//!   AACP events, playback samples, local call changes and ticks) and
+//!   executes the commands it returns; every decision is the core's
+//!   (DECISIONS #8).
 //! - `Legacy` is the eager playback takeover the app used before: the
 //!   playback listener and the three ownership reactions, moved here from
 //!   devices/airpods.rs without changes.
@@ -28,6 +29,7 @@ use crate::bluetooth::aacp::{
 };
 use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::media_controller::{self, MediaController};
+use crate::stream_monitor::{self, CallSamples};
 use crate::utils::SwitchingMode;
 use futures::future::BoxFuture;
 use log::{error, info};
@@ -204,6 +206,29 @@ pub(crate) async fn announce(
     Ok(())
 }
 
+/// Tell every connected remote host whether Linux is in a call (the core's
+/// `AdvertiseCall`): the in-call media information, or the idle one the
+/// announcement sends once the call ends.
+pub(crate) async fn advertise_call(
+    manager: &AACPManager,
+    local: &str,
+    in_call: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let peers = manager.state.lock().await.connected_devices.clone();
+    for peer in peers.iter().filter(|d| d.mac != local) {
+        if in_call {
+            manager
+                .send_media_information_call(local, &peer.mac)
+                .await?;
+        } else {
+            manager
+                .send_media_information_new_device(local, &peer.mac)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Whether the AACP receive loop still has the control session. The guard is
 /// dropped before this returns.
 async fn session_alive(manager: &AACPManager) -> bool {
@@ -291,6 +316,8 @@ struct Shell {
     /// Asks the router to forward what is left in the primary queue.
     flush: mpsc::UnboundedSender<FlushRequest>,
     play_rx: PlaybackSamples,
+    /// Local call state changes (#11).
+    call_rx: CallSamples,
 }
 
 impl Shell {
@@ -324,6 +351,11 @@ impl Shell {
                 Command::Announce => {
                     if let Err(e) = announce(&self.manager, &self.local).await {
                         error!("Handoff: failed to announce Linux to remote hosts: {e}");
+                    }
+                }
+                Command::AdvertiseCall(in_call) => {
+                    if let Err(e) = advertise_call(&self.manager, &self.local, in_call).await {
+                        error!("Handoff: failed to advertise call state {in_call}: {e}");
                     }
                 }
                 Command::PauseMedia => self.media.pause().await,
@@ -451,6 +483,10 @@ async fn run_handoff(mut shell: Shell) {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::Playback { sampled_at, playing }).await
             }
+            Some((_, in_call)) = shell.call_rx.recv() => {
+                sync_session(&mut core, &mut shell).await
+                    || step(&mut core, &mut shell, Input::LocalCall(in_call)).await
+            }
             _ = tick.tick() => {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::Tick).await
@@ -487,6 +523,7 @@ enum Policy {
         manager: AACPManager,
         media: Arc<dyn MediaActions>,
         play_rx: PlaybackSamples,
+        call_rx: CallSamples,
     },
     Legacy(Legacy),
     Off,
@@ -502,11 +539,23 @@ struct Legacy {
 
 impl Switching {
     /// Start the selected mode. `media` and `playback` are used only by the
-    /// handoff mode; `playback` is called only in that mode.
+    /// handoff mode; `playback` is called only in that mode. The handoff
+    /// mode monitors local calls with `stream_monitor::spawn_call_poller`.
     pub(crate) async fn start(
         setup: SwitchingSetup,
         media: Arc<dyn MediaActions>,
         playback: impl FnOnce() -> PlaybackSamples,
+    ) -> Self {
+        Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller).await
+    }
+
+    /// `start` with the local call monitor injected: `calls` gets the AirPods
+    /// MAC and is called only in the handoff mode.
+    pub(crate) async fn start_with_calls(
+        setup: SwitchingSetup,
+        media: Arc<dyn MediaActions>,
+        playback: impl FnOnce() -> PlaybackSamples,
+        calls: impl FnOnce(&str) -> CallSamples,
     ) -> Self {
         let SwitchingSetup {
             mode,
@@ -525,6 +574,7 @@ impl Switching {
                     manager,
                     media,
                     play_rx: playback(),
+                    call_rx: calls(&airpods_mac),
                 }
             }
             SwitchingMode::Legacy => {
@@ -577,6 +627,7 @@ impl Switching {
                 manager,
                 media,
                 play_rx,
+                call_rx,
             } => {
                 let (events_tx, handoff_events) = mpsc::unbounded_channel();
                 let (flush_tx, flush_rx) = mpsc::unbounded_channel();
@@ -588,6 +639,7 @@ impl Switching {
                     events: handoff_events,
                     flush: flush_tx,
                     play_rx,
+                    call_rx,
                 };
                 spawn_handoff_task(self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
@@ -757,6 +809,7 @@ mod tests {
     use super::*;
     use crate::bluetooth::aacp::{
         AudioSource, AudioSourceType, ConnectedDevice, ControlCommandStatus, EarDetectionStatus,
+        encode_media_information_call,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
@@ -942,6 +995,10 @@ mod tests {
         reference(|m| async move { m.send_add_tipi_device(LOCAL, remote).await }).await
     }
 
+    async fn expected_call(remote: &'static str) -> Vec<u8> {
+        reference(|m| async move { m.send_media_information_call(LOCAL, remote).await }).await
+    }
+
     /// Packets the legacy takeover sends and the handoff path must not.
     async fn hijack_packets() -> Vec<Vec<u8>> {
         vec![
@@ -986,6 +1043,8 @@ mod tests {
         records: Arc<Records>,
         play_tx: mpsc::Sender<(Instant, bool)>,
         playback_started: Arc<AtomicBool>,
+        /// The injected call monitor's sender (no sound server in tests).
+        call_tx: mpsc::Sender<(Instant, bool)>,
         /// The sender given to `set_event_channel`.
         events: EventTx,
         handler: Arc<DeviceHandler>,
@@ -1050,7 +1109,9 @@ mod tests {
             });
             let (events, events_rx) = mpsc::unbounded_channel();
             manager.set_event_channel(events.clone()).await;
-            let switching = Switching::start(
+            let (call_tx, call_rx) = mpsc::channel(8);
+            let calls_for = mac.to_string();
+            let switching = Switching::start_with_calls(
                 SwitchingSetup {
                     mode,
                     airpods_mac: mac.to_string(),
@@ -1064,6 +1125,10 @@ mod tests {
                     started.store(true, Ordering::SeqCst);
                     play_rx
                 },
+                move |airpods_mac: &str| {
+                    assert_eq!(airpods_mac, calls_for);
+                    call_rx
+                },
             )
             .await;
             switching.dispatch_events(events_rx, handler.clone().handle());
@@ -1071,6 +1136,7 @@ mod tests {
                 records,
                 play_tx,
                 playback_started,
+                call_tx,
                 events,
                 handler,
             }
@@ -1079,6 +1145,11 @@ mod tests {
         /// Emit an event the way the manager does.
         fn emit(&self, event: AACPEvent) {
             self.events.send(event).expect("event channel open");
+        }
+
+        /// A call state change from the call monitor.
+        async fn call(&self, in_call: bool) {
+            let _ = self.call_tx.send((Instant::now(), in_call)).await;
         }
 
         async fn play(&self, playing: bool) {
@@ -1224,6 +1295,101 @@ mod tests {
         );
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 1);
+
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_local_call_refuses_remote_and_advertises() {
+        let mac = "5A:00:00:00:00:0C";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        expect_startup(&h, &mut rx).await;
+        expect_take(&h, &mut rx).await;
+        h.emit(owns(1));
+        wait_until("the take's ACK", || {
+            traced(mac).iter().any(|l| l.starts_with("ACK owner=linux"))
+        })
+        .await;
+
+        // A call starts on Linux: one in-call media information packet per
+        // remote host, and nothing else.
+        h.call(true).await;
+        let advertised = next_packet(&mut rx).await;
+        assert_eq!(advertised, expected_call(REMOTE).await);
+        assert_eq!(
+            advertised[4..],
+            encode_media_information_call(LOCAL, REMOTE).expect("reference")[..]
+        );
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        // The same state again changes nothing.
+        h.call(true).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+        // An iPhone starts media and asks for the AirPods: refused, with no
+        // OwnsConnection [0] and no pause.
+        h.emit(AACPEvent::AudioSource(AudioSource {
+            mac: REMOTE.to_string(),
+            r#type: AudioSourceType::Media,
+        }));
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        wait_until("the refusal", || {
+            traced(mac)
+                .iter()
+                .any(|l| l == "REMOTE requested ownership; refused during a local call")
+        })
+        .await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+
+        // A host that joins during the call is announced and told of it.
+        let hosts = vec![host(LOCAL), host(REMOTE), host(SECOND_REMOTE)];
+        manager.state.lock().await.connected_devices = hosts.clone();
+        h.emit(AACPEvent::ConnectedDevices(
+            vec![host(LOCAL), host(REMOTE)],
+            hosts,
+        ));
+        let mut announced = Vec::new();
+        for _ in 0..6 {
+            announced.push(next_packet(&mut rx).await);
+        }
+        assert_eq!(
+            announced,
+            [
+                expected_new_device(REMOTE).await,
+                expected_tipi(REMOTE).await,
+                expected_new_device(SECOND_REMOTE).await,
+                expected_tipi(SECOND_REMOTE).await,
+                expected_call(REMOTE).await,
+                expected_call(SECOND_REMOTE).await,
+            ]
+        );
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+        // The call ends with playback still running: the idle media
+        // information per remote host, no release.
+        h.call(false).await;
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(REMOTE).await
+        );
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(SECOND_REMOTE).await
+        );
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+
+        // Normal policy again: the next request yields once.
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+        let trace = traced(mac);
+        assert!(
+            position(&trace, "CALL ended on Linux")
+                < position(&trace, "REMOTE requested ownership; yielding")
+        );
 
         stop_handoff_task(mac);
     }

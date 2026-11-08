@@ -1001,6 +1001,18 @@ impl AACPManager {
         .await
     }
 
+    pub async fn send_media_information_call(
+        &self,
+        self_mac_address: &str,
+        target_mac_address: &str,
+    ) -> Result<()> {
+        self.send_data_packet(&encode_media_information_call(
+            self_mac_address,
+            target_mac_address,
+        )?)
+        .await
+    }
+
     pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<()> {
         self.send_data_packet(&encode_hijack_request(target_mac_address)?)
             .await
@@ -1243,6 +1255,25 @@ pub(crate) fn encode_media_information_new_device(
     target_mac_address: &str,
 ) -> std::io::Result<Vec<u8>> {
     let dict = media_information_body("NA", false, self_mac_address, "Mac", 100);
+    smart_routing_packet(target_mac_address, &dict)
+}
+
+// otherDeviceAudioCategory for a host in a call (#11).
+//
+// PROVISIONAL and unverified: no Apple in-call relay has been captured yet.
+// #35's captures show only 100 (idle) and 301 (media); 401 is the next step
+// of that scale. Replace it once mo captures the relay an iPhone or Mac sends
+// during a call (hardware validation of #11).
+pub(crate) const AUDIO_CATEGORY_CALL: u32 = 401;
+
+// Media information that tells the other hosts Linux is in a call: the same
+// dict as `encode_media_information_new_device` (playingApp "NA"), with
+// hostStreamingState YES and otherDeviceAudioCategory AUDIO_CATEGORY_CALL.
+pub(crate) fn encode_media_information_call(
+    self_mac_address: &str,
+    target_mac_address: &str,
+) -> std::io::Result<Vec<u8>> {
+    let dict = media_information_body("NA", true, self_mac_address, "Mac", AUDIO_CATEGORY_CALL);
     smart_routing_packet(target_mac_address, &dict)
 }
 
@@ -1642,6 +1673,24 @@ mod tests {
         0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76, 0x69, 0x63, 0x65, 0x41, 0x75,
         0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72, 0x79, 0x30, 0x64,
     ];
+    // #11's in-call media information (encode_media_information_call). It is
+    // GOLDEN_MEDIA_INFORMATION_NEW_DEVICE with these bytes changed:
+    // - length 0x68 -> 0x6A: the dict grows by two bytes (one each below).
+    // - "NO" `42 4E 4F` -> "YES" `43 59 45 53`: hostStreamingState YES, a
+    //   3-byte string as in Apple's streaming captures (#35).
+    // - otherDeviceAudioCategory `30 64` (100) -> `31 91 01`: the u16 LE form
+    //   of AUDIO_CATEGORY_CALL (401 = 0x0191). 401 is provisional and
+    //   unverified until an Apple in-call relay is captured.
+    const GOLDEN_MEDIA_INFORMATION_CALL: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x6A, 0x00, 0x01,
+        0xE5, 0x4A, 0x70, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x42, 0x4E, 0x41,
+        0x52, 0x68, 0x6F, 0x73, 0x74, 0x53, 0x74, 0x72, 0x65, 0x61, 0x6D, 0x69, 0x6E, 0x67, 0x53,
+        0x74, 0x61, 0x74, 0x65, 0x43, 0x59, 0x45, 0x53, 0x49, 0x62, 0x74, 0x41, 0x64, 0x64, 0x72,
+        0x65, 0x73, 0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A, 0x33, 0x33, 0x3A, 0x34, 0x34,
+        0x3A, 0x35, 0x35, 0x3A, 0x36, 0x36, 0x46, 0x62, 0x74, 0x4E, 0x61, 0x6D, 0x65, 0x43, 0x4D,
+        0x61, 0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76, 0x69, 0x63, 0x65, 0x41,
+        0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72, 0x79, 0x31, 0x91, 0x01,
+    ];
     const GOLDEN_ADD_TIPI_DEVICE: &[u8] = &[
         0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x4E, 0x00, 0x01,
         0xE5, 0x48, 0x69, 0x64, 0x6C, 0x65, 0x54, 0x69, 0x6D, 0x65, 0x08, 0x47, 0x6E, 0x65, 0x77,
@@ -1746,6 +1795,30 @@ mod tests {
             .await
             .expect("send_media_information_new_device");
         assert_eq!(sent_packet(&mut rx), GOLDEN_MEDIA_INFORMATION_NEW_DEVICE);
+    }
+
+    #[tokio::test]
+    async fn golden_send_media_information_call() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_media_information_call(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+            .await
+            .expect("send_media_information_call");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_MEDIA_INFORMATION_CALL);
+    }
+
+    #[test]
+    fn golden_encode_media_information_call() {
+        assert_eq!(AUDIO_CATEGORY_CALL, 401);
+        let packet = encode_media_information_call(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+            .expect("encode_media_information_call");
+        assert_eq!(packet, without_header(GOLDEN_MEDIA_INFORMATION_CALL));
+        // Built by the shared builders: the new-device dict with only the
+        // streaming state and the category changed.
+        assert_eq!(
+            packet[11..],
+            media_information_body("NA", true, GOLDEN_SELF_MAC, "Mac", AUDIO_CATEGORY_CALL)
+        );
     }
 
     #[tokio::test]
@@ -1915,6 +1988,7 @@ mod tests {
                 encode_media_information_new_device(GOLDEN_SELF_MAC, bad),
                 bad,
             );
+            assert_invalid_mac_error(encode_media_information_call(GOLDEN_SELF_MAC, bad), bad);
             assert_invalid_mac_error(encode_add_tipi_device(GOLDEN_SELF_MAC, bad), bad);
         }
     }
@@ -1934,6 +2008,9 @@ mod tests {
                 .await,
             manager
                 .send_media_information_new_device(GOLDEN_SELF_MAC, bad)
+                .await,
+            manager
+                .send_media_information_call(GOLDEN_SELF_MAC, bad)
                 .await,
             manager.send_add_tipi_device(GOLDEN_SELF_MAC, bad).await,
         ];
@@ -2334,6 +2411,11 @@ mod tests {
                 "media_information_new_device",
                 encode_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
                     .expect("media_information_new_device"),
+            ),
+            (
+                "media_information_call",
+                encode_media_information_call(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+                    .expect("media_information_call"),
             ),
             (
                 "add_tipi_device",
