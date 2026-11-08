@@ -8,13 +8,9 @@ use dbus::arg::RefArg;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use futures::future::BoxFuture;
-use libpulse_binding::callbacks::ListResult;
-use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
@@ -579,19 +575,6 @@ where
     false
 }
 
-#[derive(Clone, Debug)]
-struct OwnedCardProfileInfo {
-    name: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct OwnedCardInfo {
-    index: u32,
-    proplist: Proplist,
-    profiles: Vec<OwnedCardProfileInfo>,
-    active_profile: Option<String>,
-}
-
 struct MediaControllerState {
     connected_device_mac: String,
     local_mac: String,
@@ -1007,10 +990,7 @@ impl MediaController {
             get_card_info_list_sync()
                 .into_iter()
                 .find(|c| c.index == card_index)
-                .map(|c| {
-                    let names = c.profiles.into_iter().filter_map(|p| p.name).collect();
-                    (names, c.active_profile)
-                })
+                .map(|c| (c.profiles, c.active_profile))
                 .unwrap_or_default()
         })
         .await
@@ -1379,11 +1359,7 @@ impl MediaController {
             let available = get_card_info_list_sync()
                 .iter()
                 .find(|c| c.index == index)
-                .map(|card| {
-                    card.profiles
-                        .iter()
-                        .any(|p| p.name.as_ref().is_some_and(|n| n.starts_with("a2dp-sink")))
-                })
+                .map(|card| card.profiles.iter().any(|p| p.starts_with("a2dp-sink")))
                 .unwrap_or(false);
             debug!("A2DP profile available: {}", available);
             available
@@ -1846,7 +1822,7 @@ async fn blocking(f: impl FnOnce() -> bool + Send + 'static) -> bool {
 async fn find_card_index(mac: String) -> Option<u32> {
     tokio::task::spawn_blocking(move || {
         get_card_info_list_sync().into_iter().find_map(|card| {
-            let device_string = card.proplist.get_str("device.string")?;
+            let device_string = card.device_string?;
             device_string.contains(&mac).then_some(card.index)
         })
     })
@@ -1854,44 +1830,10 @@ async fn find_card_index(mac: String) -> Option<u32> {
     .unwrap_or(None)
 }
 
-fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
-    let Ok((mut mainloop, context)) = pulse::connect("LibrePods") else {
-        return vec![];
-    };
-
-    let introspector = context.introspect();
-    let cards: Rc<RefCell<Vec<OwnedCardInfo>>> = Rc::new(RefCell::new(Vec::new()));
-    let mut op = introspector.get_card_info_list({
-        let cards = Rc::downgrade(&cards);
-        move |result| {
-            if let ListResult::Item(item) = result {
-                let profiles = item
-                    .profiles
-                    .iter()
-                    .map(|p| OwnedCardProfileInfo {
-                        name: p.name.as_ref().map(|n| n.to_string()),
-                    })
-                    .collect();
-                let active_profile = item
-                    .active_profile
-                    .as_ref()
-                    .and_then(|p| p.name.as_ref().map(|n| n.to_string()));
-                pulse::update(&cards, |cards| {
-                    cards.push(OwnedCardInfo {
-                        index: item.index,
-                        proplist: item.proplist.clone(),
-                        profiles,
-                        active_profile,
-                    })
-                });
-            }
-        }
-    });
-
-    if pulse::wait(&mut mainloop, &mut op, "card list").is_err() {
-        return vec![];
-    }
-    Rc::try_unwrap(cards).unwrap().into_inner()
+fn get_card_info_list_sync() -> Vec<pulse::Card> {
+    pulse::RawConnection::connect("LibrePods")
+        .and_then(|mut connection| connection.cards())
+        .unwrap_or_default()
 }
 
 fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
@@ -1926,27 +1868,16 @@ fn suspend_sink_sync(sink_name: &str, suspend: bool) -> bool {
 
 /// The uncorked sink inputs that play to the sink of the device `mac`.
 fn uncorked_inputs_on_sink_of(mac: &str) -> HashSet<u32> {
-    let Ok((mut mainloop, context)) = pulse::connect("LibrePods") else {
+    let inputs = pulse::RawConnection::connect("LibrePods")
+        .and_then(|mut connection| connection.sink_inputs(None));
+    let Ok(inputs) = inputs else {
         return HashSet::new();
     };
-    let inputs: Rc<RefCell<Vec<(u32, u32)>>> = Rc::default();
-    let mut op = context.introspect().get_sink_input_info_list({
-        let inputs = Rc::downgrade(&inputs);
-        move |result| {
-            if let ListResult::Item(input) = result
-                && !input.corked
-            {
-                pulse::update(&inputs, |inputs| inputs.push((input.index, input.sink)));
-            }
-        }
-    });
-    if pulse::wait(&mut mainloop, &mut op, "sink input list").is_err() {
-        return HashSet::new();
-    }
     let mut device_sink: HashMap<u32, bool> = HashMap::new();
     inputs
-        .take()
         .into_iter()
+        .filter(|input| !input.corked)
+        .map(|input| (input.index, input.sink))
         .filter(|&(_, sink)| {
             *device_sink.entry(sink).or_insert_with(|| {
                 pulse::sinks("LibrePods", pulse::Sinks::Index(sink))
