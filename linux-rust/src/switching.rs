@@ -1596,6 +1596,7 @@ mod tests {
         h.emit(owns(1));
         let stopped = Instant::now();
         h.play(false).await;
+        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
         let hold = crate::handoff::RELEASE_HOLD;
         let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
             .await
@@ -2297,6 +2298,7 @@ mod tests {
         // it, so its ACK carries the deferred pause (#39 keeps that one).
         let stopped = Instant::now();
         h.play(false).await;
+        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
         let hold = crate::handoff::RELEASE_HOLD;
         let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
             .await
@@ -2973,6 +2975,7 @@ mod tests {
         h.emit(owns(1));
         let stopped = Instant::now();
         streams.set(Vec::new());
+        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
         let hold = crate::handoff::RELEASE_HOLD;
         let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
             .await
