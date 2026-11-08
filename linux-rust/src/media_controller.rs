@@ -806,6 +806,7 @@ impl MediaController {
         } else if new_all_out {
             debug!("Condition met: buds removed, pausing media");
             let was_playing = self.state.lock().await.is_playing;
+            // shortcut: real D-Bus pause() is not injectable, so this path is untested end to end (#133)
             removal_self_paused = marks_self_pause(self.pause().await, was_playing);
             {
                 let state = self.state.lock().await;
