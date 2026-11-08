@@ -17,6 +17,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 
 // Reconnecting AirPods creates a fresh MediaController. Keep the listener task
 // outside the controller so the replacement can stop its predecessor by MAC.
@@ -351,6 +352,45 @@ const _: () = assert!(
     a2dp_activation_worst_case_wait().as_millis() <= A2DP_RECOVERY_BOUND.as_millis(),
     "activate_a2dp_profile worst case exceeds A2DP_RECOVERY_BOUND"
 );
+
+/// Wall-clock limit on `activate_a2dp_profile`, run time of every sound-server
+/// query (up to `pulse::CONNECT_TIMEOUT + OPERATION_TIMEOUT` each) and of the
+/// WirePlumber restart included (#123).
+const A2DP_ACTIVATION_DEADLINE: Duration = Duration::from_secs(20);
+
+// The sleeps alone never trip the deadline.
+const _: () = assert!(
+    A2DP_ACTIVATION_DEADLINE.as_millis() >= a2dp_activation_worst_case_wait().as_millis()
+        && A2DP_ACTIVATION_DEADLINE.as_millis() >= A2DP_RECOVERY_BOUND.as_millis(),
+    "A2DP_ACTIVATION_DEADLINE is shorter than the activation's sleeps"
+);
+
+/// A2DP activation ran out of `A2DP_ACTIVATION_DEADLINE`.
+#[derive(Debug, PartialEq, Eq)]
+struct DeadlineExceeded;
+
+/// Run `step` with only the time left before `deadline`; never start it once
+/// the deadline has passed.
+async fn before_deadline<Fut: Future>(
+    deadline: Instant,
+    step: impl FnOnce() -> Fut,
+) -> Result<Fut::Output, DeadlineExceeded> {
+    if Instant::now() >= deadline {
+        return Err(DeadlineExceeded);
+    }
+    tokio::time::timeout_at(deadline, step())
+        .await
+        .map_err(|_| DeadlineExceeded)
+}
+
+/// Start `step` only before `deadline`. Past it, never finish, so the
+/// enclosing `before_deadline` ends there and nothing after `step` runs.
+async fn started_before<Fut: Future>(deadline: Instant, step: impl FnOnce() -> Fut) -> Fut::Output {
+    if Instant::now() >= deadline {
+        std::future::pending::<()>().await;
+    }
+    step().await
+}
 
 /// Call `lookup` until it finds a card index, at most `attempts` times,
 /// sleeping `interval` between tries (not after the last one). The lookup is
@@ -897,19 +937,6 @@ impl MediaController {
         .unwrap_or_default()
     }
 
-    /// Resolves the card by Bluetooth MAC and refreshes the cached index.
-    /// PipeWire can assign a different index after a disconnect/reconnect.
-    /// Polls the full `CARD_LOOKUP_ATTEMPTS` budget.
-    async fn refresh_device_index(&self) -> Option<u32> {
-        let mac = self.state.lock().await.connected_device_mac.clone();
-        if mac.is_empty() {
-            return None;
-        }
-        let index = self.get_audio_device_index(&mac).await;
-        self.state.lock().await.device_index = index;
-        index
-    }
-
     /// One availability check inside the A2DP enumeration waits. The first
     /// check reuses the index resolved before the wait. Every later check
     /// re-resolves the card (a reconnect can change its index) with a
@@ -951,6 +978,8 @@ impl MediaController {
         info!("Restarting WirePlumber to rediscover A2DP profiles");
         let result = tokio::process::Command::new("systemctl")
             .args(["--user", "restart", "wireplumber"])
+            // The activation deadline drops this future; don't leave systemctl behind.
+            .kill_on_drop(true)
             .output()
             .await;
 
@@ -969,6 +998,7 @@ impl MediaController {
 
     pub async fn activate_a2dp_profile(&self) {
         debug!("Entering activate_a2dp_profile");
+        let deadline = Instant::now() + A2DP_ACTIVATION_DEADLINE;
 
         let mac = self.state.lock().await.connected_device_mac.clone();
         if mac.is_empty() {
@@ -976,40 +1006,117 @@ impl MediaController {
             return;
         }
 
+        let outcome = self
+            .activate_a2dp_profile_with(
+                deadline,
+                || self.get_audio_device_index(&mac),
+                || {
+                    self.recover_a2dp_availability_by(
+                        deadline,
+                        || find_card_index(mac.clone()),
+                        || self.is_a2dp_profile_available(),
+                        || self.restart_wire_plumber(),
+                    )
+                },
+                |idx| self.get_preferred_a2dp_profile(idx),
+                |idx, profile| async move {
+                    tokio::task::spawn_blocking(move || set_card_profile_sync(idx, &profile))
+                        .await
+                        .unwrap_or(false)
+                },
+            )
+            .await;
+        if outcome == Err(DeadlineExceeded) {
+            warn!("A2DP activation gave up after {A2DP_ACTIVATION_DEADLINE:?}: the sound server is too slow");
+        }
+    }
+
+    /// `recover_a2dp_availability` with the production checks, bounded by
+    /// `deadline`: no step starts once it has passed, and recovery returns
+    /// false by then. A restart cut off by the deadline is a failed restart.
+    /// `find` is the one-shot card scan of each re-check (#68), `available`
+    /// the A2DP query.
+    async fn recover_a2dp_availability_by<F, FFut, A, AFut, R, RFut>(
+        &self,
+        deadline: Instant,
+        find: F,
+        available: A,
+        restart: R,
+    ) -> bool
+    where
+        F: Fn() -> FFut,
+        FFut: Future<Output = Option<u32>>,
+        A: Fn() -> AFut,
+        AFut: Future<Output = bool>,
+        R: Fn() -> RFut,
+        RFut: Future<Output = bool>,
+    {
+        let (find, available, restart) = (&find, &available, &restart);
+        let mut first_check = true;
+        before_deadline(deadline, || {
+            recover_a2dp_availability(
+                Self::A2DP_ENUMERATION_ATTEMPTS,
+                Self::A2DP_ENUMERATION_INTERVAL,
+                move || {
+                    self.a2dp_enumeration_check(
+                        std::mem::replace(&mut first_check, false),
+                        move || started_before(deadline, find),
+                        tokio::time::sleep,
+                        move || started_before(deadline, available),
+                    )
+                },
+                move || async move { before_deadline(deadline, restart).await.unwrap_or(false) },
+                tokio::time::sleep,
+            )
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// The activation after the MAC check, every step bounded by `deadline`:
+    /// `lookup` is the initial full card lookup, `recover` makes sure A2DP is
+    /// offered, `choose` picks the profile and `set` switches to it. State is
+    /// written only after a step returns, so a step cut off writes nothing.
+    async fn activate_a2dp_profile_with<L, LFut, V, VFut, C, CFut, P, PFut>(
+        &self,
+        deadline: Instant,
+        lookup: L,
+        recover: V,
+        choose: C,
+        set: P,
+    ) -> Result<(), DeadlineExceeded>
+    where
+        L: FnOnce() -> LFut,
+        LFut: Future<Output = Option<u32>>,
+        V: FnOnce() -> VFut,
+        VFut: Future<Output = bool>,
+        C: FnOnce(u32) -> CFut,
+        CFut: Future<Output = ProfileChoice>,
+        P: FnOnce(u32, String) -> PFut,
+        PFut: Future<Output = bool>,
+    {
         // Always resolve the card by MAC first: a reconnect can change its index.
-        if self.refresh_device_index().await.is_none() {
+        let index = before_deadline(deadline, lookup).await?;
+        self.state.lock().await.device_index = index;
+        if index.is_none() {
             warn!("Could not get device index. Cannot activate A2DP profile.");
-            return;
+            return Ok(());
         }
 
-        let mut first_check = true;
-        let available = recover_a2dp_availability(
-            Self::A2DP_ENUMERATION_ATTEMPTS,
-            Self::A2DP_ENUMERATION_INTERVAL,
-            || {
-                let mac = &mac;
-                self.a2dp_enumeration_check(
-                    std::mem::replace(&mut first_check, false),
-                    move || find_card_index(mac.clone()),
-                    tokio::time::sleep,
-                    || self.is_a2dp_profile_available(),
-                )
-            },
-            || self.restart_wire_plumber(),
-            tokio::time::sleep,
-        )
-        .await;
-        if !available {
+        if !recover().await {
+            if Instant::now() >= deadline {
+                return Err(DeadlineExceeded);
+            }
             error!("A2DP profile unavailable, skipping profile activation");
-            return;
+            return Ok(());
         }
 
         let Some(idx) = self.state.lock().await.device_index else {
             error!("Device index not available for activating profile.");
-            return;
+            return Ok(());
         };
 
-        let preferred_profile = match self.get_preferred_a2dp_profile(idx).await {
+        let preferred_profile = match before_deadline(deadline, || choose(idx)).await? {
             // Leave an already-active A2DP variant alone. Switching profiles
             // recreates the PipeWire sink and stops the stream that triggered
             // this activation, so players pause again right after the user
@@ -1019,26 +1126,23 @@ impl MediaController {
                     "A2DP profile {} already active, leaving it unchanged",
                     active
                 );
-                return;
+                return Ok(());
             }
             ProfileChoice::Unavailable => {
                 error!("No suitable A2DP profile found");
-                return;
+                return Ok(());
             }
             ProfileChoice::Activate(profile) => profile,
         };
 
         info!("Activating A2DP profile for AirPods: {}", preferred_profile);
         let profile_name = preferred_profile.clone();
-        let success = tokio::task::spawn_blocking(move || set_card_profile_sync(idx, &profile_name))
-            .await
-            .unwrap_or(false);
-
-        if success {
+        if before_deadline(deadline, || set(idx, profile_name)).await? {
             info!("Successfully activated A2DP profile: {}", preferred_profile);
         } else {
             warn!("Failed to activate A2DP profile: {}", preferred_profile);
         }
+        Ok(())
     }
 
     async fn pause_with<F>(&self, pause_players: F) -> PauseOutcome
@@ -2648,6 +2752,217 @@ mod tests {
             (false, CARD_LOOKUP_ATTEMPTS_PER_CHECK, 0, false)
         );
         assert_eq!(controller.state.lock().await.device_index, None);
+    }
+
+    /// Just under one media_controller query's bound (`pulse` connect + operation).
+    fn slow_query() -> Duration {
+        pulse::CONNECT_TIMEOUT + pulse::OPERATION_TIMEOUT - Duration::from_millis(1)
+    }
+
+    /// Injected activation steps for the deadline tests: each records when it
+    /// started, then answers `out` after `took` on the (paused) tokio clock.
+    #[derive(Default)]
+    struct Steps(std::cell::RefCell<Vec<(&'static str, Instant)>>);
+
+    impl Steps {
+        fn step<T>(&self, name: &'static str, took: Duration, out: T) -> impl Future<Output = T> {
+            self.0.borrow_mut().push((name, Instant::now()));
+            async move {
+                tokio::time::sleep(took).await;
+                out
+            }
+        }
+
+        fn started(&self, name: &str) -> usize {
+            self.0.borrow().iter().filter(|(n, _)| *n == name).count()
+        }
+
+        fn started_from(&self, deadline: Instant) -> usize {
+            self.0.borrow().iter().filter(|(_, t)| *t >= deadline).count()
+        }
+    }
+
+    #[test]
+    fn a2dp_activation_deadline_value() {
+        assert_eq!(A2DP_ACTIVATION_DEADLINE, Duration::from_secs(20));
+        assert!(A2DP_ACTIVATION_DEADLINE <= Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a2dp_activation_deadline_cuts_slow_initial_lookup() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.device_index = Some(99);
+        let steps = Steps::default();
+        let start = Instant::now();
+        let deadline = start + A2DP_ACTIVATION_DEADLINE;
+
+        // The card never shows up: the full poll alone would take ~50 s.
+        let outcome = controller
+            .activate_a2dp_profile_with(
+                deadline,
+                || {
+                    retry_card_lookup(CARD_LOOKUP_ATTEMPTS, CARD_LOOKUP_INTERVAL, || {
+                        steps.step("lookup", slow_query(), None)
+                    })
+                },
+                || steps.step("recover", Duration::ZERO, true),
+                |_| steps.step("choose", Duration::ZERO, ProfileChoice::Unavailable),
+                |_, _| steps.step("set", Duration::ZERO, true),
+            )
+            .await;
+
+        assert_eq!(outcome, Err(DeadlineExceeded));
+        assert!(start.elapsed() <= A2DP_ACTIVATION_DEADLINE);
+        assert_eq!(steps.started_from(deadline), 0);
+        assert!(steps.started("lookup") > 1);
+        assert_eq!(steps.started("recover") + steps.started("choose") + steps.started("set"), 0);
+        // The cut lookup wrote nothing.
+        assert_eq!(controller.state.try_lock().unwrap().device_index, Some(99));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a2dp_activation_deadline_cuts_slow_recovery() {
+        let controller = MediaController::new(String::new(), String::new());
+        let steps = Steps::default();
+        let finds = std::cell::Cell::new(0u32);
+        let start = Instant::now();
+        let deadline = start + A2DP_ACTIVATION_DEADLINE;
+
+        // Every query takes just under its bound and the card never offers
+        // A2DP. Each re-check finds the card under a new index.
+        let outcome = controller
+            .activate_a2dp_profile_with(
+                deadline,
+                || steps.step("lookup", slow_query(), Some(10)),
+                || {
+                    controller.recover_a2dp_availability_by(
+                        deadline,
+                        || {
+                            finds.set(finds.get() + 1);
+                            steps.step("find", slow_query(), Some(10 + finds.get()))
+                        },
+                        || steps.step("available", slow_query(), false),
+                        || steps.step("restart", Duration::ZERO, true),
+                    )
+                },
+                |_| steps.step("choose", slow_query(), ProfileChoice::Unavailable),
+                |_, _| steps.step("set", slow_query(), true),
+            )
+            .await;
+
+        assert_eq!(outcome, Err(DeadlineExceeded));
+        assert!(start.elapsed() <= A2DP_ACTIVATION_DEADLINE);
+        assert_eq!(steps.started_from(deadline), 0);
+        assert_eq!(steps.started("choose") + steps.started("set"), 0);
+        // The last find was cut off: the index of the one before it stays.
+        let finds = finds.get();
+        assert!(finds >= 2);
+        assert_eq!(
+            controller.state.try_lock().unwrap().device_index,
+            Some(10 + finds - 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a2dp_activation_deadline_restart_hangs() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.device_index = Some(3);
+        let steps = Steps::default();
+        let start = Instant::now();
+        let deadline = start + A2DP_ACTIVATION_DEADLINE;
+
+        let recovered = controller
+            .recover_a2dp_availability_by(
+                deadline,
+                || steps.step("find", Duration::ZERO, Some(3)),
+                || steps.step("available", Duration::ZERO, false),
+                || async {
+                    steps.step("restart", Duration::ZERO, ()).await;
+                    std::future::pending::<bool>().await
+                },
+            )
+            .await;
+
+        assert!(!recovered);
+        assert!(start.elapsed() <= A2DP_ACTIVATION_DEADLINE);
+        assert_eq!(steps.started("restart"), 1);
+        assert_eq!(steps.started_from(deadline), 0);
+        assert!(controller.state.try_lock().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a2dp_activation_deadline_no_step_starts_at_deadline() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.device_index = Some(3);
+        let steps = Steps::default();
+        let start = Instant::now();
+        // The enumeration wait's first re-check (find 2 s, query instant)
+        // starts at once; the next one is due one interval later, exactly at
+        // the deadline, and must not start its find.
+        let find = Duration::from_secs(2);
+        let deadline = start + find + MediaController::A2DP_ENUMERATION_INTERVAL;
+
+        let recovered = controller
+            .recover_a2dp_availability_by(
+                deadline,
+                || steps.step("find", find, Some(3)),
+                || steps.step("available", Duration::ZERO, false),
+                || steps.step("restart", Duration::ZERO, true),
+            )
+            .await;
+
+        assert!(!recovered);
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!((steps.started("find"), steps.started("available")), (1, 2));
+        assert_eq!(steps.started_from(deadline), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a2dp_activation_deadline_fast_path_unchanged() {
+        for (active, expected_set) in [
+            (None, Some((3, "a2dp-sink".to_string()))),
+            (Some("a2dp-sink-sbc"), None),
+        ] {
+            let controller = MediaController::new(String::new(), String::new());
+            let steps = Steps::default();
+            let set_to = std::cell::RefCell::new(None);
+            let start = Instant::now();
+            let deadline = start + A2DP_ACTIVATION_DEADLINE;
+
+            let outcome = controller
+                .activate_a2dp_profile_with(
+                    deadline,
+                    || steps.step("lookup", Duration::ZERO, Some(3)),
+                    || {
+                        controller.recover_a2dp_availability_by(
+                            deadline,
+                            || steps.step("find", Duration::ZERO, Some(3)),
+                            || steps.step("available", Duration::ZERO, true),
+                            || steps.step("restart", Duration::ZERO, true),
+                        )
+                    },
+                    |_| {
+                        let choice = select_a2dp_profile(
+                            &profiles(&ALL_A2DP),
+                            active,
+                            None,
+                            PreferredCodec::Aac,
+                        );
+                        steps.step("choose", Duration::ZERO, choice)
+                    },
+                    |idx, profile| {
+                        *set_to.borrow_mut() = Some((idx, profile));
+                        steps.step("set", Duration::ZERO, true)
+                    },
+                )
+                .await;
+
+            assert_eq!(outcome, Ok(()));
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            assert_eq!(set_to.into_inner(), expected_set);
+            assert_eq!(steps.started("find") + steps.started("restart"), 0);
+            assert_eq!(controller.state.try_lock().unwrap().device_index, Some(3));
+        }
     }
 
     #[tokio::test]
