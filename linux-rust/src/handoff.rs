@@ -335,7 +335,7 @@ impl Handoff {
                             self.request(now, true, Cause::User, out);
                             self.say("REQUEST owner=linux");
                         }
-                        TakeoverAction::Skip(TakeoverSkip::NoSession) => self.say(NO_SESSION),
+                        TakeoverAction::Skip(_) if !self.live() => self.say(NO_SESSION),
                         TakeoverAction::Skip(_) => self.say(
                             "BLOCKED take needs two hosts, an in-ear bud, and confirmed idle audio",
                         ),
