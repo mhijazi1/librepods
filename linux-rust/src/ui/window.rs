@@ -157,6 +157,23 @@ fn with_connect_mode(
     Some(root)
 }
 
+/// Returns the devices JSON with `data` stored under `addr`, given the result of
+/// reading the current file. Only a missing file counts as empty; any other read,
+/// parse or serialize error is returned so the caller never drops existing devices.
+fn devices_with_added(
+    existing: std::io::Result<String>,
+    addr: &str,
+    data: DeviceData,
+) -> std::io::Result<String> {
+    let mut devices: HashMap<String, DeviceData> = match existing {
+        Ok(json) => serde_json::from_str(&json)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => return Err(e),
+    };
+    devices.insert(addr.to_string(), data);
+    Ok(serde_json::to_string(&devices)?)
+}
+
 /// Replaces the settings file at `path` with `contents` without ever leaving it
 /// half-written: a temp file next to the target is written, fsynced and renamed
 /// over it. An existing target is resolved first, so a symlink stays a symlink,
@@ -784,29 +801,22 @@ impl App {
                     && let Some(type_) = self.selected_device_type.take()
                 {
                     let devices_path = get_devices_path();
-                    let devices_json = std::fs::read_to_string(&devices_path).unwrap_or_else(|e| {
-                        error!("Failed to read devices file: {}", e);
-                        "{}".to_string()
-                    });
-                    let mut devices_list: HashMap<String, DeviceData> =
-                        serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                            error!("Deserialization failed: {}", e);
-                            HashMap::new()
-                        });
-                    devices_list.insert(
-                        addr.to_string(),
-                        DeviceData {
-                            name,
-                            type_: type_.clone(),
-                            information: None,
-                        },
-                    );
-                    let updated_json = serde_json::to_string(&devices_list).unwrap_or_else(|e| {
-                        error!("Serialization failed: {}", e);
-                        "{}".to_string()
-                    });
-                    if let Err(e) = write_settings_file(&devices_path, &updated_json) {
-                        error!("Failed to write devices file: {}", e);
+                    let data = DeviceData {
+                        name,
+                        type_,
+                        information: None,
+                    };
+                    match devices_with_added(
+                        std::fs::read_to_string(&devices_path),
+                        &addr.to_string(),
+                        data,
+                    ) {
+                        Ok(updated_json) => {
+                            if let Err(e) = write_settings_file(&devices_path, &updated_json) {
+                                error!("Failed to write devices file: {}", e);
+                            }
+                        }
+                        Err(e) => error!("Not adding device, devices file unusable: {}", e),
                     }
                     self.selected_tab = Tab::Device(addr.to_string());
                 }
@@ -1702,6 +1712,116 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    fn device(name: &str, type_: DeviceType) -> DeviceData {
+        DeviceData {
+            name: name.to_string(),
+            type_,
+            information: None,
+        }
+    }
+
+    /// Two devices, one with `information`, as a devices.json map.
+    fn two_devices() -> serde_json::Map<String, serde_json::Value> {
+        let mut nothing = device("Ear (2)", DeviceType::Nothing);
+        nothing.information = Some(crate::devices::enums::DeviceInformation::Nothing(
+            crate::devices::nothing::NothingInformation {
+                serial_number: "SN1".to_string(),
+                firmware_version: "1.0.0".to_string(),
+            },
+        ));
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "AA:AA:AA:AA:AA:AA".into(),
+            serde_json::to_value(nothing).unwrap(),
+        );
+        map.insert(
+            "BB:BB:BB:BB:BB:BB".into(),
+            serde_json::to_value(device("AirPods Pro", DeviceType::AirPods)).unwrap(),
+        );
+        map
+    }
+
+    fn parse(json: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn devices_with_added_missing_file_starts_empty() {
+        let new = device("New", DeviceType::AirPods);
+        let json = devices_with_added(
+            Err(std::io::ErrorKind::NotFound.into()),
+            "CC:CC:CC:CC:CC:CC",
+            new.clone(),
+        )
+        .unwrap();
+        let map = parse(&json);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["CC:CC:CC:CC:CC:CC"], serde_json::to_value(new).unwrap());
+    }
+
+    #[test]
+    fn devices_with_added_keeps_existing() {
+        let existing = two_devices();
+        let new = device("New", DeviceType::AirPods);
+        let json = devices_with_added(
+            Ok(serde_json::to_string(&existing).unwrap()),
+            "CC:CC:CC:CC:CC:CC",
+            new.clone(),
+        )
+        .unwrap();
+        let map = parse(&json);
+        assert_eq!(map.len(), 3);
+        for (addr, value) in &existing {
+            assert_eq!(&map[addr], value, "{addr} changed");
+        }
+        assert_eq!(map["CC:CC:CC:CC:CC:CC"], serde_json::to_value(new).unwrap());
+    }
+
+    #[test]
+    fn devices_with_added_replaces_same_address() {
+        let existing = two_devices();
+        let new = device("Renamed", DeviceType::AirPods);
+        let json = devices_with_added(
+            Ok(serde_json::to_string(&existing).unwrap()),
+            "AA:AA:AA:AA:AA:AA",
+            new.clone(),
+        )
+        .unwrap();
+        let map = parse(&json);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["AA:AA:AA:AA:AA:AA"], serde_json::to_value(new).unwrap());
+        assert_eq!(map["BB:BB:BB:BB:BB:BB"], existing["BB:BB:BB:BB:BB:BB"]);
+    }
+
+    #[test]
+    fn devices_with_added_rejects_unparsable_file() {
+        let json =
+            r#"{"AA:AA:AA:AA:AA:AA": {"name": "x", "type_": "AirPods", "information": null},}"#;
+        let err = devices_with_added(
+            Ok(json.to_string()),
+            "CC:CC:CC:CC:CC:CC",
+            device("New", DeviceType::AirPods),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("trailing comma"), "{err}");
+    }
+
+    #[test]
+    fn devices_with_added_rejects_read_errors() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let err = devices_with_added(
+                Err(kind.into()),
+                "CC:CC:CC:CC:CC:CC",
+                device("New", DeviceType::AirPods),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), kind);
+        }
     }
 
     #[test]
