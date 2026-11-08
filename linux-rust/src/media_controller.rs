@@ -204,8 +204,9 @@ pub(crate) enum TakeoverSkip {
     AwaitingNewPlayback,
     /// #841: no live AACP control session, so the routing state is stale.
     NoSession,
-    /// #841: the AirPods do not report exactly this machine plus one remote host.
-    NotTwoHosts,
+    /// #841: the AirPods do not report this machine plus at least one remote
+    /// host (Linux alone, Linux absent, or no host list).
+    NoRemoteHost,
     /// #841: the audio source is not confirmed idle or local media (a remote
     /// call or remote media, unknown activity, or no report).
     AudioNotIdle,
@@ -262,8 +263,9 @@ pub(crate) fn decide_takeover(inputs: TakeoverInputs) -> TakeoverDecision {
     }
 }
 
-/// The #841 guards, in order: case recovery, live session, exactly two hosts
-/// (this machine and one remote), audio source idle or local media.
+/// The #841 guards, in order: case recovery, live session, Linux plus a
+/// remote host (this machine and at least one other device, so 2, 3, 4...
+/// hosts), audio source idle or local media.
 fn handoff_block(trigger: TakeoverTrigger, guards: HandoffGuards) -> Option<TakeoverSkip> {
     let recovery_allows = match trigger {
         TakeoverTrigger::ReconnectedForPlayback => {
@@ -276,8 +278,8 @@ fn handoff_block(trigger: TakeoverTrigger, guards: HandoffGuards) -> Option<Take
         Some(TakeoverSkip::AwaitingNewPlayback)
     } else if !routing.has_session {
         Some(TakeoverSkip::NoSession)
-    } else if routing.host_count != 2 || !routing.local_host || !routing.remote_host {
-        Some(TakeoverSkip::NotTwoHosts)
+    } else if routing.host_count < 2 || !routing.local_host || !routing.remote_host {
+        Some(TakeoverSkip::NoRemoteHost)
     } else {
         match routing.audio {
             Some(AudioSourceType::None) => None,
@@ -666,7 +668,7 @@ impl MediaController {
                     // not supply (`handoff: None`).
                     TakeoverSkip::AwaitingNewPlayback
                     | TakeoverSkip::NoSession
-                    | TakeoverSkip::NotTwoHosts
+                    | TakeoverSkip::NoRemoteHost
                     | TakeoverSkip::AudioNotIdle => {}
                 }
                 continue;
@@ -1851,15 +1853,21 @@ mod tests {
     const LOCAL: &str = "01:02:03:04:05:06";
     const REMOTE: &str = "07:08:09:0A:0B:0C";
 
-    /// Routing a #841 take accepts: live session, this machine plus one
-    /// remote host, a bud in an ear, idle audio.
-    fn ready_routing() -> RoutingSnapshot {
-        let hosts = [LOCAL, REMOTE].map(|mac| ConnectedDevice {
-            mac: mac.to_string(),
-            info1: 0,
-            info2: 0,
-            r#type: None,
-        });
+    const REMOTE_2: &str = "0D:0E:0F:10:11:12";
+    const REMOTE_3: &str = "13:14:15:16:17:18";
+
+    /// Routing copied from a real `ConnectedDevice` list `macs`, with a live
+    /// session, a bud in an ear and idle audio.
+    fn routing_with_hosts(macs: &[&str]) -> RoutingSnapshot {
+        let hosts: Vec<ConnectedDevice> = macs
+            .iter()
+            .map(|mac| ConnectedDevice {
+                mac: mac.to_string(),
+                info1: 0,
+                info2: 0,
+                r#type: None,
+            })
+            .collect();
         let idle = AudioSource {
             mac: "00:00:00:00:00:00".to_string(),
             r#type: AudioSourceType::None,
@@ -1873,6 +1881,12 @@ mod tests {
         )
     }
 
+    /// Routing a #841 take accepts: live session, this machine plus one
+    /// remote host, a bud in an ear, idle audio.
+    fn ready_routing() -> RoutingSnapshot {
+        routing_with_hosts(&[LOCAL, REMOTE])
+    }
+
     fn guards(routing: RoutingSnapshot) -> Option<HandoffGuards> {
         Some(HandoffGuards {
             routing,
@@ -1882,12 +1896,12 @@ mod tests {
 
     #[test]
     fn takeover_legacy_ignores_routing_guards() {
-        // Three hosts and a remote call: the #841 guards block this take.
+        // Only Linux connected and a remote call: the #841 guards block this
+        // take on the hosts, and with a remote host back on the call.
         let blocking = RoutingSnapshot {
-            host_count: 3,
             audio: Some(AudioSourceType::Call),
             audio_from_local: false,
-            ..ready_routing()
+            ..routing_with_hosts(&[LOCAL])
         };
         assert_eq!(
             decide_takeover(TakeoverInputs {
@@ -1895,12 +1909,14 @@ mod tests {
                 ..takeover_inputs()
             })
             .action,
-            TakeoverAction::Skip(TakeoverSkip::NotTwoHosts)
+            TakeoverAction::Skip(TakeoverSkip::NoRemoteHost)
         );
+        let with_remote = ready_routing();
         assert_eq!(
             decide_takeover(TakeoverInputs {
                 handoff: guards(RoutingSnapshot {
-                    host_count: 2,
+                    host_count: with_remote.host_count,
+                    remote_host: with_remote.remote_host,
                     ..blocking
                 }),
                 ..takeover_inputs()
@@ -2001,14 +2017,14 @@ mod tests {
                     remote_host: false,
                     ..ready_routing()
                 },
-                TakeoverSkip::NotTwoHosts,
+                TakeoverSkip::NoRemoteHost,
             ),
             (
                 RoutingSnapshot {
                     local_host: false,
                     ..ready_routing()
                 },
-                TakeoverSkip::NotTwoHosts,
+                TakeoverSkip::NoRemoteHost,
             ),
             (
                 RoutingSnapshot {
@@ -2073,6 +2089,58 @@ mod tests {
             .action,
             TakeoverAction::Skip(TakeoverSkip::NoTransition)
         );
+    }
+
+    #[test]
+    fn takeover_host_count_table() {
+        // Linux plus any number of remote hosts takes; Linux alone, Linux
+        // absent or no host list does not. Hardware #22 took with three
+        // hosts (iPhone + Mac + Linux).
+        let take = TakeoverAction::TakeOver;
+        let skip = TakeoverAction::Skip(TakeoverSkip::NoRemoteHost);
+        let table: [(&[&str], TakeoverAction); 7] = [
+            (&[], skip),
+            (&[LOCAL], skip),
+            (&[LOCAL, REMOTE], take),
+            (&[LOCAL, REMOTE, REMOTE_2], take),
+            (&[REMOTE, LOCAL, REMOTE_2, REMOTE_3], take),
+            (&[REMOTE, REMOTE_2], skip),
+            (&[REMOTE, REMOTE_2, REMOTE_3], skip),
+        ];
+        for (hosts, expected) in table {
+            let routing = routing_with_hosts(hosts);
+            assert_eq!(routing.host_count, hosts.len(), "{hosts:?}");
+            let poll = TakeoverInputs {
+                handoff: guards(routing),
+                bud_in_ear: routing.bud_in_ear,
+                ..takeover_inputs()
+            };
+            assert_eq!(decide_takeover(poll).action, expected, "poll {hosts:?}");
+            for trigger in [
+                TakeoverTrigger::Manual,
+                TakeoverTrigger::ReconnectedForPlayback,
+            ] {
+                let recovery = match trigger {
+                    TakeoverTrigger::ReconnectedForPlayback => CaseRecovery::PlaybackRequested,
+                    _ => CaseRecovery::Immediate,
+                };
+                assert_eq!(
+                    decide_takeover(TakeoverInputs::handoff(trigger, routing, recovery)).action,
+                    expected,
+                    "{trigger:?} {hosts:?}"
+                );
+            }
+            // The legacy path has no host guard.
+            assert_eq!(
+                decide_takeover(TakeoverInputs {
+                    handoff: None,
+                    ..poll
+                })
+                .action,
+                take,
+                "legacy {hosts:?}"
+            );
+        }
     }
 
     #[test]
