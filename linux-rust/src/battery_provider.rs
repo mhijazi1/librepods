@@ -316,6 +316,22 @@ impl<S: BatterySink> Drop for BatteryExporter<S> {
     }
 }
 
+/// Feeds one battery report into a shared exporter. A poisoned lock is
+/// recovered, since the exporter's state stays consistent between calls. This
+/// is the only update path for the device handler: the live
+/// `AACPEvent::BatteryInfo` arm and the connect seed (#75) both call it. It
+/// blocks (registration is a D-Bus round trip), so call it from
+/// `spawn_blocking`.
+pub fn export_battery<S: BatterySink>(
+    exporter: &std::sync::Mutex<BatteryExporter<S>>,
+    infos: &[BatteryInfo],
+) {
+    exporter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .update(infos);
+}
+
 /// `dev_AA_BB_CC_DD_EE_FF`, BlueZ's object name for a device address.
 fn device_node(mac: &str) -> String {
     format!("dev_{}", mac.to_uppercase().replace(':', "_"))
@@ -925,6 +941,43 @@ mod tests {
         assert_eq!(ex.state(), ExporterState::Registered);
         drop(ex);
         assert_eq!(*calls.borrow(), [Call::Register, Call::Set(80), Call::Set(80)]);
+    }
+
+    #[test]
+    fn exporter_seed_then_event_registers_once_and_updates() {
+        let (ex, calls) = exporter(false, false);
+        let shared = std::sync::Mutex::new(ex);
+        // The connect seed (a report that arrived before the event channel).
+        export_battery(&shared, &[b(Left, 80, NotCharging), b(Right, 60, NotCharging)]);
+        // A later live event.
+        export_battery(&shared, &[b(Right, 45, NotCharging)]);
+        assert_eq!(*calls.borrow(), [Call::Register, Call::Set(60), Call::Set(45)]);
+    }
+
+    #[test]
+    fn exporter_seed_repeated_by_queued_event_makes_no_call() {
+        // A report that lands between set_event_channel and the snapshot is
+        // both in the seed and in the event queue: the repeat is a no-op.
+        let (ex, calls) = exporter(false, false);
+        let shared = std::sync::Mutex::new(ex);
+        let report = [b(Left, 80, NotCharging), b(Right, 60, NotCharging)];
+        export_battery(&shared, &report);
+        export_battery(&shared, &report);
+        assert_eq!(*calls.borrow(), [Call::Register, Call::Set(60)]);
+    }
+
+    #[test]
+    fn exporter_seed_recovers_poisoned_lock() {
+        let (ex, calls) = exporter(false, false);
+        let shared = std::sync::Mutex::new(ex);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.lock();
+            panic!("poison the exporter lock");
+        }));
+        assert!(poisoned.is_err());
+        assert!(shared.is_poisoned());
+        export_battery(&shared, &[b(Headphone, 70, NotCharging)]);
+        assert_eq!(*calls.borrow(), [Call::Register, Call::Set(70)]);
     }
 
     #[test]

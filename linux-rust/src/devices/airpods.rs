@@ -1,12 +1,11 @@
-use crate::battery_provider::{BatteryExporter, BluezBatteryProvider};
+use crate::battery_provider::{BatteryExporter, BluezBatteryProvider, export_battery};
+use crate::bluetooth::aacp::BatteryInfo;
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
-use crate::bluetooth::aacp::{BatteryInfo, BatteryStatus};
 use crate::media_controller::MediaController;
 use crate::switching::{Switching, SwitchingSetup, device_media, spawn_playback_poller};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
-use crate::ui::window::merge_battery_entry;
 use bluer::Address;
 use ksni::Handle;
 use log::{debug, error, info, warn};
@@ -162,6 +161,33 @@ impl AirPodsDevice {
                 .await;
         }
 
+        // A BATTERY_INFO answering the notification request above can land
+        // before the channel was attached; its event is then lost and the
+        // tray and desktop export would stay empty until the next change
+        // (#75). Seed both from the stored report through the same paths as
+        // the event arm, before dispatch_events starts the handlers, so every
+        // queued event is applied after the seed. The window seeds itself
+        // from state.battery_info. A report that is both in the seed and in
+        // the queue is applied twice, which is idempotent.
+        if let Some(seed) = battery_seed(&aacp_manager).await {
+            debug!(
+                "Seeding tray and desktop battery from stored report: {:?}",
+                seed
+            );
+            if let Some(handle) = &tray_handle {
+                handle
+                    .update(|tray: &mut MyTray| tray.apply_battery(&seed))
+                    .await;
+            }
+            if let Some(exporter) = battery_exporter.clone() {
+                let exported =
+                    tokio::task::spawn_blocking(move || export_battery(&exporter, &seed)).await;
+                if let Err(e) = exported {
+                    warn!("Desktop battery seed export task failed: {}", e);
+                }
+            }
+        }
+
         let aacp_manager_clone = aacp_manager.clone();
         tokio::spawn(async move {
             while let Some((id, value)) = command_rx.recv().await {
@@ -288,46 +314,9 @@ impl AirPodsDevice {
                     AACPEvent::BatteryInfo(battery_info) => {
                         debug!("Received BatteryInfo event: {:?}", battery_info);
                         if let Some(handle) = &tray_handle {
+                            // Same per-component rule as the window (#52).
                             handle
-                                .update(|tray: &mut MyTray| {
-                                    // Same per-component rule as the window: a
-                                    // Disconnected entry keeps a known level/status.
-                                    fn apply(
-                                        level: &mut Option<u8>,
-                                        status: &mut Option<BatteryStatus>,
-                                        b: &BatteryInfo,
-                                    ) {
-                                        let prev = (*level).zip(*status);
-                                        let (l, s) = merge_battery_entry(prev, (b.level, b.status));
-                                        *level = Some(l);
-                                        *status = Some(s);
-                                    }
-                                    for b in &battery_info {
-                                        match b.component as u8 {
-                                            0x01 => apply(
-                                                &mut tray.battery_headphone,
-                                                &mut tray.battery_headphone_status,
-                                                b,
-                                            ),
-                                            0x02 => apply(
-                                                &mut tray.battery_r,
-                                                &mut tray.battery_r_status,
-                                                b,
-                                            ),
-                                            0x04 => apply(
-                                                &mut tray.battery_l,
-                                                &mut tray.battery_l_status,
-                                                b,
-                                            ),
-                                            0x08 => apply(
-                                                &mut tray.battery_c,
-                                                &mut tray.battery_c_status,
-                                                b,
-                                            ),
-                                            _ => {}
-                                        }
-                                    }
-                                })
+                                .update(|tray: &mut MyTray| tray.apply_battery(&battery_info))
                                 .await;
                         }
                         debug!("Updated tray with new battery info");
@@ -343,10 +332,7 @@ impl AirPodsDevice {
                             // keep it off the runtime. The lock lives only
                             // inside the blocking closure.
                             let exported = tokio::task::spawn_blocking(move || {
-                                exporter
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .update(&battery_info);
+                                export_battery(&exporter, &battery_info);
                             })
                             .await;
                             if let Err(e) = exported {
@@ -416,6 +402,19 @@ impl AirPodsDevice {
     }
 }
 
+/// The last AACP battery report the manager stored, or None when none has
+/// arrived yet. Used to seed the tray and the desktop export with a report
+/// whose event was sent before the event channel was attached (#75). The
+/// state guard lives only inside the block, so nothing awaits while holding
+/// it.
+async fn battery_seed(manager: &AACPManager) -> Option<Vec<BatteryInfo>> {
+    let batteries = {
+        let state = manager.state.lock().await;
+        state.battery_info.clone()
+    };
+    (!batteries.is_empty()).then_some(batteries)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AirPodsInformation {
     pub name: String,
@@ -430,4 +429,100 @@ pub struct AirPodsInformation {
     pub right_serial_number: String,
     pub version3: String,
     pub le_keys: AirPodsLEKeys,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bluetooth::aacp::{BatteryComponent, BatteryStatus};
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    /// Header + BATTERY_INFO (opcode 0x04, 0x00, count 3) with 5-byte entries
+    /// (component, 0x01, level, status, 0x01): Left 80% NotCharging, Right 60%
+    /// Charging, Case 90% Charging.
+    const BATTERY_PACKET: [u8; 22] = [
+        0x04, 0x00, 0x04, 0x00, // header
+        0x04, 0x00, 0x03, // opcode, 0x00, count
+        0x04, 0x01, 80, 0x02, 0x01, // Left
+        0x02, 0x01, 60, 0x01, 0x01, // Right
+        0x08, 0x01, 90, 0x01, 0x01, // Case
+    ];
+
+    fn expected() -> Vec<BatteryInfo> {
+        vec![
+            BatteryInfo {
+                component: BatteryComponent::Left,
+                level: 80,
+                status: BatteryStatus::NotCharging,
+            },
+            BatteryInfo {
+                component: BatteryComponent::Right,
+                level: 60,
+                status: BatteryStatus::Charging,
+            },
+            BatteryInfo {
+                component: BatteryComponent::Case,
+                level: 90,
+                status: BatteryStatus::Charging,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn battery_seed_recovers_report_sent_before_event_channel() {
+        let manager = AACPManager::new();
+        // The report arrives while no event channel is attached.
+        manager.receive_packet(&BATTERY_PACKET).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_channel(tx).await;
+
+        let seed = battery_seed(&manager).await;
+        assert_eq!(seed, Some(expected()));
+        // The event itself was lost: only the seed can recover it.
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let mut tray = MyTray::default();
+        tray.apply_battery(&seed.unwrap_or_default());
+        assert_eq!(tray.battery_l, Some(80));
+        assert_eq!(tray.battery_l_status, Some(BatteryStatus::NotCharging));
+        assert_eq!(tray.battery_r, Some(60));
+        assert_eq!(tray.battery_r_status, Some(BatteryStatus::Charging));
+        assert_eq!(tray.battery_c, Some(90));
+        assert_eq!(tray.battery_c_status, Some(BatteryStatus::Charging));
+        assert_eq!(tray.battery_headphone, None);
+
+        // The guard was released: the state lock is free again.
+        assert!(manager.state.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn battery_seed_none_without_report() {
+        let manager = AACPManager::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_channel(tx).await;
+        assert_eq!(battery_seed(&manager).await, None);
+    }
+
+    #[tokio::test]
+    async fn battery_seed_report_after_channel_is_both_queued_and_seeded() {
+        // A report after set_event_channel is queued and also in the seed;
+        // applying both leaves the tray as the report says.
+        let manager = AACPManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_channel(tx).await;
+        manager.receive_packet(&BATTERY_PACKET).await;
+
+        let seed = battery_seed(&manager).await.unwrap_or_default();
+        assert_eq!(seed, expected());
+        let mut tray = MyTray::default();
+        tray.apply_battery(&seed);
+        match rx.try_recv() {
+            Ok(AACPEvent::BatteryInfo(queued)) => tray.apply_battery(&queued),
+            other => panic!("expected a queued BatteryInfo event, got {other:?}"),
+        }
+        assert_eq!(tray.battery_l, Some(80));
+        assert_eq!(tray.battery_r, Some(60));
+        assert_eq!(tray.battery_c, Some(90));
+        assert_eq!(tray.battery_c_status, Some(BatteryStatus::Charging));
+    }
 }
