@@ -17,6 +17,12 @@ use std::time::{Duration, Instant};
 
 /// How long an ownership request may wait for its acknowledgement.
 pub(crate) const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long after a release was sent an OwnsConnection=0 may still be taken
+/// for its late acknowledgement once its ACK timed out (#62), inclusive.
+/// Measured from the send, so the tick cadence does not move it. Twice
+/// `ACK_TIMEOUT`, an engineering default: a capture of real late-ACK delays
+/// may retune it. A later 0 is a genuine loss and yields.
+pub(crate) const LATE_ACK_WINDOW: Duration = Duration::from_secs(10);
 /// First reconnect delay after a disconnect or a successful reconnect.
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 /// Reconnect backoff cap.
@@ -56,8 +62,9 @@ pub(crate) enum Input {
     /// in automatic mode, forgets the take and its pending request). The 0
     /// that acknowledges Linux's own playback-stop or remote-request release
     /// pauses nothing (#39). During the reconnect take a 0 only updates the
-    /// cached owner (#43). A 0 after a release whose acknowledgement timed
-    /// out is that release's late acknowledgement, not a loss (#55).
+    /// cached owner (#43). A 0 within `LATE_ACK_WINDOW` of sending a release
+    /// whose acknowledgement timed out is that release's late
+    /// acknowledgement, not a loss (#55); a later 0 is a loss (#62).
     Ownership(Vec<u8>),
     /// Another host asked Linux to give up ownership. A repeat while Linux's
     /// release for an earlier request is pending sends nothing; a repeat
@@ -165,11 +172,14 @@ pub(crate) struct Handoff {
     /// take. Cleared at the take's ACK, its timeout, a disconnect and any new
     /// request.
     reconnect_take_pending: bool,
-    /// Cause of Linux's last release whose acknowledgement timed out. A
-    /// later OwnsConnection=0 is that release's late acknowledgement, not a
-    /// loss (#55). Cleared when it is consumed, by any report that Linux
-    /// still owns, a disconnect and any new request.
-    timed_out_release: Option<Cause>,
+    /// Cause and send time of Linux's last release whose acknowledgement
+    /// timed out. An OwnsConnection=0 within `LATE_ACK_WINDOW` of that send
+    /// is the release's late acknowledgement, not a loss (#55); a later one
+    /// is a genuine loss (#62). Expiry is checked only when a report
+    /// arrives, never by `tick`. Cleared when any 0 consumes it (late or
+    /// not), by any report that Linux still owns, a disconnect and any new
+    /// request.
+    timed_out_release: Option<(Cause, Instant)>,
     recovery: CaseRecovery,
     case_closed: bool,
     /// Playback stopped while a take was pending: release once it settles.
@@ -301,7 +311,9 @@ impl Handoff {
                     self.say("REMOTE requested ownership; release already pending");
                     return;
                 }
-                if self.pending.is_none() && self.timed_out_release == Some(Cause::Remote) {
+                if self.pending.is_none()
+                    && matches!(self.timed_out_release, Some((Cause::Remote, _)))
+                {
                     // The release was never acknowledged: send it again. Its
                     // [0] is acknowledged like the first one, without a pause.
                     self.say("REMOTE requested ownership; re-sending the timed-out release");
@@ -459,9 +471,10 @@ impl Handoff {
     /// - the acknowledgement of Linux's own release pauses only after a user
     ///   or quit release (upstream #841), or as the deferred pause of a
     ///   blocked retake; a playback-stop or remote-request release left
-    ///   nothing playing to pause. A 0 after a release whose
-    ///   acknowledgement timed out is that release's late acknowledgement
-    ///   and follows the same rule, without a second reconcile (#55);
+    ///   nothing playing to pause. A 0 within `LATE_ACK_WINDOW` of sending
+    ///   a release whose acknowledgement timed out is that release's late
+    ///   acknowledgement and follows the same rule, without a second
+    ///   reconcile (#55); a later 0 falls through to the rule below (#62);
     /// - otherwise, while Linux holds or is taking the AirPods, another host
     ///   took them: `yield_take` yields once.
     fn ownership(&mut self, now: Instant, value: Vec<u8>, out: &mut Vec<Command>) {
@@ -486,13 +499,20 @@ impl Handoff {
             self.say("OWNER stale not-linux report during the reconnect take; ignored");
             return;
         }
-        // A release of Linux's timed out with nothing pending since: a 0 is
-        // its late acknowledgement (#55); any other value says Linux still
-        // owns, so that release failed and is forgotten.
+        // A release of Linux's timed out with nothing pending since: a 0
+        // within `LATE_ACK_WINDOW` of its send is its late acknowledgement
+        // (#55); a later 0 is a genuine loss as if there were no marker
+        // (#62); any other value says Linux still owns, so that release
+        // failed and is forgotten.
         let late_release = self
             .timed_out_release
             .take()
-            .filter(|_| value == [0] && acked.is_none());
+            .filter(|&(_, sent)| {
+                value == [0]
+                    && acked.is_none()
+                    && now.saturating_duration_since(sent) <= LATE_ACK_WINDOW
+            })
+            .map(|(cause, _)| cause);
         let mut deferred_pause = false;
         if value == [0] {
             match acked.map(|p| p.cause).or(late_release) {
@@ -710,7 +730,7 @@ impl Handoff {
             self.reconnect_take_pending = false;
             // A release may still be acknowledged late: that 0 is not a
             // loss of the take it gave back (#55).
-            self.timed_out_release = (!pending.desired).then_some(pending.cause);
+            self.timed_out_release = (!pending.desired).then_some((pending.cause, pending.since));
             if self.quitting {
                 out.push(Command::Fail("release was not acknowledged"));
                 return;
@@ -1754,6 +1774,51 @@ mod tests {
         assert_eq!(count_lines(&lines, "ACK owner=not-linux late"), 1);
         // Consumed once: the release is not paused for again.
         assert_eq!(p.feed(6400, Input::Ownership(vec![0])), []);
+    }
+
+    /// Automatic playback release at 1500 ms whose ACK timed out at 6600 ms.
+    fn playback_release_timed_out() -> Probe {
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(6600, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 1);
+        p
+    }
+
+    #[test]
+    fn release_timeout_then_loss_after_window_yields() {
+        // Long after the release's late-ACK window, a 0 is another host
+        // taking the AirPods (#62): one YIELD and one pause.
+        let mut p = playback_release_timed_out();
+        assert_eq!(p.feed(60000, Input::Ownership(vec![0])), [PauseMedia]);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "YIELD"), 1);
+        assert_eq!(count_lines(&lines, "ACK owner=not-linux late"), 0);
+        assert_eq!(p.core.timed_out_release, None);
+    }
+
+    #[test]
+    fn late_release_ack_window_boundary() {
+        assert_eq!(LATE_ACK_WINDOW, Duration::from_secs(10));
+        // The release was sent at 1500 ms; the window is inclusive.
+        let edge = 1500 + LATE_ACK_WINDOW.as_millis() as u64;
+
+        // (a) Exactly at the window's end: the late acknowledgement.
+        let mut p = playback_release_timed_out();
+        assert_eq!(p.feed(edge, Input::Ownership(vec![0])), []);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "ACK owner=not-linux late"), 1);
+        assert_eq!(count_lines(&lines, "YIELD"), 0);
+        assert_eq!(p.core.timed_out_release, None);
+
+        // (b) One millisecond later: a genuine loss.
+        let mut p = playback_release_timed_out();
+        assert_eq!(p.feed(edge + 1, Input::Ownership(vec![0])), [PauseMedia]);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "YIELD"), 1);
+        assert_eq!(count_lines(&lines, "ACK owner=not-linux late"), 0);
+        assert_eq!(p.core.timed_out_release, None);
     }
 
     #[test]
