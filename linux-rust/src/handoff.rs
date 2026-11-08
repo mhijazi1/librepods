@@ -60,8 +60,9 @@ pub(crate) enum Input {
     /// for a remote host in `new` that the core does not already know; the
     /// report's `old` may be stale (a replay of a report already in the
     /// session snapshot) and is not used for that decision (#58). Until
-    /// `InitBacklogDrained` or a disconnect, a host in the `Reconnected`
-    /// snapshot is known too, so stale replays never re-announce (#79).
+    /// `InitBacklogDrained`, `Auto` or a disconnect, a host in the
+    /// `Reconnected` snapshot is known too, so stale replays never
+    /// re-announce (#79); only the probe's echo timeout keeps it longer.
     ConnectedDevices {
         old: Vec<ConnectedDevice>,
         new: Vec<ConnectedDevice>,
@@ -77,11 +78,16 @@ pub(crate) enum Input {
     /// whose acknowledgement timed out is that release's late
     /// acknowledgement, not a loss (#55); a later 0 is a loss (#62).
     Ownership(Vec<u8>),
-    /// Another host asked Linux to give up ownership. A repeat while Linux's
-    /// release for an earlier request is pending sends nothing; a repeat
-    /// after that release timed out re-sends it without pausing again (#61).
-    /// During a local call Linux keeps the AirPods it holds or is taking and
-    /// refuses (#11).
+    /// Another host asked Linux to give up ownership. While any Linux release
+    /// is pending (playback/auto, user, quit or remote) the request joins it
+    /// and sends no second "not owning" (#61, #137). The join pauses at most
+    /// once, in automatic mode when Linux had taken: for a user/quit release
+    /// or a playback restart during the release. A repeat after Linux's
+    /// remote release timed out re-sends it without pausing again (#61).
+    /// While a local call holds or is taking the AirPods, a pending or
+    /// timed-out remote release still goes ahead (joined, or re-sent); any
+    /// other request is refused (#11), and a release Linux already sent is
+    /// not taken back.
     RemoteOwnershipRequest,
     /// The shell found the control session dead (the AACP receive loop
     /// cleared it without an event) while some of its events may still be
@@ -100,8 +106,10 @@ pub(crate) enum Input {
     /// the echo of its last "not owning" in the probe, the pre-snapshot
     /// queue on the default path); later events are fresh. It ends the
     /// reconnect take's stale-report window, so a later 0 that acknowledges
-    /// nothing is a loss, and the snapshot hosts' announce exemption (#79).
-    /// Otherwise it changes nothing. Fed in queue order, never on a timer.
+    /// nothing is a loss, and the snapshot hosts' announce exemption (#79),
+    /// which `Auto` or a disconnect also ends; only the probe's echo timeout
+    /// leaves it in place. Otherwise it changes nothing. Fed in queue order,
+    /// never on a timer.
     InitBacklogDrained,
     /// Switch to automatic handoff (REPL `auto`). Its "not owning" is a
     /// pending release, so the reply is that release's acknowledgement and
@@ -238,11 +246,11 @@ pub(crate) struct Handoff {
     retry_delay: Duration,
     hosts: Vec<ConnectedDevice>,
     /// Hosts of the adopted `Reconnected` snapshot: replayed reports queued
-    /// before it never announce them (#79). Cleared at `InitBacklogDrained`
-    /// and on disconnect. Accepted limit: without that boundary (the
-    /// probe's echo timed out, or a manual/no-audio reconnect with an empty
-    /// backlog) they stay exempt until the next disconnect, so a snapshot
-    /// host that leaves and rejoins in that session is not re-announced.
+    /// before it never announce them (#79). Cleared at `InitBacklogDrained`,
+    /// `Auto` and on disconnect. Accepted limit: if the probe's echo timed
+    /// out (automatic already on, so no boundary and no `Auto`) they stay
+    /// exempt until the next disconnect, so a snapshot host that leaves and
+    /// rejoins in that session is not re-announced (#150).
     /// A host outside the snapshot is always announced.
     snapshot_hosts: Vec<ConnectedDevice>,
     ears: Vec<EarDetectionStatus>,
@@ -367,7 +375,9 @@ impl Handoff {
                 // event's `old`: a report queued before the session snapshot
                 // (seed, Reconnected facts) is replayed with a stale `old`
                 // and must not announce a second time (#58).
-                // Reconnected snapshot hosts count as known until the boundary (#79).
+                // Reconnected snapshot hosts count as known until the boundary,
+                // `Auto` or a disconnect (#79); only the probe's echo timeout
+                // leaves them known for the session.
                 if self.automatic
                     && self.live()
                     && new.iter().any(|d| {
@@ -476,6 +486,8 @@ impl Handoff {
                     self.say(NO_SESSION);
                     return;
                 }
+                // Queued replays are fed before REPL input, so the #79 exemption can end here.
+                self.snapshot_hosts.clear();
                 out.push(Command::ConnectA2dp);
                 if !self.requested_take && self.pending.is_none() {
                     // Tracked like a playback-stop release (#54). A release
@@ -2874,6 +2886,24 @@ mod tests {
         reconnect_with(&mut p, 100, &[L, R, R2]);
         assert_eq!(p.feed(1300, report(&[L], &[L, R])), []);
         assert_eq!(p.feed(1400, report(&[L, R], &[L, R, R3])), [Announce]);
+    }
+
+    #[test]
+    fn connected_devices_snapshot_exemption_ends_at_auto() {
+        // #150: a manual/no-audio reconnect gets no boundary; Auto ends it.
+        let mut p = Probe::new(false, true);
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(1100, Input::Tick), [Reconnect { audio: false }]);
+        let facts = SessionFacts {
+            hosts: vec![host(L), host(R)],
+            ..SessionFacts::default()
+        };
+        let out = p.feed(1200, Input::Reconnected(facts));
+        assert_eq!(announces(&out), 0, "{out:?}");
+        let auto = p.feed(1300, Input::Auto);
+        assert_eq!(announces(&auto), 1, "{auto:?}");
+        assert_eq!(p.feed(1400, report(&[L, R], &[L])), []);
+        assert_eq!(p.feed(1500, report(&[L], &[L, R])), [Announce]);
     }
 
     // "Connect to this computer" (#16).
