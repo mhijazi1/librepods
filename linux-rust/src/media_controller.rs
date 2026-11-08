@@ -2781,7 +2781,11 @@ mod tests {
         }
 
         fn started_from(&self, deadline: Instant) -> usize {
-            self.0.borrow().iter().filter(|(_, t)| *t >= deadline).count()
+            self.0
+                .borrow()
+                .iter()
+                .filter(|(_, t)| *t >= deadline)
+                .count()
         }
     }
 
@@ -2818,7 +2822,10 @@ mod tests {
         assert!(start.elapsed() <= A2DP_ACTIVATION_DEADLINE);
         assert_eq!(steps.started_from(deadline), 0);
         assert!(steps.started("lookup") > 1);
-        assert_eq!(steps.started("recover") + steps.started("choose") + steps.started("set"), 0);
+        assert_eq!(
+            steps.started("recover") + steps.started("choose") + steps.started("set"),
+            0
+        );
         // The cut lookup wrote nothing.
         assert_eq!(controller.state.try_lock().unwrap().device_index, Some(99));
     }
