@@ -34,7 +34,11 @@ Put new issues in the milestone whose outcome they serve.
   PipeWire actually do. Whenever a ticket depends on such behaviour (a guess, an unverified assumption, a "probably"), file a `spike`
   issue labelled `hardware` to validate it, instead of leaving it only in the "Hardware validation" section. File it even when it can
   only run during or after the issue that found it:
-  - Link it with `deps.sh`. The spike is blocked by the issue when it needs that issue's code.
+  - Link it with `deps.sh`, in whichever direction the work needs:
+    - **The issue is blocked by the spike** when the right implementation depends on the answer, so building first risks rework. The
+      issue then waits until mo has run the spike.
+    - **The spike is blocked by the issue** when it validates that issue's code, so it can only run once the code is merged.
+    - Use neither link when the spike only confirms behaviour the code already handles either way.
   - Its criteria are mo's exact steps, and what each possible outcome would mean for the code.
   - `lanes.sh` never starts `hardware` issues: mo runs them with the orchestrator, and the findings come back as follow-up issues.
 - Prefer extracting pure, testable logic (parsing, encoding, policy decisions) from I/O code over adding large mocks.
