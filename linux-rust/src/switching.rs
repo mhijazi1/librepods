@@ -77,8 +77,30 @@ impl PlaybackSamples {
     /// re-baseline the stream monitor at `reset` before it observes its next
     /// listing. Anchored to `reset`, not to now, so a stream first audible
     /// after the reset still counts however late this is applied.
+    #[cfg(test)]
     pub(crate) fn rebaseline(&self, reset: Instant) {
         *self.rebaseline.lock().unwrap_or_else(|e| e.into_inner()) = Some(reset);
+    }
+
+    /// Run the core's step at now, `core_step(now)`, under the re-baseline
+    /// lock, and when it asks for `DrainPlayback` request the stream
+    /// monitor's re-baseline at that now before the lock is released, so
+    /// before any command is awaited (#90). The stream worker holds
+    /// the same lock from its clock read to its publish, so each of its
+    /// observes falls wholly before now, published before it (a poller
+    /// sample stamped at or after now reads it), or wholly after the
+    /// request.
+    pub(crate) fn handle(
+        &self,
+        core_step: impl FnOnce(Instant) -> Vec<Command>,
+    ) -> (Instant, Vec<Command>) {
+        let mut request = self.rebaseline.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let commands = core_step(now);
+        if commands.contains(&Command::DrainPlayback) {
+            *request = Some(now);
+        }
+        (now, commands)
     }
 
     /// `Command::DrainPlayback`: drop the samples already taken.
@@ -182,25 +204,28 @@ pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
         PulsePeaks::new(),
         MIN_STREAM_PLAYBACK,
         PLAYBACK_POLL,
+        |_| (),
     )
 }
 
 /// `spawn_playback_poller` with its sources, minimum stream duration and
-/// interval injected. Every `interval` it samples `mpris` on the blocking
-/// pool and sends `(sampled_at, mpris || streams)`, where `streams` is the
-/// latest state of the stream monitor over `streams` and `peaks`. The
-/// stream monitor samples in its own task
-/// (`stream_monitor::spawn_stream_playback`), so a sound server that never
-/// answers leaves the stream state as it was but never holds up the MPRIS
-/// samples. Only edges reach the handoff core (`Input::Playback`), which
-/// keeps every takeover decision; `PlaybackSamples::rebaseline`
-/// re-baselines the stream monitor when the core resets its baseline (#90).
+/// interval injected, and the stream monitor's `observed` hook. Every
+/// `interval` it samples `mpris` on the blocking pool and sends
+/// `(sampled_at, mpris || streams)`, where `streams` is the latest state of
+/// the stream monitor over `streams` and `peaks`. The stream monitor
+/// samples in its own task (`stream_monitor::spawn_stream_playback`), so a
+/// sound server that never answers leaves the stream state as it was but
+/// never holds up the MPRIS samples. Only edges reach the handoff core
+/// (`Input::Playback`), which keeps every takeover decision;
+/// `PlaybackSamples::handle` re-baselines the stream monitor when the core
+/// resets its baseline (#90).
 fn spawn_playback_poller_with<M, S, P>(
     mpris: M,
     streams: S,
     peaks: P,
     min_stream: Duration,
     interval: Duration,
+    observed: impl Fn(Instant) + Send + Sync + 'static,
 ) -> PlaybackSamples
 where
     M: Fn() -> bool + Send + Sync + 'static,
@@ -215,10 +240,14 @@ where
         min_stream,
         interval,
         rebaseline.clone(),
+        observed,
     );
     let mpris = Arc::new(mpris);
     tokio::spawn(async move {
         loop {
+            // Stamped before the stream state is read: a sample
+            // stamped at or after a step's reset reads every state the
+            // stream monitor published before that reset.
             let sampled_at = Instant::now();
             let mpris = mpris.clone();
             let mpris_playing = tokio::task::spawn_blocking(move || mpris())
@@ -531,16 +560,8 @@ impl Shell {
 /// Feed one input to the core, log its lines and execute its commands. True
 /// when the task should end.
 async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
-    let now = Instant::now();
-    let commands = core.handle(now, input);
+    let (now, commands) = shell.play_rx.handle(|now| core.handle(now, input));
     remember_last_owner_linux(&shell.mac, core.last_owner_linux());
-    // Before any command is awaited, so a stream debouncing at the reset
-    // can't reach the minimum while SendOwnership or Announce wait (#90); a
-    // stream reaching it between `now` and this request still counts.
-    // shortcut: that window, while core.handle runs, stays open (#146)
-    if commands.contains(&Command::DrainPlayback) {
-        shell.play_rx.rebaseline(now);
-    }
     for line in core.take_lines() {
         info!("Handoff {}: {line}", shell.mac);
         if let Some(sink) = &shell.lines {
@@ -1438,6 +1459,7 @@ mod tests {
                         AllAudible,
                         min_stream,
                         STREAM_TEST_POLL,
+                        |_| (),
                     )
                 }),
             )
@@ -2695,6 +2717,7 @@ mod tests {
             AllAudible,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
+            |_| (),
         );
         assert!(!next_sample(&mut rx).await.1);
         mpris.store(true, Ordering::SeqCst);
@@ -2717,6 +2740,7 @@ mod tests {
             AllAudible,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
+            |_| (),
         );
         assert!(!next_sample(&mut rx).await.1);
         // The stream monitor's baseline has the event sound only.
@@ -2745,6 +2769,7 @@ mod tests {
             AllAudible,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
+            |_| (),
         );
         assert!(!next_sample(&mut rx).await.1);
         mpris.store(true, Ordering::SeqCst);
@@ -2781,6 +2806,7 @@ mod tests {
             AllAudible,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
+            |_| (),
         );
         streams.settle().await;
         rx
@@ -2819,7 +2845,7 @@ mod tests {
     /// after it. The re-baseline, stamped with the reset, is requested only a
     /// fifth of the minimum after the stream was seen, so it applies late.
     /// Returns the samples and when the stream started. It calls
-    /// `rebaseline` directly, not through `step`; that path test is #146.
+    /// `rebaseline` directly; the `step_rebaseline` tests go through `step`.
     async fn late_rebaseline(before_reset: bool) -> (PlaybackSamples, Instant) {
         let streams = LiveStreams::default();
         let mut rx = stream_poller(&streams, streams.clone()).await;
@@ -2930,6 +2956,315 @@ mod tests {
         let seen = samples_for(&mut rx, STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
         assert!(!seen.is_empty());
         assert!(seen.iter().all(|playing| *playing), "{seen:?}");
+    }
+
+    /// What a held stream worker reports: the instant it was held at, and
+    /// the hold, released when sent to or dropped.
+    type Held = (Instant, std::sync::mpsc::Sender<()>);
+
+    /// Holds the stream worker once armed: at its first `reached(at)` with
+    /// `at` at or after the armed instant, it reports `at` and waits there.
+    #[derive(Clone, Default)]
+    struct Hold(Arc<StdMutex<Option<(Instant, oneshot::Sender<Held>)>>>);
+
+    impl Hold {
+        fn arm(&self, from: Instant) -> oneshot::Receiver<Held> {
+            let (report, held) = oneshot::channel();
+            *self.0.lock().unwrap() = Some((from, report));
+            held
+        }
+
+        fn reached(&self, at: Instant) {
+            let armed = self.0.lock().unwrap().take_if(|(from, _)| at >= *from);
+            if let Some((_, report)) = armed {
+                let (release, released) = std::sync::mpsc::channel();
+                if report.send((at, release)).is_ok() {
+                    let _ = released.recv();
+                }
+            }
+        }
+    }
+
+    async fn held(held: oneshot::Receiver<Held>) -> Held {
+        tokio::time::timeout(Duration::from_secs(3), held)
+            .await
+            .expect("the stream worker held")
+            .expect("hold armed")
+    }
+
+    /// Every candidate audible; asked about candidates, it first waits at
+    /// its `Hold`, before the worker's clock read.
+    struct HeldPeaks(Hold);
+
+    impl PeakSource for HeldPeaks {
+        fn levels(&mut self, candidates: &std::collections::HashSet<u32>) -> HashMap<u32, f32> {
+            if !candidates.is_empty() {
+                self.0.reached(Instant::now());
+            }
+            AllAudible.levels(candidates)
+        }
+    }
+
+    /// A stream-only poller over `streams` with `peaks` and the stream
+    /// worker's `observed` hook, past its empty baseline listing.
+    async fn held_poller<P: PeakSource + 'static>(
+        streams: &LiveStreams,
+        peaks: P,
+        observed: impl Fn(Instant) + Send + Sync + 'static,
+    ) -> PlaybackSamples {
+        let rx = spawn_playback_poller_with(
+            || false,
+            streams.clone(),
+            peaks,
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+            observed,
+        );
+        streams.settle().await;
+        rx
+    }
+
+    /// A core step that resets the baseline, run through
+    /// `PlaybackSamples::handle` on its own thread over `rx`'s re-baseline
+    /// slot. The core's now goes to the returned receiver; the core returns
+    /// [DrainPlayback] once `finish` is sent to or dropped.
+    fn reset_step(
+        rx: &PlaybackSamples,
+    ) -> (oneshot::Receiver<Instant>, std::sync::mpsc::Sender<()>) {
+        let samples = PlaybackSamples {
+            rx: mpsc::channel(1).1,
+            rebaseline: rx.rebaseline.clone(),
+        };
+        let (reset_tx, reset) = oneshot::channel();
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            samples.handle(|now| {
+                let _ = reset_tx.send(now);
+                let _ = finished.recv();
+                vec![Command::DrainPlayback]
+            })
+        });
+        (reset, finish)
+    }
+
+    /// The samples stamped at or after `reset` for `period`, up to and
+    /// including the first that `last` accepts.
+    async fn samples_since(
+        rx: &mut PlaybackSamples,
+        reset: Instant,
+        period: Duration,
+        last: impl Fn(bool) -> bool,
+    ) -> Vec<(Instant, bool)> {
+        let end = tokio::time::Instant::now() + period;
+        let mut seen = Vec::new();
+        while let Ok((sampled_at, playing)) = tokio::time::timeout_at(end, next_sample(rx)).await {
+            if sampled_at >= reset {
+                seen.push((sampled_at, playing));
+                if last(playing) {
+                    break;
+                }
+            }
+        }
+        seen
+    }
+
+    fn values(seen: &[(Instant, bool)]) -> Vec<bool> {
+        seen.iter().map(|&(_, playing)| playing).collect()
+    }
+
+    /// The synchronous gap: the core resets while the worker samples a
+    /// stream debouncing since before the reset, and the worker's clock,
+    /// read after the reset, completes the minimum before the core's step
+    /// has returned. The stream still never plays.
+    #[tokio::test]
+    async fn playback_poller_rebaseline_sync_gap_never_plays() {
+        let streams = LiveStreams::default();
+        let hold = Hold::default();
+        let mut rx = held_poller(&streams, HeldPeaks(hold.clone()), |_| ()).await;
+        // Held at the levels of the stream's first listing; its clock, read
+        // after this, starts the debounce.
+        let first = hold.arm(Instant::now());
+        streams.set(vec![music(12)]);
+        let (seen, release) = held(first).await;
+        // Half the minimum later, so no observe before it completes it.
+        let racing = hold.arm(seen + STREAM_TEST_MIN / 2);
+        drop(release);
+        let (listed, release) = held(racing).await;
+        // The step runs while that sample is held, its core step held too.
+        let (reset, finish) = reset_step(&rx);
+        let reset = reset.await.expect("the core stepped");
+        let mut seen = samples_since(&mut rx, reset, Duration::from_secs(3), |_| true).await;
+        // The worker's clock completes the minimum.
+        tokio::time::sleep_until((listed + STREAM_TEST_MIN).into()).await;
+        drop(release);
+        // Without the shared lock, the observe counts the stream here,
+        // before the step's request.
+        seen.extend(samples_since(&mut rx, reset, STREAM_TEST_MIN / 2, |playing| playing).await);
+        drop(finish);
+        seen.extend(samples_since(&mut rx, reset, STREAM_TEST_MIN * 2, |_| false).await);
+        let seen = values(&seen);
+        assert!(seen.iter().all(|playing| !playing), "{seen:?}");
+    }
+
+    /// The publish latency: the worker completes a stream's minimum
+    /// before the core's reset and publishes only after it. The core sees
+    /// no new start: every sample from the reset on plays.
+    #[tokio::test]
+    async fn playback_poller_rebaseline_publish_latency_keeps_counted_stream() {
+        let streams = LiveStreams::default();
+        let hold = Hold::default();
+        let observed = hold.clone();
+        let mut rx = held_poller(&streams, AllAudible, move |at| observed.reached(at)).await;
+        // Held after an observe: the next listing has the stream, so the
+        // next observe starts its debounce.
+        let (_, release) = held(hold.arm(Instant::now())).await;
+        streams.set(vec![music(13)]);
+        let first = hold.arm(Instant::now());
+        drop(release);
+        let (started, release) = held(first).await;
+        // Held after the observe that completes the minimum, before its
+        // publish.
+        let completing = hold.arm(started + STREAM_TEST_MIN);
+        drop(release);
+        let (_, release) = held(completing).await;
+        let (mut reset, finish) = reset_step(&rx);
+        drop(finish);
+        // Without the shared lock the step resets now, and a sample after
+        // it reads the unpublished state; with it, the step waits.
+        let mut seen = Vec::new();
+        let early = tokio::time::timeout(STREAM_TEST_MIN / 2, &mut reset)
+            .await
+            .ok()
+            .map(|reset| reset.expect("the core stepped"));
+        if let Some(reset) = early {
+            seen = samples_since(&mut rx, reset, Duration::from_secs(3), |_| true).await;
+        }
+        drop(release);
+        let reset = match early {
+            Some(reset) => reset,
+            None => reset.await.expect("the core stepped"),
+        };
+        seen.extend(samples_since(&mut rx, reset, STREAM_TEST_MIN * 2, |_| false).await);
+        let seen = values(&seen);
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|playing| *playing), "{seen:?}");
+    }
+
+    /// Its twin: a stream first audible after the reset plays once, after
+    /// the minimum.
+    #[tokio::test]
+    async fn playback_poller_rebaseline_publish_latency_later_stream_plays_once() {
+        let streams = LiveStreams::default();
+        let mut rx = held_poller(&streams, AllAudible, |_| ()).await;
+        let (reset, finish) = reset_step(&rx);
+        drop(finish);
+        let reset = reset.await.expect("the core stepped");
+        let started = Instant::now();
+        streams.set(vec![music(14)]);
+        let seen = samples_since(
+            &mut rx,
+            reset,
+            STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2,
+            |_| false,
+        )
+        .await;
+        let starts: Vec<Instant> = seen
+            .windows(2)
+            .filter(|pair| !pair[0].1 && pair[1].1)
+            .map(|pair| pair[1].0)
+            .collect();
+        assert_eq!(starts.len(), 1, "{:?}", values(&seen));
+        assert!(!seen[0].1);
+        assert!(starts[0].duration_since(started) >= STREAM_TEST_MIN);
+    }
+
+    /// The daemon's startup `Input::Auto` resets the core's baseline with
+    /// the real playback poller running, and `music(21)` starts before the
+    /// reset (`before_reset`) or during Auto's SendOwnership(false), which
+    /// the shell awaits before DrainPlayback and the test holds with a full
+    /// send channel: past the stream's remaining debounce (before the reset)
+    /// or briefly. The first MPRIS poll waits for the reset, so the
+    /// poller's pending sample is stamped after it. Returns the harness, the
+    /// packets after Auto's and the reply to its "not owning", and when the
+    /// stream started.
+    async fn step_rebaseline(
+        mac: &str,
+        before_reset: bool,
+    ) -> (Harness, mpsc::Receiver<Vec<u8>>, Instant) {
+        let (manager, mut rx, tx) = ready_session().await;
+        let mut queued = 0;
+        while tx.try_send(Vec::new()).is_ok() {
+            queued += 1;
+        }
+        let (open_mpris, mpris_gate) = std::sync::mpsc::channel::<()>();
+        let mpris_gate = StdMutex::new(Some(mpris_gate));
+        let mpris = move || {
+            if let Some(gate) = mpris_gate.lock().unwrap().take() {
+                let _ = gate.recv();
+            }
+            false
+        };
+        let streams = LiveStreams::default();
+        let h =
+            Harness::start_streams(mac, &manager, mpris, streams.clone(), STREAM_TEST_MIN).await;
+        // The handoff task has not run yet (a current-thread runtime): it
+        // reads the session first, so Auto waits for this guard.
+        let session = manager.state.try_lock().expect("session state free");
+        streams.settle().await;
+        let start = || {
+            let started = Instant::now();
+            streams.set(vec![music(21)]);
+            started
+        };
+        let started = before_reset.then(start);
+        streams.settle().await;
+        drop(session);
+        // Auto's ConnectA2dp: the core has reset, and SendOwnership(false)
+        // is held.
+        wait_until("Auto", || h.activations() == 1).await;
+        drop(open_mpris);
+        let started = started.unwrap_or_else(start);
+        streams.settle().await;
+        let held = if before_reset {
+            STREAM_TEST_MIN + STREAM_TEST_MIN / 5
+        } else {
+            STREAM_TEST_MIN / 5
+        };
+        tokio::time::sleep(held).await;
+        for _ in 0..queued {
+            assert_eq!(next_packet(&mut rx).await, Vec::<u8>::new());
+        }
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(REMOTE).await
+        );
+        assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
+        h.emit(owns(0));
+        (h, rx, started)
+    }
+
+    #[tokio::test]
+    async fn handoff_step_rebaseline_stream_before_reset_never_takes() {
+        let mac = "5A:00:00:00:00:14";
+        let (h, mut rx, _) = step_rebaseline(mac, true).await;
+        tokio::time::sleep(STREAM_TEST_MIN * 2).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_step_rebaseline_stream_after_reset_takes_once() {
+        let mac = "5A:00:00:00:00:15";
+        let (h, mut rx, started) = step_rebaseline(mac, false).await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert!(started.elapsed() >= STREAM_TEST_MIN);
+        h.emit(owns(1));
+        tokio::time::sleep(STREAM_TEST_MIN).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        stop_handoff_task(mac);
     }
 
     #[tokio::test]

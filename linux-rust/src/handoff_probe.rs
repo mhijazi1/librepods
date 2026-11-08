@@ -340,13 +340,9 @@ impl Io {
 /// Feed one input to the core, print its protocol lines and execute its
 /// commands. Ok(true) when the probe should stop.
 async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
-    let now = Instant::now();
-    let commands = core.handle(now, input);
-    // Before ConnectA2dp and the sends are awaited (#90), as the daemon's.
-    // shortcut: a debounce ending between `now` and this request counts (#146)
-    if commands.contains(&Command::DrainPlayback) {
-        io.play_rx.rebaseline(now);
-    }
+    // The daemon's order (#90): the re-baseline is requested at the
+    // core's now, under the stream worker's lock.
+    let (_, commands) = io.play_rx.handle(|now| core.handle(now, input));
     for line in core.take_lines() {
         println!("{line}");
         if let Some(log) = &io.log {
