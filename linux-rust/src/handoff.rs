@@ -638,18 +638,19 @@ impl Handoff {
         }
         let resuming = self.requested_take && self.resume_until.is_some();
         match self.pending {
+            // A track change's gap: the stop's release was still held. Linux
+            // already owns, so a fresh take's host and wear policy is moot.
+            None if holding && !resuming => {
+                self.say("AUTO playback restarted within the release hold; Linux already owns");
+                if resume_deferred {
+                    self.resume_if_idle(now, out);
+                }
+            }
             None => match self.decide_poll(previous, playing).action {
                 // The resume chain's kick, or its Play after the profile
                 // cycle: Linux already owns the AirPods.
                 TakeoverAction::TakeOver if resuming => {
                     self.say("AUTO playback restarted during the A2DP resume; Linux already owns")
-                }
-                // A track change's gap: the stop's release was still held.
-                TakeoverAction::TakeOver if holding => {
-                    self.say("AUTO playback restarted within the release hold; Linux already owns");
-                    if resume_deferred {
-                        self.resume_if_idle(now, out);
-                    }
                 }
                 TakeoverAction::TakeOver if !self.auto_take_allowed() => {
                     self.say(CONNECT_MODE_SKIP)
@@ -4005,6 +4006,21 @@ mod tests {
         assert_eq!(p.feed(600, Input::Ownership(vec![1])), [RouteToAirPods]);
         assert_eq!(p.feed(700, Input::LocalCall(true)), [AdvertiseCall(true)]);
         assert_eq!(p.play(2000, true), []);
+
+        // The phone disconnecting first blocks a fresh take, not the resume
+        // of the take Linux already holds.
+        let mut p = routed();
+        assert_eq!(p.feed(20, idle_transport()), []);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.play(550, false), []);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), [RouteToAirPods]);
+        assert_eq!(p.feed(700, report(&[LOCAL, REMOTE], &[LOCAL])), []);
+        assert_eq!(p.play(2000, true), [ResumeA2dp]);
+        assert_eq!(p.play(2500, false), []);
+        assert_eq!(p.play(3000, true), []);
+        for ms in (3100..=end + HOLD_MS).step_by(100) {
+            assert_eq!(p.feed(ms, Input::Tick), [], "{ms}");
+        }
     }
 
     #[test]
