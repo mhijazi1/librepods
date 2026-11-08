@@ -590,20 +590,6 @@ impl StreamSource for PulseStreams {
         let (mut mainloop, context) = pulse::connect("LibrePods call monitor")?;
         let introspector = context.introspect();
 
-        let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
-        let mut op = introspector.get_source_info_list({
-            let monitors = Rc::downgrade(&monitors);
-            move |result| {
-                pulse::update(&monitors, |monitors| {
-                    monitors.record(result, |source| {
-                        source.monitor_of_sink.is_some().then_some(source.index)
-                    })
-                })
-            }
-        });
-        pulse::wait(&mut mainloop, &mut op, "source list")?;
-        let monitors: HashSet<u32> = monitors.take().finish("source list")?.into_iter().collect();
-
         let outputs: Rc<RefCell<ListAccumulator<(u32, StreamProps)>>> = Rc::default();
         let mut op = introspector.get_source_output_info_list({
             let outputs = Rc::downgrade(&outputs);
@@ -645,15 +631,27 @@ impl StreamSource for PulseStreams {
         pulse::wait(&mut mainloop, &mut op, "card list")?;
         let cards = cards.take().finish("card list")?;
 
-        let streams = outputs
-            .into_iter()
-            .map(|(source, stream)| StreamProps {
-                monitor: monitors.contains(&source),
-                ..stream
-            })
-            .collect();
+        // Source info has its own connection (#193), so only when needed.
+        let monitors = if outputs.is_empty() {
+            Vec::new()
+        } else {
+            pulse::monitor_sources("LibrePods call monitor")?
+        };
+        let streams = mark_monitors(outputs, &monitors);
         Ok(AudioSnapshot { streams, cards })
     }
+}
+
+/// Each source output's stream, a `monitor` iff its source is one of
+/// `monitors`, the monitor sources' indices.
+fn mark_monitors(outputs: Vec<(u32, StreamProps)>, monitors: &[u32]) -> Vec<StreamProps> {
+    outputs
+        .into_iter()
+        .map(|(source, stream)| StreamProps {
+            monitor: monitors.contains(&source),
+            ..stream
+        })
+        .collect()
 }
 
 /// The results of one libpulse list query, shared by every list callback so
@@ -946,18 +944,10 @@ fn peak_stream(mainloop: &mut Mainloop, index: u32) -> io::Result<PeakStream> {
     let sink = sinks.take().finish("sink input info")?.pop();
     let sink = sink.ok_or_else(|| pulse_error("sink input info"))?;
 
-    let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
-    let mut op = introspector.get_sink_info_by_index(sink, {
-        let monitors = Rc::downgrade(&monitors);
-        move |result| {
-            pulse::update(&monitors, |monitors| {
-                monitors.record(result, |sink| Some(sink.monitor_source))
-            })
-        }
-    });
-    pulse::wait(mainloop, &mut op, "sink info")?;
-    let monitor = monitors.take().finish("sink info")?.pop();
-    let monitor = monitor.ok_or_else(|| pulse_error("sink info"))?;
+    let monitor = pulse::sinks("LibrePods", pulse::Sinks::Index(sink))?
+        .pop()
+        .ok_or_else(|| pulse_error("sink info"))?
+        .monitor_source;
 
     let spec = Spec {
         format: Format::FLOAT32NE,
@@ -2649,5 +2639,26 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn capture_is_monitor_iff_its_source_is_a_monitor_source() {
+        let capture = |index| StreamProps {
+            direction: StreamDirection::Capture,
+            props: BTreeMap::from([("media.role".to_string(), "phone".to_string())]),
+            monitor: false,
+            index,
+            corked: false,
+            muted: false,
+        };
+        // Output 1 records monitor source 5, output 2 microphone source 6.
+        let streams = mark_monitors(vec![(5, capture(1)), (6, capture(2))], &[5, 9]);
+        assert_eq!(
+            streams.iter().map(|s| s.monitor).collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert!(!crate::call_detect::is_call_stream(&streams[0]));
+        assert!(crate::call_detect::is_call_stream(&streams[1]));
+        assert!(mark_monitors(Vec::new(), &[5]).is_empty());
     }
 }

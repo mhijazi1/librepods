@@ -2436,6 +2436,7 @@ dependencies = [
  "imageproc",
  "ksni",
  "libpulse-binding",
+ "libpulse-sys",
  "log",
  "serde",
  "serde_json",
