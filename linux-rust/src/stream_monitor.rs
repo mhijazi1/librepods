@@ -22,20 +22,18 @@ use crate::call_detect::{
     StreamDirection, StreamProps, airpods_card_profile, call_active, is_takeover_worthy,
 };
 use crate::pulse::{self, pulse_error};
-use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::{Context, State as ContextState};
 use libpulse_binding::def::BufferAttr;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
+#[cfg(test)]
 use libpulse_binding::proplist::Proplist;
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::{
     FlagSet as StreamFlagSet, PeekResult, State as StreamState, Stream,
 };
 use libpulse_binding::volume::{ChannelVolumes, Volume};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::rc::Rc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -440,7 +438,8 @@ fn sink_input_muted(mute: bool, volume: &ChannelVolumes) -> bool {
     mute || (!channels.is_empty() && channels.iter().all(|&v| v == Volume::MUTED))
 }
 
-/// A sink input as `call_detect` sees it.
+/// `playback_stream_props` on a binding proplist, for tests.
+#[cfg(test)]
 pub(crate) fn playback_stream(
     index: u32,
     proplist: &Proplist,
@@ -448,9 +447,20 @@ pub(crate) fn playback_stream(
     mute: bool,
     volume: &ChannelVolumes,
 ) -> StreamProps {
+    playback_stream_props(index, props(proplist), corked, mute, volume)
+}
+
+/// A sink input as `call_detect` sees it.
+fn playback_stream_props(
+    index: u32,
+    props: BTreeMap<String, String>,
+    corked: bool,
+    mute: bool,
+    volume: &ChannelVolumes,
+) -> StreamProps {
     StreamProps {
         direction: StreamDirection::Playback,
-        props: props(proplist),
+        props,
         monitor: false,
         index,
         corked,
@@ -490,13 +500,6 @@ pub(crate) struct PulsePlaybackStreams {
     dead: bool,
 }
 
-/// A libpulse connection kept between listings. `context` is declared
-/// first, so it is dropped before its mainloop.
-struct PulseConnection {
-    context: Context,
-    mainloop: Mainloop,
-}
-
 impl PulsePlaybackStreams {
     pub(crate) fn new() -> Self {
         Self::spawn(PLAYBACK_LIST_BOUND, || {
@@ -504,13 +507,9 @@ impl PulsePlaybackStreams {
             move || {
                 list_reusing(
                     &mut connection,
-                    || {
-                        let (mainloop, context) = pulse::connect("LibrePods playback monitor")?;
-                        Ok(PulseConnection { context, mainloop })
-                    },
-                    // Introspecting a context that isn't Ready panics.
-                    |c| c.context.get_state() == ContextState::Ready,
-                    |c| sink_inputs(&mut c.mainloop, &c.context),
+                    || pulse::RawConnection::connect("LibrePods playback monitor"),
+                    pulse::RawConnection::ready,
+                    sink_inputs,
                 )
             }
         })
@@ -585,81 +584,42 @@ fn list_reusing<C, T>(
     result
 }
 
-/// Every sink input on `context`, which must be Ready.
-fn sink_inputs(mainloop: &mut Mainloop, context: &Context) -> io::Result<Vec<StreamProps>> {
-    let introspector = context.introspect();
-    let inputs: Rc<RefCell<ListAccumulator<StreamProps>>> = Rc::default();
-    let mut op = introspector.get_sink_input_info_list({
-        let inputs = Rc::downgrade(&inputs);
-        move |result| {
-            pulse::update(&inputs, |inputs| {
-                inputs.record(result, |input| {
-                    Some(playback_stream(
-                        input.index,
-                        &input.proplist,
-                        input.corked,
-                        input.mute,
-                        &input.volume,
-                    ))
-                })
-            })
-        }
-    });
-    pulse::wait(mainloop, &mut op, "sink input list")?;
-    inputs.take().finish("sink input list")
+/// Every sink input on `connection`.
+fn sink_inputs(connection: &mut pulse::RawConnection) -> io::Result<Vec<StreamProps>> {
+    let inputs = connection.sink_inputs(None)?;
+    Ok(inputs
+        .into_iter()
+        .map(|i| playback_stream_props(i.index, i.props, i.corked, i.mute, &i.volume))
+        .collect())
 }
 
 impl StreamSource for PulseStreams {
     fn snapshot(&mut self) -> io::Result<AudioSnapshot> {
-        let (mut mainloop, context) = pulse::connect("LibrePods call monitor")?;
-        let introspector = context.introspect();
-
-        let outputs: Rc<RefCell<ListAccumulator<(u32, StreamProps)>>> = Rc::default();
-        let mut op = introspector.get_source_output_info_list({
-            let outputs = Rc::downgrade(&outputs);
-            move |result| {
-                pulse::update(&outputs, |outputs| {
-                    outputs.record(result, |output| {
-                        let stream = StreamProps {
-                            direction: StreamDirection::Capture,
-                            props: props(&output.proplist),
-                            monitor: false,
-                            index: output.index,
-                            corked: output.corked,
-                            muted: false,
-                        };
-                        Some((output.source, stream))
-                    })
-                })
-            }
-        });
-        pulse::wait(&mut mainloop, &mut op, "source output list")?;
-        let outputs = outputs.take().finish("source output list")?;
-
-        let cards: Rc<RefCell<ListAccumulator<(String, Option<String>)>>> = Rc::default();
-        let mut op = introspector.get_card_info_list({
-            let cards = Rc::downgrade(&cards);
-            move |result| {
-                pulse::update(&cards, |cards| {
-                    cards.record(result, |card| {
-                        let name = card.name.as_ref()?.to_string();
-                        let profile = card
-                            .active_profile
-                            .as_ref()
-                            .and_then(|p| p.name.as_ref().map(|n| n.to_string()));
-                        Some((name, profile))
-                    })
-                })
-            }
-        });
-        pulse::wait(&mut mainloop, &mut op, "card list")?;
-        let cards = cards.take().finish("card list")?;
-
-        // Source info has its own connection (#193), so only when needed.
+        let mut raw = pulse::RawConnection::connect("LibrePods call monitor")?;
+        let outputs: Vec<(u32, StreamProps)> = raw
+            .source_outputs()?
+            .into_iter()
+            .map(|output| {
+                let stream = StreamProps {
+                    direction: StreamDirection::Capture,
+                    props: output.props,
+                    monitor: false,
+                    index: output.index,
+                    corked: output.corked,
+                    muted: false,
+                };
+                (output.source, stream)
+            })
+            .collect();
+        let cards = raw
+            .cards()?
+            .into_iter()
+            .filter_map(|card| Some((card.name?, card.active_profile)))
+            .collect();
         let monitors = if outputs.is_empty() {
             Vec::new()
         } else {
-            pulse::monitor_sources("LibrePods call monitor")?
+            raw.monitor_sources()?
         };
         let streams = mark_monitors(outputs, &monitors);
         Ok(AudioSnapshot { streams, cards })
@@ -678,59 +638,8 @@ fn mark_monitors(outputs: Vec<(u32, StreamProps)>, monitors: &[u32]) -> Vec<Stre
         .collect()
 }
 
-/// The results of one libpulse list query, shared by every list callback so
-/// that a failed or truncated listing is an error rather than a short list.
-/// libpulse delivers each entry as `Item`, then exactly one `End` on success
-/// or one `Error` on failure; an operation can also finish (or be cancelled)
-/// without either.
-#[derive(Debug)]
-struct ListAccumulator<T> {
-    items: Vec<T>,
-    failed: bool,
-    ended: bool,
-}
-
-impl<T> Default for ListAccumulator<T> {
-    fn default() -> Self {
-        ListAccumulator {
-            items: Vec::new(),
-            failed: false,
-            ended: false,
-        }
-    }
-}
-
-impl<T> ListAccumulator<T> {
-    /// Record one callback result. `keep` maps an item to the value to keep,
-    /// or None to skip that item (it is not an error).
-    fn record<I>(&mut self, result: ListResult<I>, keep: impl FnOnce(I) -> Option<T>) {
-        match result {
-            ListResult::Item(item) => {
-                if let Some(value) = keep(item) {
-                    self.items.push(value);
-                }
-            }
-            ListResult::End => self.ended = true,
-            ListResult::Error => self.failed = true,
-        }
-    }
-
-    /// The kept items once the operation is over: Err if the server reported
-    /// an error or the list never reached its end.
-    fn finish(self, what: &str) -> io::Result<Vec<T>> {
-        if self.failed {
-            return Err(io::Error::other(format!(
-                "PulseAudio {what} reported an error"
-            )));
-        }
-        if !self.ended {
-            return Err(io::Error::other(format!("PulseAudio {what} ended early")));
-        }
-        Ok(self.items)
-    }
-}
-
-fn props(list: &Proplist) -> BTreeMap<String, String> {
+#[cfg(test)]
+pub(crate) fn props(list: &Proplist) -> BTreeMap<String, String> {
     list.iter()
         .filter_map(|key| list.get_str(&key).map(|value| (key, value)))
         .collect()
@@ -954,21 +863,13 @@ fn peak_thread(candidates: &CandidateRx, peaks: &Mutex<HashMap<u32, f32>>) {
 /// manager no reason to switch to a headset profile.
 fn peak_stream(mainloop: &mut Mainloop, index: u32) -> io::Result<PeakStream> {
     let mut context = pulse::connect_on(mainloop, "LibrePods")?;
-    let introspector = context.introspect();
-    let sinks: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
-    let mut op = introspector.get_sink_input_info(index, {
-        let sinks = Rc::downgrade(&sinks);
-        move |result| {
-            pulse::update(&sinks, |sinks| {
-                sinks.record(result, |input| Some(input.sink))
-            })
-        }
-    });
-    pulse::wait(mainloop, &mut op, "sink input info")?;
-    let sink = sinks.take().finish("sink input info")?.pop();
-    let sink = sink.ok_or_else(|| pulse_error("sink input info"))?;
+    // One short raw connection for both lookups.
+    let mut raw = pulse::RawConnection::connect("LibrePods")?;
+    let sink = raw.sink_inputs(Some(index))?.pop();
+    let sink = sink.ok_or_else(|| pulse_error("sink input info"))?.sink;
 
-    let monitor = pulse::sinks("LibrePods", pulse::Sinks::Index(sink))?
+    let monitor = raw
+        .sinks(pulse::Sinks::Index(sink))?
         .pop()
         .ok_or_else(|| pulse_error("sink info"))?
         .monitor_source;
@@ -1187,53 +1088,9 @@ mod tests {
     }
 
     #[test]
-    fn list_accumulator_items_then_end_is_ok() {
-        let mut list = ListAccumulator::default();
-        list.record(ListResult::Item(1), Some);
-        list.record(ListResult::Item(2), Some);
-        list.record(ListResult::End, Some);
-        assert_eq!(list.finish("test list").unwrap(), vec![1, 2]);
-    }
-
-    #[test]
-    fn list_accumulator_skips_unkept_items() {
-        let mut list = ListAccumulator::default();
-        list.record(ListResult::Item(1), |n: i32| (n > 1).then_some(n));
-        list.record(ListResult::Item(2), |n: i32| (n > 1).then_some(n));
-        list.record(ListResult::End, |n: i32| Some(n));
-        assert_eq!(list.finish("test list").unwrap(), vec![2]);
-    }
-
-    #[test]
-    fn list_accumulator_error_is_err() {
-        let mut list = ListAccumulator::default();
-        list.record(ListResult::Item(1), Some);
-        list.record(ListResult::Error, Some);
-        list.record(ListResult::End, Some);
-        assert!(list.finish("test list").is_err());
-    }
-
-    #[test]
-    fn list_accumulator_without_end_is_err() {
-        let mut list = ListAccumulator::default();
-        list.record(ListResult::Item(1), Some);
-        assert!(list.finish("test list").is_err());
-        assert!(
-            ListAccumulator::<i32>::default()
-                .finish("test list")
-                .is_err()
-        );
-    }
-
-    #[test]
     fn poller_holds_call_through_failed_snapshot() {
-        // A card listing that never reached End, as PulseStreams sees it.
-        let mut truncated = ListAccumulator::default();
-        truncated.record(ListResult::Item(()), Some);
-        let failed = truncated
-            .finish("card list")
-            .map(|_| AudioSnapshot::default());
-        assert!(failed.is_err());
+        // A card listing that never reached End, as `pulse` reports it.
+        let failed = Err(io::Error::other("PulseAudio card list ended early"));
         let mut source = FakeSource::new(vec![in_call(), failed, in_call()]);
         let mut poller = CallPoller::default();
         assert_eq!(poller.poll(&mut source, MAC), Some(true));
@@ -1927,12 +1784,7 @@ mod tests {
         let mut proplist = Proplist::new().expect("proplist");
         proplist.set_str("media.role", "Music").unwrap();
         proplist.set_str("application.name", "mpv").unwrap();
-        let mut complete = ListAccumulator::default();
-        complete.record(ListResult::Item(&proplist), |p: &Proplist| {
-            Some(unmuted_input(p))
-        });
-        complete.record(ListResult::End, |p: &Proplist| Some(unmuted_input(p)));
-        let complete = complete.finish("sink input list");
+        let complete = Ok(vec![unmuted_input(&proplist)]);
         let streams = complete.as_ref().expect("a complete list").clone();
         assert_eq!(streams.len(), 1);
         assert_eq!(streams[0].direction, StreamDirection::Playback);
@@ -1942,19 +1794,12 @@ mod tests {
             streams[0].props.get("media.role").map(String::as_str),
             Some("Music")
         );
-        // A listing with an item and no End: an Err snapshot, not one
-        // stream (or none).
-        let mut truncated = ListAccumulator::default();
-        truncated.record(ListResult::Item(&proplist), |p: &Proplist| {
-            Some(unmuted_input(p))
-        });
-        let truncated = truncated.finish("sink input list");
-        assert!(truncated.is_err());
-        // An empty listing cut short is an error too.
-        let mut empty_cut = ListAccumulator::<StreamProps>::default();
-        empty_cut.record(ListResult::Error, |p: &Proplist| Some(unmuted_input(p)));
-        let empty_cut = empty_cut.finish("sink input list");
-        assert!(empty_cut.is_err());
+        // A listing with no End or with an Error, as `pulse` reports it: an
+        // Err snapshot, not one stream (or none).
+        let truncated = Err(io::Error::other("PulseAudio sink input info ended early"));
+        let empty_cut = Err(io::Error::other(
+            "PulseAudio sink input info reported an error",
+        ));
 
         let start = Instant::now();
         let mut source = FakePlayback::new(vec![
