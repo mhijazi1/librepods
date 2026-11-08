@@ -6,7 +6,6 @@ use dbus::arg::RefArg;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use libpulse_binding::callbacks::ListResult;
-use libpulse_binding::context::introspect::SinkInfo;
 use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
@@ -588,13 +587,6 @@ struct OwnedCardInfo {
     proplist: Proplist,
     profiles: Vec<OwnedCardProfileInfo>,
     active_profile: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct OwnedSinkInfo {
-    name: Option<String>,
-    proplist: Proplist,
-    volume: ChannelVolumes,
 }
 
 struct MediaControllerState {
@@ -1758,27 +1750,8 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
 }
 
 fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
-    let (mut mainloop, context) = pulse::connect("LibrePods").ok()?;
-    let introspector = context.introspect();
-    let sink_info: Rc<RefCell<Option<OwnedSinkInfo>>> = Rc::new(RefCell::new(None));
-    let mut op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info = Rc::downgrade(&sink_info);
-        move |result: ListResult<&SinkInfo>| {
-            if let ListResult::Item(item) = result {
-                pulse::update(&sink_info, |sink_info| {
-                    *sink_info = Some(OwnedSinkInfo {
-                        name: item.name.as_ref().map(|s| s.to_string()),
-                        proplist: item.proplist.clone(),
-                        volume: item.volume,
-                    })
-                });
-            }
-        }
-    });
-    pulse::wait(&mut mainloop, &mut op, "sink info").ok()?;
-
-    let borrowed = sink_info.borrow();
-    let info = borrowed.as_ref()?;
+    let sinks = pulse::sinks("LibrePods", pulse::Sinks::Name(sink_name)).ok()?;
+    let info = sinks.first()?;
     let channels = info.volume.len();
     if channels == 0 {
         return None;
@@ -1798,42 +1771,24 @@ fn set_card_profile_sync(card_index: u32, profile_name: &str) -> bool {
 }
 
 pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
+    // The lookup has its own connection (#193) and fails on a missing sink.
+    let sinks = pulse::sinks("LibrePods", pulse::Sinks::Name(sink_name));
+    let Some(info) = sinks.ok().and_then(|sinks| sinks.into_iter().next()) else {
+        error!("Sink not found: {}", sink_name);
+        return false;
+    };
     let Ok((mut mainloop, context)) = pulse::connect("LibrePods") else {
         return false;
     };
     let mut introspector = context.introspect();
-    let sink_info: Rc<RefCell<Option<OwnedSinkInfo>>> = Rc::new(RefCell::new(None));
-    let mut op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info = Rc::downgrade(&sink_info);
-        move |result: ListResult<&SinkInfo>| {
-            if let ListResult::Item(item) = result {
-                pulse::update(&sink_info, |sink_info| {
-                    *sink_info = Some(OwnedSinkInfo {
-                        name: item.name.as_ref().map(|s| s.to_string()),
-                        proplist: item.proplist.clone(),
-                        volume: item.volume,
-                    })
-                });
-            }
-        }
-    });
-    if pulse::wait(&mut mainloop, &mut op, "sink info").is_err() {
-        return false;
-    }
+    let channels = info.volume.len();
+    let mut new_volumes = ChannelVolumes::default();
+    let raw =
+        (((target_volume as f64) / 100.0) * Volume::NORMAL.0.as_f64().unwrap()).round() as u32;
+    new_volumes.set(channels, Volume(raw));
 
-    if let Some(info) = sink_info.borrow().as_ref() {
-        let channels = info.volume.len();
-        let mut new_volumes = ChannelVolumes::default();
-        let raw =
-            (((target_volume as f64) / 100.0) * Volume::NORMAL.0.as_f64().unwrap()).round() as u32;
-        new_volumes.set(channels, Volume(raw));
-
-        let mut op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
-        pulse::wait(&mut mainloop, &mut op, "sink volume change").is_ok()
-    } else {
-        error!("Sink not found: {}", sink_name);
-        false
-    }
+    let mut op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
+    pulse::wait(&mut mainloop, &mut op, "sink volume change").is_ok()
 }
 
 async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
@@ -1843,34 +1798,17 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
     let mac_clone = mac.to_string();
 
     tokio::task::spawn_blocking(move || {
-        let (mut mainloop, context) = pulse::connect("LibrePods").ok()?;
-        let introspector = context.introspect();
-        let sink_list: Rc<RefCell<Vec<OwnedSinkInfo>>> = Rc::new(RefCell::new(Vec::new()));
-        let mut op = introspector.get_sink_info_list({
-            let sink_list = Rc::downgrade(&sink_list);
-            move |result: ListResult<&SinkInfo>| {
-                if let ListResult::Item(item) = result {
-                    pulse::update(&sink_list, |sink_list| {
-                        sink_list.push(OwnedSinkInfo {
-                            name: item.name.as_ref().map(|s| s.to_string()),
-                            proplist: item.proplist.clone(),
-                            volume: item.volume,
-                        })
-                    });
-                }
-            }
-        });
-        pulse::wait(&mut mainloop, &mut op, "sink list").ok()?;
+        let sink_list = pulse::sinks("LibrePods", pulse::Sinks::All).ok()?;
 
-        for sink in sink_list.borrow().iter() {
-            if let Some(device_string) = sink.proplist.get_str("device.string")
+        for sink in sink_list.iter() {
+            if let Some(device_string) = &sink.device_string
                 && device_string.to_uppercase().contains(&mac_clone.to_uppercase())
                 && let Some(name) = &sink.name
             {
                 info!("Found sink name for MAC {}: {}", mac_clone, name);
                 return Some(name.to_string());
             }
-            if let Some(bluez_path) = sink.proplist.get_str("bluez.path") {
+            if let Some(bluez_path) = &sink.bluez_path {
                 let mac_from_path = bluez_path
                     .split('/')
                     .next_back()

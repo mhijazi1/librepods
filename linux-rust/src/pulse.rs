@@ -1,13 +1,22 @@
 //! The one libpulse connect and operation wait. Both are bounded, so a
 //! sound server that accepts the socket but never answers fails a query with
 //! `io::ErrorKind::TimedOut` instead of wedging the thread that asked.
+//!
+//! Sink and source info is read here with raw libpulse-sys calls (#193):
+//! libpulse-binding 2.30.1 transmutes their `state` into an enum that lacks
+//! INIT (-2) and UNLINKED (-3), which aborts (debug) or is UB (release) when
+//! an entry is torn down while listed.
 
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
 use libpulse_binding::mainloop::standard::Mainloop;
 use libpulse_binding::operation::{Operation, State as OperationState};
 use libpulse_binding::time::MicroSeconds;
+use libpulse_binding::volume::ChannelVolumes;
+use libpulse_sys as sys;
 use std::cell::RefCell;
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::io;
+use std::ptr;
 use std::rc::Weak;
 use std::time::{Duration, Instant};
 
@@ -87,6 +96,239 @@ pub(crate) fn update<T>(state: &Weak<RefCell<T>>, f: impl FnOnce(&mut T)) {
     }
 }
 
+/// What LibrePods reads of a sink.
+pub(crate) struct Sink {
+    pub(crate) name: Option<String>,
+    pub(crate) device_string: Option<String>,
+    pub(crate) bluez_path: Option<String>,
+    pub(crate) volume: ChannelVolumes,
+    pub(crate) monitor_source: u32,
+}
+
+/// Which sinks `sinks` lists.
+pub(crate) enum Sinks<'a> {
+    All,
+    Name(&'a str),
+    Index(u32),
+}
+
+/// The sinks `which` picks, on a new connection named `name`.
+pub(crate) fn sinks(name: &str, which: Sinks) -> io::Result<Vec<Sink>> {
+    let sink_name = match which {
+        Sinks::Name(n) => CString::new(n).map_err(|_| pulse_error("sink info"))?,
+        _ => CString::default(),
+    };
+    let cb = Some(sink_cb as extern "C" fn(_, _, _, _));
+    query(name, "sink info", |context, list| match which {
+        // SAFETY: `context` is Ready, `list` is what `sink_cb` expects, and
+        // libpulse copies `sink_name` before this returns.
+        Sinks::All => unsafe { sys::pa_context_get_sink_info_list(context, cb, list) },
+        // SAFETY: as above.
+        Sinks::Name(_) => unsafe {
+            sys::pa_context_get_sink_info_by_name(context, sink_name.as_ptr(), cb, list)
+        },
+        // SAFETY: as above.
+        Sinks::Index(i) => unsafe { sys::pa_context_get_sink_info_by_index(context, i, cb, list) },
+    })
+}
+
+/// The indices of every monitor source (one with `monitor_of_sink` set), on
+/// a new connection named `name`.
+pub(crate) fn monitor_sources(name: &str) -> io::Result<Vec<u32>> {
+    let cb = Some(source_cb as extern "C" fn(_, _, _, _));
+    let sources: Vec<Option<u32>> = query(name, "source list", |context, list| {
+        // SAFETY: `context` is Ready and `list` is what `source_cb` expects.
+        unsafe { sys::pa_context_get_source_info_list(context, cb, list) }
+    })?;
+    Ok(sources.into_iter().flatten().collect())
+}
+
+/// A libpulse-sys context on a binding `Mainloop`; libpulse-binding keeps
+/// its own context pointer private.
+struct RawContext(*mut sys::pa_context);
+
+impl RawContext {
+    /// Connect as `name` on `mainloop`, within `CONNECT_TIMEOUT`. The
+    /// context must be dropped before `mainloop`.
+    fn connect(mainloop: &mut Mainloop, name: &str) -> io::Result<Self> {
+        let name = CString::new(name).map_err(|_| pulse_error("context"))?;
+        let api: &sys::pa_mainloop_api = mainloop.get_api().as_ref();
+        // SAFETY: `api` is `mainloop`'s own vtable (same libpulse-sys), live
+        // while the mainloop is; libpulse copies `name`.
+        let context = unsafe { sys::pa_context_new(api, name.as_ptr()) };
+        if context.is_null() {
+            return Err(pulse_error("context"));
+        }
+        let context = RawContext(context);
+        // SAFETY: a live, unconnected context; null server and spawn api
+        // mean the default server, and NOAUTOSPAWN as `connect_on` does.
+        let connected = unsafe {
+            sys::pa_context_connect(
+                context.0,
+                ptr::null(),
+                sys::PA_CONTEXT_NOAUTOSPAWN,
+                ptr::null(),
+            )
+        };
+        if connected < 0 {
+            return Err(pulse_error("connection"));
+        }
+        run_until(
+            CONNECT_TIMEOUT,
+            "connection",
+            Instant::now,
+            // SAFETY: `context` is live until it drops.
+            || context_ready(unsafe { sys::pa_context_get_state(context.0) }.into()),
+            |left| iterate(mainloop, left),
+        )?;
+        Ok(context)
+    }
+}
+
+impl Drop for RawContext {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the non-null context `connect` created, and
+        // this is its only owner.
+        unsafe {
+            sys::pa_context_disconnect(self.0);
+            sys::pa_context_unref(self.0);
+        }
+    }
+}
+
+/// One info query's entries and its end-of-list mark, as libpulse passes it
+/// to the callback: 0 while entries come, > 0 at the end, < 0 on error.
+struct List<T> {
+    items: Vec<T>,
+    eol: i32,
+}
+
+/// Run the info query `start` begins on a new connection named `name`, and
+/// return its entries. `start` gets the Ready context and the callback's
+/// userdata. The wait is bounded like `wait`; a query still running when it
+/// gives up is cancelled before its userdata is freed.
+fn query<T>(
+    name: &str,
+    what: &str,
+    start: impl FnOnce(*mut sys::pa_context, *mut c_void) -> *mut sys::pa_operation,
+) -> io::Result<Vec<T>> {
+    let mut mainloop = Mainloop::new().ok_or_else(|| pulse_error("mainloop"))?;
+    let context = RawContext::connect(&mut mainloop, name)?;
+    let list = Box::into_raw(Box::new(List::<T> {
+        items: Vec::new(),
+        eol: 0,
+    }));
+    let op = start(context.0, list.cast());
+    let result = if op.is_null() {
+        Err(pulse_error(what))
+    } else {
+        let result = run_until(
+            OPERATION_TIMEOUT,
+            what,
+            Instant::now,
+            // SAFETY: we hold `op`'s reference until the unref below.
+            || operation_done(unsafe { sys::pa_operation_get_state(op) }, what),
+            |left| iterate(&mut mainloop, left),
+        );
+        // SAFETY: `op` is live until the unref. A Done or Cancelled
+        // operation never calls back again, and cancelling a Running one
+        // unlinks its callback, so nothing reaches `list` after this.
+        unsafe {
+            if sys::pa_operation_get_state(op) == OperationState::Running {
+                sys::pa_operation_cancel(op);
+            }
+            sys::pa_operation_unref(op);
+        }
+        result
+    };
+    // SAFETY: `list` came from `Box::into_raw` above and, per the block
+    // above, no callback can touch it any more.
+    let list = unsafe { Box::from_raw(list) };
+    result?;
+    match list.eol {
+        0 => Err(io::Error::other(format!("PulseAudio {what} ended early"))),
+        eol if eol < 0 => Err(io::Error::other(format!(
+            "PulseAudio {what} reported an error"
+        ))),
+        _ => Ok(list.items),
+    }
+}
+
+/// Add one callback's entry, or its end mark if it has none, to `list`.
+// SAFETY: callers pass the `List<T>` `query` gave libpulse as `list`.
+unsafe fn collect<T>(list: *mut c_void, eol: i32, item: Option<T>) {
+    // SAFETY: per the contract, `list` is a live `List<T>` that only this
+    // callback touches while it runs.
+    let list = unsafe { &mut *list.cast::<List<T>>() };
+    match item {
+        Some(item) => list.items.push(item),
+        None => list.eol = eol,
+    }
+}
+
+extern "C" fn sink_cb(
+    _: *mut sys::pa_context,
+    info: *const sys::pa_sink_info,
+    eol: i32,
+    list: *mut c_void,
+) {
+    // SAFETY: `sinks` passes a `List<Sink>`; a non-null `info` is a
+    // filled-in entry.
+    unsafe { collect(list, eol, (!info.is_null()).then(|| sink_fields(info))) }
+}
+
+extern "C" fn source_cb(
+    _: *mut sys::pa_context,
+    info: *const sys::pa_source_info,
+    eol: i32,
+    list: *mut c_void,
+) {
+    // SAFETY: `monitor_sources` passes a `List<Option<u32>>`; a non-null
+    // `info` is a filled-in entry.
+    unsafe { collect(list, eol, (!info.is_null()).then(|| monitor_source(info))) }
+}
+
+/// A sink's fields. Each is read alone through the raw pointer, so its
+/// `state`, which may be a value the sys enum lacks, is never read.
+// SAFETY: callers pass an entry libpulse filled in (or a test built).
+unsafe fn sink_fields(info: *const sys::pa_sink_info) -> Sink {
+    // SAFETY: per the contract; the pointers are null or C strings and a
+    // proplist that live for this call.
+    unsafe {
+        let props = (*info).proplist;
+        Sink {
+            name: string((*info).name),
+            device_string: prop(props, c"device.string"),
+            bluez_path: prop(props, c"bluez.path"),
+            volume: (*info).volume.into(),
+            monitor_source: (*info).monitor_source,
+        }
+    }
+}
+
+/// A source's index if it is a monitor source, read like `sink_fields`.
+// SAFETY: callers pass an entry libpulse filled in (or a test built).
+unsafe fn monitor_source(info: *const sys::pa_source_info) -> Option<u32> {
+    // SAFETY: per the contract.
+    unsafe { ((*info).monitor_of_sink != sys::PA_INVALID_INDEX).then_some((*info).index) }
+}
+
+/// Property `key` of `props`, which may be null.
+// SAFETY: callers pass a null or live proplist.
+unsafe fn prop(props: *const sys::pa_proplist, key: &CStr) -> Option<String> {
+    if props.is_null() {
+        return None;
+    }
+    // SAFETY: per the contract; the value lives as long as `props`.
+    unsafe { string(sys::pa_proplist_gets(props, key.as_ptr())) }
+}
+
+// SAFETY: callers pass null or a live C string.
+unsafe fn string(s: *const c_char) -> Option<String> {
+    // SAFETY: per the contract.
+    (!s.is_null()).then(|| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned())
+}
+
 fn context_ready(state: ContextState) -> io::Result<bool> {
     match state {
         ContextState::Ready => Ok(true),
@@ -141,7 +383,9 @@ fn run_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libpulse_binding::volume::Volume;
     use std::cell::Cell;
+    use std::mem::MaybeUninit;
     use std::rc::Rc;
 
     /// Runs `run_until` on a virtual clock that each step advances by the
@@ -258,5 +502,66 @@ mod tests {
         // A late call after the caller gave up is a no-op.
         callback(item.clone());
         assert_eq!(Rc::strong_count(&item), 1);
+    }
+
+    // Each entry below is zeroed C memory with `state` written as the raw C
+    // int libpulse sends while a sink or source is set up (INIT, -2) or torn
+    // down (UNLINKED, -3), values the sys enums lack.
+
+    #[test]
+    fn sink_fields_ignore_init_and_unlinked_state() {
+        // SAFETY: a new proplist, freed below; keys and values are C strings.
+        let props = unsafe {
+            let props = sys::pa_proplist_new();
+            sys::pa_proplist_sets(props, c"device.string".as_ptr(), c"AA:BB".as_ptr());
+            sys::pa_proplist_sets(props, c"bluez.path".as_ptr(), c"/dev_AA".as_ptr());
+            props
+        };
+        let mut volume = ChannelVolumes::default();
+        volume.set(2, Volume(0x8000));
+        for state in [-2, -3] {
+            let mut info = MaybeUninit::<sys::pa_sink_info>::zeroed();
+            let p = info.as_mut_ptr();
+            // SAFETY: field writes into `info`, which is never read whole,
+            // and reads of it as libpulse would pass it; `props` and the
+            // name outlive the reads.
+            let (empty, sink) = unsafe {
+                (&raw mut (*p).state).cast::<i32>().write(state);
+                let empty = sink_fields(p);
+                (*p).name = c"bluez_output.AA".as_ptr();
+                (*p).proplist = props;
+                (*p).volume = *volume.as_ref();
+                (*p).monitor_source = 7;
+                (empty, sink_fields(p))
+            };
+            let none = (None, None, None);
+            assert_eq!((empty.name, empty.device_string, empty.bluez_path), none);
+            assert_eq!(sink.name.as_deref(), Some("bluez_output.AA"), "{state}");
+            assert_eq!(sink.device_string.as_deref(), Some("AA:BB"));
+            assert_eq!(sink.bluez_path.as_deref(), Some("/dev_AA"));
+            assert_eq!(sink.volume, volume);
+            assert_eq!(sink.monitor_source, 7);
+        }
+        // SAFETY: `props` is no longer used.
+        unsafe { sys::pa_proplist_free(props) };
+    }
+
+    #[test]
+    fn source_fields_ignore_init_and_unlinked_state() {
+        for state in [-2, -3] {
+            for (monitor_of_sink, expected) in [(3, Some(9)), (sys::PA_INVALID_INDEX, None)] {
+                let mut info = MaybeUninit::<sys::pa_source_info>::zeroed();
+                let p = info.as_mut_ptr();
+                // SAFETY: field writes into `info`, which is never read
+                // whole, then a read of it as libpulse would pass it.
+                let monitor = unsafe {
+                    (&raw mut (*p).state).cast::<i32>().write(state);
+                    (*p).index = 9;
+                    (*p).monitor_of_sink = monitor_of_sink;
+                    monitor_source(p)
+                };
+                assert_eq!(monitor, expected, "state {state}");
+            }
+        }
     }
 }
