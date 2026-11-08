@@ -6,6 +6,7 @@ mod handoff;
 mod handoff_log;
 mod handoff_probe;
 mod media_controller;
+mod pulse;
 mod stream_monitor;
 mod switching;
 mod ui;

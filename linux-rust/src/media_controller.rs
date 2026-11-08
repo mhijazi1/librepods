@@ -1,15 +1,12 @@
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use crate::bluetooth::aacp::{AACPManagerState, AudioSource, AudioSourceType, ConnectedDevice};
+use crate::pulse;
 use dbus::arg::RefArg;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::introspect::SinkInfo;
-use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
-use libpulse_binding::def::Retval;
-use libpulse_binding::mainloop::standard::Mainloop;
-use libpulse_binding::operation::State as OperationState;
 use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
@@ -1518,22 +1515,8 @@ impl MediaController {
 }
 
 // --- PulseAudio helpers ---
-
-fn pulse_connect() -> Option<(Mainloop, Context)> {
-    let mut mainloop = Mainloop::new()?;
-    let mut context = Context::new(&mainloop, "LibrePods")?;
-    context.connect(None, ContextFlagSet::NOAUTOSPAWN, None).ok()?;
-    loop {
-        mainloop.iterate(false);
-        match context.get_state() {
-            libpulse_binding::context::State::Ready => break,
-            libpulse_binding::context::State::Failed
-            | libpulse_binding::context::State::Terminated => return None,
-            _ => {}
-        }
-    }
-    Some((mainloop, context))
-}
+// Each query connects through `pulse`, so a stalled sound server fails it
+// after the pulse timeouts with the same result as no sound server.
 
 /// One scan of the card list for the card whose `device.string` contains
 /// `mac`. Never retries; callers pick the retry budget.
@@ -1549,15 +1532,14 @@ async fn find_card_index(mac: String) -> Option<u32> {
 }
 
 fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
-    let (mut mainloop, context) = match pulse_connect() {
-        Some(c) => c,
-        None => return vec![],
+    let Ok((mut mainloop, context)) = pulse::connect("LibrePods") else {
+        return vec![];
     };
 
     let introspector = context.introspect();
     let cards: Rc<RefCell<Vec<OwnedCardInfo>>> = Rc::new(RefCell::new(Vec::new()));
-    let op = introspector.get_card_info_list({
-        let cards = cards.clone();
+    let mut op = introspector.get_card_info_list({
+        let cards = Rc::downgrade(&cards);
         move |result| {
             if let ListResult::Item(item) = result {
                 let profiles = item
@@ -1571,43 +1553,43 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
                     .active_profile
                     .as_ref()
                     .and_then(|p| p.name.as_ref().map(|n| n.to_string()));
-                cards.borrow_mut().push(OwnedCardInfo {
-                    index: item.index,
-                    proplist: item.proplist.clone(),
-                    profiles,
-                    active_profile,
+                pulse::update(&cards, |cards| {
+                    cards.push(OwnedCardInfo {
+                        index: item.index,
+                        proplist: item.proplist.clone(),
+                        profiles,
+                        active_profile,
+                    })
                 });
             }
         }
     });
 
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+    if pulse::wait(&mut mainloop, &mut op, "card list").is_err() {
+        return vec![];
     }
-    mainloop.quit(Retval(0));
     Rc::try_unwrap(cards).unwrap().into_inner()
 }
 
 fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
-    let (mut mainloop, context) = pulse_connect()?;
+    let (mut mainloop, context) = pulse::connect("LibrePods").ok()?;
     let introspector = context.introspect();
     let sink_info: Rc<RefCell<Option<OwnedSinkInfo>>> = Rc::new(RefCell::new(None));
-    let op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info = sink_info.clone();
+    let mut op = introspector.get_sink_info_by_name(sink_name, {
+        let sink_info = Rc::downgrade(&sink_info);
         move |result: ListResult<&SinkInfo>| {
             if let ListResult::Item(item) = result {
-                *sink_info.borrow_mut() = Some(OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
+                pulse::update(&sink_info, |sink_info| {
+                    *sink_info = Some(OwnedSinkInfo {
+                        name: item.name.as_ref().map(|s| s.to_string()),
+                        proplist: item.proplist.clone(),
+                        volume: item.volume,
+                    })
                 });
             }
         }
     });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    mainloop.quit(Retval(0));
+    pulse::wait(&mut mainloop, &mut op, "sink info").ok()?;
 
     let borrowed = sink_info.borrow();
     let info = borrowed.as_ref()?;
@@ -1621,40 +1603,36 @@ fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
 }
 
 fn set_card_profile_sync(card_index: u32, profile_name: &str) -> bool {
-    let (mut mainloop, context) = match pulse_connect() {
-        Some(c) => c,
-        None => return false,
+    let Ok((mut mainloop, context)) = pulse::connect("LibrePods") else {
+        return false;
     };
     let mut introspector = context.introspect();
-    let op = introspector.set_card_profile_by_index(card_index, profile_name, None);
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    mainloop.quit(Retval(0));
-    true
+    let mut op = introspector.set_card_profile_by_index(card_index, profile_name, None);
+    pulse::wait(&mut mainloop, &mut op, "card profile change").is_ok()
 }
 
 pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
-    let (mut mainloop, context) = match pulse_connect() {
-        Some(c) => c,
-        None => return false,
+    let Ok((mut mainloop, context)) = pulse::connect("LibrePods") else {
+        return false;
     };
     let mut introspector = context.introspect();
     let sink_info: Rc<RefCell<Option<OwnedSinkInfo>>> = Rc::new(RefCell::new(None));
-    let op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info = sink_info.clone();
+    let mut op = introspector.get_sink_info_by_name(sink_name, {
+        let sink_info = Rc::downgrade(&sink_info);
         move |result: ListResult<&SinkInfo>| {
             if let ListResult::Item(item) = result {
-                *sink_info.borrow_mut() = Some(OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
+                pulse::update(&sink_info, |sink_info| {
+                    *sink_info = Some(OwnedSinkInfo {
+                        name: item.name.as_ref().map(|s| s.to_string()),
+                        proplist: item.proplist.clone(),
+                        volume: item.volume,
+                    })
                 });
             }
         }
     });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
+    if pulse::wait(&mut mainloop, &mut op, "sink info").is_err() {
+        return false;
     }
 
     if let Some(info) = sink_info.borrow().as_ref() {
@@ -1664,12 +1642,8 @@ pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
             (((target_volume as f64) / 100.0) * Volume::NORMAL.0.as_f64().unwrap()).round() as u32;
         new_volumes.set(channels, Volume(raw));
 
-        let op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
-        mainloop.quit(Retval(0));
-        true
+        let mut op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
+        pulse::wait(&mut mainloop, &mut op, "sink volume change").is_ok()
     } else {
         error!("Sink not found: {}", sink_name);
         false
@@ -1683,25 +1657,24 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
     let mac_clone = mac.to_string();
 
     tokio::task::spawn_blocking(move || {
-        let (mut mainloop, context) = pulse_connect()?;
+        let (mut mainloop, context) = pulse::connect("LibrePods").ok()?;
         let introspector = context.introspect();
         let sink_list: Rc<RefCell<Vec<OwnedSinkInfo>>> = Rc::new(RefCell::new(Vec::new()));
-        let op = introspector.get_sink_info_list({
-            let sink_list = sink_list.clone();
+        let mut op = introspector.get_sink_info_list({
+            let sink_list = Rc::downgrade(&sink_list);
             move |result: ListResult<&SinkInfo>| {
                 if let ListResult::Item(item) = result {
-                    sink_list.borrow_mut().push(OwnedSinkInfo {
-                        name: item.name.as_ref().map(|s| s.to_string()),
-                        proplist: item.proplist.clone(),
-                        volume: item.volume,
+                    pulse::update(&sink_list, |sink_list| {
+                        sink_list.push(OwnedSinkInfo {
+                            name: item.name.as_ref().map(|s| s.to_string()),
+                            proplist: item.proplist.clone(),
+                            volume: item.volume,
+                        })
                     });
                 }
             }
         });
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
-        mainloop.quit(Retval(0));
+        pulse::wait(&mut mainloop, &mut op, "sink list").ok()?;
 
         for sink in sink_list.borrow().iter() {
             if let Some(device_string) = sink.proplist.get_str("device.string")
