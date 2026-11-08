@@ -150,6 +150,13 @@ pub(crate) struct Handoff {
     /// "stopped" first sample is a stop edge. Takeover decisions still see
     /// no baseline.
     take_assumes_playing: bool,
+    /// The take sent on reconnect is awaiting its acknowledgement. The
+    /// session's queued OwnsConnection=0 reports from this window answer the
+    /// "not owning" that connecting the session (and its audio) sent, which
+    /// `SessionFacts::owner` already reflected; they are not a loss of the
+    /// take. Cleared at the take's ACK, its timeout, a disconnect and any new
+    /// request.
+    reconnect_take_pending: bool,
     recovery: CaseRecovery,
     case_closed: bool,
     /// Playback stopped while a take was pending: release once it settles.
@@ -182,6 +189,7 @@ impl Handoff {
             was_playing: None,
             playback_baseline_at: now,
             take_assumes_playing: false,
+            reconnect_take_pending: false,
             recovery: if connected {
                 CaseRecovery::Immediate
             } else {
@@ -426,6 +434,15 @@ impl Handoff {
             && self.play_during_release
             && self.was_playing == Some(true);
         self.owner = Some(value.clone());
+        if value == [0] && self.reconnect_take_pending {
+            // A stale report queued while the reconnected session
+            // initialized, not a loss of the pending take (which wants 1, so
+            // this is not its acknowledgement): neither pause the playback
+            // the take is for nor forget the take, or a stop during it could
+            // not be released.
+            self.say("OWNER stale not-linux report during the reconnect take; ignored");
+            return;
+        }
         let mut deferred_pause = false;
         if value == [0] {
             if self.requested_take && self.automatic {
@@ -450,6 +467,7 @@ impl Handoff {
             now.saturating_duration_since(pending.since).as_millis()
         ));
         self.pending = None;
+        self.reconnect_take_pending = false;
         if !pending.desired {
             self.requested_take = false;
         }
@@ -506,6 +524,7 @@ impl Handoff {
         self.connected = false;
         self.session_lost = false;
         self.pending = None;
+        self.reconnect_take_pending = false;
         self.requested_take = false;
         self.was_playing = None;
         self.take_assumes_playing = false;
@@ -565,6 +584,8 @@ impl Handoff {
         // The take was for playback seen before this baseline: a first
         // sample that finds it stopped must release.
         self.take_assumes_playing = took;
+        // The session's queued OwnsConnection=0 reports predate this take.
+        self.reconnect_take_pending = took;
         out.push(Command::DrainPlayback);
         self.retry_delay = FIRST_RETRY;
         self.say("RECONNECTED with fresh routing and wear state");
@@ -587,6 +608,7 @@ impl Handoff {
         {
             self.say("TIMEOUT ownership acknowledgement not received; audible handoff unconfirmed");
             self.pending = None;
+            self.reconnect_take_pending = false;
             if self.quitting {
                 out.push(Command::Fail("release was not acknowledged"));
                 return;
@@ -621,6 +643,7 @@ impl Handoff {
         });
         self.stop_during_take = false;
         self.play_during_release = false;
+        self.reconnect_take_pending = false;
         out.push(Command::SendOwnership(desired));
     }
 
@@ -1296,5 +1319,105 @@ mod tests {
             p.feed(5700, Input::Tick),
             [Fail("release was not acknowledged")]
         );
+    }
+
+    /// Automatic, worn, case closed, disconnected, then new playback that
+    /// reconnects and takes at 1200 ms: the take's [1] is pending.
+    fn reconnect_take() -> Probe {
+        let mut p = Probe::ready();
+        p.feed(20, Input::EarState(vec![InCase, InCase]));
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        assert_eq!(p.play(500, false), []);
+        assert_eq!(p.play(1000, true), []);
+        assert_eq!(p.feed(1100, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(1200, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
+        );
+        p
+    }
+
+    #[test]
+    fn reconnect_take_ignores_stale_init_ownership() {
+        // The adopted session's queue still holds the [0] answering the
+        // "not owning" sent by connect_control and the audio reconnect.
+        let mut p = reconnect_take();
+        assert_eq!(p.feed(1300, Input::Ownership(vec![0])), []);
+        // The stop during the take is not lost: it releases once the take
+        // settles.
+        assert_eq!(p.play(1500, false), []);
+        let mut settled = p.feed(1600, Input::Ownership(vec![1]));
+        settled.extend(p.play(2000, false));
+        assert_eq!(settled, [SendOwnership(false)]);
+        // The release's acknowledgement never takes back.
+        assert!(
+            !p.feed(2100, Input::Ownership(vec![0]))
+                .contains(&SendOwnership(true))
+        );
+        for ms in [2500, 3000, 3500] {
+            assert_eq!(p.play(ms, false), []);
+        }
+        assert_eq!(p.feed(9000, Input::Tick), []);
+
+        // Playback keeps running: Linux keeps the AirPods, nothing pauses,
+        // and a later stop releases.
+        let mut p = reconnect_take();
+        assert_eq!(p.feed(1300, Input::Ownership(vec![0])), []);
+        assert_eq!(p.play(1500, true), []);
+        assert_eq!(p.feed(1600, Input::Ownership(vec![1])), []);
+        for ms in [2000, 2500, 3000] {
+            assert_eq!(p.play(ms, true), []);
+        }
+        assert_eq!(p.feed(9000, Input::Tick), []);
+        assert_eq!(p.play(9500, false), [SendOwnership(false)]);
+
+        // Queued wear, host and audio reports in the same window still
+        // update the core: the buds went back in the case, so the next
+        // disconnect waits for new playback instead of reconnecting. The
+        // pause on that disconnect shows the take was not forgotten.
+        let mut p = reconnect_take();
+        assert_eq!(p.feed(1300, Input::Ownership(vec![0])), []);
+        assert_eq!(
+            p.feed(
+                1310,
+                Input::ConnectedDevices {
+                    old: two_hosts(),
+                    new: two_hosts(),
+                },
+            ),
+            []
+        );
+        assert_eq!(p.feed(1320, Input::AudioSource(idle())), []);
+        assert_eq!(p.feed(1330, Input::EarState(vec![InCase, InCase])), []);
+        assert_eq!(p.feed(1600, Input::Ownership(vec![1])), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(1700, Input::Disconnected), [PauseMedia, DropSession]);
+        assert!(
+            p.core
+                .take_lines()
+                .iter()
+                .any(|l| l.starts_with("CASE waiting for new Linux playback"))
+        );
+        for ms in (2000..=9000).step_by(500) {
+            assert_eq!(p.feed(ms, Input::Tick), []);
+        }
+    }
+
+    #[test]
+    fn genuine_loss_after_reconnect_take_pauses() {
+        // The take settled with its ACK: a later [0] is a real loss and
+        // pauses as upstream #841 does.
+        let mut p = reconnect_take();
+        assert_eq!(p.feed(1300, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1500, true), []);
+        assert_eq!(p.feed(2000, Input::Ownership(vec![0])), [PauseMedia]);
+        // The take was forgotten: the stop releases nothing.
+        assert_eq!(p.play(2500, false), []);
+
+        // The take is never acknowledged: its timeout ends the window too.
+        let mut p = reconnect_take();
+        assert_eq!(p.feed(6000, Input::Tick), []);
+        assert_eq!(p.feed(6300, Input::Tick), []);
+        assert_eq!(p.feed(6400, Input::Ownership(vec![0])), [PauseMedia]);
     }
 }
