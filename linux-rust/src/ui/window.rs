@@ -157,6 +157,42 @@ fn with_connect_mode(
     Some(root)
 }
 
+/// Why a settings or preferences write didn't happen.
+#[derive(Debug)]
+enum SaveError {
+    /// Reading preferences.json or `write_settings_file` failed.
+    Io(std::io::Error),
+    /// `with_connect_mode` refused: preferences.json isn't a JSON object with an object per device.
+    NotSettingsJson,
+}
+
+/// The status shown on the tab whose write failed. Never includes file contents.
+fn save_status_text(err: &SaveError) -> String {
+    match err {
+        SaveError::Io(e) => format!("Couldn't save: {e}"),
+        SaveError::NotSettingsJson => {
+            "Couldn't save: preferences.json isn't valid settings JSON".to_string()
+        }
+    }
+}
+
+/// Records a write's outcome for `scope` (the tab that triggered it): an error sets
+/// that tab's status, a success clears only that tab's status.
+fn apply_save_result(
+    statuses: &mut HashMap<Tab, String>,
+    scope: Tab,
+    result: Result<(), SaveError>,
+) {
+    match result {
+        Ok(()) => {
+            statuses.remove(&scope);
+        }
+        Err(e) => {
+            statuses.insert(scope, save_status_text(&e));
+        }
+    }
+}
+
 /// Returns the devices JSON with `data` stored under `addr`, given the result of
 /// reading the current file. Only a missing file counts as empty; any other read,
 /// parse or serialize error is returned so the caller never drops existing devices.
@@ -225,6 +261,9 @@ pub struct App {
     connect_modes: HashMap<String, ConnectMode>,
     /// Switching mode as of the last AirPods connection, for the picker's hint.
     switching_mode: crate::utils::SwitchingMode,
+    /// "Couldn't save" status per tab (Settings, or Device(mac) for connectMode),
+    /// set and cleared only through `apply_save_result`.
+    save_statuses: HashMap<Tab, String>,
 }
 
 pub struct BluetoothState {
@@ -372,6 +411,7 @@ impl App {
                 preferred_codec,
                 connect_modes: HashMap::new(),
                 switching_mode: crate::utils::SwitchingMode::default(),
+                save_statuses: HashMap::new(),
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -415,9 +455,11 @@ impl App {
                     app_settings_path.to_str().unwrap(),
                     settings
                 );
-                if let Err(e) = write_settings_file(&app_settings_path, &settings.to_string()) {
+                let result = write_settings_file(&app_settings_path, &settings.to_string());
+                if let Err(e) = &result {
                     error!("Failed to write {}: {}", app_settings_path.display(), e);
                 }
+                apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
                 Task::none()
             }
             Message::CopyToClipboard(data) => iced::clipboard::write(data),
@@ -794,9 +836,11 @@ impl App {
                     app_settings_path.to_str().unwrap(),
                     settings
                 );
-                if let Err(e) = write_settings_file(&app_settings_path, &settings.to_string()) {
+                let result = write_settings_file(&app_settings_path, &settings.to_string());
+                if let Err(e) = &result {
                     error!("Failed to write {}: {}", app_settings_path.display(), e);
                 }
+                apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
                 Task::none()
             }
             Message::PreferredCodecChanged(codec) => {
@@ -813,13 +857,16 @@ impl App {
                     app_settings_path.to_str().unwrap(),
                     settings
                 );
-                if let Err(e) = write_settings_file(&app_settings_path, &settings.to_string()) {
+                let result = write_settings_file(&app_settings_path, &settings.to_string());
+                if let Err(e) = &result {
                     error!("Failed to write {}: {}", app_settings_path.display(), e);
                 }
+                apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
                 Task::none()
             }
             Message::ConnectModeChanged(mac, mode) => {
                 let path = get_preferences_path();
+                let scope = Tab::Device(mac.clone());
                 // Only a missing file counts as empty: any other read error
                 // must not replace the user's preferences.
                 let current = match std::fs::read_to_string(&path) {
@@ -827,6 +874,7 @@ impl App {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(e) => {
                         error!("Not saving connectMode: failed to read {}: {}", path.display(), e);
+                        apply_save_result(&mut self.save_statuses, scope, Err(SaveError::Io(e)));
                         return Task::none();
                     }
                 };
@@ -835,14 +883,17 @@ impl App {
                         "Not saving connectMode: {} is not a JSON object with an object per device",
                         path.display()
                     );
+                    apply_save_result(&mut self.save_statuses, scope, Err(SaveError::NotSettingsJson));
                     return Task::none();
                 };
-                match write_settings_file(&path, &format!("{prefs:#}")) {
+                let result = write_settings_file(&path, &format!("{prefs:#}"));
+                match &result {
                     Ok(()) => {
                         self.connect_modes.insert(mac, mode);
                     }
                     Err(e) => error!("Failed to write {}: {}", path.display(), e),
                 }
+                apply_save_result(&mut self.save_statuses, scope, result.map_err(SaveError::Io));
                 Task::none()
             }
             Message::StemControlChanged(is_enabled) => {
@@ -859,9 +910,11 @@ impl App {
                     app_settings_path.to_str().unwrap(),
                     settings
                 );
-                if let Err(e) = write_settings_file(&app_settings_path, &settings.to_string()) {
+                let result = write_settings_file(&app_settings_path, &settings.to_string());
+                if let Err(e) = &result {
                     error!("Failed to write {}: {}", app_settings_path.display(), e);
                 }
+                apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
                 Task::none()
             }
         }
@@ -1071,6 +1124,8 @@ impl App {
                                                                         style
                                                                     }
                                                                 )),
+                                                                self.save_statuses.get(&Tab::Device(id.clone()))
+                                                                    .map(|status| text(status).size(12).style(text::danger)),
                                                             ])
                                                                 .padding(Padding {
                                                                     top: 20.0,
@@ -1392,6 +1447,8 @@ impl App {
                                     controls_settings_col,
                                     Space::new().height(Length::from(20)),
                                     audio_settings_col,
+                                    self.save_statuses.get(&Tab::Settings)
+                                        .map(|status| text(status).size(12).style(text::danger)),
                                 ]
                             )
                                 .padding(20)
@@ -2078,6 +2135,60 @@ mod tests {
             let hint = connect_mode_hint(mode).unwrap();
             assert!(hint.to_lowercase().contains("handoff"), "{mode:?}: {hint}");
         }
+    }
+
+    #[test]
+    fn save_status_text_names_reason() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let text = save_status_text(&SaveError::Io(err));
+        assert_eq!(text, "Couldn't save: permission denied");
+        assert_eq!(
+            save_status_text(&SaveError::NotSettingsJson),
+            "Couldn't save: preferences.json isn't valid settings JSON"
+        );
+    }
+
+    fn denied() -> Result<(), SaveError> {
+        Err(SaveError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+    }
+
+    #[test]
+    fn save_failure_sets_status() {
+        let mut statuses = HashMap::new();
+        apply_save_result(&mut statuses, Tab::Settings, denied());
+        assert!(statuses[&Tab::Settings].starts_with("Couldn't save: "));
+        let device = Tab::Device(MAC.to_string());
+        apply_save_result(&mut statuses, device.clone(), Err(SaveError::NotSettingsJson));
+        assert_eq!(
+            statuses[&device],
+            save_status_text(&SaveError::NotSettingsJson)
+        );
+    }
+
+    #[test]
+    fn save_success_clears_status() {
+        let mut statuses = HashMap::new();
+        apply_save_result(&mut statuses, Tab::Settings, denied());
+        apply_save_result(&mut statuses, Tab::Settings, Ok(()));
+        assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn save_success_keeps_other_scope_status() {
+        let mut statuses = HashMap::new();
+        let device = Tab::Device(MAC.to_string());
+        let other = Tab::Device("11:22:33:44:55:66".to_string());
+        apply_save_result(&mut statuses, Tab::Settings, denied());
+        apply_save_result(&mut statuses, device.clone(), denied());
+        apply_save_result(&mut statuses, other.clone(), denied());
+        apply_save_result(&mut statuses, device.clone(), Ok(()));
+        assert!(!statuses.contains_key(&device));
+        assert!(statuses.contains_key(&Tab::Settings));
+        assert!(statuses.contains_key(&other));
+        apply_save_result(&mut statuses, Tab::Settings, Ok(()));
+        assert_eq!(statuses.keys().collect::<Vec<_>>(), vec![&other]);
     }
 }
 
