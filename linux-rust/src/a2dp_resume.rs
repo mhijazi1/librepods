@@ -209,6 +209,8 @@ pub(crate) async fn run(
     mut cancel: oneshot::Receiver<()>,
     routed: impl Future<Output = ()>,
 ) {
+    // Tokio's clock, so tests can pause it; the same as std's otherwise.
+    let clock = || tokio::time::Instant::now().into_std();
     tokio::select! {
         biased;
         _ = &mut cancel => {
@@ -216,13 +218,13 @@ pub(crate) async fn run(
             return;
         }
         _ = routed => {}
-        _ = tokio::time::sleep_until(until.into()) => {
-            info!("A2DP resume: the default sink route outlasted the window");
-            return;
-        }
+        _ = tokio::time::sleep_until(until.into()) => {}
     }
-    // Tokio's clock, so tests can pause it; the same as std's otherwise.
-    let clock = || tokio::time::Instant::now().into_std();
+    // The route and the deadline can both be ready at one poll.
+    if clock() >= until {
+        info!("A2DP resume: the default sink route outlasted the window");
+        return;
+    }
     let mut chain = Chain::new(clock(), until, io.playing().await);
     loop {
         let (due, senses, reads_players) = (chain.due(), chain.senses(), chain.reads_players());
@@ -766,6 +768,29 @@ mod tests {
         let (acted, chain) = spawn_after_route(std::future::pending(), cancelled);
         chain.await.unwrap();
         assert_eq!(start.elapsed(), A2DP_RESUME_WINDOW);
+        assert_eq!(*acted.lock().unwrap(), []);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_settling_after_window_unpolled_acts_nothing() {
+        let (route_done, route) = oneshot::channel::<()>();
+        let (_cancel, cancelled) = oneshot::channel();
+        let acted = Arc::new(StdMutex::new(Vec::new()));
+        let io = SlowIo {
+            read: |_| Duration::ZERO,
+            reads: AtomicUsize::new(0),
+            acted: acted.clone(),
+        };
+        let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
+        let mut chain = std::pin::pin!(run(io, until, cancelled, async {
+            let _ = route.await;
+        }));
+        assert!(futures::poll!(&mut chain).is_pending());
+        // The window passes and the route ends before the run is polled
+        // again, so both are ready at once.
+        tokio::time::advance(Duration::from_secs(9)).await;
+        route_done.send(()).unwrap();
+        chain.await;
         assert_eq!(*acted.lock().unwrap(), []);
     }
 
