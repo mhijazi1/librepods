@@ -171,6 +171,7 @@ fn select_a2dp_profile(
 /// first lookup (~3 s) and the restart (systemctl + 2 s) the whole call can
 /// take ~43 s. When the card is present but has no A2DP profile yet, the
 /// lookups are immediate and the bound is ~4 s + restart + ~4 s.
+// debt: #32 worst-case ~43 s activate_a2dp_profile wait (nested card-lookup polling)
 async fn recover_a2dp_availability<C, CFut, R, RFut, S, SFut>(
     attempts: u32,
     interval: Duration,
