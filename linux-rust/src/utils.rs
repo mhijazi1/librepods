@@ -190,6 +190,37 @@ pub fn load_auto_connect(mac: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Reads the top-level `exportBattery` (export the AirPods battery to BlueZ,
+/// see battery_provider.rs) from already-parsed preferences. Missing
+/// preferences, a missing key or null give the default (true); a bool is used
+/// as-is; any other type logs a warning and gives the default too.
+pub fn export_battery_from_value(preferences: Option<&serde_json::Value>) -> bool {
+    match preferences.and_then(|p| p.get("exportBattery")) {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Bool(enabled)) => *enabled,
+        Some(other) => {
+            log::warn!(
+                "Invalid exportBattery preference {other}; expected true or false. Exporting the battery."
+            );
+            true
+        }
+    }
+}
+
+/// Extracts `exportBattery` from the preferences JSON; anything missing or
+/// unreadable gives the default (true). Split from the file read for tests.
+pub fn parse_export_battery(preferences: &str) -> bool {
+    let value = serde_json::from_str::<serde_json::Value>(preferences).ok();
+    export_battery_from_value(value.as_ref())
+}
+
+/// Reads `exportBattery` from preferences.json, defaulting to true.
+pub fn load_export_battery() -> bool {
+    std::fs::read_to_string(get_preferences_path())
+        .map(|s| parse_export_battery(&s))
+        .unwrap_or(true)
+}
+
 fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let mut swapped_key = *key;
     swapped_key.reverse();
@@ -439,6 +470,49 @@ mod tests {
         let prefs = r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":false},"11:22:33:44:55:66":{"autoConnect":true}}"#;
         assert!(!parse_auto_connect(prefs, "AA:BB:CC:DD:EE:FF"));
         assert!(parse_auto_connect(prefs, "11:22:33:44:55:66"));
+    }
+
+    #[test]
+    fn export_battery_missing_gives_true() {
+        assert!(export_battery_from_value(None));
+        assert!(export_battery_from_value(Some(&serde_json::json!({}))));
+        assert!(export_battery_from_value(Some(&serde_json::json!({"exportBattery": null}))));
+        assert!(parse_export_battery("{}"));
+        assert!(parse_export_battery(""));
+        assert!(parse_export_battery("not json"));
+        assert!(parse_export_battery(r#"{"exportBattery":null}"#));
+    }
+
+    #[test]
+    fn export_battery_bool_used_as_is() {
+        assert!(!export_battery_from_value(Some(&serde_json::json!({"exportBattery": false}))));
+        assert!(export_battery_from_value(Some(&serde_json::json!({"exportBattery": true}))));
+        assert!(!parse_export_battery(r#"{"exportBattery":false}"#));
+        assert!(parse_export_battery(r#"{"exportBattery":true}"#));
+    }
+
+    #[test]
+    fn export_battery_wrong_type_gives_true() {
+        for value in [r#""no""#, r#""false""#, "0", "1", "[]", r#"{"enabled":false}"#] {
+            assert!(
+                parse_export_battery(&format!(r#"{{"exportBattery":{value}}}"#)),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_battery_next_to_switching_and_auto_connect() {
+        let prefs = r#"{"switching":"off","exportBattery":false,"AA:BB:CC:DD:EE:FF":{"autoConnect":false}}"#;
+        assert!(!parse_export_battery(prefs));
+        assert_eq!(parse_switching_mode(prefs), SwitchingMode::Off);
+        assert!(!parse_auto_connect(prefs, "AA:BB:CC:DD:EE:FF"));
+        assert!(parse_auto_connect(prefs, "11:22:33:44:55:66"));
+
+        let prefs = r#"{"switching":"legacy","AA:BB:CC:DD:EE:FF":{"autoConnect":true}}"#;
+        assert!(parse_export_battery(prefs));
+        assert_eq!(parse_switching_mode(prefs), SwitchingMode::Legacy);
+        assert!(parse_auto_connect(prefs, "AA:BB:CC:DD:EE:FF"));
     }
 
     #[test]
