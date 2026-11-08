@@ -16,11 +16,11 @@
 use crate::call_detect::{
     StreamDirection, StreamProps, airpods_card_profile, call_active, is_takeover_worthy,
 };
+use crate::pulse::{self, pulse_error};
 use libpulse_binding::callbacks::ListResult;
-use libpulse_binding::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
+use libpulse_binding::context::{Context, State as ContextState};
 use libpulse_binding::def::BufferAttr;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
-use libpulse_binding::operation::{Operation, State as OperationState};
 use libpulse_binding::proplist::Proplist;
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::{
@@ -322,7 +322,9 @@ impl PlaybackTracker {
 /// playing in the first listing never make it true, see `PlaybackTracker`).
 /// Each sample is timed when the listing and levels return. Sampling runs on
 /// the blocking pool in its own task, so a sound server that never answers
-/// stalls only this state, never the caller. The task stops once every
+/// stalls only this state, never the caller, and only until its connect or
+/// listing times out (`pulse::CONNECT_TIMEOUT`, `pulse::OPERATION_TIMEOUT`;
+/// the last state is kept). The task stops once every
 /// receiver is dropped, dropping `peaks`; if sampling panics the state
 /// drops to false.
 pub(crate) fn spawn_stream_playback<S, P>(
@@ -397,10 +399,10 @@ pub(crate) struct PulseStreams;
 
 impl PlaybackSource for PulseStreams {
     fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
-        let (mut mainloop, context) = connect("LibrePods call monitor")?;
+        let (mut mainloop, context) = pulse::connect("LibrePods call monitor")?;
         let introspector = context.introspect();
         let inputs: Rc<RefCell<ListAccumulator<StreamProps>>> = Rc::default();
-        let op = introspector.get_sink_input_info_list({
+        let mut op = introspector.get_sink_input_info_list({
             let inputs = inputs.clone();
             move |result| {
                 inputs.borrow_mut().record(result, |input| {
@@ -414,18 +416,18 @@ impl PlaybackSource for PulseStreams {
                 })
             }
         });
-        wait(&mut mainloop, &op, "sink input list")?;
+        pulse::wait(&mut mainloop, &mut op, "sink input list")?;
         inputs.take().finish("sink input list")
     }
 }
 
 impl StreamSource for PulseStreams {
     fn snapshot(&mut self) -> io::Result<AudioSnapshot> {
-        let (mut mainloop, context) = connect("LibrePods call monitor")?;
+        let (mut mainloop, context) = pulse::connect("LibrePods call monitor")?;
         let introspector = context.introspect();
 
         let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
-        let op = introspector.get_source_info_list({
+        let mut op = introspector.get_source_info_list({
             let monitors = monitors.clone();
             move |result| {
                 monitors.borrow_mut().record(result, |source| {
@@ -433,11 +435,11 @@ impl StreamSource for PulseStreams {
                 })
             }
         });
-        wait(&mut mainloop, &op, "source list")?;
+        pulse::wait(&mut mainloop, &mut op, "source list")?;
         let monitors: HashSet<u32> = monitors.take().finish("source list")?.into_iter().collect();
 
         let outputs: Rc<RefCell<ListAccumulator<(u32, StreamProps)>>> = Rc::default();
-        let op = introspector.get_source_output_info_list({
+        let mut op = introspector.get_source_output_info_list({
             let outputs = outputs.clone();
             move |result| {
                 outputs.borrow_mut().record(result, |output| {
@@ -453,11 +455,11 @@ impl StreamSource for PulseStreams {
                 })
             }
         });
-        wait(&mut mainloop, &op, "source output list")?;
+        pulse::wait(&mut mainloop, &mut op, "source output list")?;
         let outputs = outputs.take().finish("source output list")?;
 
         let cards: Rc<RefCell<ListAccumulator<(String, Option<String>)>>> = Rc::default();
-        let op = introspector.get_card_info_list({
+        let mut op = introspector.get_card_info_list({
             let cards = cards.clone();
             move |result| {
                 cards.borrow_mut().record(result, |card| {
@@ -470,7 +472,7 @@ impl StreamSource for PulseStreams {
                 })
             }
         });
-        wait(&mut mainloop, &op, "card list")?;
+        pulse::wait(&mut mainloop, &mut op, "card list")?;
         let cards = cards.take().finish("card list")?;
 
         let streams = outputs
@@ -540,54 +542,6 @@ fn props(list: &Proplist) -> BTreeMap<String, String> {
     list.iter()
         .filter_map(|key| list.get_str(&key).map(|value| (key, value)))
         .collect()
-}
-
-fn pulse_error(what: &str) -> io::Error {
-    io::Error::other(format!("PulseAudio {what} failed"))
-}
-
-/// Connect to the sound server as `name`, blocking until the context is
-/// ready.
-// shortcut: duplicates media_controller.rs's pulse_connect, and the peak thread keeps one more connection per measured stream; fold them together (#73)
-fn connect(name: &str) -> io::Result<(Mainloop, Context)> {
-    let mut mainloop = Mainloop::new().ok_or_else(|| pulse_error("mainloop"))?;
-    let context = connect_on(&mut mainloop, name)?;
-    Ok((mainloop, context))
-}
-
-/// `connect` on an existing mainloop.
-fn connect_on(mainloop: &mut Mainloop, name: &str) -> io::Result<Context> {
-    let mut context = Context::new(mainloop, name).ok_or_else(|| pulse_error("context"))?;
-    context
-        .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-        .map_err(|_| pulse_error("connection"))?;
-    loop {
-        if !matches!(mainloop.iterate(true), IterateResult::Success(_)) {
-            return Err(pulse_error("mainloop iteration"));
-        }
-        match context.get_state() {
-            ContextState::Ready => return Ok(context),
-            ContextState::Failed | ContextState::Terminated => {
-                return Err(pulse_error("connection"));
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Run the mainloop until the operation is done.
-// shortcut: no timeout; a sound server that never answers stalls the call and stream-playback monitors (not the handoff task or MPRIS samples) and the peak thread (its streams then read silent) until restart (#73)
-fn wait<F: ?Sized>(mainloop: &mut Mainloop, op: &Operation<F>, what: &str) -> io::Result<()> {
-    loop {
-        match op.get_state() {
-            OperationState::Running => {}
-            OperationState::Done => return Ok(()),
-            OperationState::Cancelled => return Err(pulse_error(what)),
-        }
-        if !matches!(mainloop.iterate(true), IterateResult::Success(_)) {
-            return Err(pulse_error(what));
-        }
-    }
 }
 
 /// Peak record streams' sample rate: one peak per 40 ms, as pavucontrol's
@@ -807,19 +761,19 @@ fn peak_thread(candidates: &CandidateRx, peaks: &Mutex<HashMap<u32, f32>>) {
 /// sets no `media.role`, so it is no call input (#11) and gives the session
 /// manager no reason to switch to a headset profile.
 fn peak_stream(mainloop: &mut Mainloop, index: u32) -> io::Result<PeakStream> {
-    let mut context = connect_on(mainloop, "LibrePods")?;
+    let mut context = pulse::connect_on(mainloop, "LibrePods")?;
     let introspector = context.introspect();
     let sinks: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
-    let op = introspector.get_sink_input_info(index, {
+    let mut op = introspector.get_sink_input_info(index, {
         let sinks = sinks.clone();
         move |result| sinks.borrow_mut().record(result, |input| Some(input.sink))
     });
-    wait(mainloop, &op, "sink input info")?;
+    pulse::wait(mainloop, &mut op, "sink input info")?;
     let sink = sinks.take().finish("sink input info")?.pop();
     let sink = sink.ok_or_else(|| pulse_error("sink input info"))?;
 
     let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
-    let op = introspector.get_sink_info_by_index(sink, {
+    let mut op = introspector.get_sink_info_by_index(sink, {
         let monitors = monitors.clone();
         move |result| {
             monitors
@@ -827,7 +781,7 @@ fn peak_stream(mainloop: &mut Mainloop, index: u32) -> io::Result<PeakStream> {
                 .record(result, |sink| Some(sink.monitor_source))
         }
     });
-    wait(mainloop, &op, "sink info")?;
+    pulse::wait(mainloop, &mut op, "sink info")?;
     let monitor = monitors.take().finish("sink info")?.pop();
     let monitor = monitor.ok_or_else(|| pulse_error("sink info"))?;
 
@@ -919,15 +873,33 @@ mod tests {
 
     impl StreamSource for FakeSource {
         fn snapshot(&mut self) -> io::Result<AudioSnapshot> {
-            match self.script.lock().unwrap().pop_front() {
+            let next = self.script.lock().unwrap().pop_front();
+            match next {
                 Some(Ok(snapshot)) => {
                     self.last = snapshot.clone();
                     Ok(snapshot)
                 }
-                Some(Err(e)) => Err(e),
+                Some(Err(e)) => Err(stall(e)),
                 None => Ok(self.last.clone()),
             }
         }
+    }
+
+    /// A pulse timeout, as `pulse::wait` returns it from a stalled server.
+    fn timed_out<T>() -> io::Result<T> {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "PulseAudio timed out",
+        ))
+    }
+
+    /// Fakes return a timeout only after a short stall, as pulse does at its
+    /// deadline; other errors at once.
+    fn stall(e: io::Error) -> io::Error {
+        if e.kind() == io::ErrorKind::TimedOut {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        e
     }
 
     fn call_stream() -> StreamProps {
@@ -1009,6 +981,20 @@ mod tests {
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), None);
+        assert_eq!(poller.poll(&mut source, MAC), Some(false));
+    }
+
+    #[test]
+    fn poller_keeps_state_through_timed_out_snapshot() {
+        let mut source =
+            FakeSource::new(vec![in_call(), timed_out(), timed_out(), in_call(), idle()]);
+        let mut poller = CallPoller::default();
+        assert_eq!(poller.poll(&mut source, MAC), Some(true));
+        // Timeouts neither end nor repeat the call...
+        assert_eq!(poller.poll(&mut source, MAC), None);
+        assert_eq!(poller.poll(&mut source, MAC), None);
+        assert_eq!(poller.poll(&mut source, MAC), None);
+        // ...and the next good sample still reports a change.
         assert_eq!(poller.poll(&mut source, MAC), Some(false));
     }
 
@@ -1106,6 +1092,29 @@ mod tests {
         assert_eq!(script.lock().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn spawned_poller_survives_timeout_and_stops_when_dropped() {
+        let source = FakeSource::new(vec![idle(), timed_out(), timed_out(), in_call()]);
+        let script = source.script.clone();
+        let mut rx = spawn_call_poller_with(MAC.to_string(), source, Duration::from_millis(5));
+        let mut changes = Vec::new();
+        for _ in 0..2 {
+            let (_, in_call) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("a change")
+                .expect("poller running");
+            changes.push(in_call);
+        }
+        // The timeouts reported nothing; the snapshot after them did.
+        assert_eq!(changes, [false, true]);
+        assert!(script.lock().unwrap().is_empty());
+        drop(rx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        script.lock().unwrap().push_back(idle());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(script.lock().unwrap().len(), 1);
+    }
+
     /// Plays back a script of sink-input listings and errors, then repeats
     /// the last listing.
     struct FakePlayback {
@@ -1124,12 +1133,13 @@ mod tests {
 
     impl PlaybackSource for FakePlayback {
         fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
-            match self.script.lock().unwrap().pop_front() {
+            let next = self.script.lock().unwrap().pop_front();
+            match next {
                 Some(Ok(streams)) => {
                     self.last = streams.clone();
                     Ok(streams)
                 }
-                Some(Err(e)) => Err(e),
+                Some(Err(e)) => Err(stall(e)),
                 None => Ok(self.last.clone()),
             }
         }
@@ -1626,6 +1636,39 @@ mod tests {
             .expect("stream playback ended")
             .expect("monitor running");
         // Dropping the receiver stops the task.
+        drop(rx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        script.lock().unwrap().push_back(Ok(vec![music(2)]));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(script.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spawned_stream_playback_survives_timeout_and_stops_when_dropped() {
+        let source = FakePlayback::new(vec![Ok(vec![]), timed_out(), Ok(vec![music(1)])]);
+        let script = source.script.clone();
+        let mut rx = spawn_stream_playback(
+            source,
+            AllAudible,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
+            .await
+            .expect("stream playback after a timeout")
+            .expect("monitor running");
+        // A timeout while playing keeps the state; the next listing ends it.
+        script
+            .lock()
+            .unwrap()
+            .extend([timed_out(), timed_out(), Ok(vec![])]);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(*rx.borrow());
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| !*playing))
+            .await
+            .expect("stream playback ended")
+            .expect("monitor running");
+        assert!(script.lock().unwrap().is_empty());
         drop(rx);
         tokio::time::sleep(Duration::from_millis(50)).await;
         script.lock().unwrap().push_back(Ok(vec![music(2)]));
