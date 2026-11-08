@@ -347,8 +347,15 @@ impl Handoff {
                 // keeping its `since` so the ACK timeout is not pushed back,
                 // and make now the one pause its ACK would have made: a
                 // user/quit release, or a playback restart it would retake
-                // for. A remote release already paused when it was sent.
-                if let Some(p) = self.pending.as_mut().filter(|p| !p.desired) {
+                // for. A remote release already paused when it was sent. A
+                // local call refuses (below) any release but a remote one, so
+                // the release still settles for the call (#11).
+                let call_holds = self.local_call && self.requested_take;
+                if let Some(p) = self
+                    .pending
+                    .as_mut()
+                    .filter(|p| !p.desired && (p.cause == Cause::Remote || !call_holds))
+                {
                     if self.automatic
                         && self.requested_take
                         && (matches!(p.cause, Cause::User | Cause::Quit)
@@ -2295,6 +2302,23 @@ mod tests {
         assert_eq!(p.feed(1700, Input::RemoteOwnershipRequest), [PauseMedia]);
         assert_eq!(p.feed(1800, Input::Ownership(vec![0])), []);
         assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+
+        // A call started during the release: refused as before (#11), so
+        // the ACK still retakes for the restarted playback.
+        let mut p = acked_auto_take();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1550, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play(1600, true), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(1700, Input::RemoteOwnershipRequest), []);
+        assert_eq!(
+            p.core.take_lines(),
+            ["REMOTE requested ownership; refused during a local call"]
+        );
+        assert_eq!(
+            p.feed(1800, Input::Ownership(vec![0])),
+            [SendOwnership(true)]
+        );
     }
 
     #[test]
