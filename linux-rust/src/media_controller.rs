@@ -378,9 +378,13 @@ async fn before_deadline<Fut: Future>(
     if Instant::now() >= deadline {
         return Err(DeadlineExceeded);
     }
-    tokio::time::timeout_at(deadline, step())
-        .await
-        .map_err(|_| DeadlineExceeded)
+    // Deadline first: `timeout_at` polls the step before its timer, so a step
+    // woken exactly at the deadline could still start another query.
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err(DeadlineExceeded),
+        out = step() => Ok(out),
+    }
 }
 
 /// Start `step` only before `deadline`. Past it, never finish, so the
@@ -1103,7 +1107,7 @@ impl MediaController {
             return Ok(());
         }
 
-        if !recover().await {
+        if !before_deadline(deadline, recover).await? {
             if Instant::now() >= deadline {
                 return Err(DeadlineExceeded);
             }
@@ -2817,6 +2821,37 @@ mod tests {
         assert_eq!(steps.started("recover") + steps.started("choose") + steps.started("set"), 0);
         // The cut lookup wrote nothing.
         assert_eq!(controller.state.try_lock().unwrap().device_index, Some(99));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a2dp_activation_deadline_initial_lookup_retry_at_deadline() {
+        let controller = MediaController::new(String::new(), String::new());
+        let steps = Steps::default();
+        let start = Instant::now();
+        let deadline = start + A2DP_ACTIVATION_DEADLINE;
+
+        // Failing lookups of 3.75 s plus the 250 ms retry gap start at
+        // 0, 4, 8, 12 and 16 s; the gap after the fifth ends exactly at the
+        // deadline, and the sixth lookup must not start.
+        let outcome = controller
+            .activate_a2dp_profile_with(
+                deadline,
+                || {
+                    retry_card_lookup(CARD_LOOKUP_ATTEMPTS, CARD_LOOKUP_INTERVAL, || {
+                        steps.step("lookup", Duration::from_millis(3750), None)
+                    })
+                },
+                || steps.step("recover", Duration::ZERO, true),
+                |_| steps.step("choose", Duration::ZERO, ProfileChoice::Unavailable),
+                |_, _| steps.step("set", Duration::ZERO, true),
+            )
+            .await;
+
+        assert_eq!(outcome, Err(DeadlineExceeded));
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!(steps.started_from(deadline), 0);
+        assert_eq!(steps.started("lookup"), 5);
+        assert!(controller.state.try_lock().is_ok());
     }
 
     #[tokio::test(start_paused = true)]
