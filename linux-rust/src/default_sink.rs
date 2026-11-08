@@ -10,8 +10,6 @@ use crate::media_controller::MediaController;
 use crate::pulse;
 use futures::future::BoxFuture;
 use log::{info, warn};
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, watch};
 
@@ -183,15 +181,7 @@ impl DefaultSinkIo for MediaController {
 }
 
 fn set_default_sink_sync(name: &str) -> bool {
-    let Ok((mut mainloop, mut context)) = pulse::connect("LibrePods") else {
-        return false;
-    };
-    let accepted = Rc::new(RefCell::new(false));
-    let mut op = context.set_default_sink(name, {
-        let accepted = Rc::downgrade(&accepted);
-        move |success| pulse::update(&accepted, |accepted| *accepted = success)
-    });
-    pulse::wait(&mut mainloop, &mut op, "default sink change").is_ok() && *accepted.borrow()
+    pulse::set_default_sink("LibrePods", name)
 }
 
 #[cfg(test)]
