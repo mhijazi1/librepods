@@ -1747,7 +1747,8 @@ impl MediaController {
                 if profiles.is_empty() {
                     info!("A2DP resume: no profile cycle from {active:?}");
                 }
-                blocking(move || profiles.iter().all(|p| set_card_profile_sync(index, p))).await
+                blocking(move || run_profile_cycle(&profiles, |p| set_card_profile_sync(index, p)))
+                    .await
             }
         }
     }
@@ -1773,6 +1774,12 @@ fn resume_profiles(
         }
         ProfileChoice::Unavailable => Vec::new(),
     }
+}
+
+/// Sets every profile in order, even after a failed write, so a lost reply
+/// to the "off" write never leaves the card off. True only if all succeeded.
+fn run_profile_cycle(profiles: &[String], mut set: impl FnMut(&str) -> bool) -> bool {
+    profiles.iter().fold(true, |ok, p| set(p) && ok)
 }
 
 /// The A2DP resume chain's production I/O (#200), on the controller clone
@@ -3545,6 +3552,31 @@ mod tests {
         // A call on HFP: no cycle, even with A2DP available.
         let hfp = Some("headset-head-unit");
         assert!(cycle(&["off", "headset-head-unit", "a2dp-sink"], hfp, "").is_empty());
+    }
+
+    /// Runs the profile cycle over `list` with a setter failing on `fails`.
+    /// Returns (result, profiles attempted in order).
+    fn run_cycle(list: &[&str], fails: &[&str]) -> (bool, Vec<String>) {
+        let mut attempted = Vec::new();
+        let ok = run_profile_cycle(&profiles(list), |p| {
+            attempted.push(p.to_string());
+            !fails.contains(&p)
+        });
+        (ok, attempted)
+    }
+
+    #[test]
+    fn profile_cycle_restores_a2dp_after_off_write_fails() {
+        let both = ["off", "a2dp-sink"];
+        assert_eq!(run_cycle(&both, &["off"]), (false, profiles(&both)));
+    }
+
+    #[test]
+    fn profile_cycle_reports_each_outcome_after_trying_every_write() {
+        let both = ["off", "a2dp-sink"];
+        assert_eq!(run_cycle(&both, &[]), (true, profiles(&both)));
+        assert_eq!(run_cycle(&both, &["a2dp-sink"]), (false, profiles(&both)));
+        assert_eq!(run_cycle(&[], &[]), (true, Vec::new()));
     }
 
     const TEST_INTERVAL: Duration = Duration::from_millis(1);
