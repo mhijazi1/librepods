@@ -1118,35 +1118,58 @@ mod tests {
             .collect()
     }
 
-    /// Report A is queued, then the cut and report B queue on the state lock
-    /// in that order (tokio's Mutex is FIFO). If the cut released the lock
-    /// between the backlog take and the facts read, B would land in between.
-    #[tokio::test]
-    async fn reconnect_facts_cut_splits_reports_exactly() {
+    /// Report A=[L] is queued, then the cut and report B=[L]->[L,R] queue on
+    /// the held state lock in the given order (tokio's Mutex is FIFO).
+    /// Returns the facts, the backlog and the events still queued.
+    async fn facts_cut_around_report(
+        cut_first: bool,
+    ) -> (SessionFacts, Vec<AACPEvent>, Vec<AACPEvent>) {
         let manager = AACPManager::new();
         let (tx, events) = tokio::sync::mpsc::unbounded_channel();
         manager.set_event_channel(tx).await;
         manager.receive_packet(&hosts_packet(&[L_MAC])).await;
         let held = manager.state.lock().await;
-        let cut = tokio::spawn(cut_facts((manager.clone(), events), InitBacklog::default()));
-        // current_thread: each yield runs the spawned task up to its lock wait.
-        tokio::task::yield_now().await;
+        let cut = cut_facts((manager.clone(), events), InitBacklog::default());
         let reporter = manager.clone();
-        let report = tokio::spawn(async move {
+        let report = async move {
             reporter
                 .receive_packet(&hosts_packet(&[L_MAC, R_MAC]))
                 .await
-        });
+        };
+        // current_thread: each yield runs the spawned task up to its lock wait.
+        let (cut, report) = if cut_first {
+            let cut = tokio::spawn(cut);
+            tokio::task::yield_now().await;
+            (cut, tokio::spawn(report))
+        } else {
+            let report = tokio::spawn(report);
+            tokio::task::yield_now().await;
+            (tokio::spawn(cut), report)
+        };
         tokio::task::yield_now().await;
         drop(held);
         let (((_, mut events), backlog), facts) = cut.await.unwrap();
         report.await.unwrap();
+        (facts, backlog.events, drain(&mut events))
+    }
+
+    /// (a) The cut queues before B: if it released the lock between the
+    /// backlog take and the facts read, B would land in between.
+    /// (b) B queues before the cut: if the cut read `events.len()` before
+    /// taking the lock, B would be in the facts but left in the queue.
+    #[tokio::test]
+    async fn reconnect_facts_cut_splits_reports_exactly() {
+        let (facts, backlog, rest) = facts_cut_around_report(true).await;
         assert_eq!(facts.hosts, [core_device(CORE_LOCAL)]);
-        assert_eq!(host_reports(&backlog.events).last().unwrap().1, facts.hosts);
-        let rest = drain(&mut events);
+        assert_eq!(host_reports(&backlog).last().unwrap().1, facts.hosts);
         let rest = host_reports(&rest);
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].0, facts.hosts);
+
+        let (facts, backlog, rest) = facts_cut_around_report(false).await;
+        assert_eq!(facts.hosts, [CORE_LOCAL, CORE_REMOTE].map(core_device));
+        assert_eq!(host_reports(&backlog).last().unwrap().1, facts.hosts);
+        assert_eq!(host_reports(&rest), []);
     }
 
     const L_MAC: [u8; 6] = [1, 2, 3, 4, 5, 6];
