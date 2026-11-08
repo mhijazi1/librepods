@@ -97,7 +97,6 @@ pub(crate) fn update<T>(state: &Weak<RefCell<T>>, f: impl FnOnce(&mut T)) {
 }
 
 /// What LibrePods reads of a sink.
-#[derive(Clone, Debug)]
 pub(crate) struct Sink {
     pub(crate) name: Option<String>,
     pub(crate) device_string: Option<String>,

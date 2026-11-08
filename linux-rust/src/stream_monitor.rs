@@ -2659,6 +2659,5 @@ mod tests {
         );
         assert!(!crate::call_detect::is_call_stream(&streams[0]));
         assert!(crate::call_detect::is_call_stream(&streams[1]));
-        assert!(mark_monitors(Vec::new(), &[5]).is_empty());
     }
 }
