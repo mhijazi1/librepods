@@ -20,6 +20,13 @@ Background research (mo's vault): Research/Headphones/AirPods Automatic Switchin
 Put new issues in the milestone whose outcome they serve.
 
 ## Constraints
+- **Behaviour questions are answered by macOS (mo, 2026-11-08).** When an issue raises an open question about how switching,
+  ownership, routing, audio or notifications should behave, the answer is "do what macOS does with the same AirPods". Don't ask mo
+  to choose between behaviours.
+  - If what macOS does is already documented (DECISIONS.md, a closed spike, or the vault research notes), use it and cite it.
+  - Otherwise, file a `hardware` spike to observe the Mac doing the same thing (steps plus `audioaccessoryd` log), map each
+    possible outcome to the change it implies, and link the issue as blocked by the spike.
+  - Ask mo only for things macOS has no counterpart for (Linux-only features, PipeWire/WirePlumber choices, costs and scope).
 - **This is a fork. All issues, PRs and merges go to `mhijazi1/librepods` only, with base `linux-parity`. Never open, comment on or
   reference-write anything in `librepods-org/librepods` (upstream).** Upstream PR numbers (#688, #689, #724, #766, #775, #841) refer to
   upstream; their heads are available locally as branches `pr-<n>` in the main clone, or via
