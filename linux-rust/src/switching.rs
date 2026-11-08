@@ -28,6 +28,7 @@ use crate::bluetooth::aacp::{
     ControlCommandIdentifiers as Control,
 };
 use crate::handoff::{Command, Handoff, Input, SessionFacts};
+use crate::handoff_log;
 use crate::media_controller::{self, MediaController};
 use crate::stream_monitor::{self, CallSamples, MIN_STREAM_PLAYBACK, PlaybackSource, PulseStreams};
 use crate::utils::SwitchingMode;
@@ -583,13 +584,23 @@ struct Legacy {
 impl Switching {
     /// Start the selected mode. `media` and `playback` are used only by the
     /// handoff mode; `playback` is called only in that mode. The handoff
-    /// mode monitors local calls with `stream_monitor::spawn_call_poller`.
+    /// mode monitors local calls with `stream_monitor::spawn_call_poller`
+    /// and appends the core's lines to the handoff log (#21) if it opens.
     pub(crate) async fn start(
         setup: SwitchingSetup,
         media: Arc<dyn MediaActions>,
         playback: impl FnOnce() -> PlaybackSamples,
     ) -> Self {
-        Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller).await
+        let log = (setup.mode == SwitchingMode::Handoff)
+            .then(handoff_log::app_log)
+            .flatten();
+        let mac = setup.airpods_mac.clone();
+        let switching =
+            Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller).await;
+        match log {
+            Some(log) => switching.with_line_sink(log.sink(mac)),
+            None => switching,
+        }
     }
 
     /// `start` with the local call monitor injected: `calls` gets the AirPods
@@ -644,9 +655,7 @@ impl Switching {
     }
 
     /// Also hand every line of the handoff core to `sink`, after it is
-    /// logged. Only the handoff mode emits lines. Test-only until #21 uses it
-    /// as a production sink.
-    #[cfg(test)]
+    /// logged. Only the handoff mode emits lines.
     pub(crate) fn with_line_sink(mut self, sink: LineSink) -> Self {
         self.lines = Some(sink);
         self
@@ -1370,6 +1379,99 @@ mod tests {
         assert_eq!(h.activations(), 1);
 
         stop_handoff_task(mac);
+    }
+
+    /// #21: a handoff session through the default path, its lines appended
+    /// by the handoff log's LineSink, never puts the proximity keys the
+    /// session carried in the log.
+    #[tokio::test]
+    async fn handoff_log_never_contains_proximity_keys() {
+        const IRK: [u8; 16] = [
+            0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18, 0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e,
+            0x8f, 0x90,
+        ];
+        const ENC: [u8; 16] = [
+            0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2,
+            0xe1, 0xf0,
+        ];
+        // Standard base64 of IRK and ENC, without the padding.
+        const BASE64: [&str; 2] = ["obLD1OX2BxgpOktcbX6PkA", "Dx4tPEtaaXiHlqW0w9Lh8A"];
+        let mac = "5A:00:00:00:00:21";
+        let dir = std::env::temp_dir().join(format!(
+            "librepods-handoff-log-keys-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("librepods/handoff.jsonl");
+        let log = Arc::new(handoff_log::Log::open(&path, handoff_log::Source::App).unwrap());
+        let logged = || std::fs::read_to_string(&path).unwrap();
+
+        let (manager, _rx, _tx) = ready_session().await;
+        let media = Arc::new(FakeMedia {
+            records: Arc::new(Records::default()),
+            mac: mac.to_string(),
+        });
+        let media_controller = Arc::new(Mutex::new(MediaController::new(
+            mac.to_string(),
+            LOCAL.to_string(),
+        )));
+        let (events, events_rx) = mpsc::unbounded_channel();
+        manager.set_event_channel(events.clone()).await;
+        let (play_tx, play_rx) = mpsc::channel(8);
+        let (_call_tx, call_rx) = mpsc::channel(8);
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        Switching::start_with_calls(
+            SwitchingSetup {
+                mode: SwitchingMode::Handoff,
+                airpods_mac: mac.to_string(),
+                local_mac: LOCAL.to_string(),
+                manager: manager.clone(),
+                media_controller,
+                command_tx,
+            },
+            media,
+            move || play_rx,
+            move |_: &str| call_rx,
+        )
+        .await
+        .with_line_sink(log.sink(mac.to_string()))
+        .dispatch_events(events_rx, Arc::new(DeviceHandler::default()).handle());
+        wait_until("the automatic start", || logged().contains("AUTO enabled")).await;
+
+        events
+            .send(AACPEvent::ProximityKeys(vec![
+                (0x01, IRK.to_vec()),
+                (0x04, ENC.to_vec()),
+            ]))
+            .unwrap();
+        play_tx.send((Instant::now(), false)).await.unwrap();
+        play_tx.send((Instant::now(), true)).await.unwrap();
+        wait_until("the take", || logged().contains("requested Linux ownership")).await;
+        events.send(owns(1)).unwrap();
+        events
+            .send(AACPEvent::ConnectedDevices(
+                vec![host(LOCAL), host(REMOTE)],
+                vec![host(LOCAL), host(REMOTE), host(SECOND_REMOTE)],
+            ))
+            .unwrap();
+        events.send(AACPEvent::OwnershipToFalseRequest).unwrap();
+        wait_until("the yield", || {
+            logged().contains("REMOTE requested ownership; yielding")
+        })
+        .await;
+        stop_handoff_task(mac);
+
+        let text = logged();
+        assert!(text.contains("ACK owner=linux"), "{text}");
+        for key in [IRK, ENC] {
+            for encoded in [hex::encode(key), hex::encode_upper(key)] {
+                assert!(!text.contains(&encoded), "{encoded} in {text}");
+            }
+        }
+        for encoded in BASE64 {
+            assert!(!text.contains(encoded), "{encoded} in {text}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

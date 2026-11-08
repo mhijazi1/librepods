@@ -3,6 +3,7 @@ mod bluetooth;
 mod call_detect;
 mod devices;
 mod handoff;
+mod handoff_log;
 mod handoff_probe;
 mod media_controller;
 mod stream_monitor;
@@ -46,6 +47,12 @@ struct Args {
         help = "Run automatic handoff without interactive input"
     )]
     handoff_auto: bool,
+    #[arg(
+        long,
+        conflicts_with = "handoff_probe",
+        help = "Summarise the last session of the handoff log and exit"
+    )]
+    handoff_report: bool,
     #[arg(long, short = 'd', help = "Enable debug logging")]
     debug: bool,
     #[arg(
@@ -66,6 +73,11 @@ struct Args {
 
 fn main() -> iced::Result {
     let args = Args::parse();
+
+    if args.handoff_report {
+        println!("{}", handoff_log::default_report());
+        return Ok(());
+    }
 
     if let Some(address) = args.handoff_probe {
         env_logger::Builder::new()

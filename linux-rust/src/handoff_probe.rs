@@ -2,6 +2,7 @@ use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control,
 };
 use crate::handoff::{Command, Handoff, Input};
+use crate::handoff_log;
 use crate::switching::{
     advertise_call, announce, event_input, session_facts, spawn_playback_poller,
 };
@@ -138,6 +139,8 @@ struct Io {
     retry: Option<tokio::task::JoinHandle<Result<ControlSession>>>,
     /// Session made by the last reconnect, until the core adopts or cancels it.
     candidate: Option<ControlSession>,
+    /// The handoff log, if it opened (#21).
+    log: Option<handoff_log::Log>,
 }
 
 impl Io {
@@ -240,6 +243,9 @@ async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
     let commands = core.handle(Instant::now(), input);
     for line in core.take_lines() {
         println!("{line}");
+        if let Some(log) = &io.log {
+            log.line(&io.address.to_string(), &line);
+        }
     }
     io.execute(commands).await
 }
@@ -346,6 +352,7 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
         play_rx,
         retry: None,
         candidate: None,
+        log: handoff_log::open_default(handoff_log::Source::Probe),
     };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -691,6 +698,25 @@ mod tests {
     #[test]
     fn cli_handoff_auto_requires_handoff_probe() {
         assert!(cli_parse(&["librepods", "--handoff-auto"]).is_err());
+    }
+
+    #[test]
+    fn cli_handoff_report_parses() {
+        assert!(cli_parse(&["librepods", "--handoff-report"]).unwrap().handoff_report);
+        assert!(!cli_parse(&["librepods"]).unwrap().handoff_report);
+    }
+
+    #[test]
+    fn cli_handoff_report_conflicts_with_probe() {
+        let error = cli_parse(&[
+            "librepods",
+            "--handoff-report",
+            "--handoff-probe",
+            "AA:BB:CC:DD:EE:FF",
+        ])
+        .err()
+        .expect("--handoff-report with --handoff-probe must not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
