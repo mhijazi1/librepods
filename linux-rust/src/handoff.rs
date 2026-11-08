@@ -410,7 +410,7 @@ impl Handoff {
                         }
                         TakeoverAction::Skip(_) if !self.live() => self.say(NO_SESSION),
                         TakeoverAction::Skip(_) => self.say(
-                            "BLOCKED take needs two hosts, an in-ear bud, and confirmed idle audio",
+                            "BLOCKED take needs Linux plus a remote host, an in-ear bud, and confirmed idle audio",
                         ),
                     }
                 }
@@ -911,6 +911,8 @@ mod tests {
 
     const LOCAL: &str = "01:02:03:04:05:06";
     const REMOTE: &str = "07:08:09:0A:0B:0C";
+    const REMOTE_2: &str = "0D:0E:0F:10:11:12";
+    const REMOTE_3: &str = "13:14:15:16:17:18";
 
     fn host(mac: &str) -> ConnectedDevice {
         ConnectedDevice {
@@ -960,11 +962,19 @@ mod tests {
             }
         }
 
-        /// Automatic, connected, both hosts, worn, idle audio, and a first
-        /// "stopped" sample as the baseline.
+        /// Automatic, connected, Linux plus a remote host, worn, idle audio,
+        /// and a first "stopped" sample as the baseline.
         fn ready() -> Self {
+            Self::ready_with_hosts(two_hosts())
+        }
+
+        /// `ready`, with the AirPods reporting `hosts` instead.
+        fn ready_with_hosts(hosts: Vec<ConnectedDevice>) -> Self {
             let mut probe = Self::new(true, true);
-            probe.routing(ready_facts());
+            probe.routing(SessionFacts {
+                hosts,
+                ..ready_facts()
+            });
             assert_eq!(probe.play(10, false), []);
             probe
         }
@@ -1022,6 +1032,48 @@ mod tests {
     }
 
     #[test]
+    fn takes_with_three_or_four_hosts() {
+        // Linux plus two or three remotes (hardware #22: iPhone + Mac +
+        // Linux) takes like Linux plus one.
+        let hosts_lists = [
+            vec![host(LOCAL), host(REMOTE), host(REMOTE_2)],
+            vec![host(REMOTE), host(LOCAL), host(REMOTE_2), host(REMOTE_3)],
+        ];
+        for hosts in hosts_lists {
+            let n = hosts.len();
+            let mut p = Probe::ready_with_hosts(hosts.clone());
+            assert_eq!(p.play(500, true), [SendOwnership(true)], "hosts={n}");
+
+            let mut p = Probe::new(false, true);
+            p.routing(SessionFacts {
+                hosts,
+                ..ready_facts()
+            });
+            p.core.take_lines();
+            assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)], "hosts={n}");
+            let lines = p.core.take_lines();
+            assert!(
+                lines.iter().any(|l| l.starts_with("REQUEST owner=linux")),
+                "hosts={n}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_take_when_only_linux_hosts() {
+        let mut p = Probe::ready_with_hosts(vec![host(LOCAL)]);
+        assert_eq!(p.play(500, true), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(600, Input::Take), []);
+        let lines = p.core.take_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("BLOCKED take needs Linux plus a remote host"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn no_take_when_not_worn() {
         let mut p = Probe::ready();
         p.feed(20, Input::EarState(vec![OutOfEar, InCase]));
@@ -1066,7 +1118,8 @@ mod tests {
         assert_eq!(p.play(10, false), []);
         assert_eq!(p.play(500, true), []);
 
-        // Hosts other than this machine plus one remote.
+        // Hosts that are not this machine plus a remote one: Linux alone,
+        // then remotes without Linux.
         let mut p = Probe::ready();
         p.feed(
             20,
@@ -1077,13 +1130,13 @@ mod tests {
         );
         assert_eq!(p.play(500, true), []);
         assert_eq!(p.play(1000, false), []);
-        let three = vec![host(LOCAL), host(REMOTE), host("0D:0E:0F:10:11:12")];
+        let remotes_only = vec![host(REMOTE), host(REMOTE_2)];
         assert_eq!(
             p.feed(
                 1100,
                 Input::ConnectedDevices {
                     old: vec![host(LOCAL)],
-                    new: three.clone(),
+                    new: remotes_only.clone(),
                 },
             ),
             [Announce]
@@ -1094,7 +1147,7 @@ mod tests {
             p.feed(
                 2100,
                 Input::ConnectedDevices {
-                    old: three,
+                    old: remotes_only,
                     new: two_hosts(),
                 },
             ),

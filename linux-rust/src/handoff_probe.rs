@@ -610,6 +610,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn take_allowed_with_three_hosts() {
+        // Linux plus two remotes (hardware #22: iPhone + Mac + Linux).
+        let manager = AACPManager::new();
+        manager
+            .receive_packet(&[
+                4, 0, 4, 0, 0x2e, 0, 0, 0, 3, 1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 1, 0,
+                13, 14, 15, 16, 17, 18, 1, 0,
+            ])
+            .await;
+        manager.receive_packet(&[4, 0, 4, 0, 6, 0, 0, 0]).await;
+        manager
+            .receive_packet(&[4, 0, 4, 0, 0x0e, 0, 0, 0, 0, 0, 0, 0, 0])
+            .await;
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        manager.state.lock().await.sender = Some(sender);
+        let local = "01:02:03:04:05:06";
+        let state = manager.state.lock().await;
+        assert_eq!(state.connected_devices.len(), 3);
+        assert_eq!(state.connected_devices[2].mac, "0D:0E:0F:10:11:12");
+        assert!(
+            state
+                .ear_detection_status
+                .contains(&EarDetectionStatus::InEar)
+        );
+        assert!(take_allowed(&state, local));
+    }
+
+    #[tokio::test]
     async fn disconnect_invalidates_routing_and_wear_before_reconnect() {
         let manager = AACPManager::new();
         manager
@@ -699,8 +727,8 @@ mod tests {
         }
     }
 
-    /// Two hosts, both buds in ear, idle audio and Linux owning: a take on
-    /// this session would be allowed.
+    /// Linux plus a remote host, both buds in ear, idle audio and Linux not
+    /// owning: a take on this session would be allowed.
     fn feed_worn_idle_session(core: &mut Handoff, now: Instant) {
         core.handle(
             now,
@@ -798,7 +826,7 @@ mod tests {
         let lines = core.take_lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].starts_with("BLOCKED take needs two hosts"),
+            lines[0].starts_with("BLOCKED take needs Linux plus a remote host"),
             "{lines:?}"
         );
     }
