@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -133,11 +133,20 @@ impl Log {
         }
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .mode(0o600)
             .open(path)?;
-        if file.metadata()?.len() > MAX_LOG_BYTES {
+        let len = file.metadata()?.len();
+        let mut last = [b'\n'];
+        if len > MAX_LOG_BYTES {
             file.set_len(0)?;
+        } else if len > 0 {
+            file.read_exact_at(&mut last, len - 1)?;
+        }
+        // End a torn last record, so the session_start is a line of its own.
+        if last != [b'\n'] {
+            file.write_all(b"\n")?;
         }
         write_record(
             &mut file,
@@ -465,6 +474,34 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1, "{text}");
         assert!(report(&text).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_reopen_after_torn_tail() {
+        let dir = temp_dir("torn");
+        let path = dir.join("handoff.jsonl");
+        let old = concat!(
+            r#"{"record":"session_start","ts_ms":1000,"version":"0.1.0","source":"app"}"#,
+            "\n",
+            r#"{"record":"line","ts_ms":2000,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_linux","line":"ACK owner=linux elapsed_ms=1"}"#,
+            "\n",
+            r#"{"record":"line","ts_ms":2500,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_linux","line":"ACK owner=linux elapsed_ms=2"}"#,
+            "\n",
+            r#"{"record":"line","ts_ms":3000,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_li"#,
+        );
+        std::fs::write(&path, old).unwrap();
+        let log = Log::open(&path, Source::App).unwrap();
+        log.line("AA:BB:CC:DD:EE:FF", "ACK owner=linux elapsed_ms=5");
+        drop(log);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let new_start = text.lines().rev().nth(1).unwrap();
+        let Ok(Record::SessionStart { ts_ms, .. }) = serde_json::from_str(new_start) else {
+            panic!("the new session_start is not a line of its own:\n{text}");
+        };
+        let report = report(&text).unwrap();
+        assert_eq!(report.started_ms, ts_ms, "{text}");
+        assert_eq!(report.takeovers, 1, "{text}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
