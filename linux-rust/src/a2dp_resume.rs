@@ -11,7 +11,7 @@
 //! LibrePods instead of PipeWire).
 
 use dbus::blocking::Connection;
-use dbus::blocking::stdintf::org_freedesktop_dbus::ObjectManager;
+use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use futures::future::BoxFuture;
 use log::{info, warn};
 use std::time::{Duration, Instant};
@@ -256,11 +256,18 @@ pub(crate) fn spawn_transport_poller(airpods_mac: &str) -> mpsc::Receiver<bool> 
         .name("librepods-a2dp".to_string())
         .spawn(move || {
             let mut bus = None;
+            let mut reader = TransportReader::default();
             poll_transport(&tx, TRANSPORT_POLL, || {
                 if bus.is_none() {
                     bus = Connection::new_system().ok();
                 }
-                let active = bus.as_ref().and_then(|bus| transport_active(bus, &device));
+                let active = bus.as_ref().and_then(|bus| {
+                    reader.read(
+                        || transport_paths(bus, &device),
+                        |path| transport_state(bus, path),
+                    )
+                });
+                // The reader cleared its paths on that None too.
                 if active.is_none() {
                     bus = None;
                 }
@@ -294,25 +301,89 @@ fn poll_transport(
     }
 }
 
-/// Whether a `MediaTransport1` under `device` (`/dev_XX_..._XX/`) is not
-/// idle, read from BlueZ's object tree. None when BlueZ can't be read.
-fn transport_active(bus: &Connection, device: &str) -> Option<bool> {
+/// A cached transport path no longer exists (BlueZ removed or re-created it).
+struct Gone;
+
+/// The AirPods' transport paths, looked up once and then only read.
+#[derive(Default)]
+struct TransportReader {
+    paths: Vec<String>,
+}
+
+impl TransportReader {
+    /// Whether any transport is not idle; no transport reads idle. Looks the
+    /// paths up when none are cached or one is gone, in the same read. None
+    /// when `lookup` or `state` fails on the bus; that clears the cache.
+    fn read(
+        &mut self,
+        lookup: impl FnOnce() -> Option<Vec<String>>,
+        mut state: impl FnMut(&str) -> Result<Option<bool>, Gone>,
+    ) -> Option<bool> {
+        if !self.paths.is_empty()
+            && let Ok(active) = self.states(&mut state)
+        {
+            return active;
+        }
+        self.paths = lookup()?;
+        // A path gone right after its lookup reads idle; the next read looks
+        // it up again.
+        self.states(&mut state).unwrap_or(Some(false))
+    }
+
+    /// Any cached path's State not idle; on a failure or a gone path, the
+    /// cache is cleared.
+    fn states(
+        &mut self,
+        state: &mut impl FnMut(&str) -> Result<Option<bool>, Gone>,
+    ) -> Result<Option<bool>, Gone> {
+        let mut active = false;
+        for path in &self.paths {
+            match state(path) {
+                Ok(Some(path_active)) => active |= path_active,
+                failed => {
+                    self.paths.clear();
+                    return failed;
+                }
+            }
+        }
+        Ok(Some(active))
+    }
+}
+
+/// The `MediaTransport1` paths under `device` (`/dev_XX_..._XX/`), from
+/// BlueZ's object tree. None when BlueZ can't be read.
+fn transport_paths(bus: &Connection, device: &str) -> Option<Vec<String>> {
     let objects = bus
         .with_proxy("org.bluez", "/", Duration::from_secs(2))
         .get_managed_objects()
         .ok()?;
     Some(
         objects
-            .iter()
-            .filter(|(path, _)| path.contains(device))
-            .filter_map(|(_, interfaces)| interfaces.get("org.bluez.MediaTransport1"))
-            .any(|props| {
-                props
-                    .get("State")
-                    .and_then(|state| state.0.as_str())
-                    .is_some_and(|state| state != "idle")
-            }),
+            .into_iter()
+            .filter(|(path, interfaces)| {
+                path.contains(device) && interfaces.contains_key("org.bluez.MediaTransport1")
+            })
+            .map(|(path, _)| path.to_string())
+            .collect(),
     )
+}
+
+/// Whether the transport at `path` is not idle. Gone when BlueZ no longer
+/// has it; Ok(None) when BlueZ can't be read.
+fn transport_state(bus: &Connection, path: &str) -> Result<Option<bool>, Gone> {
+    let state: Result<String, _> = bus
+        .with_proxy("org.bluez", path, Duration::from_secs(2))
+        .get("org.bluez.MediaTransport1", "State");
+    match state {
+        Ok(state) => Ok(Some(state != "idle")),
+        Err(e) => match e.name().unwrap_or("") {
+            "org.freedesktop.DBus.Error.UnknownObject"
+            | "org.freedesktop.DBus.Error.UnknownInterface"
+            | "org.freedesktop.DBus.Error.UnknownMethod"
+            | "org.freedesktop.DBus.Error.InvalidArgs" => Err(Gone),
+            _ => Ok(None),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -621,5 +692,135 @@ mod tests {
             sent.push(active);
         }
         assert_eq!(sent, [false, true, false]);
+    }
+
+    /// Counting fake BlueZ for `TransportReader`: `paths` is what a lookup
+    /// finds, `states` each path's State (absent: gone); None fails the bus.
+    #[derive(Default)]
+    struct FakeBlueZ {
+        paths: Option<Vec<&'static str>>,
+        states: Vec<(&'static str, Option<&'static str>)>,
+        lookups: usize,
+        reads: usize,
+    }
+
+    impl FakeBlueZ {
+        fn read(&mut self, reader: &mut TransportReader) -> Option<bool> {
+            let (paths, states) = (&self.paths, &self.states);
+            let (lookups, reads) = (&mut self.lookups, &mut self.reads);
+            reader.read(
+                || {
+                    *lookups += 1;
+                    paths
+                        .as_ref()
+                        .map(|p| p.iter().map(|p| p.to_string()).collect())
+                },
+                |path| {
+                    *reads += 1;
+                    match states.iter().find(|(p, _)| *p == path) {
+                        Some((_, Some(state))) => Ok(Some(*state != "idle")),
+                        Some((_, None)) => Ok(None),
+                        None => Err(Gone),
+                    }
+                },
+            )
+        }
+    }
+
+    const FD0: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/fd0";
+    const FD1: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/fd1";
+
+    #[test]
+    fn transport_reader_looks_up_path_once_then_reads_state() {
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0]),
+            ..Default::default()
+        };
+        let mut reader = TransportReader::default();
+        for (tick, state) in ["idle", "pending", "active", "idle"]
+            .iter()
+            .cycle()
+            .take(12)
+            .enumerate()
+        {
+            bluez.states = vec![(FD0, Some(*state))];
+            assert_eq!(
+                bluez.read(&mut reader),
+                Some(*state != "idle"),
+                "tick {tick}"
+            );
+        }
+        assert_eq!((bluez.lookups, bluez.reads), (1, 12));
+    }
+
+    #[test]
+    fn transport_reader_relooks_up_when_path_gone() {
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0]),
+            states: vec![(FD0, Some("idle"))],
+            ..Default::default()
+        };
+        let mut reader = TransportReader::default();
+        assert_eq!(bluez.read(&mut reader), Some(false));
+        // BlueZ re-created the transport as fd1, now active: seen this tick.
+        bluez.paths = Some(vec![FD1]);
+        bluez.states = vec![(FD1, Some("active"))];
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        assert_eq!((bluez.lookups, bluez.reads), (2, 3));
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        assert_eq!((bluez.lookups, bluez.reads), (2, 4));
+    }
+
+    #[test]
+    fn transport_reader_without_transport_reads_idle_and_retries() {
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![]),
+            ..Default::default()
+        };
+        let mut reader = TransportReader::default();
+        assert_eq!(bluez.read(&mut reader), Some(false));
+        assert_eq!(bluez.read(&mut reader), Some(false));
+        assert_eq!((bluez.lookups, bluez.reads), (2, 0));
+        // Gone again right after its lookup: idle, looked up next tick.
+        bluez.paths = Some(vec![FD0]);
+        assert_eq!(bluez.read(&mut reader), Some(false));
+        bluez.states = vec![(FD0, Some("pending"))];
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        assert_eq!((bluez.lookups, bluez.reads), (4, 2));
+    }
+
+    #[test]
+    fn transport_reader_any_non_idle_is_active() {
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0, FD1]),
+            states: vec![(FD0, Some("idle")), (FD1, Some("active"))],
+            ..Default::default()
+        };
+        let mut reader = TransportReader::default();
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        bluez.states = vec![(FD0, Some("idle")), (FD1, Some("idle"))];
+        assert_eq!(bluez.read(&mut reader), Some(false));
+        assert_eq!((bluez.lookups, bluez.reads), (1, 4));
+    }
+
+    #[test]
+    fn transport_reader_bus_failure_returns_none_and_clears_cache() {
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0]),
+            states: vec![(FD0, Some("active"))],
+            ..Default::default()
+        };
+        let mut reader = TransportReader::default();
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        bluez.states = vec![(FD0, None)];
+        assert_eq!(bluez.read(&mut reader), None);
+        assert!(reader.paths.is_empty());
+        // The failed lookup too.
+        bluez.paths = None;
+        assert_eq!(bluez.read(&mut reader), None);
+        bluez.paths = Some(vec![FD0]);
+        bluez.states = vec![(FD0, Some("active"))];
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        assert_eq!((bluez.lookups, bluez.reads), (3, 3));
     }
 }
