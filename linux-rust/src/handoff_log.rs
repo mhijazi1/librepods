@@ -220,12 +220,10 @@ impl Log {
                     }
                 }
             });
-            match fresh {
-                Ok((_, Ok(fresh))) => file = fresh,
-                Ok((renamed, Err(e))) => {
-                    warn!("{}", rotation_warning(path, &rotated, renamed, &e))
-                }
-                Err(e) => warn!("{}", rotation_warning(path, &rotated, false, &e)),
+            // An error before the rename (dir open, lock, metadata) moved nothing.
+            match fresh.unwrap_or_else(|e| (false, Err(e))) {
+                (_, Ok(fresh)) => file = fresh,
+                (renamed, Err(e)) => warn!("{}", rotation_warning(path, &rotated, renamed, &e)),
             }
         }
         let len = file.metadata()?.len();
