@@ -284,8 +284,8 @@ pub(crate) struct Handoff {
     lines: Vec<String>,
     /// Emit `RouteToAirPods`/`RouteAway` (#40).
     default_sink_routing: bool,
-    /// This take already sent `RouteAway`; the next `RouteToAirPods` clears
-    /// it, so a timed-out remote release's later loss sends no second one.
+    /// This take already sent `RouteAway`; the next take clears it, so a
+    /// timed-out remote release's later loss sends no second one.
     routed_away: bool,
 }
 
@@ -807,7 +807,6 @@ impl Handoff {
         // Before the resume, so its audible check finds the stream on the
         // AirPods sink (#40).
         if held && self.default_sink_routing {
-            self.routed_away = false;
             out.push(Command::RouteToAirPods);
         }
         // A take that found the transport idle gets its audio back (#200).
@@ -1044,6 +1043,7 @@ impl Handoff {
     fn request(&mut self, now: Instant, desired: bool, cause: Cause, out: &mut Vec<Command>) {
         if desired {
             self.requested_take = true;
+            self.routed_away = false;
         }
         self.pending = Some(Pending {
             desired,
@@ -3681,6 +3681,22 @@ mod tests {
         assert_eq!(p.feed(12100, Input::Ownership(vec![1])), [RouteToAirPods]);
         assert_eq!(
             p.feed(12500, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
+    }
+
+    #[test]
+    fn retake_lost_before_ack_routes_away() {
+        let mut p = routed_take();
+        assert_eq!(
+            p.feed(1100, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
+        assert_eq!(p.play(1500, false), []);
+        assert_eq!(p.play(2000, true), [SendOwnership(true)]);
+        // Lost before its ACK: this take routes away too.
+        assert_eq!(
+            p.feed(2100, Input::Ownership(vec![0])),
             [PauseMedia, RouteAway]
         );
     }
