@@ -8,7 +8,7 @@ use crate::media_controller::{
     decide_takeover, routing_snapshot_of,
 };
 use crate::switching::{
-    advertise_call, announce, event_input, session_facts, spawn_playback_poller,
+    PlaybackSamples, advertise_call, announce, event_input, session_facts, spawn_playback_poller,
 };
 use bluer::Address;
 use std::time::{Duration, Instant};
@@ -204,7 +204,7 @@ struct Io {
     media: MediaController,
     manager: AACPManager,
     events: tokio::sync::mpsc::UnboundedReceiver<AACPEvent>,
-    play_rx: tokio::sync::mpsc::Receiver<(Instant, bool)>,
+    play_rx: PlaybackSamples,
     retry: Option<tokio::task::JoinHandle<Result<Reconnection>>>,
     /// Session made by the last reconnect, until the core adopts or cancels it.
     candidate: Option<Reconnection>,
@@ -305,7 +305,7 @@ impl Io {
                     }
                     self.adapter.device(self.address)?.disconnect().await?;
                 }
-                Command::DrainPlayback => while self.play_rx.try_recv().is_ok() {},
+                Command::DrainPlayback => self.play_rx.drain(),
                 Command::Exit => return Ok(true),
                 Command::Fail(reason) => return Err(reason.into()),
             }
@@ -317,7 +317,13 @@ impl Io {
 /// Feed one input to the core, print its protocol lines and execute its
 /// commands. Ok(true) when the probe should stop.
 async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
-    let commands = core.handle(Instant::now(), input);
+    let now = Instant::now();
+    let commands = core.handle(now, input);
+    // Before ConnectA2dp and the sends are awaited (#90), as the daemon's.
+    // shortcut: a debounce ending between `now` and this request counts (#146)
+    if commands.contains(&Command::DrainPlayback) {
+        io.play_rx.rebaseline(now);
+    }
     for line in core.take_lines() {
         println!("{line}");
         if let Some(log) = &io.log {

@@ -154,7 +154,9 @@ pub(crate) enum Command {
     AdoptSession,
     /// Close the session the last reconnect made and disconnect the device.
     CancelReconnect,
-    /// Drop playback samples taken before the new baseline.
+    /// Drop playback samples taken before the new baseline, and re-baseline
+    /// stream playback: a stream still in its debounce counts only after it
+    /// stops and plays again (#90).
     DrainPlayback,
     /// Stop the probe.
     Exit,
@@ -459,6 +461,7 @@ impl Handoff {
                 self.automatic = true;
                 self.announce(out);
                 self.reset_baseline(now);
+                out.push(Command::DrainPlayback);
                 self.say("AUTO enabled; waiting for a new playback start after the baseline");
             }
             Input::Manual => {
@@ -1412,7 +1415,7 @@ mod tests {
         p.routing(ready_facts());
         assert_eq!(
             p.feed(1000, Input::Auto),
-            [ConnectA2dp, SendOwnership(false), Announce]
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
         );
         // The reply to Auto's "not owning" (#54).
         assert_eq!(p.feed(1050, Input::Ownership(vec![0])), []);
@@ -1910,7 +1913,7 @@ mod tests {
         p.routing(ready_facts());
         assert_eq!(
             p.feed(100, Input::Auto),
-            [ConnectA2dp, SendOwnership(false), Announce]
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
         );
         p.core.take_lines();
         let mut all = p.play(200, false);
@@ -2368,7 +2371,7 @@ mod tests {
         assert_eq!(
             all,
             [
-                vec![ConnectA2dp, SendOwnership(false), Announce],
+                vec![ConnectA2dp, SendOwnership(false), Announce, DrainPlayback],
                 vec![],
                 vec![],
                 vec![],
@@ -2591,7 +2594,8 @@ mod tests {
                 ConnectA2dp,
                 SendOwnership(false),
                 Announce,
-                AdvertiseCall(true)
+                AdvertiseCall(true),
+                DrainPlayback
             ]
         );
 
