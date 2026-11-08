@@ -286,8 +286,7 @@ impl Io {
                     self.retry = Some(tokio::spawn(async move {
                         let (manager, mut events) = connect_control(address).await?;
                         if !audio {
-                            let session = (manager, events);
-                            return Ok(cut_facts(session, InitBacklog::default()).await);
+                            return Ok(cut_facts((manager, events), InitBacklog::default()).await);
                         }
                         let device = adapter.device(address)?;
                         let connected = tokio::time::timeout(
@@ -1143,11 +1142,12 @@ mod tests {
             let cut = host_reports(&backlog.events);
             assert_eq!(cut.last().unwrap().1, facts.hosts);
             let rest = drain(&mut events);
-            if let Some((old, _)) = host_reports(&rest).first() {
+            let rest = host_reports(&rest);
+            if let Some((old, _)) = rest.first() {
                 assert_eq!(*old, facts.hosts);
                 splits += 1;
             }
-            assert_eq!(cut.len() + host_reports(&rest).len(), 8);
+            assert_eq!(cut.len() + rest.len(), 8);
         }
         assert!(splits > 0, "no cut landed mid-stream");
     }
