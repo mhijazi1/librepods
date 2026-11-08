@@ -298,6 +298,17 @@ impl Handoff {
         self
     }
 
+    /// Start with Linux as the last owner or not: the shell keeps the value
+    /// across a session's handoff tasks (#16).
+    pub(crate) fn with_last_owner_linux(mut self, last_owner_linux: bool) -> Self {
+        self.last_owner_linux = last_owner_linux;
+        self
+    }
+
+    pub(crate) fn last_owner_linux(&self) -> bool {
+        self.last_owner_linux
+    }
+
     pub(crate) fn connected(&self) -> bool {
         self.connected
     }
@@ -346,7 +357,7 @@ impl Handoff {
                 self.ears = ears;
             }
             Input::AudioSource(source) => {
-                if self.remote_audio(&source) {
+                if self.remote_took(&source) {
                     self.last_owner_linux = false;
                 }
                 self.audio = Some(source);
@@ -618,6 +629,7 @@ impl Handoff {
         let replay_play = acked.is_some_and(|p| !p.desired)
             && self.play_during_release
             && self.was_playing == Some(true);
+        let was_linux = self.owner.as_deref() == Some(&[1]);
         self.owner = Some(value.clone());
         if value == [1] {
             self.last_owner_linux = true;
@@ -657,6 +669,10 @@ impl Handoff {
                 // pause stays. A late acknowledgement (#55) is handled the
                 // same way; it cannot be a replay, as nothing was pending.
                 Some(cause) => {
+                    // A remote release handed the AirPods to the other host.
+                    if cause == Cause::Remote {
+                        self.last_owner_linux = false;
+                    }
                     if self.requested_take && self.automatic {
                         match cause {
                             Cause::User | Cause::Quit => out.push(Command::PauseMedia),
@@ -670,6 +686,8 @@ impl Handoff {
                     self.yield_take(out);
                     return;
                 }
+                // Another host took the AirPods without asking.
+                None if was_linux => self.last_owner_linux = false,
                 None => {}
             }
             self.requested_take = false;
@@ -823,7 +841,7 @@ impl Handoff {
         self.ears = facts.ears;
         self.audio = facts.audio;
         self.owner = facts.owner;
-        if self.audio.as_ref().is_some_and(|a| self.remote_audio(a)) {
+        if self.audio.as_ref().is_some_and(|a| self.remote_took(a)) {
             self.last_owner_linux = false;
         }
         if self.owner.as_deref() == Some(&[1]) {
@@ -1009,10 +1027,13 @@ impl Handoff {
         self.connect_mode == ConnectMode::Automatically || self.last_owner_linux
     }
 
-    /// Another host plays media or is in a call: it has the AirPods.
-    fn remote_audio(&self, source: &AudioSource) -> bool {
+    /// Another host plays media or is in a call: it has the AirPods, unless a
+    /// local call holds them (it then refuses the request that follows).
+    fn remote_took(&self, source: &AudioSource) -> bool {
         use crate::bluetooth::aacp::AudioSourceType::{Call, Media};
-        source.mac != self.local && matches!(source.r#type, Media | Call)
+        source.mac != self.local
+            && matches!(source.r#type, Media | Call)
+            && !(self.local_call && self.requested_take)
     }
 
     fn decide_take(&self, trigger: TakeoverTrigger) -> TakeoverDecision {
@@ -3020,14 +3041,24 @@ mod tests {
 
     #[test]
     fn when_last_connected_refused_remote_request_keeps_last_owner() {
-        // A local call refuses the request: Linux keeps the AirPods.
+        // A local call refuses the request: Linux keeps the AirPods. As in
+        // `local_call_refuses_remote_request`, the iPhone's media comes
+        // first.
         let mut p = last_owner_take();
         assert_eq!(p.feed(1100, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(
+            p.feed(
+                1150,
+                Input::AudioSource(source(REMOTE, AudioSourceType::Media))
+            ),
+            []
+        );
         assert_eq!(p.feed(1200, Input::RemoteOwnershipRequest), []);
         assert_eq!(
             p.feed(1300, Input::LocalCall(false)),
             [AdvertiseCall(false)]
         );
+        assert_eq!(p.feed(1350, Input::AudioSource(idle())), []);
         assert_eq!(p.play(1500, false), [SendOwnership(false)]);
         assert_eq!(p.feed(1600, Input::Ownership(vec![0])), []);
         assert_eq!(p.play(2000, true), [SendOwnership(true)]);
@@ -3121,5 +3152,82 @@ mod tests {
         assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
         assert_eq!(skips(&mut p), 0);
         assert_eq!(p.feed(200, Input::Ownership(vec![1])), []);
+    }
+
+    #[test]
+    fn when_last_connected_late_take_ack_after_remote_request_skips() {
+        // A take's ACK [1] arrives after Linux yielded to a remote request;
+        // the [0] that acknowledges the remote release still clears it.
+        let mut p = ready_in(WhenLastConnected);
+        assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
+        assert_eq!(
+            p.feed(200, Input::RemoteOwnershipRequest),
+            [PauseMedia, SendOwnership(false)]
+        );
+        assert_eq!(p.feed(300, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(400, Input::Ownership(vec![0])), []);
+        p.core.take_lines();
+        assert_eq!(p.play(1000, true), []);
+        assert_eq!(skips(&mut p), 1);
+    }
+
+    #[test]
+    fn when_last_connected_late_remote_release_ack_skips() {
+        // The same, with the remote release's [0] after its timeout (#55).
+        let mut p = last_owner_take();
+        assert_eq!(
+            p.feed(1100, Input::RemoteOwnershipRequest),
+            [PauseMedia, SendOwnership(false)]
+        );
+        assert_eq!(p.feed(1150, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1500, false), []);
+        assert_eq!(p.feed(6200, Input::Tick), []);
+        assert_eq!(p.feed(6300, Input::Ownership(vec![0])), []);
+        assert_eq!(
+            count_lines(&p.core.take_lines(), "ACK owner=not-linux late"),
+            1
+        );
+        assert_eq!(p.play(7000, true), []);
+        assert_eq!(skips(&mut p), 1);
+    }
+
+    #[test]
+    fn when_last_connected_unsolicited_loss_skips() {
+        // Owner [1] without a Linux take, then [0]: another host took them.
+        let mut p = ready_in(WhenLastConnected);
+        assert_eq!(p.feed(20, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(30, Input::Ownership(vec![0])), []);
+        p.core.take_lines();
+        assert_eq!(p.play(500, true), []);
+        assert_eq!(skips(&mut p), 1);
+
+        // A repeated [0] after Linux's own release leaves it the last owner.
+        let mut p = last_owner_take();
+        assert_eq!(p.play(1100, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(1300, Input::Ownership(vec![0])), []);
+        assert_eq!(p.play(1500, true), [SendOwnership(true)]);
+        assert_eq!(skips(&mut p), 0);
+    }
+
+    #[test]
+    fn when_last_connected_seeded_last_owner_takes() {
+        // A new core for the same AirPods (the shell's per-MAC store, #16)
+        // with seed facts saying owner [0] and no remote audio.
+        for (seeded, playback) in [(true, vec![SendOwnership(true)]), (false, vec![])] {
+            let t0 = Instant::now();
+            let mut p = Probe {
+                core: Handoff::new(LOCAL.to_string(), t0, true, true)
+                    .with_connect_mode(WhenLastConnected)
+                    .with_last_owner_linux(seeded),
+                t0,
+            };
+            p.routing(ready_facts());
+            assert_eq!(p.play(10, false), []);
+            p.core.take_lines();
+            assert_eq!(p.play(500, true), playback, "seeded={seeded}");
+            assert_eq!(skips(&mut p), usize::from(!seeded), "seeded={seeded}");
+            assert_eq!(p.core.last_owner_linux(), seeded);
+        }
     }
 }

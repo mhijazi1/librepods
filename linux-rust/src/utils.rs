@@ -222,15 +222,18 @@ pub fn connect_mode_from_value(preferences: Option<&serde_json::Value>, mac: &st
     else {
         return ConnectMode::default();
     };
-    if value.is_null() {
-        return ConnectMode::default();
+    // Match the strings: serde would also take {"when_last_connected": null}.
+    match value.as_str() {
+        Some("automatically") => ConnectMode::Automatically,
+        Some("when_last_connected") => ConnectMode::WhenLastConnected,
+        _ if value.is_null() => ConnectMode::default(),
+        _ => {
+            log::warn!(
+                "Unknown connectMode preference {value} for {mac}; expected \"automatically\" or \"when_last_connected\". Using automatically."
+            );
+            ConnectMode::default()
+        }
     }
-    serde_json::from_value(value.clone()).unwrap_or_else(|_| {
-        log::warn!(
-            "Unknown connectMode preference {value} for {mac}; expected \"automatically\" or \"when_last_connected\". Using automatically."
-        );
-        ConnectMode::default()
-    })
 }
 
 /// Extracts a device's `connectMode` from the preferences JSON (see
@@ -620,6 +623,8 @@ mod tests {
             r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":3}}"#,
             r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":true}}"#,
             r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":["when_last_connected"]}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":{"when_last_connected":null}}}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":{"automatically":null}}}"#,
         ] {
             assert_eq!(
                 parse_connect_mode(prefs, MAC),

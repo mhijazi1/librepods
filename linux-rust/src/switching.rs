@@ -288,6 +288,22 @@ static HANDOFF_TASKS: LazyLock<StdMutex<HashMap<String, HandoffTask>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
+// Whether Linux was the last owner of each AirPods MAC (#16). Outlives the
+// handoff task, which a reconnect replaces; forgotten when the app quits.
+static LAST_OWNER_LINUX: LazyLock<StdMutex<HashMap<String, bool>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn last_owner_linux(mac: &str) -> bool {
+    LAST_OWNER_LINUX.lock().unwrap().get(mac) == Some(&true)
+}
+
+fn remember_last_owner_linux(mac: &str, value: bool) {
+    LAST_OWNER_LINUX
+        .lock()
+        .unwrap()
+        .insert(mac.to_string(), value);
+}
+
 /// Stop the handoff task of this AirPods MAC, if one runs.
 pub(crate) fn stop_handoff_task(mac: &str) {
     if let Some(task) = HANDOFF_TASKS.lock().unwrap().remove(mac) {
@@ -444,6 +460,7 @@ impl Shell {
 /// when the task should end.
 async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     let commands = core.handle(Instant::now(), input);
+    remember_last_owner_linux(&shell.mac, core.last_owner_linux());
     for line in core.take_lines() {
         info!("Handoff {}: {line}", shell.mac);
         if let Some(sink) = &shell.lines {
@@ -524,7 +541,8 @@ async fn run_handoff(mut shell: Shell) {
         (session_facts(&state), backlog)
     };
     let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true)
-        .with_connect_mode(shell.connect_mode);
+        .with_connect_mode(shell.connect_mode)
+        .with_last_owner_linux(last_owner_linux(&shell.mac));
     for input in seed_inputs(facts) {
         if step(&mut core, &mut shell, input).await {
             return;
@@ -2862,5 +2880,18 @@ mod tests {
             }
             assert_eq!(p.takes(), [vec![SendOwnership(true)]]);
         }
+    }
+
+    #[test]
+    fn last_owner_store_is_per_mac() {
+        // MACs no other test uses: the store is process-wide.
+        const A: &str = "16:16:16:16:16:0A";
+        const B: &str = "16:16:16:16:16:0B";
+        assert!(!last_owner_linux(A));
+        remember_last_owner_linux(A, true);
+        assert!(last_owner_linux(A));
+        assert!(!last_owner_linux(B));
+        remember_last_owner_linux(A, false);
+        assert!(!last_owner_linux(A));
     }
 }
