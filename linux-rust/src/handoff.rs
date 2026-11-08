@@ -2362,7 +2362,7 @@ mod tests {
         assert_eq!(
             all,
             [
-                vec![ConnectA2dp, SendOwnership(false), Announce],
+                vec![ConnectA2dp, SendOwnership(false), Announce, DrainPlayback],
                 vec![],
                 vec![],
                 vec![],
