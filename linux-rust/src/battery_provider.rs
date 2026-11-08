@@ -158,7 +158,10 @@ pub fn battery1_read_from_error(name: &str, message: &str) -> Result<Battery1Rea
 pub fn battery1_read_from_value(value: &dyn RefArg) -> Result<Battery1Read, String> {
     match (value.arg_type(), value.as_str()) {
         (ArgType::String, Some(s)) => Ok(Battery1Read::Source(s.to_string())),
-        _ => Err(format!("Battery1.Source is not a string (type {})", value.signature())),
+        _ => Err(format!(
+            "Battery1.Source is not a string (type {})",
+            value.signature()
+        )),
     }
 }
 
@@ -260,9 +263,7 @@ impl<S: BatterySink> BatteryExporter<S> {
     /// line through the line sink; ours resolves silently; an absent
     /// Battery1 or a read error leaves it unresolved for the next update.
     fn resolve_owner(&mut self) {
-        if self.owner_resolved
-            || self.state != ExporterState::Registered
-            || self.exported.is_none()
+        if self.owner_resolved || self.state != ExporterState::Registered || self.exported.is_none()
         {
             return;
         }
@@ -359,8 +360,9 @@ enum Command {
 
 /// How long `battery_source` waits for the provider thread's answer: the
 /// D-Bus call timeout plus one poll interval and a small margin.
-const READ_SOURCE_WAIT: Duration =
-    BLUEZ_CALL_TIMEOUT.saturating_add(POLL_INTERVAL).saturating_add(Duration::from_millis(400));
+const READ_SOURCE_WAIT: Duration = BLUEZ_CALL_TIMEOUT
+    .saturating_add(POLL_INTERVAL)
+    .saturating_add(Duration::from_millis(400));
 
 /// The real sink: serves one `org.bluez.BatteryProvider1` object under
 /// `PROVIDER_ROOT` on the system bus and registers it with the adapter's
@@ -466,7 +468,8 @@ struct ProviderObjects {
 
 impl ProviderObjects {
     fn new(adapter: &str, mac: &str) -> Result<Self, String> {
-        let path = |p: String| Path::new(p.clone()).map_err(|e| format!("invalid object path {p}: {e}"));
+        let path =
+            |p: String| Path::new(p.clone()).map_err(|e| format!("invalid object path {p}: {e}"));
         Ok(Self {
             root: path(PROVIDER_ROOT.to_string())?,
             battery: path(battery_object_path(mac))?,
@@ -481,7 +484,10 @@ impl ProviderObjects {
             "Device".into(),
             Variant(Box::new(self.device.clone()) as Box<dyn RefArg>),
         );
-        props.insert("Percentage".into(), Variant(Box::new(pct) as Box<dyn RefArg>));
+        props.insert(
+            "Percentage".into(),
+            Variant(Box::new(pct) as Box<dyn RefArg>),
+        );
         props.insert(
             "Source".into(),
             Variant(Box::new(PROVIDER_SOURCE.to_string()) as Box<dyn RefArg>),
@@ -502,15 +508,21 @@ impl ProviderObjects {
                 Some(old) if old == pct => Ok(None),
                 Some(_) => {
                     let mut changed = PropMap::new();
-                    changed.insert("Percentage".into(), Variant(Box::new(pct) as Box<dyn RefArg>));
+                    changed.insert(
+                        "Percentage".into(),
+                        Variant(Box::new(pct) as Box<dyn RefArg>),
+                    );
                     Message::new_signal(&*self.battery, PROPERTIES_IFACE, "PropertiesChanged")
                         .map(|m| Some(m.append3(PROVIDER_IFACE, changed, Vec::<String>::new())))
                 }
             },
             Command::Remove => match self.percentage.take() {
                 None => Ok(None),
-                Some(_) => Message::new_signal(&*self.root, OBJECT_MANAGER_IFACE, "InterfacesRemoved")
-                    .map(|m| Some(m.append2(self.battery.clone(), vec![PROVIDER_IFACE.to_string()]))),
+                Some(_) => {
+                    Message::new_signal(&*self.root, OBJECT_MANAGER_IFACE, "InterfacesRemoved").map(
+                        |m| Some(m.append2(self.battery.clone(), vec![PROVIDER_IFACE.to_string()])),
+                    )
+                }
             },
             // A read changes none of our objects; `ProviderThread` answers it.
             Command::ReadSource(_) => Ok(None),
@@ -554,9 +566,7 @@ impl ProviderObjects {
             }
             (PROPERTIES_IFACE, "Get") if on_battery => {
                 let value = match (call.read2::<&str, &str>(), self.percentage) {
-                    (Ok((PROVIDER_IFACE, name)), Some(pct)) => {
-                        self.properties(pct).remove(name)
-                    }
+                    (Ok((PROVIDER_IFACE, name)), Some(pct)) => self.properties(pct).remove(name),
                     _ => None,
                 };
                 Some(match value {
@@ -637,7 +647,10 @@ impl ProviderThread {
                      (BlueZ may need `Experimental = true` in the [General] section of main.conf)"
                 )
             })?;
-        debug!("Registered battery provider {} on {adapter_path}", PROVIDER_ROOT);
+        debug!(
+            "Registered battery provider {} on {adapter_path}",
+            PROVIDER_ROOT
+        );
         Ok(Self {
             conn,
             adapter_path,
@@ -692,7 +705,11 @@ impl ProviderThread {
     fn read_source(&self) -> Result<Battery1Read, String> {
         let result: Result<(Variant<Box<dyn RefArg>>,), dbus::Error> = self
             .conn
-            .with_proxy(BLUEZ_SERVICE, self.objects.device.clone(), BLUEZ_CALL_TIMEOUT)
+            .with_proxy(
+                BLUEZ_SERVICE,
+                self.objects.device.clone(),
+                BLUEZ_CALL_TIMEOUT,
+            )
             .method_call(PROPERTIES_IFACE, "Get", (BATTERY1_IFACE, "Source"));
         match result {
             Ok((value,)) => battery1_read_from_value(&*value.0),
@@ -752,25 +769,49 @@ mod tests {
 
     #[test]
     fn percentage_both_buds_worn_gives_minimum() {
-        assert_eq!(pct(&[b(Left, 80, NotCharging), b(Right, 60, NotCharging)]), Some(60));
-        assert_eq!(pct(&[b(Left, 30, NotCharging), b(Right, 90, NotCharging)]), Some(30));
+        assert_eq!(
+            pct(&[b(Left, 80, NotCharging), b(Right, 60, NotCharging)]),
+            Some(60)
+        );
+        assert_eq!(
+            pct(&[b(Left, 30, NotCharging), b(Right, 90, NotCharging)]),
+            Some(30)
+        );
         // Both charging (both in the case): still the lower one.
-        assert_eq!(pct(&[b(Left, 40, Charging), b(Right, 70, Charging)]), Some(40));
+        assert_eq!(
+            pct(&[b(Left, 40, Charging), b(Right, 70, Charging)]),
+            Some(40)
+        );
     }
 
     #[test]
     fn percentage_bud_in_case_gives_worn_bud() {
         // The worn bud wins even when it is the higher one.
-        assert_eq!(pct(&[b(Left, 20, Charging), b(Right, 70, NotCharging)]), Some(70));
-        assert_eq!(pct(&[b(Left, 85, NotCharging), b(Right, 10, Charging)]), Some(85));
+        assert_eq!(
+            pct(&[b(Left, 20, Charging), b(Right, 70, NotCharging)]),
+            Some(70)
+        );
+        assert_eq!(
+            pct(&[b(Left, 85, NotCharging), b(Right, 10, Charging)]),
+            Some(85)
+        );
         // And when it is the lower one.
-        assert_eq!(pct(&[b(Left, 90, Charging), b(Right, 50, NotCharging)]), Some(50));
+        assert_eq!(
+            pct(&[b(Left, 90, Charging), b(Right, 50, NotCharging)]),
+            Some(50)
+        );
     }
 
     #[test]
     fn percentage_one_bud_unknown_gives_other() {
-        assert_eq!(pct(&[b(Left, 10, Disconnected), b(Right, 55, NotCharging)]), Some(55));
-        assert_eq!(pct(&[b(Left, 45, Charging), b(Right, 5, Disconnected)]), Some(45));
+        assert_eq!(
+            pct(&[b(Left, 10, Disconnected), b(Right, 55, NotCharging)]),
+            Some(55)
+        );
+        assert_eq!(
+            pct(&[b(Left, 45, Charging), b(Right, 5, Disconnected)]),
+            Some(45)
+        );
         assert_eq!(pct(&[b(Right, 66, NotCharging)]), Some(66));
         assert_eq!(pct(&[b(Left, 77, Charging)]), Some(77));
     }
@@ -778,7 +819,10 @@ mod tests {
     #[test]
     fn percentage_nothing_known_gives_none() {
         assert_eq!(pct(&[]), None);
-        assert_eq!(pct(&[b(Left, 50, Disconnected), b(Right, 50, Disconnected)]), None);
+        assert_eq!(
+            pct(&[b(Left, 50, Disconnected), b(Right, 50, Disconnected)]),
+            None
+        );
         assert_eq!(pct(&[b(Case, 90, Charging)]), None);
         assert_eq!(pct(&[b(Headphone, 70, Disconnected)]), None);
     }
@@ -788,13 +832,20 @@ mod tests {
         assert_eq!(pct(&[b(Headphone, 42, NotCharging)]), Some(42));
         assert_eq!(pct(&[b(Headphone, 88, Charging)]), Some(88));
         // A known bud takes precedence over the headphone entry.
-        assert_eq!(pct(&[b(Headphone, 88, NotCharging), b(Left, 12, NotCharging)]), Some(12));
+        assert_eq!(
+            pct(&[b(Headphone, 88, NotCharging), b(Left, 12, NotCharging)]),
+            Some(12)
+        );
     }
 
     #[test]
     fn percentage_case_never_contributes() {
         let buds = [b(Left, 80, NotCharging), b(Right, 60, NotCharging)];
-        for case in [b(Case, 5, NotCharging), b(Case, 100, Charging), b(Case, 0, Charging)] {
+        for case in [
+            b(Case, 5, NotCharging),
+            b(Case, 100, Charging),
+            b(Case, 0, Charging),
+        ] {
             let mut with_case = buds.to_vec();
             with_case.push(case.clone());
             assert_eq!(pct(&with_case), Some(60), "{case:?}");
@@ -817,7 +868,10 @@ mod tests {
 
     #[test]
     fn percentage_clamped_to_100() {
-        assert_eq!(pct(&[b(Left, 150, NotCharging), b(Right, 120, NotCharging)]), Some(100));
+        assert_eq!(
+            pct(&[b(Left, 150, NotCharging), b(Right, 120, NotCharging)]),
+            Some(100)
+        );
         assert_eq!(pct(&[b(Headphone, 255, NotCharging)]), Some(100));
         assert_eq!(pct(&[b(Right, 100, NotCharging)]), Some(100));
     }
@@ -852,7 +906,11 @@ mod tests {
         }
         fn set(&mut self, pct: u8) -> Result<(), String> {
             self.calls.borrow_mut().push(Call::Set(pct));
-            if self.fail_set { Err("bus gone".into()) } else { Ok(()) }
+            if self.fail_set {
+                Err("bus gone".into())
+            } else {
+                Ok(())
+            }
         }
         fn remove(&mut self) -> Result<(), String> {
             self.calls.borrow_mut().push(Call::Remove);
@@ -869,7 +927,10 @@ mod tests {
     fn exporter(
         fail_register: bool,
         fail_set: bool,
-    ) -> (BatteryExporter<FakeSink>, std::rc::Rc<std::cell::RefCell<Vec<Call>>>) {
+    ) -> (
+        BatteryExporter<FakeSink>,
+        std::rc::Rc<std::cell::RefCell<Vec<Call>>>,
+    ) {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let sink = FakeSink {
             calls: calls.clone(),
@@ -893,7 +954,13 @@ mod tests {
         assert_eq!(ex.state(), ExporterState::Registered);
         assert_eq!(
             *calls.borrow(),
-            [Call::Register, Call::Set(60), Call::Set(50), Call::Remove, Call::Set(40)]
+            [
+                Call::Register,
+                Call::Set(60),
+                Call::Set(50),
+                Call::Remove,
+                Call::Set(40)
+            ]
         );
     }
 
@@ -911,14 +978,20 @@ mod tests {
         let (mut ex, calls) = exporter(false, false);
         ex.update(&[b(Headphone, 70, NotCharging)]);
         drop(ex);
-        assert_eq!(*calls.borrow(), [Call::Register, Call::Set(70), Call::Remove]);
+        assert_eq!(
+            *calls.borrow(),
+            [Call::Register, Call::Set(70), Call::Remove]
+        );
 
         // Nothing exported at drop time: no trailing remove.
         let (mut ex, calls) = exporter(false, false);
         ex.update(&[b(Headphone, 70, NotCharging)]);
         ex.update(&[b(Headphone, 70, Disconnected)]);
         drop(ex);
-        assert_eq!(*calls.borrow(), [Call::Register, Call::Set(70), Call::Remove]);
+        assert_eq!(
+            *calls.borrow(),
+            [Call::Register, Call::Set(70), Call::Remove]
+        );
     }
 
     #[test]
@@ -940,7 +1013,10 @@ mod tests {
         ex.update(&[b(Left, 80, NotCharging)]);
         assert_eq!(ex.state(), ExporterState::Registered);
         drop(ex);
-        assert_eq!(*calls.borrow(), [Call::Register, Call::Set(80), Call::Set(80)]);
+        assert_eq!(
+            *calls.borrow(),
+            [Call::Register, Call::Set(80), Call::Set(80)]
+        );
     }
 
     #[test]
@@ -948,10 +1024,16 @@ mod tests {
         let (ex, calls) = exporter(false, false);
         let shared = std::sync::Mutex::new(ex);
         // The connect seed (a report that arrived before the event channel).
-        export_battery(&shared, &[b(Left, 80, NotCharging), b(Right, 60, NotCharging)]);
+        export_battery(
+            &shared,
+            &[b(Left, 80, NotCharging), b(Right, 60, NotCharging)],
+        );
         // A later live event.
         export_battery(&shared, &[b(Right, 45, NotCharging)]);
-        assert_eq!(*calls.borrow(), [Call::Register, Call::Set(60), Call::Set(45)]);
+        assert_eq!(
+            *calls.borrow(),
+            [Call::Register, Call::Set(60), Call::Set(45)]
+        );
     }
 
     #[test]
@@ -991,7 +1073,10 @@ mod tests {
             "/org/bluez/hci1/dev_AA_BB_CC_DD_EE_0F"
         );
         let battery = battery_object_path("AA:BB:CC:DD:EE:FF");
-        assert!(battery.starts_with(&format!("{PROVIDER_ROOT}/")), "{battery}");
+        assert!(
+            battery.starts_with(&format!("{PROVIDER_ROOT}/")),
+            "{battery}"
+        );
         assert_eq!(battery, "/org/librepods/battery/dev_AA_BB_CC_DD_EE_FF");
         assert!(Path::new(battery).is_ok());
         assert!(ProviderObjects::new("hci0", "AA:BB:CC:DD:EE:FF").is_ok());
@@ -1013,7 +1098,9 @@ mod tests {
     }
 
     fn signal(objects: &mut ProviderObjects, command: Command) -> Result<Message, String> {
-        objects.apply(command)?.ok_or_else(|| "no signal".to_string())
+        objects
+            .apply(command)?
+            .ok_or_else(|| "no signal".to_string())
     }
 
     #[test]
@@ -1054,8 +1141,12 @@ mod tests {
         let reply = objects.reply(&elsewhere);
         assert_eq!(reply.map(|r| r.msg_type()), Some(MessageType::Error));
         // The battery object is only served while a percentage is exported.
-        let get_all = call(&battery_object_path("AA:BB:CC:DD:EE:FF"), PROPERTIES_IFACE, "GetAll")?
-            .append1(PROVIDER_IFACE);
+        let get_all = call(
+            &battery_object_path("AA:BB:CC:DD:EE:FF"),
+            PROPERTIES_IFACE,
+            "GetAll",
+        )?
+        .append1(PROVIDER_IFACE);
         let reply = objects.reply(&get_all);
         assert_eq!(reply.map(|r| r.msg_type()), Some(MessageType::Error));
         Ok(())
@@ -1078,11 +1169,17 @@ mod tests {
     #[test]
     fn owner_foreign_source_carries_it() {
         let read = Battery1Read::Source("HFP".to_string());
-        assert_eq!(battery_owner(&read), BatteryOwner::Foreign("HFP".to_string()));
+        assert_eq!(
+            battery_owner(&read),
+            BatteryOwner::Foreign("HFP".to_string())
+        );
         // Exact match only.
         for other in ["librepods", "LibrePods ", ""] {
             let read = Battery1Read::Source(other.to_string());
-            assert_eq!(battery_owner(&read), BatteryOwner::Foreign(other.to_string()));
+            assert_eq!(
+                battery_owner(&read),
+                BatteryOwner::Foreign(other.to_string())
+            );
         }
     }
 
@@ -1109,12 +1206,29 @@ mod tests {
         );
         // Standard names.
         for name in ["UnknownObject", "UnknownInterface", "UnknownMethod"] {
-            assert_eq!(battery1_read_from_error(&e(name), "whatever"), Ok(Absent), "{name}");
+            assert_eq!(
+                battery1_read_from_error(&e(name), "whatever"),
+                Ok(Absent),
+                "{name}"
+            );
         }
-        assert_eq!(battery1_read_from_error(&e("UnknownProperty"), ""), Ok(NoSource));
+        assert_eq!(
+            battery1_read_from_error(&e("UnknownProperty"), ""),
+            Ok(NoSource)
+        );
         // Everything else is an error, retried later.
-        for name in ["InvalidArgs", "NoReply", "Timeout", "ServiceUnknown", "Failed", "AccessDenied"] {
-            assert!(battery1_read_from_error(&e(name), "Something else").is_err(), "{name}");
+        for name in [
+            "InvalidArgs",
+            "NoReply",
+            "Timeout",
+            "ServiceUnknown",
+            "Failed",
+            "AccessDenied",
+        ] {
+            assert!(
+                battery1_read_from_error(&e(name), "Something else").is_err(),
+                "{name}"
+            );
         }
         assert!(battery1_read_from_error("org.bluez.Error.Failed", "No such property").is_err());
         assert!(battery1_read_from_error("", "").is_err());
@@ -1123,7 +1237,10 @@ mod tests {
     #[test]
     fn owner_read_maps_values() {
         let s: Box<dyn RefArg> = Box::new("HFP".to_string());
-        assert_eq!(battery1_read_from_value(&*s), Ok(Battery1Read::Source("HFP".to_string())));
+        assert_eq!(
+            battery1_read_from_value(&*s),
+            Ok(Battery1Read::Source("HFP".to_string()))
+        );
         let n: Box<dyn RefArg> = Box::new(42u8);
         assert!(battery1_read_from_value(&*n).is_err());
         let o: Box<dyn RefArg> = Box::new(Path::from("/org/bluez"));
@@ -1156,7 +1273,8 @@ mod tests {
             reads: reads.clone(),
         };
         let recorder = lines.clone();
-        let log: LineSink = Box::new(move |line: &str| recorder.lock().unwrap().push(line.to_string()));
+        let log: LineSink =
+            Box::new(move |line: &str| recorder.lock().unwrap().push(line.to_string()));
         Owned {
             ex: BatteryExporter::with_log(sink, log),
             calls,
@@ -1190,7 +1308,11 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("\"HFP\""), "{}", lines[0]);
         assert!(lines[0].contains("not shown"), "{}", lines[0]);
-        assert!(lines[0].contains("Desktop battery (BlueZ BatteryProvider)"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("Desktop battery (BlueZ BatteryProvider)"),
+            "{}",
+            lines[0]
+        );
         assert_eq!(
             *o.calls.borrow(),
             [Call::Register, Call::Set(80), Call::Set(70), Call::Set(60)]
@@ -1210,13 +1332,20 @@ mod tests {
 
     #[test]
     fn exporter_owner_read_error_retries_without_logging() {
-        let mut o = owned(vec![Err("NoReply".into()), Err("Timeout".into()), src("HFP")]);
+        let mut o = owned(vec![
+            Err("NoReply".into()),
+            Err("Timeout".into()),
+            src("HFP"),
+        ]);
         o.ex.update(&[b(Left, 80, NotCharging)]);
         assert_eq!(o.reads.get(), 1);
         o.ex.update(&[b(Left, 70, NotCharging)]);
         assert_eq!(o.reads.get(), 2);
         assert!(o.lines.lock().unwrap().is_empty());
-        assert_eq!(*o.calls.borrow(), [Call::Register, Call::Set(80), Call::Set(70)]);
+        assert_eq!(
+            *o.calls.borrow(),
+            [Call::Register, Call::Set(80), Call::Set(70)]
+        );
         assert_eq!(o.ex.state(), ExporterState::Registered);
         // The next update reads again and resolves.
         o.ex.update(&[b(Left, 60, NotCharging)]);
@@ -1285,7 +1414,13 @@ mod tests {
         assert!(lines[0].contains(NO_SOURCE), "{}", lines[0]);
         assert_eq!(
             *o.calls.borrow(),
-            [Call::Register, Call::Set(80), Call::Remove, Call::Set(60), Call::Set(50)]
+            [
+                Call::Register,
+                Call::Set(80),
+                Call::Remove,
+                Call::Set(60),
+                Call::Set(50)
+            ]
         );
     }
 

@@ -3,12 +3,12 @@ use crate::bluetooth::aacp::{
 };
 use crate::handoff::{Command, Handoff, Input};
 use crate::handoff_log;
-use crate::switching::{
-    advertise_call, announce, event_input, session_facts, spawn_playback_poller,
-};
 use crate::media_controller::{
     CaseRecovery, MediaController, TakeoverAction, TakeoverInputs, TakeoverTrigger,
     decide_takeover, routing_snapshot_of,
+};
+use crate::switching::{
+    advertise_call, announce, event_input, session_facts, spawn_playback_poller,
 };
 use bluer::Address;
 use std::time::{Duration, Instant};
@@ -702,7 +702,11 @@ mod tests {
 
     #[test]
     fn cli_handoff_report_parses() {
-        assert!(cli_parse(&["librepods", "--handoff-report"]).unwrap().handoff_report);
+        assert!(
+            cli_parse(&["librepods", "--handoff-report"])
+                .unwrap()
+                .handoff_report
+        );
         assert!(!cli_parse(&["librepods"]).unwrap().handoff_report);
     }
 
