@@ -560,7 +560,7 @@ impl Handoff {
                 self.automatic = true;
                 self.announce(out);
                 // A still-held stop release (#205) fires only if a stopped
-                // sample follows this baseline before the hold ends (#253, #255).
+                // sample follows this baseline before the hold ends (#253).
                 self.reset_baseline(now);
                 out.push(Command::DrainPlayback);
                 self.say("AUTO enabled; waiting for a new playback start after the baseline");
