@@ -124,7 +124,7 @@ impl AirPodsDevice {
             local_mac.clone(),
         )));
         let mc_clone = media_controller.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
 
         aacp_manager.set_event_channel(tx).await;
@@ -233,9 +233,13 @@ impl AirPodsDevice {
         });
 
         let ui_tx_clone = ui_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                switching.on_event(&event).await;
+        // The switching mode gets every event first, independently of these
+        // handlers (switching.rs).
+        switching.dispatch_events(rx, move |event: AACPEvent| {
+            let mc_clone = mc_clone.clone();
+            let tray_handle = tray_handle.clone();
+            let ui_tx_clone = ui_tx_clone.clone();
+            async move {
                 let event_clone = event.clone();
                 match event {
                     AACPEvent::EarDetection(old_status, new_status) => {
@@ -302,7 +306,7 @@ impl AirPodsDevice {
                         let controller = mc_clone.lock().await;
                         controller.handle_conversational_awareness(status).await;
                     }
-                    // Ownership and announcements: `switching.on_event` above.
+                    // Ownership and announcements: the switching mode.
                     AACPEvent::ConnectedDevices(..) | AACPEvent::OwnershipToFalseRequest => {}
                     AACPEvent::StemPress(press_type, bud_type) => {
                         use crate::bluetooth::aacp::StemPressType;

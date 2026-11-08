@@ -14,6 +14,13 @@
 //! The app lifecycle (main.rs, BlueZ, le.rs auto-connect) owns reconnection:
 //! when the control session dies the handoff task ends, and the replacement
 //! `AirPodsDevice` starts a new one.
+//!
+//! `Switching::dispatch_events` is the device's AACP event dispatch: a
+//! router that never awaits anything but the next event hands each event to
+//! the switching mode first, then to the device's handlers (ear detection,
+//! conversational awareness, stem press, tray, UI) in their own task. A slow
+//! handler therefore never holds up ownership answers, and on session loss
+//! the handoff task can still drain every event the manager emitted.
 
 use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers,
@@ -25,10 +32,11 @@ use crate::utils::SwitchingMode;
 use futures::future::BoxFuture;
 use log::{error, info};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 /// How often the handoff task ticks the core (ACK timeouts) and checks that
@@ -38,6 +46,11 @@ pub(crate) const TICK: Duration = Duration::from_millis(200);
 pub(crate) const PLAYBACK_POLL: Duration = Duration::from_millis(500);
 
 type ControlTx = mpsc::UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>;
+type Events = mpsc::UnboundedReceiver<AACPEvent>;
+type EventTx = mpsc::UnboundedSender<AACPEvent>;
+/// A request to the event router to forward everything still in the primary
+/// queue; answered once it has.
+type FlushRequest = oneshot::Sender<()>;
 /// Playback samples: whether any local player was playing at the instant.
 pub(crate) type PlaybackSamples = mpsc::Receiver<(Instant, bool)>;
 
@@ -238,11 +251,24 @@ struct Shell {
     local: String,
     manager: AACPManager,
     media: Arc<dyn MediaActions>,
-    events: mpsc::UnboundedReceiver<AACPEvent>,
+    /// The switching side of the event router's fan-out.
+    events: Events,
+    /// Asks the router to forward what is left in the primary queue.
+    flush: mpsc::UnboundedSender<FlushRequest>,
     play_rx: PlaybackSamples,
 }
 
 impl Shell {
+    /// Wait until the router has forwarded every event still in the primary
+    /// AACP queue to `events`. Returns at once if the router has ended (the
+    /// primary queue closed after it forwarded everything).
+    async fn flush(&self) {
+        let (done, flushed) = oneshot::channel();
+        if self.flush.send(done).is_ok() {
+            let _ = flushed.await;
+        }
+    }
+
     /// Execute the core's commands in order. True when the task should end.
     /// No AACP or MediaController guard is held here; the sends and media
     /// actions take their own.
@@ -302,6 +328,8 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     let commands = core.handle(Instant::now(), input);
     for line in core.take_lines() {
         info!("Handoff {}: {line}", shell.mac);
+        #[cfg(test)]
+        tests::trace(&shell.mac, line);
     }
     shell.execute(commands).await
 }
@@ -322,8 +350,8 @@ async fn mark_session_lost(core: &mut Handoff, shell: &mut Shell) -> bool {
     false
 }
 
-/// Once the session is gone: SessionLost, the events still queued, then
-/// Disconnected (which ends the task).
+/// Once the session is gone: SessionLost, every event the manager emitted
+/// before it cleared the session, then Disconnected (which ends the task).
 async fn sync_session(core: &mut Handoff, shell: &mut Shell) -> bool {
     if !core.connected() || session_alive(&shell.manager).await {
         return false;
@@ -331,6 +359,9 @@ async fn sync_session(core: &mut Handoff, shell: &mut Shell) -> bool {
     if step(core, shell, Input::SessionLost).await {
         return true;
     }
+    // The manager emits under the state lock that cleared the sender, so
+    // those events are all in the primary queue or already forwarded here.
+    shell.flush().await;
     while let Ok(event) = shell.events.try_recv() {
         if on_event(core, shell, event).await {
             return true;
@@ -405,20 +436,36 @@ pub(crate) struct SwitchingSetup {
     pub(crate) command_tx: ControlTx,
 }
 
-/// One device's switching policy. `AirPodsDevice` starts it once and passes
-/// every AACP event to `on_event`.
+/// One device's switching policy. `AirPodsDevice` starts it once, then hands
+/// it the device's AACP event stream with `dispatch_events`.
 pub(crate) struct Switching {
-    mode: SwitchingMode,
+    airpods_mac: String,
+    policy: Policy,
+}
+
+enum Policy {
+    /// The handoff task's inputs; it starts with the event stream.
+    Handoff {
+        local: String,
+        manager: AACPManager,
+        media: Arc<dyn MediaActions>,
+        play_rx: PlaybackSamples,
+    },
+    Legacy(Legacy),
+    Off,
+}
+
+/// What the legacy ConnectedDevices / OwnershipToFalseRequest reactions use.
+struct Legacy {
     local_mac: String,
     manager: AACPManager,
     media_controller: Arc<Mutex<MediaController>>,
     command_tx: ControlTx,
-    handoff_events: Option<mpsc::UnboundedSender<AACPEvent>>,
 }
 
 impl Switching {
     /// Start the selected mode. `media` and `playback` are used only by the
-    /// handoff mode; `playback` is called only when the handoff task starts.
+    /// handoff mode; `playback` is called only in that mode.
     pub(crate) async fn start(
         setup: SwitchingSetup,
         media: Arc<dyn MediaActions>,
@@ -433,39 +480,93 @@ impl Switching {
             command_tx,
         } = setup;
         info!("Switching mode for {airpods_mac}: {mode:?}");
-        let mut handoff_events = None;
-        match mode {
+        let policy = match mode {
             SwitchingMode::Handoff => {
                 media_controller::stop_playback_listener(&airpods_mac);
-                let (events_tx, events) = mpsc::unbounded_channel();
-                handoff_events = Some(events_tx);
-                let shell = Shell {
-                    mac: airpods_mac.clone(),
-                    local: local_mac.clone(),
-                    manager: manager.clone(),
+                Policy::Handoff {
+                    local: local_mac,
+                    manager,
                     media,
-                    events,
                     play_rx: playback(),
-                };
-                spawn_handoff_task(airpods_mac, shell);
+                }
             }
             SwitchingMode::Legacy => {
                 stop_handoff_task(&airpods_mac);
                 Self::start_legacy(&manager, &media_controller, &command_tx).await;
+                Policy::Legacy(Legacy {
+                    local_mac,
+                    manager,
+                    media_controller,
+                    command_tx,
+                })
             }
             SwitchingMode::Off => {
                 stop_handoff_task(&airpods_mac);
                 media_controller::stop_playback_listener(&airpods_mac);
+                Policy::Off
             }
-        }
+        };
         Switching {
-            mode,
-            local_mac,
-            manager,
-            media_controller,
-            command_tx,
-            handoff_events,
+            airpods_mac,
+            policy,
         }
+    }
+
+    /// The device's AACP event dispatch, used by `AirPodsDevice::new`.
+    /// `events` is the receiver of the channel given to
+    /// `AACPManager::set_event_channel`. A router task hands every event to
+    /// the switching mode first (the handoff task's queue, or the legacy
+    /// reactions' task), then to `handle`: the device's ear detection,
+    /// conversational awareness, stem press, tray and UI handling, which runs
+    /// in its own task and sees every event once, in order. The router only
+    /// sends on unbounded channels, so a slow `handle` (an A2DP activation
+    /// behind the MediaController lock) never holds up the switching mode,
+    /// and when the handoff task finds the session dead it can have the
+    /// router forward whatever the manager emitted before (DECISIONS #8).
+    pub(crate) fn dispatch_events<H, F>(self, events: Events, mut handle: H)
+    where
+        H: FnMut(AACPEvent) -> F + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (handlers, mut handler_events) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = handler_events.recv().await {
+                handle(event).await;
+            }
+        });
+        let (switching, flush) = match self.policy {
+            Policy::Handoff {
+                local,
+                manager,
+                media,
+                play_rx,
+            } => {
+                let (events_tx, handoff_events) = mpsc::unbounded_channel();
+                let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+                let shell = Shell {
+                    mac: self.airpods_mac.clone(),
+                    local,
+                    manager,
+                    media,
+                    events: handoff_events,
+                    flush: flush_tx,
+                    play_rx,
+                };
+                spawn_handoff_task(self.airpods_mac, shell);
+                (Some(events_tx), Some(flush_rx))
+            }
+            Policy::Legacy(legacy) => {
+                let (events_tx, mut legacy_events) = mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    while let Some(event) = legacy_events.recv().await {
+                        legacy.legacy_event(&event).await;
+                    }
+                });
+                (Some(events_tx), None)
+            }
+            Policy::Off => (None, None),
+        };
+        tokio::spawn(route_events(events, switching, handlers, flush));
     }
 
     /// The legacy playback listener and OwnsConnection reaction, moved from
@@ -503,20 +604,56 @@ impl Switching {
         });
     }
 
-    /// Hand one AACP event to the mode: the handoff task's queue, the legacy
-    /// ConnectedDevices / OwnershipToFalseRequest reactions, or nothing.
-    pub(crate) async fn on_event(&self, event: &AACPEvent) {
-        match self.mode {
-            SwitchingMode::Handoff => {
-                if let Some(events) = &self.handoff_events {
-                    let _ = events.send(event.clone());
+}
+
+/// Forward each AACP event to the switching mode, if it takes events, then
+/// to the device handlers. The router only sends on unbounded channels, so it
+/// is always ready for the next event and for a flush request, which the
+/// handoff task makes once it finds the session dead.
+async fn route_events(
+    mut events: Events,
+    switching: Option<EventTx>,
+    handlers: EventTx,
+    mut flush: Option<mpsc::UnboundedReceiver<FlushRequest>>,
+) {
+    let forward = |event: AACPEvent| {
+        if let Some(switching) = &switching {
+            let _ = switching.send(event.clone());
+        }
+        let _ = handlers.send(event);
+    };
+    loop {
+        tokio::select! {
+            biased;
+            request = flush_request(&mut flush) => match request {
+                Some(done) => {
+                    while let Ok(event) = events.try_recv() {
+                        forward(event);
+                    }
+                    let _ = done.send(());
                 }
-            }
-            SwitchingMode::Legacy => self.legacy_event(event).await,
-            SwitchingMode::Off => {}
+                // The handoff task ended.
+                None => flush = None,
+            },
+            event = events.recv() => match event {
+                Some(event) => forward(event),
+                None => break,
+            },
         }
     }
+}
 
+/// The next flush request; never resolves once there can be none.
+async fn flush_request(
+    flush: &mut Option<mpsc::UnboundedReceiver<FlushRequest>>,
+) -> Option<FlushRequest> {
+    match flush {
+        Some(requests) => requests.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+impl Legacy {
     /// The legacy reactions, moved from AirPodsDevice::new's event loop
     /// unchanged.
     async fn legacy_event(&self, event: &AACPEvent) {
@@ -585,6 +722,7 @@ mod tests {
         AudioSource, AudioSourceType, ConnectedDevice, ControlCommandStatus, EarDetectionStatus,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use tokio::sync::Notify;
 
     const LOCAL: &str = "01:02:03:04:05:06";
     const REMOTE: &str = "07:08:09:0A:0B:0C";
@@ -592,6 +730,31 @@ mod tests {
     /// Long enough for several ticks: anything the task would still send has
     /// been sent by then.
     const SETTLE: Duration = Duration::from_millis(600);
+
+    /// Per AirPods MAC: the core's lines and the media actions the shell
+    /// executed, in order.
+    static TRACES: LazyLock<StdMutex<HashMap<String, Vec<String>>>> =
+        LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+    pub(super) fn trace(mac: &str, entry: String) {
+        TRACES
+            .lock()
+            .unwrap()
+            .entry(mac.to_string())
+            .or_default()
+            .push(entry);
+    }
+
+    fn traced(mac: &str) -> Vec<String> {
+        TRACES.lock().unwrap().get(mac).cloned().unwrap_or_default()
+    }
+
+    fn position(trace: &[String], prefix: &str) -> usize {
+        trace
+            .iter()
+            .position(|entry| entry.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} in {trace:#?}"))
+    }
 
     #[derive(Default)]
     struct Records {
@@ -601,18 +764,64 @@ mod tests {
 
     /// Records the media actions instead of touching D-Bus or PipeWire. The
     /// record is made when the shell asks, before the future runs.
-    struct FakeMedia(Arc<Records>);
+    struct FakeMedia {
+        records: Arc<Records>,
+        mac: String,
+    }
 
     impl MediaActions for FakeMedia {
         fn pause(&self) -> BoxFuture<'static, ()> {
-            self.0.pauses.fetch_add(1, Ordering::SeqCst);
+            self.records.pauses.fetch_add(1, Ordering::SeqCst);
+            trace(&self.mac, "PauseMedia".to_string());
             Box::pin(async {})
         }
 
         fn activate_a2dp(&self) -> BoxFuture<'static, ()> {
-            self.0.activations.fetch_add(1, Ordering::SeqCst);
+            self.records.activations.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }
+    }
+
+    /// Stands in for the device's ear/CA/stem/tray/UI handler. Records each
+    /// event it starts and finishes (in Debug form); with `block_ear` it
+    /// waits on the first EarDetection until `release`, like ear detection
+    /// stuck behind an A2DP activation.
+    #[derive(Default)]
+    struct DeviceHandler {
+        started: StdMutex<Vec<String>>,
+        finished: StdMutex<Vec<String>>,
+        block_ear: AtomicBool,
+        release: Notify,
+    }
+
+    impl DeviceHandler {
+        fn started(&self) -> Vec<String> {
+            self.started.lock().unwrap().clone()
+        }
+
+        fn finished(&self) -> Vec<String> {
+            self.finished.lock().unwrap().clone()
+        }
+
+        fn handle(self: Arc<Self>) -> impl FnMut(AACPEvent) -> BoxFuture<'static, ()> + Send {
+            move |event| {
+                let handler = self.clone();
+                Box::pin(async move {
+                    let name = format!("{event:?}");
+                    handler.started.lock().unwrap().push(name.clone());
+                    if matches!(event, AACPEvent::EarDetection(..))
+                        && handler.block_ear.swap(false, Ordering::SeqCst)
+                    {
+                        handler.release.notified().await;
+                    }
+                    handler.finished.lock().unwrap().push(name);
+                })
+            }
+        }
+    }
+
+    fn named(events: &[AACPEvent]) -> Vec<String> {
+        events.iter().map(|e| format!("{e:?}")).collect()
     }
 
     fn host(mac: &str) -> ConnectedDevice {
@@ -629,6 +838,11 @@ mod tests {
             identifier: Control::OwnsConnection,
             value: vec![value],
         })
+    }
+
+    /// Both buds go from in ear to `status`.
+    fn wear(status: EarDetectionStatus) -> AACPEvent {
+        AACPEvent::EarDetection(vec![EarDetectionStatus::InEar; 2], vec![status; 2])
     }
 
     /// A manager with an injected send channel (DECISIONS #2).
@@ -722,15 +936,29 @@ mod tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
     }
 
+    /// A device's switching wired as AirPodsDevice::new wires it: started,
+    /// then fed through `dispatch_events` from the manager's event channel.
     struct Harness {
-        switching: Switching,
         records: Arc<Records>,
         play_tx: mpsc::Sender<(Instant, bool)>,
         playback_started: Arc<AtomicBool>,
+        /// The sender given to `set_event_channel`.
+        events: EventTx,
+        handler: Arc<DeviceHandler>,
     }
 
     impl Harness {
         async fn start(mode: SwitchingMode, mac: &str, manager: &AACPManager) -> Self {
+            Self::start_with(mode, mac, manager, false).await
+        }
+
+        /// `block_ear`: the device handler blocks on the first EarDetection.
+        async fn start_with(
+            mode: SwitchingMode,
+            mac: &str,
+            manager: &AACPManager,
+            block_ear: bool,
+        ) -> Self {
             let records = Arc::new(Records::default());
             let (play_tx, play_rx) = mpsc::channel(8);
             let playback_started = Arc::new(AtomicBool::new(false));
@@ -745,6 +973,8 @@ mod tests {
                     let _ = forward.send_control_command(id, &value).await;
                 }
             });
+            let (events, events_rx) = mpsc::unbounded_channel();
+            manager.set_event_channel(events.clone()).await;
             let switching = Switching::start(
                 SwitchingSetup {
                     mode,
@@ -757,19 +987,31 @@ mod tests {
                     ))),
                     command_tx,
                 },
-                Arc::new(FakeMedia(records.clone())),
+                Arc::new(FakeMedia {
+                    records: records.clone(),
+                    mac: mac.to_string(),
+                }),
                 move || {
                     started.store(true, Ordering::SeqCst);
                     play_rx
                 },
             )
             .await;
+            let handler = Arc::new(DeviceHandler::default());
+            handler.block_ear.store(block_ear, Ordering::SeqCst);
+            switching.dispatch_events(events_rx, handler.clone().handle());
             Harness {
-                switching,
                 records,
                 play_tx,
                 playback_started,
+                events,
+                handler,
             }
+        }
+
+        /// Emit an event the way the manager does.
+        fn emit(&self, event: AACPEvent) {
+            self.events.send(event).expect("event channel open");
         }
 
         async fn play(&self, playing: bool) {
@@ -827,18 +1069,20 @@ mod tests {
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
 
         // ACK, then playback stops: exactly the release.
-        h.switching.on_event(&owns(1)).await;
+        h.emit(owns(1));
         h.play(false).await;
         assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
 
         // The release ACK pauses once (#841: Linux took the AirPods).
-        h.switching.on_event(&owns(0)).await;
+        h.emit(owns(0));
         wait_until("the pause", || h.pauses() >= 1).await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 1);
         assert_eq!(h.activations(), 1);
+        // The device handler saw both reports too.
+        assert_eq!(h.handler.finished(), named(&[owns(1), owns(0)]));
 
         stop_handoff_task(mac);
     }
@@ -850,13 +1094,11 @@ mod tests {
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;
-        h.switching.on_event(&owns(1)).await;
+        h.emit(owns(1));
 
         // Another host asks for the AirPods: the core pauses and yields once;
         // no legacy reaction adds a second [0] or a deactivate.
-        h.switching
-            .on_event(&AACPEvent::OwnershipToFalseRequest)
-            .await;
+        h.emit(AACPEvent::OwnershipToFalseRequest);
         assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 1);
@@ -865,12 +1107,10 @@ mod tests {
         // connected remote host, as the probe's `announce` does).
         let hosts = vec![host(LOCAL), host(REMOTE), host(SECOND_REMOTE)];
         manager.state.lock().await.connected_devices = hosts.clone();
-        h.switching
-            .on_event(&AACPEvent::ConnectedDevices(
-                vec![host(LOCAL), host(REMOTE)],
-                hosts,
-            ))
-            .await;
+        h.emit(AACPEvent::ConnectedDevices(
+            vec![host(LOCAL), host(REMOTE)],
+            hosts,
+        ));
         let mut announced = Vec::new();
         for _ in 0..4 {
             announced.push(next_packet(&mut rx).await);
@@ -898,7 +1138,7 @@ mod tests {
         let task = handoff_task(mac).expect("handoff task");
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;
-        h.switching.on_event(&owns(1)).await;
+        h.emit(owns(1));
 
         // The receive loop clears the dead session without an event.
         manager.disconnect().await;
@@ -912,14 +1152,177 @@ mod tests {
         manager.state.lock().await.sender = Some(tx);
         h.play(false).await;
         h.play(true).await;
-        h.switching.on_event(&owns(0)).await;
-        h.switching
-            .on_event(&AACPEvent::OwnershipToFalseRequest)
-            .await;
+        h.emit(owns(0));
+        h.emit(AACPEvent::OwnershipToFalseRequest);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert!(rx.try_recv().is_err());
         assert_eq!(h.pauses(), 1);
         assert_eq!(h.activations(), 1);
+    }
+
+    #[tokio::test]
+    async fn handoff_not_stalled_by_slow_device_handler() {
+        let mac = "5A:00:00:00:00:08";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start_with(SwitchingMode::Handoff, mac, &manager, true).await;
+        expect_startup(&h, &mut rx).await;
+        expect_take(&h, &mut rx).await;
+
+        // The device handler blocks on a wear report, as ear detection does
+        // behind an A2DP activation (up to ~43 s).
+        let worn = wear(EarDetectionStatus::InEar);
+        h.emit(worn.clone());
+        wait_until("the handler to block", || {
+            h.handler.started() == named(&[worn.clone()])
+        })
+        .await;
+        // Queued behind it: the take's ACK, then another host's request.
+        h.emit(owns(1));
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+
+        // The core still yields once and pauses once.
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+        // And it saw the ownership report queued behind the blocked event
+        // before the request.
+        let trace = traced(mac);
+        assert!(
+            position(&trace, "ACK owner=linux")
+                < position(&trace, "REMOTE requested ownership; yielding")
+        );
+        // The handler is still blocked on the wear report.
+        assert_eq!(h.handler.started(), named(&[worn.clone()]));
+        assert!(h.handler.finished().is_empty());
+
+        // Released, it handles every event once, in order.
+        h.handler.release.notify_one();
+        let all = named(&[worn, owns(1), AACPEvent::OwnershipToFalseRequest]);
+        wait_until("the handler to catch up", || h.handler.finished() == all).await;
+        assert_eq!(h.handler.started(), all);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_session_loss_drains_primary_queue() {
+        let mac = "5A:00:00:00:00:09";
+        let (manager, mut rx, tx) = ready_session().await;
+        let h = Harness::start_with(SwitchingMode::Handoff, mac, &manager, true).await;
+        let task = handoff_task(mac).expect("handoff task");
+        expect_startup(&h, &mut rx).await;
+        expect_take(&h, &mut rx).await;
+        h.emit(owns(1));
+        // Playback stops: the release is pending.
+        h.play(false).await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+
+        // The buds go in the case; the device handler blocks on that report.
+        let in_case = wear(EarDetectionStatus::InCase);
+        h.emit(in_case.clone());
+        wait_until("the handler to block", || {
+            h.handler.started() == named(&[owns(1), in_case.clone()])
+        })
+        .await;
+        let before = traced(mac).len();
+
+        // The release ACK arrives, then the receive loop clears the session.
+        // The test runtime is single-threaded and neither call yields, so no
+        // task sees the ACK before the session is gone.
+        let release_ack = expected_owns(0).await;
+        manager.receive_packet(&release_ack).await;
+        manager.disconnect().await;
+        wait_until("the task to end", || task.is_finished()).await;
+
+        // As in handoff::tests::session_loss_before_release_ack_does_not_retake:
+        // SessionLost → [], Ownership([0]) → [PauseMedia], Disconnected →
+        // [DropSession], with the case closure from the queued wear report.
+        let trace = traced(mac)[before..].to_vec();
+        let expected = [
+            "SESSION lost",
+            "ACK owner=not-linux",
+            "PauseMedia",
+            "DISCONNECTED",
+            "CASE waiting for new Linux playback",
+        ];
+        assert_eq!(trace.len(), expected.len(), "{trace:#?}");
+        for (entry, prefix) in trace.iter().zip(expected) {
+            assert!(entry.starts_with(prefix), "{trace:#?}");
+        }
+        assert_eq!(h.pauses(), 1);
+        assert!(handoff_task(mac).is_none());
+
+        // Nothing is sent afterwards, even on a live sender.
+        manager.state.lock().await.sender = Some(tx);
+        h.play(true).await;
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(h.pauses(), 1);
+
+        // Released, the handler gets the wear report once, then the rest in
+        // order.
+        assert_eq!(h.handler.finished(), named(&[owns(1)]));
+        h.handler.release.notify_one();
+        let all = named(&[
+            owns(1),
+            in_case,
+            owns(0),
+            AACPEvent::OwnershipToFalseRequest,
+        ]);
+        wait_until("the handler to catch up", || h.handler.finished() == all).await;
+        assert_eq!(h.handler.started(), all);
+    }
+
+    #[tokio::test]
+    async fn router_flush_forwards_every_queued_event() {
+        // The handoff task's flush, made once it finds the session dead,
+        // returns only after everything already in the primary queue has
+        // been forwarded to it.
+        let (primary_tx, primary) = mpsc::unbounded_channel();
+        let (switching_tx, mut switching) = mpsc::unbounded_channel();
+        let (handlers_tx, mut handlers) = mpsc::unbounded_channel();
+        let (flush_tx, flush) = mpsc::unbounded_channel();
+        let queued = [owns(1), wear(EarDetectionStatus::InCase), owns(0)];
+        for event in &queued {
+            primary_tx.send(event.clone()).unwrap();
+        }
+        let (done, flushed) = oneshot::channel();
+        flush_tx.send(done).unwrap();
+        let router = tokio::spawn(route_events(
+            primary,
+            Some(switching_tx),
+            handlers_tx,
+            Some(flush),
+        ));
+        flushed.await.expect("flush answered");
+        let mut forwarded = Vec::new();
+        while let Ok(event) = switching.try_recv() {
+            forwarded.push(event);
+        }
+        assert_eq!(named(&forwarded), named(&queued));
+
+        // The handlers get the same events, in order.
+        let mut handled = Vec::new();
+        while let Ok(event) = handlers.try_recv() {
+            handled.push(event);
+        }
+        assert_eq!(named(&handled), named(&queued));
+
+        // Once the primary queue closes the router ends, and a flush (the
+        // shell's `Shell::flush`) is not left waiting.
+        drop(primary_tx);
+        tokio::time::timeout(Duration::from_secs(3), router)
+            .await
+            .expect("router ended")
+            .unwrap();
+        let (done, flushed) = oneshot::channel();
+        assert!(flush_tx.send(done).is_err());
+        assert!(flushed.await.is_err());
     }
 
     #[tokio::test]
@@ -957,12 +1360,10 @@ mod tests {
 
         h.play(false).await;
         h.play(true).await;
-        h.switching.on_event(&owns(1)).await;
+        h.emit(owns(1));
         h.play(false).await;
-        h.switching.on_event(&owns(0)).await;
-        h.switching
-            .on_event(&AACPEvent::OwnershipToFalseRequest)
-            .await;
+        h.emit(owns(0));
+        h.emit(AACPEvent::OwnershipToFalseRequest);
         // An OwnsConnection [0] report also reaches control command
         // subscribers (the legacy pause/deactivate reaction).
         manager
@@ -970,12 +1371,10 @@ mod tests {
             .await;
         let hosts = vec![host(LOCAL), host(REMOTE), host(SECOND_REMOTE)];
         manager.state.lock().await.connected_devices = hosts.clone();
-        h.switching
-            .on_event(&AACPEvent::ConnectedDevices(
-                vec![host(LOCAL), host(REMOTE)],
-                hosts,
-            ))
-            .await;
+        h.emit(AACPEvent::ConnectedDevices(
+            vec![host(LOCAL), host(REMOTE)],
+            hosts,
+        ));
 
         tokio::time::sleep(SETTLE).await;
         assert!(rx.try_recv().is_err());
@@ -984,6 +1383,8 @@ mod tests {
         assert!(!h.playback_started.load(Ordering::SeqCst));
         assert!(handoff_task(mac).is_none());
         assert!(!media_controller::playback_listener_registered(mac));
+        // The device handlers still get every event.
+        assert_eq!(h.handler.finished().len(), 5);
     }
 
     #[tokio::test]
@@ -1006,6 +1407,29 @@ mod tests {
         assert!(!media_controller::playback_listener_registered(mac));
         assert!(handoff_task(mac).is_some());
         stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn switching_legacy_reactions_get_dispatched_events() {
+        // The legacy ConnectedDevices reaction runs on events from the
+        // dispatch: it announces the new remote host.
+        let mac = "5A:00:00:00:00:0A";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Legacy, mac, &manager).await;
+        h.emit(AACPEvent::ConnectedDevices(
+            vec![host(LOCAL), host(REMOTE)],
+            vec![host(LOCAL), host(REMOTE), host(SECOND_REMOTE)],
+        ));
+        let announce = [
+            expected_new_device(SECOND_REMOTE).await,
+            expected_tipi(SECOND_REMOTE).await,
+        ];
+        let mut sent = Vec::new();
+        while sent.len() < 2 || !sent.ends_with(&announce) {
+            sent.push(next_packet(&mut rx).await);
+        }
+        wait_until("the handler", || h.handler.finished().len() == 1).await;
+        media_controller::stop_playback_listener(mac);
     }
 
     #[test]
