@@ -1985,8 +1985,8 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
             .into_iter()
             .find_map(|sink| sink.name.clone().filter(|_| sink_of_mac(&sink, &mac_clone)));
         match &name {
-            Some(name) => info!("Found sink name for MAC {}: {}", mac_clone, name),
-            None => error!("No matching sink found for MAC address: {}", mac_clone),
+            Some(name) => debug!("Found sink name for MAC {}: {}", mac_clone, name),
+            None => debug!("No matching sink found for MAC address: {}", mac_clone),
         }
         name
     })
