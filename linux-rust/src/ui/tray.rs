@@ -4,11 +4,14 @@ use ab_glyph::{Font, ScaleFont};
 use ksni::{Icon, ToolTip};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::bluetooth::aacp::{BatteryStatus, ControlCommandIdentifiers};
+use crate::bluetooth::aacp::{
+    BatteryComponent, BatteryInfo, BatteryStatus, ControlCommandIdentifiers,
+};
 use crate::ui::messages::BluetoothUIMessage;
+use crate::ui::window::merge_battery_entry;
 use crate::utils::get_app_settings_path;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MyTray {
     pub conversation_detect_enabled: Option<bool>,
     pub battery_headphone: Option<u8>,
@@ -24,6 +27,36 @@ pub struct MyTray {
     pub allow_off_option: Option<u8>,
     pub command_tx: Option<UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>>,
     pub ui_tx: Option<UnboundedSender<BluetoothUIMessage>>,
+}
+
+impl MyTray {
+    /// Applies an AACP battery report to the tray's per-component fields
+    /// (Headphone, Left, Right, Case). Each entry goes through the window's
+    /// `merge_battery_entry` with prev = `level.zip(status)`, so a
+    /// Disconnected entry keeps a known level/status (#52). Components absent
+    /// from the report keep their fields. This is the only AACP battery path
+    /// into the tray: the live `AACPEvent::BatteryInfo` arm and the connect
+    /// seed (#75) both call it.
+    pub fn apply_battery(&mut self, infos: &[BatteryInfo]) {
+        fn merge_into(level: &mut Option<u8>, status: &mut Option<BatteryStatus>, b: &BatteryInfo) {
+            let prev = (*level).zip(*status);
+            let (l, s) = merge_battery_entry(prev, (b.level, b.status));
+            *level = Some(l);
+            *status = Some(s);
+        }
+        for b in infos {
+            let (level, status) = match b.component {
+                BatteryComponent::Headphone => (
+                    &mut self.battery_headphone,
+                    &mut self.battery_headphone_status,
+                ),
+                BatteryComponent::Right => (&mut self.battery_r, &mut self.battery_r_status),
+                BatteryComponent::Left => (&mut self.battery_l, &mut self.battery_l_status),
+                BatteryComponent::Case => (&mut self.battery_c, &mut self.battery_c_status),
+            };
+            merge_into(level, status, b);
+        }
+    }
 }
 
 impl ksni::Tray for MyTray {
@@ -297,5 +330,74 @@ fn generate_icon(text: &str, text_mode: bool, charging: bool) -> Icon {
         width: width as i32,
         height: height as i32,
         data,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use BatteryComponent::{Case, Headphone, Left, Right};
+    use BatteryStatus::{Charging, Disconnected, NotCharging};
+
+    fn b(component: BatteryComponent, level: u8, status: BatteryStatus) -> BatteryInfo {
+        BatteryInfo {
+            component,
+            level,
+            status,
+        }
+    }
+
+    #[test]
+    fn tray_apply_battery_fills_left_right_case() {
+        let mut tray = MyTray::default();
+        tray.apply_battery(&[
+            b(Left, 80, NotCharging),
+            b(Right, 60, Charging),
+            b(Case, 90, Charging),
+        ]);
+        assert_eq!(tray.battery_l, Some(80));
+        assert_eq!(tray.battery_l_status, Some(NotCharging));
+        assert_eq!(tray.battery_r, Some(60));
+        assert_eq!(tray.battery_r_status, Some(Charging));
+        assert_eq!(tray.battery_c, Some(90));
+        assert_eq!(tray.battery_c_status, Some(Charging));
+        assert_eq!(tray.battery_headphone, None);
+        assert_eq!(tray.battery_headphone_status, None);
+    }
+
+    #[test]
+    fn tray_apply_battery_disconnected_keeps_known_entry() {
+        let mut tray = MyTray::default();
+        tray.apply_battery(&[b(Left, 80, NotCharging), b(Right, 60, NotCharging)]);
+        // #52: a later Disconnected entry keeps the known level/status; an
+        // absent component (Right) keeps its fields.
+        tray.apply_battery(&[b(Left, 0, Disconnected)]);
+        assert_eq!(tray.battery_l, Some(80));
+        assert_eq!(tray.battery_l_status, Some(NotCharging));
+        assert_eq!(tray.battery_r, Some(60));
+        assert_eq!(tray.battery_r_status, Some(NotCharging));
+        // A known update after that still wins.
+        tray.apply_battery(&[b(Left, 75, Charging)]);
+        assert_eq!(tray.battery_l, Some(75));
+        assert_eq!(tray.battery_l_status, Some(Charging));
+    }
+
+    #[test]
+    fn tray_apply_battery_disconnected_with_nothing_known_is_stored() {
+        let mut tray = MyTray::default();
+        tray.apply_battery(&[b(Case, 0, Disconnected)]);
+        assert_eq!(tray.battery_c, Some(0));
+        assert_eq!(tray.battery_c_status, Some(Disconnected));
+    }
+
+    #[test]
+    fn tray_apply_battery_headphone_fills_headphone() {
+        let mut tray = MyTray::default();
+        tray.apply_battery(&[b(Headphone, 42, NotCharging)]);
+        assert_eq!(tray.battery_headphone, Some(42));
+        assert_eq!(tray.battery_headphone_status, Some(NotCharging));
+        assert_eq!(tray.battery_l, None);
+        assert_eq!(tray.battery_r, None);
+        assert_eq!(tray.battery_c, None);
     }
 }
