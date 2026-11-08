@@ -54,7 +54,9 @@ pub(crate) enum Input {
     /// Connected hosts report: previous and new list. Linux announces itself
     /// for a remote host in `new` that the core does not already know; the
     /// report's `old` may be stale (a replay of a report already in the
-    /// session snapshot) and is not used for that decision (#58).
+    /// session snapshot) and is not used for that decision (#58). Until
+    /// `InitBacklogDrained` or a disconnect, a host in the `Reconnected`
+    /// snapshot is known too, so stale replays never re-announce (#79).
     ConnectedDevices {
         old: Vec<ConnectedDevice>,
         new: Vec<ConnectedDevice>,
@@ -93,8 +95,8 @@ pub(crate) enum Input {
     /// the echo of its last "not owning" in the probe, the pre-snapshot
     /// queue on the default path); later events are fresh. It ends the
     /// reconnect take's stale-report window, so a later 0 that acknowledges
-    /// nothing is a loss. Otherwise it changes nothing. Fed in queue order,
-    /// never on a timer.
+    /// nothing is a loss, and the snapshot hosts' announce exemption (#79).
+    /// Otherwise it changes nothing. Fed in queue order, never on a timer.
     InitBacklogDrained,
     /// Switch to automatic handoff (REPL `auto`). Its "not owning" is a
     /// pending release, so the reply is that release's acknowledgement and
@@ -223,6 +225,14 @@ pub(crate) struct Handoff {
     retry_at: Instant,
     retry_delay: Duration,
     hosts: Vec<ConnectedDevice>,
+    /// Hosts of the adopted `Reconnected` snapshot: replayed reports queued
+    /// before it never announce them (#79). Cleared at `InitBacklogDrained`
+    /// and on disconnect. Accepted limit: without that boundary (the
+    /// probe's echo timed out, or a manual/no-audio reconnect with an empty
+    /// backlog) they stay exempt until the next disconnect, so a snapshot
+    /// host that leaves and rejoins in that session is not re-announced.
+    /// A host outside the snapshot is always announced.
+    snapshot_hosts: Vec<ConnectedDevice>,
     ears: Vec<EarDetectionStatus>,
     audio: Option<AudioSource>,
     owner: Option<Vec<u8>>,
@@ -259,6 +269,7 @@ impl Handoff {
             retry_at: now,
             retry_delay: FIRST_RETRY,
             hosts: Vec::new(),
+            snapshot_hosts: Vec::new(),
             ears: Vec::new(),
             audio: None,
             owner: None,
@@ -319,15 +330,17 @@ impl Handoff {
                 // event's `old`: a report queued before the session snapshot
                 // (seed, Reconnected facts) is replayed with a stale `old`
                 // and must not announce a second time (#58).
-                // Known limit (#79): when two or more reports queue inside
-                // that window, the first replay regresses `self.hosts` and a
-                // later one re-announces; telling stale replays apart is for
-                // #79, on the shell's queue boundary (`InitBacklogDrained`).
+                // Reconnected snapshot hosts count as known until the boundary (#79).
                 if self.automatic
                     && self.live()
-                    && new
-                        .iter()
-                        .any(|d| d.mac != self.local && !self.hosts.iter().any(|h| h.mac == d.mac))
+                    && new.iter().any(|d| {
+                        d.mac != self.local
+                            && !self
+                                .hosts
+                                .iter()
+                                .chain(&self.snapshot_hosts)
+                                .any(|h| h.mac == d.mac)
+                    })
                 {
                     self.announce(out);
                 }
@@ -396,6 +409,7 @@ impl Handoff {
                 self.retry_delay = (self.retry_delay * 2).min(MAX_RETRY);
             }
             Input::InitBacklogDrained => {
+                self.snapshot_hosts.clear();
                 if std::mem::take(&mut self.reconnect_take_pending) {
                     self.say("BACKLOG drained; the reconnect take's stale-report window ended");
                 } else {
@@ -725,6 +739,7 @@ impl Handoff {
         self.stop_during_take = false;
         self.play_during_release = false;
         self.hosts.clear();
+        self.snapshot_hosts.clear();
         self.ears.clear();
         self.audio = None;
         self.owner = None;
@@ -748,6 +763,7 @@ impl Handoff {
         out.push(Command::AdoptSession);
         self.connected = true;
         self.session_lost = false;
+        self.snapshot_hosts = facts.hosts.clone();
         self.hosts = facts.hosts;
         self.ears = facts.ears;
         self.audio = facts.audio;
@@ -2550,5 +2566,83 @@ mod tests {
         let mut p = Probe::ready();
         assert_eq!(p.feed(20, Input::LocalCall(true)), [AdvertiseCall(true)]);
         assert_eq!(p.feed(30, Input::LocalCall(false)), [AdvertiseCall(false)]);
+    }
+
+    fn report(old: &[&str], new: &[&str]) -> Input {
+        let hosts = |macs: &[&str]| macs.iter().map(|m| host(m)).collect();
+        Input::ConnectedDevices {
+            old: hosts(old),
+            new: hosts(new),
+        }
+    }
+
+    /// Drop the session at `ms` and adopt a reconnect reporting `hosts`,
+    /// which announces once.
+    fn reconnect_with(p: &mut Probe, ms: u64, hosts: &[&str]) {
+        assert_eq!(p.feed(ms, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(ms + 1000, Input::Tick), [Reconnect { audio: true }]);
+        let facts = SessionFacts {
+            hosts: hosts.iter().map(|m| host(m)).collect(),
+            ..SessionFacts::default()
+        };
+        let out = p.feed(ms + 1100, Input::Reconnected(facts));
+        assert_eq!(announces(&out), 1, "{out:?}");
+    }
+
+    const L: &str = LOCAL;
+    const R: &str = REMOTE;
+    const R2: &str = REMOTE_2;
+    const R3: &str = REMOTE_3;
+
+    #[test]
+    fn connected_devices_two_stale_replays_after_reconnect_no_reannounce() {
+        // #79: the probe adopts the reconnect, then replays its init backlog.
+        let mut p = Probe::new(true, true);
+        reconnect_with(&mut p, 100, &[L, R, R2]);
+        assert_eq!(p.feed(1300, report(&[L], &[L, R])), []);
+        // Without the snapshot exemption this one announced R2 again.
+        assert_eq!(p.feed(1400, report(&[L, R], &[L, R, R2])), []);
+        assert_eq!(p.feed(1500, Input::InitBacklogDrained), []);
+        assert_eq!(
+            p.feed(1600, report(&[L, R, R2], &[L, R, R2, R3])),
+            [Announce]
+        );
+    }
+
+    #[test]
+    fn connected_devices_two_stale_replays_default_order_one_announce() {
+        // run_handoff: seed, pre-snapshot backlog, Auto, boundary.
+        let mut p = Probe::new(false, true);
+        assert_eq!(p.feed(0, report(&[], &[L, R, R2])), []);
+        assert_eq!(p.feed(10, report(&[L], &[L, R])), []);
+        assert_eq!(p.feed(20, report(&[L, R], &[L, R, R2])), []);
+        let auto = p.feed(30, Input::Auto);
+        assert_eq!(announces(&auto), 1, "{auto:?}");
+        assert_eq!(p.feed(40, Input::InitBacklogDrained), []);
+        assert_eq!(p.feed(50, report(&[L, R, R2], &[L, R, R2, R3])), [Announce]);
+    }
+
+    #[test]
+    fn connected_devices_snapshot_exemption_ends_at_boundary_or_disconnect() {
+        // (a) After the boundary a snapshot host that leaves and rejoins is
+        // announced again.
+        let mut p = Probe::new(true, true);
+        reconnect_with(&mut p, 100, &[L, R, R2]);
+        assert_eq!(p.feed(1300, Input::InitBacklogDrained), []);
+        assert_eq!(p.feed(1400, report(&[L, R, R2], &[L, R])), []);
+        assert_eq!(p.feed(1500, report(&[L, R], &[L, R, R2])), [Announce]);
+
+        // (b) A disconnect ends it without a boundary.
+        let mut p = Probe::new(true, true);
+        reconnect_with(&mut p, 100, &[L, R, R2]);
+        reconnect_with(&mut p, 2000, &[L, R]);
+        assert_eq!(p.feed(3200, Input::InitBacklogDrained), []);
+        assert_eq!(p.feed(3300, report(&[L, R], &[L, R, R2])), [Announce]);
+
+        // (c) Before any boundary a host outside the snapshot is announced.
+        let mut p = Probe::new(true, true);
+        reconnect_with(&mut p, 100, &[L, R, R2]);
+        assert_eq!(p.feed(1300, report(&[L], &[L, R])), []);
+        assert_eq!(p.feed(1400, report(&[L, R], &[L, R, R3])), [Announce]);
     }
 }
