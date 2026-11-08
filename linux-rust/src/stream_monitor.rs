@@ -20,6 +20,7 @@ use libpulse_binding::context::{Context, FlagSet as ContextFlagSet, State as Con
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::operation::{Operation, State as OperationState};
 use libpulse_binding::proplist::Proplist;
+use libpulse_binding::volume::{ChannelVolumes, Volume};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -146,8 +147,9 @@ pub(crate) trait PlaybackSource: Send {
 /// worthy (`call_detect::is_takeover_worthy`) and uncorked in every sample
 /// for at least `min`. Corking, vanishing or reclassification forgets it, so
 /// it starts over if it comes back. Stream playback is on while any stream
-/// counts. An app that keeps a silent stream open uncorked still counts;
-/// libpulse reports no level for sink inputs (#84).
+/// counts. A muted or zero-volume stream is treated as corked, so it never
+/// counts (#84). An app that keeps a silent stream open uncorked and unmuted
+/// still counts; libpulse reports no level for sink inputs (#88).
 ///
 /// The first successful listing is the baseline: streams already playing in
 /// it never count, as MPRIS playback running at the handoff core's baseline
@@ -181,7 +183,7 @@ impl PlaybackTracker {
     pub(crate) fn observe(&mut self, now: Instant, streams: &[StreamProps]) -> Option<bool> {
         let live: HashSet<u32> = streams
             .iter()
-            .filter(|s| !s.corked && is_takeover_worthy(s))
+            .filter(|s| !s.corked && !s.muted && is_takeover_worthy(s))
             .map(|s| s.index)
             .collect();
         let preexisting = self.preexisting.get_or_insert_with(|| live.clone());
@@ -262,14 +264,29 @@ pub(crate) fn spawn_stream_playback<S: PlaybackSource + 'static>(
     rx
 }
 
+/// Whether a sink input is silenced: muted, or every channel (at least one)
+/// at `Volume::MUTED`. Reads the channels directly, as `is_muted()` is
+/// undefined for a 0-channel volume.
+fn sink_input_muted(mute: bool, volume: &ChannelVolumes) -> bool {
+    let channels = volume.get();
+    mute || (!channels.is_empty() && channels.iter().all(|&v| v == Volume::MUTED))
+}
+
 /// A sink input as `call_detect` sees it.
-fn playback_stream(index: u32, proplist: &Proplist, corked: bool) -> StreamProps {
+fn playback_stream(
+    index: u32,
+    proplist: &Proplist,
+    corked: bool,
+    mute: bool,
+    volume: &ChannelVolumes,
+) -> StreamProps {
     StreamProps {
         direction: StreamDirection::Playback,
         props: props(proplist),
         monitor: false,
         index,
         corked,
+        muted: sink_input_muted(mute, volume),
     }
 }
 
@@ -289,7 +306,13 @@ impl PlaybackSource for PulseStreams {
             let inputs = inputs.clone();
             move |result| {
                 inputs.borrow_mut().record(result, |input| {
-                    Some(playback_stream(input.index, &input.proplist, input.corked))
+                    Some(playback_stream(
+                        input.index,
+                        &input.proplist,
+                        input.corked,
+                        input.mute,
+                        &input.volume,
+                    ))
                 })
             }
         });
@@ -326,6 +349,7 @@ impl StreamSource for PulseStreams {
                         monitor: false,
                         index: output.index,
                         corked: output.corked,
+                        muted: false,
                     };
                     Some((output.source, stream))
                 })
@@ -506,6 +530,7 @@ mod tests {
             monitor: false,
             index: 0,
             corked: false,
+            muted: false,
         }
     }
 
@@ -713,6 +738,7 @@ mod tests {
             monitor: false,
             index,
             corked,
+            muted: false,
         }
     }
 
@@ -727,6 +753,13 @@ mod tests {
     fn corked_music(index: u32) -> StreamProps {
         StreamProps {
             corked: true,
+            ..music(index)
+        }
+    }
+
+    fn muted_music(index: u32) -> StreamProps {
+        StreamProps {
+            muted: true,
             ..music(index)
         }
     }
@@ -955,6 +988,81 @@ mod tests {
     }
 
     #[test]
+    fn muted_stream_never_counts() {
+        let start = Instant::now();
+        let mut tracker = started(start);
+        for i in 0..20 {
+            assert_eq!(
+                tracker.observe(start + STEP * i, &[muted_music(1)]),
+                None,
+                "{i}"
+            );
+        }
+        assert!(!tracker.playing);
+    }
+
+    #[test]
+    fn muting_stops_playback() {
+        let start = Instant::now();
+        let mut tracker = started(start);
+        assert_eq!(tracker.observe(start, &[music(1)]), None);
+        assert_eq!(tracker.observe(start + MIN, &[music(1)]), Some(true));
+        assert_eq!(
+            tracker.observe(start + MIN + STEP, &[muted_music(1)]),
+            Some(false)
+        );
+        assert_eq!(tracker.observe(start + MIN * 3, &[muted_music(1)]), None);
+    }
+
+    #[test]
+    fn unmute_restarts_debounce() {
+        let start = Instant::now();
+        let mut tracker = started(start);
+        assert_eq!(tracker.observe(start, &[music(1)]), None);
+        assert_eq!(tracker.observe(start + STEP * 3, &[muted_music(1)]), None);
+        // Unmuted again: the timer starts over from here.
+        let unmuted = start + STEP * 4;
+        assert_eq!(tracker.observe(unmuted, &[music(1)]), None);
+        assert_eq!(tracker.observe(start + MIN + STEP, &[music(1)]), None);
+        assert_eq!(
+            tracker.observe(unmuted + MIN - Duration::from_millis(1), &[music(1)]),
+            None
+        );
+        assert_eq!(tracker.observe(unmuted + MIN, &[music(1)]), Some(true));
+    }
+
+    fn volume(channels: &[Volume]) -> ChannelVolumes {
+        let mut volume = ChannelVolumes::default();
+        volume.set_len(channels.len() as u8);
+        volume.get_mut().copy_from_slice(channels);
+        volume
+    }
+
+    #[test]
+    fn sink_input_muted_flag() {
+        assert!(sink_input_muted(true, &volume(&[Volume::NORMAL; 2])));
+    }
+
+    #[test]
+    fn sink_input_muted_zero_volume() {
+        assert!(sink_input_muted(false, &volume(&[Volume::MUTED; 2])));
+        assert!(!sink_input_muted(
+            false,
+            &volume(&[Volume::MUTED, Volume(1)])
+        ));
+    }
+
+    #[test]
+    fn sink_input_muted_normal() {
+        assert!(!sink_input_muted(false, &volume(&[Volume::NORMAL; 2])));
+    }
+
+    #[test]
+    fn sink_input_muted_empty_volume() {
+        assert!(!sink_input_muted(false, &ChannelVolumes::default()));
+    }
+
+    #[test]
     fn event_stream_never_counts() {
         let start = Instant::now();
         let mut tracker = started(start);
@@ -1014,6 +1122,11 @@ mod tests {
         Err(io::Error::other("no sound server"))
     }
 
+    /// Sink input 4, uncorked and unmuted, as PulseStreams maps it.
+    fn unmuted_input(proplist: &Proplist) -> StreamProps {
+        playback_stream(4, proplist, false, false, &ChannelVolumes::default())
+    }
+
     #[test]
     fn truncated_sink_input_list_keeps_tracker_state() {
         // Sink inputs built as PulseStreams builds them, from a proplist.
@@ -1022,11 +1135,9 @@ mod tests {
         proplist.set_str("application.name", "mpv").unwrap();
         let mut complete = ListAccumulator::default();
         complete.record(ListResult::Item(&proplist), |p: &Proplist| {
-            Some(playback_stream(4, p, false))
+            Some(unmuted_input(p))
         });
-        complete.record(ListResult::End, |p: &Proplist| {
-            Some(playback_stream(4, p, false))
-        });
+        complete.record(ListResult::End, |p: &Proplist| Some(unmuted_input(p)));
         let complete = complete.finish("sink input list");
         let streams = complete.as_ref().expect("a complete list").clone();
         assert_eq!(streams.len(), 1);
@@ -1041,15 +1152,13 @@ mod tests {
         // stream (or none).
         let mut truncated = ListAccumulator::default();
         truncated.record(ListResult::Item(&proplist), |p: &Proplist| {
-            Some(playback_stream(4, p, false))
+            Some(unmuted_input(p))
         });
         let truncated = truncated.finish("sink input list");
         assert!(truncated.is_err());
         // An empty listing cut short is an error too.
         let mut empty_cut = ListAccumulator::<StreamProps>::default();
-        empty_cut.record(ListResult::Error, |p: &Proplist| {
-            Some(playback_stream(4, p, false))
-        });
+        empty_cut.record(ListResult::Error, |p: &Proplist| Some(unmuted_input(p)));
         let empty_cut = empty_cut.finish("sink input list");
         assert!(empty_cut.is_err());
 

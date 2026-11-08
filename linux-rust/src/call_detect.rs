@@ -41,6 +41,9 @@ pub(crate) struct StreamProps {
     pub(crate) index: u32,
     /// The application has corked (paused) the stream.
     pub(crate) corked: bool,
+    /// Muted, or every channel at zero volume (playback only; call
+    /// detection ignores it).
+    pub(crate) muted: bool,
 }
 
 /// Property values that mark a capture stream as a sink monitor.
@@ -179,6 +182,7 @@ mod tests {
             monitor,
             index: 0,
             corked: false,
+            muted: false,
         }
     }
 
