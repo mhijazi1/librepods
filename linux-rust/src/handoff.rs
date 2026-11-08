@@ -21,6 +21,9 @@ pub(crate) const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 /// Reconnect backoff cap.
 const MAX_RETRY: Duration = Duration::from_secs(8);
+/// Reply to a REPL command that needs a live control session.
+const NO_SESSION: &str =
+    "WAIT no live control session; reconnecting (status, manual and quit remain available)";
 
 /// Routing, wear and ownership facts of a freshly made control session,
 /// copied by the shell so a take right after a reconnect sees them before the
@@ -52,6 +55,12 @@ pub(crate) enum Input {
     Ownership(Vec<u8>),
     /// Another host asked Linux to give up ownership.
     RemoteOwnershipRequest,
+    /// The shell found the control session dead (the AACP receive loop
+    /// cleared it without an event) while some of its events may still be
+    /// queued. From here on nothing is sent on it and no take is allowed,
+    /// but the session is not dropped: the queued events (a case-closed wear
+    /// report, an ownership ACK) are still fed, then `Disconnected`.
+    SessionLost,
     /// The control session dropped.
     Disconnected,
     /// A reconnect attempt made a new control session (not yet adopted).
@@ -123,6 +132,9 @@ pub(crate) struct Handoff {
     local: String,
     automatic: bool,
     connected: bool,
+    /// The connected session died; it is torn down at the next
+    /// `Disconnected`.
+    session_lost: bool,
     quitting: bool,
     /// Ownership request awaiting its acknowledgement.
     pending: Option<Pending>,
@@ -163,6 +175,7 @@ impl Handoff {
             local,
             automatic,
             connected,
+            session_lost: false,
             quitting: false,
             pending: None,
             requested_take: false,
@@ -190,6 +203,12 @@ impl Handoff {
 
     pub(crate) fn connected(&self) -> bool {
         self.connected
+    }
+
+    /// A control session the core may send on: connected and not found
+    /// dead.
+    pub(crate) fn live(&self) -> bool {
+        self.connected && !self.session_lost
     }
 
     pub(crate) fn quitting(&self) -> bool {
@@ -232,6 +251,7 @@ impl Handoff {
             Input::AudioSource(source) => self.audio = Some(source),
             Input::ConnectedDevices { old, new } => {
                 if self.automatic
+                    && self.live()
                     && new
                         .iter()
                         .any(|d| d.mac != self.local && !old.iter().any(|o| o.mac == d.mac))
@@ -242,6 +262,12 @@ impl Handoff {
             }
             Input::Ownership(value) => self.ownership(now, value, out),
             Input::RemoteOwnershipRequest => {
+                if !self.live() {
+                    // Nothing can be sent; the disconnect that follows
+                    // pauses and clears ownership.
+                    self.say("REMOTE requested ownership; control session lost");
+                    return;
+                }
                 if self.automatic && self.requested_take {
                     out.push(Command::PauseMedia);
                 }
@@ -251,6 +277,12 @@ impl Handoff {
                 }
                 self.say("REMOTE requested ownership; yielding");
                 self.request(now, false, Cause::Remote, out);
+            }
+            Input::SessionLost => {
+                if self.live() {
+                    self.session_lost = true;
+                    self.say("SESSION lost; finishing its queued events before disconnecting");
+                }
             }
             Input::Disconnected => self.disconnected(now, out),
             Input::Reconnected(facts) => self.reconnected(now, facts, out),
@@ -264,6 +296,10 @@ impl Handoff {
                 self.retry_delay = (self.retry_delay * 2).min(MAX_RETRY);
             }
             Input::Auto => {
+                if !self.live() {
+                    self.say(NO_SESSION);
+                    return;
+                }
                 out.push(Command::ConnectA2dp);
                 if !self.requested_take {
                     out.push(Command::SendOwnership(false));
@@ -280,19 +316,23 @@ impl Handoff {
             Input::Take => {
                 if self.pending.is_some() {
                     self.say("WAIT ownership request pending");
-                } else if self.decide_take(TakeoverTrigger::Manual).action
-                    == TakeoverAction::TakeOver
-                {
-                    self.request(now, true, Cause::User, out);
-                    self.say("REQUEST owner=linux");
                 } else {
-                    self.say(
-                        "BLOCKED take needs two hosts, an in-ear bud, and confirmed idle audio",
-                    );
+                    match self.decide_take(TakeoverTrigger::Manual).action {
+                        TakeoverAction::TakeOver => {
+                            self.request(now, true, Cause::User, out);
+                            self.say("REQUEST owner=linux");
+                        }
+                        TakeoverAction::Skip(TakeoverSkip::NoSession) => self.say(NO_SESSION),
+                        TakeoverAction::Skip(_) => self.say(
+                            "BLOCKED take needs two hosts, an in-ear bud, and confirmed idle audio",
+                        ),
+                    }
                 }
             }
             Input::Release => {
-                if self.pending.is_some() {
+                if !self.live() {
+                    self.say(NO_SESSION);
+                } else if self.pending.is_some() {
                     self.say("WAIT ownership request pending");
                 } else if self.owner.as_deref() == Some(&[0]) && !self.requested_take {
                     self.say("Ownership already released");
@@ -334,7 +374,7 @@ impl Handoff {
             }
             return;
         }
-        if self.quitting {
+        if self.quitting || self.session_lost {
             return;
         }
         match self.pending {
@@ -434,7 +474,9 @@ impl Handoff {
     fn reconcile(&mut self, now: Instant, out: &mut Vec<Command>) {
         let stop = std::mem::take(&mut self.stop_during_take);
         let play = std::mem::take(&mut self.play_during_release);
-        if !self.automatic || !self.connected || self.quitting || self.pending.is_some() {
+        // Nothing is sent on a session found dead, even if the routing
+        // cached before it died would allow a take.
+        if !self.automatic || !self.live() || self.quitting || self.pending.is_some() {
             return;
         }
         if stop && self.requested_take && self.was_playing == Some(false) {
@@ -462,6 +504,7 @@ impl Handoff {
         }
         out.push(Command::DropSession);
         self.connected = false;
+        self.session_lost = false;
         self.pending = None;
         self.requested_take = false;
         self.was_playing = None;
@@ -491,6 +534,7 @@ impl Handoff {
         }
         out.push(Command::AdoptSession);
         self.connected = true;
+        self.session_lost = false;
         self.hosts = facts.hosts;
         self.ears = facts.ears;
         self.audio = facts.audio;
@@ -557,7 +601,8 @@ impl Handoff {
         if !self.quitting || self.pending.is_some_and(|p| !p.desired) {
             return;
         }
-        if !self.requested_take {
+        if !self.requested_take || self.session_lost {
+            // Nothing to release, or no session left to release it on.
             out.push(Command::Exit);
             return;
         }
@@ -587,7 +632,7 @@ impl Handoff {
 
     fn routing(&self) -> RoutingSnapshot {
         routing_snapshot(
-            self.connected,
+            self.live(),
             &self.hosts,
             &self.ears,
             self.audio.as_ref(),
@@ -1111,6 +1156,110 @@ mod tests {
         assert_eq!(p.feed(1550, Input::EarState(vec![OutOfEar, InCase])), []);
         assert_eq!(p.feed(1600, Input::Ownership(vec![0])), [PauseMedia]);
         assert_eq!(p.play(2000, true), []);
+    }
+
+    #[test]
+    fn session_loss_before_release_ack_does_not_retake() {
+        // As in restart_during_pending_release_takes_after_ack: an automatic
+        // release is pending and playback restarted during it.
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1000, false), [SendOwnership(false)]);
+        assert_eq!(p.play(1500, true), []);
+        p.core.take_lines();
+        // The buds go in the case and the link drops. run() finds the sender
+        // gone with the wear report and the release ACK still queued: it
+        // marks the session lost, feeds the queued events, then disconnects.
+        assert_eq!(p.feed(1600, Input::SessionLost), []);
+        assert_eq!(p.feed(1610, Input::EarState(vec![InCase, InCase])), []);
+        // No retake on the dead session; c8's deferred pause applies.
+        assert_eq!(p.feed(1620, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(p.feed(1630, Input::Disconnected), [DropSession]);
+        assert!(
+            p.core
+                .take_lines()
+                .iter()
+                .any(|l| l.starts_with("CASE waiting for new Linux playback"))
+        );
+        // Case recovery: no reconnect, however long, until a new
+        // stopped-to-playing playback.
+        for ms in (2000..=5600).step_by(200) {
+            assert_eq!(p.feed(ms, Input::Tick), []);
+        }
+        assert_eq!(p.play(5700, true), []);
+        assert_eq!(p.feed(5800, Input::Tick), []);
+        assert_eq!(p.play(6000, false), []);
+        assert_eq!(p.feed(6100, Input::Tick), []);
+        assert_eq!(p.play(6500, true), []);
+        assert_eq!(p.feed(6600, Input::Tick), [Reconnect { audio: true }]);
+    }
+
+    #[test]
+    fn session_loss_blocks_manual_take() {
+        // run() checks the live sender before a REPL command: on a dead
+        // sender it feeds SessionLost, the queued events (none: the select
+        // is biased), then Disconnected, and only then the command.
+        let mut p = Probe::new(false, true);
+        p.routing(ready_facts());
+        p.core.take_lines();
+        assert_eq!(p.feed(100, Input::SessionLost), []);
+        // Even before the disconnect is fed, the cached routing does not
+        // allow a take, a release or auto mode on the dead session.
+        assert_eq!(p.feed(110, Input::Take), []);
+        assert_eq!(p.feed(120, Input::Release), []);
+        assert_eq!(p.feed(130, Input::Auto), []);
+        let lines = p.core.take_lines();
+        assert_eq!(lines.iter().filter(|l| l.starts_with("WAIT")).count(), 3);
+        assert_eq!(p.feed(200, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(210, Input::Take), []);
+        assert_eq!(p.feed(220, Input::Release), []);
+        assert_eq!(p.feed(230, Input::Auto), []);
+        let lines = p.core.take_lines();
+        assert_eq!(lines.iter().filter(|l| l.starts_with("WAIT")).count(), 3);
+
+        // A manual take Linux holds: losing the session sends no release.
+        let mut p = Probe::new(false, true);
+        p.routing(ready_facts());
+        assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
+        assert_eq!(p.feed(200, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(300, Input::SessionLost), []);
+        assert_eq!(p.feed(310, Input::Release), []);
+        assert_eq!(p.feed(320, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.feed(330, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(340, Input::Take), []);
+    }
+
+    #[test]
+    fn session_loss_sends_nothing() {
+        // A stop during a pending take whose ACK is dequeued after the
+        // session died: no release on it.
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(p.feed(1100, Input::SessionLost), []);
+        assert_eq!(p.feed(1110, Input::Ownership(vec![1])), []);
+        assert_eq!(
+            p.feed(
+                1120,
+                Input::ConnectedDevices {
+                    old: vec![host(LOCAL)],
+                    new: two_hosts(),
+                },
+            ),
+            []
+        );
+        assert_eq!(p.feed(1130, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.play(1140, true), []);
+        assert_eq!(p.feed(1150, Input::Disconnected), [PauseMedia, DropSession]);
+        assert_eq!(p.feed(2200, Input::Tick), [Reconnect { audio: true }]);
+
+        // Quitting with the AirPods taken: nothing to release them on.
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(700, Input::SessionLost), []);
+        assert_eq!(p.feed(710, Input::Quit), [Exit]);
     }
 
     #[test]

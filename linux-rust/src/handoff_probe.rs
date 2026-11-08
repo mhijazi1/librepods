@@ -142,6 +142,12 @@ async fn status(manager: &AACPManager, local: &str) {
     }
 }
 
+/// Whether the AACP receive loop still has the control session. The guard is
+/// dropped before this returns.
+async fn session_alive(manager: &AACPManager) -> bool {
+    manager.state.lock().await.sender.is_some()
+}
+
 /// The probe's I/O: executes the commands of the handoff core.
 struct Io {
     adapter: bluer::Adapter,
@@ -157,17 +163,36 @@ struct Io {
 }
 
 impl Io {
+    /// A send that failed because the session died after the core's last
+    /// liveness check is not fatal: the next `sync_session` tears the session
+    /// down. Any other send error still stops the probe.
+    async fn tolerate_lost_session(&self, sent: Result<()>) -> Result<()> {
+        match sent {
+            Err(error) if !session_alive(&self.manager).await => {
+                println!("SEND failed: {error}; control session lost");
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
     /// Execute the core's commands in order. Ok(true) when it asked to exit.
     /// No AACP state guard is held here; the sends take their own.
     async fn execute(&mut self, commands: Vec<Command>) -> Result<bool> {
         for command in commands {
             match command {
                 Command::SendOwnership(owns) => {
-                    self.manager
+                    let sent = self
+                        .manager
                         .send_control_command(Control::OwnsConnection, &[u8::from(owns)])
-                        .await?
+                        .await
+                        .map_err(Into::into);
+                    self.tolerate_lost_session(sent).await?
                 }
-                Command::Announce => announce(&self.manager, &self.local).await?,
+                Command::Announce => {
+                    let sent = announce(&self.manager, &self.local).await;
+                    self.tolerate_lost_session(sent).await?
+                }
                 Command::PauseMedia => self.media.pause_all_media().await,
                 Command::ConnectA2dp => {
                     let device = self.adapter.device(self.address)?;
@@ -236,14 +261,58 @@ async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
     io.execute(commands).await
 }
 
-/// Tell the core when the control session died under it, before it acts on
-/// routing state that the disconnect already cleared.
-async fn sync_session(core: &mut Handoff, io: &mut Io) -> Result<bool> {
-    let alive = io.manager.state.lock().await.sender.is_some();
-    if core.connected() && !alive {
-        return step(core, io, Input::Disconnected).await;
+/// Feed one AACP event to the core and print STATUS after routing reports.
+/// Ok(true) when the probe should stop.
+async fn on_event(core: &mut Handoff, io: &mut Io, event: AACPEvent) -> Result<bool> {
+    let (input, show_status) = match event {
+        AACPEvent::ControlCommand(s) if s.identifier == Control::OwnsConnection => {
+            (Some(Input::Ownership(s.value)), true)
+        }
+        AACPEvent::ConnectedDevices(old, new) => (Some(Input::ConnectedDevices { old, new }), true),
+        AACPEvent::EarDetection(_, new) => (Some(Input::EarState(new)), true),
+        AACPEvent::AudioSource(source) => (Some(Input::AudioSource(source)), true),
+        AACPEvent::OwnershipToFalseRequest => (Some(Input::RemoteOwnershipRequest), false),
+        _ => (None, false),
+    };
+    if let Some(input) = input
+        && step(core, io, input).await?
+    {
+        return Ok(true);
+    }
+    if show_status {
+        status(&io.manager, &io.local).await;
     }
     Ok(false)
+}
+
+/// The AACP receive loop clears a dead session (aacp.rs `clear_connection`)
+/// without an event. Mark it lost in the core so nothing is sent or taken on
+/// it, without dropping events that are still queued.
+async fn mark_session_lost(core: &mut Handoff, io: &mut Io) -> Result<bool> {
+    if core.live() && !session_alive(&io.manager).await {
+        return step(core, io, Input::SessionLost).await;
+    }
+    Ok(false)
+}
+
+/// Tell the core when the control session died under it, before it acts on
+/// routing state that the disconnect already cleared. The receive loop sends
+/// its events before it clears the session, so once the sender is gone the
+/// queue holds all of them: feed them first (a case-closed wear report must
+/// still set case recovery), then the disconnect, which drops the session.
+async fn sync_session(core: &mut Handoff, io: &mut Io) -> Result<bool> {
+    if !core.connected() || session_alive(&io.manager).await {
+        return Ok(false);
+    }
+    if step(core, io, Input::SessionLost).await? {
+        return Ok(true);
+    }
+    while let Ok(event) = io.events.try_recv() {
+        if on_event(core, io, event).await? {
+            return Ok(true);
+        }
+    }
+    step(core, io, Input::Disconnected).await
 }
 
 /// Wait for the running reconnect attempt; never resolves without one.
@@ -319,25 +388,13 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
         tokio::select! {
             biased;
             Some(event) = io.events.recv() => {
-                let (input, show_status) = match event {
-                    AACPEvent::ControlCommand(s) if s.identifier == Control::OwnsConnection => {
-                        (Some(Input::Ownership(s.value)), true)
-                    }
-                    AACPEvent::ConnectedDevices(old, new) => {
-                        (Some(Input::ConnectedDevices { old, new }), true)
-                    }
-                    AACPEvent::EarDetection(_, new) => (Some(Input::EarState(new)), true),
-                    AACPEvent::AudioSource(source) => (Some(Input::AudioSource(source)), true),
-                    AACPEvent::OwnershipToFalseRequest => (Some(Input::RemoteOwnershipRequest), false),
-                    _ => (None, false),
-                };
-                if let Some(input) = input
-                    && step(&mut core, &mut io, input).await?
+                // Check the session before stepping the event (an ownership
+                // ACK must not retake on a dead session), but keep the rest
+                // of the queue: the disconnect comes at the next sync.
+                if mark_session_lost(&mut core, &mut io).await?
+                    || on_event(&mut core, &mut io, event).await?
                 {
                     break;
-                }
-                if show_status {
-                    status(&io.manager, &io.local).await;
                 }
             }
             Some((sampled_at, playing)) = io.play_rx.recv() => {
@@ -381,7 +438,12 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
             line = lines.next_line(), if !core.quitting() && !daemon => {
                 let line = line?;
                 let command = line.as_deref().map(str::trim).unwrap_or("quit");
-                if !core.connected() && !matches!(command, "status" | "quit" | "manual" | "") {
+                // The live-sender check comes first, so take, release and
+                // auto never act on a session the receive loop has closed.
+                if sync_session(&mut core, &mut io).await? {
+                    break;
+                }
+                if !core.connected() && matches!(command, "refresh" | "announce") {
                     println!("WAIT reconnecting; status, manual, and quit remain available");
                     continue;
                 }
