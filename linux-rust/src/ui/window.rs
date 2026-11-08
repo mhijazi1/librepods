@@ -104,7 +104,9 @@ fn charging_marker(entry: Option<&BatteryInfo>) -> &'static str {
 fn connect_mode_hint(mode: crate::utils::SwitchingMode) -> Option<&'static str> {
     match mode {
         crate::utils::SwitchingMode::Handoff => None,
-        _ => Some("Applies only when switching mode is handoff"),
+        crate::utils::SwitchingMode::Legacy | crate::utils::SwitchingMode::Off => {
+            Some("Applies only when switching mode is handoff")
+        }
     }
 }
 
