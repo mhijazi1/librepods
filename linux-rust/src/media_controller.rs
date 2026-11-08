@@ -865,24 +865,50 @@ impl MediaController {
     /// PipeWire can assign a different index after a disconnect/reconnect.
     /// Polls the full `CARD_LOOKUP_ATTEMPTS` budget.
     async fn refresh_device_index(&self) -> Option<u32> {
-        self.refresh_device_index_within(CARD_LOOKUP_ATTEMPTS).await
-    }
-
-    /// `refresh_device_index` with a single lookup and no sleep, for the
-    /// checks inside the A2DP enumeration waits (#32).
-    async fn recheck_device_index(&self) -> Option<u32> {
-        self.refresh_device_index_within(CARD_LOOKUP_ATTEMPTS_PER_CHECK)
-            .await
-    }
-
-    async fn refresh_device_index_within(&self, attempts: u32) -> Option<u32> {
         let mac = self.state.lock().await.connected_device_mac.clone();
         if mac.is_empty() {
             return None;
         }
-        let index = self.find_audio_device_index(&mac, attempts).await;
+        let index = self.get_audio_device_index(&mac).await;
         self.state.lock().await.device_index = index;
         index
+    }
+
+    /// One availability check inside the A2DP enumeration waits. The first
+    /// check reuses the index resolved before the wait. Every later check
+    /// re-resolves the card (a reconnect can change its index) with a
+    /// `CARD_LOOKUP_ATTEMPTS_PER_CHECK` lookup, stores it, and asks for A2DP
+    /// only if the card is there. Nesting the full ~3 s poll in each check
+    /// made the worst case ~43 s (#32).
+    async fn a2dp_enumeration_check<L, LFut, S, SFut, A, AFut>(
+        &self,
+        first: bool,
+        lookup: L,
+        sleep: S,
+        available: A,
+    ) -> bool
+    where
+        L: FnMut() -> LFut,
+        LFut: std::future::Future<Output = Option<u32>>,
+        S: FnMut(Duration) -> SFut,
+        SFut: std::future::Future<Output = ()>,
+        A: FnOnce() -> AFut,
+        AFut: std::future::Future<Output = bool>,
+    {
+        if !first {
+            let index = retry_card_lookup_with(
+                CARD_LOOKUP_ATTEMPTS_PER_CHECK,
+                CARD_LOOKUP_INTERVAL,
+                lookup,
+                sleep,
+            )
+            .await;
+            self.state.lock().await.device_index = index;
+            if index.is_none() {
+                return false;
+            }
+        }
+        available().await
     }
 
     async fn restart_wire_plumber(&self) -> bool {
@@ -907,7 +933,8 @@ impl MediaController {
     pub async fn activate_a2dp_profile(&self) {
         debug!("Entering activate_a2dp_profile");
 
-        if self.state.lock().await.connected_device_mac.is_empty() {
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        if mac.is_empty() {
             warn!("Connected device MAC is empty, cannot activate A2DP profile");
             return;
         }
@@ -918,20 +945,18 @@ impl MediaController {
             return;
         }
 
-        // The first check reuses the index resolved just above; every later
-        // check re-resolves the card by MAC, as a reconnect can change it.
-        // Those re-checks are single-shot: the wait already spaces them, and
-        // nesting the ~3 s poll in each one made the worst case ~43 s (#32).
         let mut first_check = true;
         let available = recover_a2dp_availability(
             Self::A2DP_ENUMERATION_ATTEMPTS,
             Self::A2DP_ENUMERATION_INTERVAL,
             || {
-                let refresh = !std::mem::replace(&mut first_check, false);
-                async move {
-                    (!refresh || self.recheck_device_index().await.is_some())
-                        && self.is_a2dp_profile_available().await
-                }
+                let mac = &mac;
+                self.a2dp_enumeration_check(
+                    std::mem::replace(&mut first_check, false),
+                    move || find_card_index(mac.clone()),
+                    tokio::time::sleep,
+                    || self.is_a2dp_profile_available(),
+                )
             },
             || self.restart_wire_plumber(),
             tokio::time::sleep,
@@ -1199,29 +1224,12 @@ impl MediaController {
         // while that happens. A single lookup can land in that window and give
         // up, leaving the audio nowhere: ownership already taken from the other
         // device, but no local profile to play through. So poll for a moment.
-        self.find_audio_device_index(mac, CARD_LOOKUP_ATTEMPTS)
-            .await
-    }
-
-    /// Looks the card up by MAC at most `attempts` times, `CARD_LOOKUP_INTERVAL`
-    /// apart.
-    async fn find_audio_device_index(&self, mac: &str, attempts: u32) -> Option<u32> {
         if mac.is_empty() {
             return None;
         }
 
-        let found = retry_card_lookup(attempts, CARD_LOOKUP_INTERVAL, || {
-            let mac_clone = mac.to_string();
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    get_card_info_list_sync().into_iter().find_map(|card| {
-                        let device_string = card.proplist.get_str("device.string")?;
-                        device_string.contains(&mac_clone).then_some(card.index)
-                    })
-                })
-                .await
-                .unwrap_or(None)
-            }
+        let found = retry_card_lookup(CARD_LOOKUP_ATTEMPTS, CARD_LOOKUP_INTERVAL, || {
+            find_card_index(mac.to_string())
         })
         .await;
 
@@ -1230,20 +1238,12 @@ impl MediaController {
                 info!("Found audio device index for MAC {}: {}", mac, index);
                 Some(index)
             }
-            None if attempts >= CARD_LOOKUP_ATTEMPTS => {
+            None => {
                 error!(
                     "No matching Bluetooth card found for MAC address: {} after {} attempts ({:?})",
                     mac,
-                    attempts,
-                    card_lookup_max_wait(attempts)
-                );
-                None
-            }
-            None => {
-                // A short re-check inside a wait; the wait logs the outcome.
-                debug!(
-                    "No Bluetooth card for MAC address {} after {} attempt(s)",
-                    mac, attempts
+                    CARD_LOOKUP_ATTEMPTS,
+                    card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS)
                 );
                 None
             }
@@ -1514,6 +1514,19 @@ fn pulse_connect() -> Option<(Mainloop, Context)> {
         }
     }
     Some((mainloop, context))
+}
+
+/// One scan of the card list for the card whose `device.string` contains
+/// `mac`. Never retries; callers pick the retry budget.
+async fn find_card_index(mac: String) -> Option<u32> {
+    tokio::task::spawn_blocking(move || {
+        get_card_info_list_sync().into_iter().find_map(|card| {
+            let device_string = card.proplist.get_str("device.string")?;
+            device_string.contains(&mac).then_some(card.index)
+        })
+    })
+    .await
+    .unwrap_or(None)
 }
 
 fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
@@ -2353,6 +2366,7 @@ mod tests {
         .await;
         assert_eq!(initial, Some(3));
 
+        let controller = MediaController::new(String::new(), String::new());
         let checks = std::cell::Cell::new(0u32);
         let restarts = std::cell::Cell::new(0u32);
         let recheck_lookups = std::cell::Cell::new(0u32);
@@ -2361,29 +2375,18 @@ mod tests {
             interval,
             || {
                 checks.set(checks.get() + 1);
-                let refresh = checks.get() > 1;
-                let (clock, recheck_lookups) = (&clock, &recheck_lookups);
-                async move {
-                    // The first check reuses the resolved index; the card
-                    // has no A2DP profile yet.
-                    if !refresh {
-                        return false;
-                    }
-                    retry_card_lookup_with(
-                        CARD_LOOKUP_ATTEMPTS_PER_CHECK,
-                        CARD_LOOKUP_INTERVAL,
-                        || {
-                            recheck_lookups.set(recheck_lookups.get() + 1);
-                            async { None }
-                        },
-                        |d| {
-                            clock.set(clock.get() + d);
-                            std::future::ready(())
-                        },
-                    )
-                    .await
-                    .is_some()
-                }
+                let recheck_lookups = &recheck_lookups;
+                // The card is missing at every re-check; at the first check
+                // (resolved index) it has no A2DP profile yet.
+                controller.a2dp_enumeration_check(
+                    checks.get() == 1,
+                    move || {
+                        recheck_lookups.set(recheck_lookups.get() + 1);
+                        async { None }
+                    },
+                    tick,
+                    || std::future::ready(false),
+                )
             },
             || {
                 restarts.set(restarts.get() + 1);
@@ -2399,6 +2402,66 @@ mod tests {
         assert_eq!(recheck_lookups.get(), 2 * attempts * CARD_LOOKUP_ATTEMPTS_PER_CHECK);
         assert_eq!(clock.get(), expected);
         assert!(clock.get() <= A2DP_RECOVERY_BOUND);
+    }
+
+    /// Runs one `a2dp_enumeration_check` whose lookup finds `found` and whose
+    /// A2DP query answers `a2dp`; returns (result, lookups, sleeps, asked).
+    async fn run_a2dp_check(
+        controller: &MediaController,
+        first: bool,
+        found: Option<u32>,
+        a2dp: bool,
+    ) -> (bool, u32, u32, bool) {
+        let lookups = std::cell::Cell::new(0u32);
+        let sleeps = std::cell::Cell::new(0u32);
+        let asked = std::cell::Cell::new(false);
+        let ok = controller
+            .a2dp_enumeration_check(
+                first,
+                || {
+                    lookups.set(lookups.get() + 1);
+                    std::future::ready(found)
+                },
+                |_| {
+                    sleeps.set(sleeps.get() + 1);
+                    std::future::ready(())
+                },
+                || {
+                    asked.set(true);
+                    std::future::ready(a2dp)
+                },
+            )
+            .await;
+        (ok, lookups.get(), sleeps.get(), asked.get())
+    }
+
+    #[tokio::test]
+    async fn a2dp_enumeration_check_relooks_up_once_after_first() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.device_index = Some(3);
+
+        // First check: reuses the resolved index, no lookup, asks for A2DP.
+        assert_eq!(
+            run_a2dp_check(&controller, true, None, true).await,
+            (true, 0, 0, true)
+        );
+        assert_eq!(controller.state.lock().await.device_index, Some(3));
+
+        // Later check, card found under a new index: stored, A2DP answered.
+        for a2dp in [true, false] {
+            assert_eq!(
+                run_a2dp_check(&controller, false, Some(9), a2dp).await,
+                (a2dp, CARD_LOOKUP_ATTEMPTS_PER_CHECK, 0, true)
+            );
+            assert_eq!(controller.state.lock().await.device_index, Some(9));
+        }
+
+        // Later check, card missing: stored as gone, A2DP not asked.
+        assert_eq!(
+            run_a2dp_check(&controller, false, None, true).await,
+            (false, CARD_LOOKUP_ATTEMPTS_PER_CHECK, 0, false)
+        );
+        assert_eq!(controller.state.lock().await.device_index, None);
     }
 
     use crate::utils::PreferredCodec;
