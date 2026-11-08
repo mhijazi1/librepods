@@ -119,13 +119,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_devices_missing_file_is_empty() {
+    fn parsing_devices_missing_file_is_empty() {
         let devices = parse_devices(Err(std::io::ErrorKind::NotFound.into())).unwrap();
         assert!(devices.is_empty());
     }
 
     #[test]
-    fn parse_devices_round_trips() {
+    fn parsing_devices_round_trips() {
         let mut devices = HashMap::new();
         devices.insert(
             "AA:AA:AA:AA:AA:AA".to_string(),
@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_devices_rejects_read_errors() {
+    fn parsing_devices_rejects_read_errors() {
         for kind in [
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::InvalidData,
@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_devices_rejects_bad_json() {
+    fn parsing_devices_rejects_bad_json() {
         for json in ["", "{", r#"{"AA:AA:AA:AA:AA:AA": 1}"#] {
             assert!(parse_devices(Ok(json.to_string())).is_err(), "{json:?}");
         }
