@@ -501,8 +501,11 @@ async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
 
 async fn run_handoff(mut shell: Shell) {
     // The event channel is set after connect and handshake, so the earlier
-    // reports exist only in the state.
-    let facts = {
+    // reports exist only in the state. The manager emits under the state
+    // lock it updates, and the router never takes that lock: flushing the
+    // router under the snapshot's guard splits the queue exactly into the
+    // events already in the snapshot and the later ones (#49).
+    let (facts, backlog) = {
         let state = shell.manager.state.lock().await;
         if state.sender.is_none() {
             info!(
@@ -511,7 +514,12 @@ async fn run_handoff(mut shell: Shell) {
             );
             return;
         }
-        session_facts(&state)
+        shell.flush().await;
+        let mut backlog = Vec::new();
+        while let Ok(event) = shell.events.try_recv() {
+            backlog.push(event);
+        }
+        (session_facts(&state), backlog)
     };
     let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true);
     for input in seed_inputs(facts) {
@@ -519,8 +527,20 @@ async fn run_handoff(mut shell: Shell) {
             return;
         }
     }
+    // Replayed before Auto, so a stale [0] in it cannot pass for the reply
+    // to Auto's "not owning" (#54).
+    for event in backlog {
+        if mark_session_lost(&mut core, &mut shell).await
+            || on_event(&mut core, &mut shell, event).await
+        {
+            return;
+        }
+    }
     // The core's own automatic startup: A2DP, "not owning", announce.
     if step(&mut core, &mut shell, Input::Auto).await {
+        return;
+    }
+    if step(&mut core, &mut shell, Input::InitBacklogDrained).await {
         return;
     }
     let mut tick = tokio::time::interval(TICK);
@@ -1341,8 +1361,10 @@ mod tests {
         assert_eq!(h.pauses(), 0);
     }
 
-    /// Playback stopped then started: one take, OwnsConnection [1] only.
+    /// The reply to Auto's "not owning" (#54), then playback stopped then
+    /// started: one take, OwnsConnection [1] only.
     async fn expect_take(h: &Harness, rx: &mut mpsc::Receiver<Vec<u8>>) {
+        h.emit(owns(0));
         h.play(false).await;
         h.play(true).await;
         assert_eq!(next_packet(rx).await, expected_owns(1).await);
@@ -1362,7 +1384,9 @@ mod tests {
         expect_startup(&h, &mut rx).await;
 
         // Take on new playback: OwnsConnection [1], no hijack, show-UI or
-        // media information packet.
+        // media information packet. The reply to Auto's "not owning" comes
+        // first (#54).
+        h.emit(owns(0));
         h.play(false).await;
         h.play(true).await;
         let take = next_packet(&mut rx).await;
@@ -1390,7 +1414,7 @@ mod tests {
         assert_eq!(h.pauses(), 0);
         assert_eq!(h.activations(), 1);
         // The device handler saw both reports too.
-        assert_eq!(h.handler.finished(), named(&[owns(1), owns(0)]));
+        assert_eq!(h.handler.finished(), named(&[owns(0), owns(1), owns(0)]));
 
         // New playback takes again; another host then takes the AirPods
         // (a [0] that acknowledges nothing): the core yields once, with
@@ -1410,6 +1434,42 @@ mod tests {
             "{trace:#?}"
         );
         assert_eq!(h.activations(), 1);
+
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_default_path_boundary_follows_pre_snapshot_backlog() {
+        let mac = "5A:00:00:00:00:31";
+        let (manager, _rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        // Nothing awaited since the task was spawned on this current-thread
+        // runtime: it has not taken its snapshot yet.
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        wait_until("the boundary", || {
+            traced(mac).iter().any(|l| l.starts_with("BACKLOG drained"))
+        })
+        .await;
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        let remote = || -> Vec<usize> {
+            let trace = traced(mac);
+            (0..trace.len())
+                .filter(|&i| trace[i].starts_with("REMOTE requested ownership"))
+                .collect()
+        };
+        wait_until("the post-snapshot request", || remote().len() == 2).await;
+        let trace = traced(mac);
+        let boundary = position(&trace, "BACKLOG drained");
+        let remote = remote();
+        assert!(remote[0] < boundary && boundary < remote[1], "{trace:#?}");
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|l| l.starts_with("BACKLOG drained"))
+                .count(),
+            1,
+            "{trace:#?}"
+        );
 
         stop_handoff_task(mac);
     }
@@ -1475,6 +1535,7 @@ mod tests {
                 (0x04, ENC.to_vec()),
             ]))
             .unwrap();
+        events.send(owns(0)).unwrap();
         play_tx.send((Instant::now(), false)).await.unwrap();
         play_tx.send((Instant::now(), true)).await.unwrap();
         wait_until("the take", || {
@@ -1736,7 +1797,7 @@ mod tests {
         let worn = wear(EarDetectionStatus::InEar);
         h.emit(worn.clone());
         wait_until("the handler to block", || {
-            h.handler.started() == named(&[worn.clone()])
+            h.handler.started() == named(&[owns(0), worn.clone()])
         })
         .await;
         // Queued behind it: the take's ACK, then another host's request.
@@ -1755,12 +1816,12 @@ mod tests {
                 < position(&trace, "REMOTE requested ownership; yielding")
         );
         // The handler is still blocked on the wear report.
-        assert_eq!(h.handler.started(), named(&[worn.clone()]));
-        assert!(h.handler.finished().is_empty());
+        assert_eq!(h.handler.started(), named(&[owns(0), worn.clone()]));
+        assert_eq!(h.handler.finished(), named(&[owns(0)]));
 
         // Released, it handles every event once, in order.
         h.handler.release.notify_one();
-        let all = named(&[worn, owns(1), AACPEvent::OwnershipToFalseRequest]);
+        let all = named(&[owns(0), worn, owns(1), AACPEvent::OwnershipToFalseRequest]);
         wait_until("the handler to catch up", || h.handler.finished() == all).await;
         assert_eq!(h.handler.started(), all);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
@@ -1857,11 +1918,17 @@ mod tests {
         manager.disconnect().await;
         wait_until("the task to end", || task.is_finished()).await;
         assert!(outer.try_lock().is_err(), "the mutex was held throughout");
-        assert_eq!(h.handler.finished(), named(&[owns(1)]));
+        assert_eq!(h.handler.finished(), named(&[owns(0), owns(1)]));
 
         // Released, ear detection and the rest run once, in order.
         h.handler.release.notify_one();
-        let all = named(&[owns(1), worn, AACPEvent::OwnershipToFalseRequest, owns(0)]);
+        let all = named(&[
+            owns(0),
+            owns(1),
+            worn,
+            AACPEvent::OwnershipToFalseRequest,
+            owns(0),
+        ]);
         wait_until("the handler to catch up", || h.handler.finished() == all).await;
         assert_eq!(h.handler.started(), all);
     }
@@ -1887,7 +1954,7 @@ mod tests {
         let in_case = wear(EarDetectionStatus::InCase);
         h.emit(in_case.clone());
         wait_until("the handler to block", || {
-            h.handler.started() == named(&[owns(1), in_case.clone()])
+            h.handler.started() == named(&[owns(0), owns(1), in_case.clone()])
         })
         .await;
         let before = traced(mac).len();
@@ -1928,9 +1995,10 @@ mod tests {
 
         // Released, the handler gets the wear report once, then the rest in
         // order.
-        assert_eq!(h.handler.finished(), named(&[owns(1)]));
+        assert_eq!(h.handler.finished(), named(&[owns(0), owns(1)]));
         h.handler.release.notify_one();
         let all = named(&[
+            owns(0),
             owns(1),
             in_case,
             owns(0),
@@ -2309,6 +2377,8 @@ mod tests {
             Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
         assert!(h.playback_started.load(Ordering::SeqCst));
         expect_startup(&h, &mut rx).await;
+        // The reply to Auto's "not owning" (#54).
+        h.emit(owns(0));
         // The stream monitor's baseline has no stream.
         streams.settle().await;
 

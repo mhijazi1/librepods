@@ -16,8 +16,64 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type ControlSession = (AACPManager, tokio::sync::mpsc::UnboundedReceiver<AACPEvent>);
+/// A reconnect attempt's session and its init backlog.
+type Reconnection = (ControlSession, InitBacklog);
 
 const A2DP_SINK: uuid::Uuid = uuid::Uuid::from_u128(0x0000110b00001000800000805f9b34fb);
+/// How long the reconnect task waits for the echo of its last "not owning".
+const INIT_ECHO_WAIT: Duration = Duration::from_secs(1);
+
+/// The events a reconnected session queued while it initialized (#49).
+#[derive(Default)]
+struct InitBacklog {
+    events: Vec<AACPEvent>,
+    /// The echo of the last "not owning" ends `events`: what follows is
+    /// fresh.
+    drained: bool,
+}
+
+/// Take every event queued so far, run `send` (the last "not owning"), then
+/// take events up to and including the first OwnsConnection report, its
+/// echo. Without an echo within `INIT_ECHO_WAIT` the backlog is not drained.
+async fn collect_init_backlog<E>(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<AACPEvent>,
+    send: impl Future<Output = std::result::Result<(), E>>,
+) -> Result<InitBacklog>
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let mut backlog = InitBacklog::default();
+    while let Ok(event) = events.try_recv() {
+        backlog.events.push(event);
+    }
+    send.await.map_err(Into::into)?;
+    backlog.drained = tokio::time::timeout(INIT_ECHO_WAIT, async {
+        while let Some(event) = events.recv().await {
+            let echo = matches!(
+                &event,
+                AACPEvent::ControlCommand(s) if s.identifier == Control::OwnsConnection
+            );
+            backlog.events.push(event);
+            if echo {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    Ok(backlog)
+}
+
+/// The core inputs an adopted session's backlog feeds before any later
+/// event: its events, then the queue boundary if the echo was seen.
+fn adoption_inputs(backlog: InitBacklog) -> Vec<Input> {
+    let mut inputs: Vec<Input> = backlog.events.into_iter().filter_map(event_input).collect();
+    if backlog.drained {
+        inputs.push(Input::InitBacklogDrained);
+    }
+    inputs
+}
 
 async fn connect_control(address: Address) -> Result<ControlSession> {
     let mut manager = AACPManager::new();
@@ -136,9 +192,12 @@ struct Io {
     manager: AACPManager,
     events: tokio::sync::mpsc::UnboundedReceiver<AACPEvent>,
     play_rx: tokio::sync::mpsc::Receiver<(Instant, bool)>,
-    retry: Option<tokio::task::JoinHandle<Result<ControlSession>>>,
+    retry: Option<tokio::task::JoinHandle<Result<Reconnection>>>,
     /// Session made by the last reconnect, until the core adopts or cancels it.
-    candidate: Option<ControlSession>,
+    candidate: Option<Reconnection>,
+    /// The adopted session's backlog inputs, fed right after the step that
+    /// adopted it.
+    adopted: Vec<Input>,
     /// The handoff log (#21); None only if no state directory is known
     /// (neither XDG_STATE_HOME nor HOME set) or its writer thread failed to
     /// start. A failed open or write warns once, then stops logging.
@@ -195,37 +254,40 @@ impl Io {
                     let adapter = self.adapter.clone();
                     let address = self.address;
                     self.retry = Some(tokio::spawn(async move {
-                        let result = connect_control(address).await?;
-                        if audio {
-                            let device = adapter.device(address)?;
-                            let connected = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                device.connect_profile(&A2DP_SINK),
-                            )
-                            .await;
-                            match connected {
-                                Ok(Ok(())) => {}
-                                _ => {
-                                    result.0.disconnect().await;
-                                    return Err("A2DP reconnection failed".into());
-                                }
-                            }
-                            result
-                                .0
-                                .send_control_command(Control::OwnsConnection, &[0])
-                                .await?;
+                        let (manager, mut events) = connect_control(address).await?;
+                        if !audio {
+                            return Ok(((manager, events), InitBacklog::default()));
                         }
-                        Ok(result)
+                        let device = adapter.device(address)?;
+                        let connected = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            device.connect_profile(&A2DP_SINK),
+                        )
+                        .await;
+                        match connected {
+                            Ok(Ok(())) => {}
+                            _ => {
+                                manager.disconnect().await;
+                                return Err("A2DP reconnection failed".into());
+                            }
+                        }
+                        let backlog = collect_init_backlog(
+                            &mut events,
+                            manager.send_control_command(Control::OwnsConnection, &[0]),
+                        )
+                        .await?;
+                        Ok(((manager, events), backlog))
                     }));
                 }
                 Command::AdoptSession => {
-                    if let Some((manager, events)) = self.candidate.take() {
+                    if let Some(((manager, events), backlog)) = self.candidate.take() {
                         self.manager = manager;
                         self.events = events;
+                        self.adopted = adoption_inputs(backlog);
                     }
                 }
                 Command::CancelReconnect => {
-                    if let Some((manager, _)) = self.candidate.take() {
+                    if let Some(((manager, _), _)) = self.candidate.take() {
                         manager.disconnect().await;
                     }
                     self.adapter.device(self.address)?.disconnect().await?;
@@ -301,10 +363,22 @@ async fn sync_session(core: &mut Handoff, io: &mut Io) -> Result<bool> {
     step(core, io, Input::Disconnected).await
 }
 
+/// Feed the init backlog of the session the last step adopted, then its
+/// boundary, before any later event of that session (#49). Ok(true) when the
+/// probe should stop.
+async fn feed_adopted(core: &mut Handoff, io: &mut Io) -> Result<bool> {
+    for input in std::mem::take(&mut io.adopted) {
+        if mark_session_lost(core, io).await? || step(core, io, input).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Wait for the running reconnect attempt; never resolves without one.
 async fn reconnect_result(
-    retry: &mut Option<tokio::task::JoinHandle<Result<ControlSession>>>,
-) -> std::result::Result<Result<ControlSession>, tokio::task::JoinError> {
+    retry: &mut Option<tokio::task::JoinHandle<Result<Reconnection>>>,
+) -> std::result::Result<Result<Reconnection>, tokio::task::JoinError> {
     match retry {
         Some(task) => task.await,
         None => std::future::pending().await,
@@ -354,6 +428,7 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
         play_rx,
         retry: None,
         candidate: None,
+        adopted: Vec::new(),
         log: handoff_log::open_default(handoff_log::Source::Probe),
     };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -382,14 +457,16 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
             result = reconnect_result(&mut io.retry) => {
                 io.retry = None;
                 let input = match result? {
-                    Ok((manager, events)) => {
+                    Ok(((manager, events), backlog)) => {
                         let facts = session_facts(&*manager.state.lock().await);
-                        io.candidate = Some((manager, events));
+                        io.candidate = Some(((manager, events), backlog));
                         Input::Reconnected(facts)
                     }
                     Err(error) => Input::ReconnectFailed(error.to_string()),
                 };
-                if step(&mut core, &mut io, input).await? {
+                if step(&mut core, &mut io, input).await?
+                    || feed_adopted(&mut core, &mut io).await?
+                {
                     break;
                 }
             }
@@ -861,5 +938,89 @@ mod tests {
             lines[0].starts_with("BLOCKED take needs Linux plus a remote host"),
             "{lines:?}"
         );
+    }
+
+    fn owns_event(value: u8) -> AACPEvent {
+        AACPEvent::ControlCommand(crate::bluetooth::aacp::ControlCommandStatus {
+            identifier: Control::OwnsConnection,
+            value: vec![value],
+        })
+    }
+
+    fn hosts_event() -> AACPEvent {
+        AACPEvent::ConnectedDevices(
+            Vec::new(),
+            vec![core_device(CORE_LOCAL), core_device(CORE_REMOTE)],
+        )
+    }
+
+    fn named(events: &[AACPEvent]) -> Vec<String> {
+        events.iter().map(|e| format!("{e:?}")).collect()
+    }
+
+    #[tokio::test]
+    async fn init_backlog_ends_at_echo_of_final_not_owning() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Queued before the send: hosts and connect_control's [0] answer,
+        // which must not be taken for the echo.
+        tx.send(hosts_event()).unwrap();
+        tx.send(owns_event(0)).unwrap();
+        let send = async {
+            tx.send(owns_event(0)).unwrap();
+            tx.send(owns_event(0)).unwrap();
+            Ok::<(), std::io::Error>(())
+        };
+        let backlog = collect_init_backlog(&mut rx, send).await.unwrap();
+        assert!(backlog.drained);
+        assert_eq!(
+            named(&backlog.events),
+            named(&[hosts_event(), owns_event(0), owns_event(0)])
+        );
+        // The later [0] is fresh: it stays queued for the core.
+        assert_eq!(named(&[rx.try_recv().unwrap()]), named(&[owns_event(0)]));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn init_backlog_without_echo_has_no_boundary() {
+        // Real time: the crate's tokio has no `test-util`, so no
+        // `tokio::time::pause`; this waits `INIT_ECHO_WAIT` once.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(hosts_event()).unwrap();
+        tx.send(owns_event(0)).unwrap();
+        let backlog = collect_init_backlog(&mut rx, async { Ok::<(), std::io::Error>(()) })
+            .await
+            .unwrap();
+        assert!(!backlog.drained);
+        assert_eq!(
+            named(&backlog.events),
+            named(&[hosts_event(), owns_event(0)])
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn adoption_inputs_end_with_boundary() {
+        let backlog = |drained| InitBacklog {
+            events: vec![
+                hosts_event(),
+                owns_event(0),
+                AACPEvent::OwnershipToFalseRequest,
+            ],
+            drained,
+        };
+        let events = vec![
+            Input::ConnectedDevices {
+                old: Vec::new(),
+                new: vec![core_device(CORE_LOCAL), core_device(CORE_REMOTE)],
+            },
+            Input::Ownership(vec![0]),
+            Input::RemoteOwnershipRequest,
+        ];
+        let mut drained = events.clone();
+        drained.push(Input::InitBacklogDrained);
+        assert_eq!(adoption_inputs(backlog(true)), drained);
+        assert_eq!(adoption_inputs(backlog(false)), events);
+        assert_eq!(adoption_inputs(InitBacklog::default()), []);
     }
 }

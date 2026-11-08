@@ -64,8 +64,9 @@ pub(crate) enum Input {
     /// holds or is taking the AirPods, is a loss: Linux yields once (pauses
     /// in automatic mode, forgets the take and its pending request). The 0
     /// that acknowledges Linux's own playback-stop or remote-request release
-    /// pauses nothing (#39). During the reconnect take a 0 only updates the
-    /// cached owner (#43). A 0 within `LATE_ACK_WINDOW` of sending a release
+    /// pauses nothing (#39). During the reconnect take, until
+    /// `InitBacklogDrained`, a 0 only updates the cached owner (#43, #49).
+    /// A 0 within `LATE_ACK_WINDOW` of sending a release
     /// whose acknowledgement timed out is that release's late
     /// acknowledgement, not a loss (#55); a later 0 is a loss (#62).
     Ownership(Vec<u8>),
@@ -87,7 +88,18 @@ pub(crate) enum Input {
     Reconnected(SessionFacts),
     /// A reconnect attempt failed.
     ReconnectFailed(String),
-    /// Switch to automatic handoff (REPL `auto`).
+    /// Queue boundary from the shell (#49): every event queued before the
+    /// session's snapshot has been fed (the reconnect's init backlog up to
+    /// the echo of its last "not owning" in the probe, the pre-snapshot
+    /// queue on the default path); later events are fresh. It ends the
+    /// reconnect take's stale-report window, so a later 0 that acknowledges
+    /// nothing is a loss. Otherwise it changes nothing. Fed in queue order,
+    /// never on a timer.
+    InitBacklogDrained,
+    /// Switch to automatic handoff (REPL `auto`). Its "not owning" is a
+    /// pending release, so the reply is that release's acknowledgement and
+    /// never a loss; a play edge before the reply is retaken once it
+    /// settles (#54).
     Auto,
     /// Switch to manual mode (REPL `manual`).
     Manual,
@@ -184,8 +196,8 @@ pub(crate) struct Handoff {
     /// session's queued OwnsConnection=0 reports from this window answer the
     /// "not owning" that connecting the session (and its audio) sent, which
     /// `SessionFacts::owner` already reflected; they are not a loss of the
-    /// take. Cleared at the take's ACK, its timeout, a disconnect and any new
-    /// request.
+    /// take. Cleared at the shell's queue boundary (#49), the take's ACK,
+    /// its timeout, a disconnect and any new request.
     reconnect_take_pending: bool,
     /// Cause and send time of Linux's last release whose acknowledgement
     /// timed out. An OwnsConnection=0 within `LATE_ACK_WINDOW` of that send
@@ -307,8 +319,8 @@ impl Handoff {
                 // and must not announce a second time (#58).
                 // Known limit (#79): when two or more reports queue inside
                 // that window, the first replay regresses `self.hosts` and a
-                // later one re-announces; telling stale replays apart needs a
-                // shell queue-boundary signal (#49).
+                // later one re-announces; telling stale replays apart is for
+                // #79, on the shell's queue boundary (`InitBacklogDrained`).
                 if self.automatic
                     && self.live()
                     && new
@@ -381,6 +393,13 @@ impl Handoff {
                 self.retry_at = now + self.retry_delay;
                 self.retry_delay = (self.retry_delay * 2).min(MAX_RETRY);
             }
+            Input::InitBacklogDrained => {
+                if std::mem::take(&mut self.reconnect_take_pending) {
+                    self.say("BACKLOG drained; the reconnect take's stale-report window ended");
+                } else {
+                    self.say("BACKLOG drained");
+                }
+            }
             Input::Auto => {
                 if !self.live() {
                     self.say(NO_SESSION);
@@ -388,7 +407,8 @@ impl Handoff {
                 }
                 out.push(Command::ConnectA2dp);
                 if !self.requested_take {
-                    out.push(Command::SendOwnership(false));
+                    // Tracked like a playback-stop release (#54).
+                    self.request(now, false, Cause::Playback, out);
                 }
                 self.automatic = true;
                 self.announce(out);
@@ -509,8 +529,9 @@ impl Handoff {
     }
 
     /// An OwnsConnection report. Rules for a 0 (#39), in order:
-    /// - during the reconnect take it is the session's stale init report and
-    ///   only updates `owner` (#43);
+    /// - during the reconnect take, until the shell's queue boundary, it is
+    ///   the session's stale init report and only updates `owner` (#43,
+    ///   #49);
     /// - the acknowledgement of Linux's own release pauses only after a user
     ///   or quit release (upstream #841), or as the deferred pause of a
     ///   blocked retake; a playback-stop or remote-request release left
@@ -1345,6 +1366,8 @@ mod tests {
             p.feed(1000, Input::Auto),
             [ConnectA2dp, SendOwnership(false), Announce]
         );
+        // The reply to Auto's "not owning" (#54).
+        assert_eq!(p.feed(1050, Input::Ownership(vec![0])), []);
         // A stopped sample from before the baseline is not an observation.
         assert_eq!(p.play(900, false), []);
         assert_eq!(p.play(1100, true), []);
@@ -1784,6 +1807,71 @@ mod tests {
 
     fn count_lines(lines: &[String], prefix: &str) -> usize {
         lines.iter().filter(|l| l.starts_with(prefix)).count()
+    }
+
+    #[test]
+    fn reconnect_take_window_ends_at_backlog_boundary() {
+        let mut p = reconnect_take();
+        // Queued before the boundary: the stale init report (#43).
+        assert_eq!(p.feed(1300, Input::Ownership(vec![0])), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(1350, Input::InitBacklogDrained), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "BACKLOG drained"), 1);
+        // After it a [0] acknowledges nothing: a loss, yielded once (#39).
+        assert_eq!(p.feed(1400, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
+        // `requested_take` is cleared: the stop releases nothing.
+        assert_eq!(p.play(1500, false), []);
+        // The pending take was dropped: no TIMEOUT for it.
+        assert_eq!(p.feed(7000, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 0);
+    }
+
+    #[test]
+    fn backlog_boundary_outside_reconnect_window_is_noop() {
+        // Take, ACK, stop, release ACK, take again, then a loss.
+        let script = |p: &mut Probe| {
+            vec![
+                p.play(1100, true),
+                p.feed(1200, Input::Ownership(vec![1])),
+                p.play(1300, false),
+                p.feed(1400, Input::Ownership(vec![0])),
+                p.play(1500, true),
+                p.feed(1600, Input::Ownership(vec![0])),
+            ]
+        };
+        for setup in [Probe::ready as fn() -> Probe, acked_auto_take] {
+            let mut with = setup();
+            assert_eq!(with.feed(1050, Input::InitBacklogDrained), []);
+            let commands = script(&mut with);
+            assert_eq!(commands, script(&mut setup()));
+            assert_eq!(commands.last().unwrap(), &[PauseMedia]);
+        }
+        // An acked take still yields on [0] after the boundary.
+        let mut p = acked_auto_take();
+        assert_eq!(p.feed(1050, Input::InitBacklogDrained), []);
+        assert_eq!(p.feed(1100, Input::Ownership(vec![0])), [PauseMedia]);
+    }
+
+    #[test]
+    fn auto_release_reply_never_yields() {
+        // #54: a stop->play edge lands before the reply to Auto's "not
+        // owning"; the reply acknowledges that release and the edge is
+        // retaken, with no yield or pause.
+        let mut p = Probe::new(false, true);
+        p.routing(ready_facts());
+        assert_eq!(
+            p.feed(100, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce]
+        );
+        p.core.take_lines();
+        let mut all = p.play(200, false);
+        all.extend(p.play(300, true));
+        all.extend(p.feed(400, Input::Ownership(vec![0])));
+        assert_eq!(all, [SendOwnership(true)]);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+        assert_eq!(p.feed(500, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(600, false), [SendOwnership(false)]);
     }
 
     /// Automatic take for playback, acknowledged, playback still running at
