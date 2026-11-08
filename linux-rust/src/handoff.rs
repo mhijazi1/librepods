@@ -59,7 +59,9 @@ pub(crate) enum Input {
     /// cached owner (#43). A 0 after a release whose acknowledgement timed
     /// out is that release's late acknowledgement, not a loss (#55).
     Ownership(Vec<u8>),
-    /// Another host asked Linux to give up ownership.
+    /// Another host asked Linux to give up ownership. A repeat while Linux's
+    /// release for an earlier request is pending sends nothing; a repeat
+    /// after that release timed out re-sends it without pausing again (#61).
     RemoteOwnershipRequest,
     /// The shell found the control session dead (the AACP receive loop
     /// cleared it without an event) while some of its events may still be
@@ -286,6 +288,24 @@ impl Handoff {
                     // Nothing can be sent; the disconnect that follows
                     // pauses and clears ownership.
                     self.say("REMOTE requested ownership; control session lost");
+                    return;
+                }
+                // A repeat of a request Linux already yielded to: that yield
+                // paused once, so this one must not pause again (#39, #61).
+                if self
+                    .pending
+                    .is_some_and(|p| !p.desired && p.cause == Cause::Remote)
+                {
+                    // Keep the pending release and its `since`, so its ACK
+                    // timeout is not pushed back.
+                    self.say("REMOTE requested ownership; release already pending");
+                    return;
+                }
+                if self.pending.is_none() && self.timed_out_release == Some(Cause::Remote) {
+                    // The release was never acknowledged: send it again. Its
+                    // [0] is acknowledged like the first one, without a pause.
+                    self.say("REMOTE requested ownership; re-sending the timed-out release");
+                    self.request(now, false, Cause::Remote, out);
                     return;
                 }
                 if self.automatic && self.requested_take {
@@ -1758,5 +1778,53 @@ mod tests {
         let (mut p, _) = remote_release_timed_out();
         assert_eq!(p.feed(6300, Input::Disconnected), [PauseMedia, DropSession]);
         assert_eq!(p.core.timed_out_release, None);
+    }
+
+    #[test]
+    fn repeated_remote_request_while_release_pending() {
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        let mut all = p.feed(1100, Input::RemoteOwnershipRequest);
+        assert_eq!(all, [PauseMedia, SendOwnership(false)]);
+        p.core.take_lines();
+        // The same yield is still in flight: no second pause, no resend.
+        let again = p.feed(1300, Input::RemoteOwnershipRequest);
+        assert_eq!(again, []);
+        all.extend(again);
+        assert_eq!(
+            p.core.take_lines(),
+            ["REMOTE requested ownership; release already pending"]
+        );
+        let stop = p.play(1500, false);
+        assert_eq!(stop, []);
+        all.extend(stop);
+        // 5.1 s after the first request, 4.9 s after the second: the
+        // release's timeout still counts from the first.
+        let tick = p.feed(6200, Input::Tick);
+        assert_eq!(tick, []);
+        all.extend(tick);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 1);
+        assert_eq!(all.iter().filter(|c| **c == PauseMedia).count(), 1);
+    }
+
+    #[test]
+    fn repeated_remote_request_after_release_timeout() {
+        let (mut p, mut all) = remote_release_timed_out();
+        // The release is re-sent; the first request already paused.
+        let again = p.feed(6300, Input::RemoteOwnershipRequest);
+        assert_eq!(again, [SendOwnership(false)]);
+        all.extend(again);
+        // Its [0] is the remote release's ACK (#39): no pause, no YIELD.
+        let ack = p.feed(6400, Input::Ownership(vec![0]));
+        assert_eq!(ack, []);
+        all.extend(ack);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "YIELD"), 0);
+        assert_eq!(count_lines(&lines, "ACK owner=not-linux"), 1);
+        assert_eq!(all.iter().filter(|c| **c == PauseMedia).count(), 1);
+        assert_eq!(
+            all.iter().filter(|c| **c == SendOwnership(false)).count(),
+            2
+        );
     }
 }
