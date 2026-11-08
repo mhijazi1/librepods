@@ -5,5 +5,9 @@
     "owner": "mhijazi1",
     "number": 12,
     "field": "Status"
+  },
+  "lanes": {
+    "max": 8,
+    "dir": "../librepods-lanes"
   }
 }

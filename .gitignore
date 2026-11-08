@@ -674,3 +674,4 @@ result-*
 .swarm/msg/
 .cargo-target/
 .swarm/project-cache.json
+.swarm/lane-claim
