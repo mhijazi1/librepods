@@ -50,7 +50,7 @@ struct Args {
     #[arg(
         long,
         conflicts_with = "handoff_probe",
-        help = "Summarise the last session of the handoff log and exit"
+        help = "Summarise the last session of the handoff log and exit (a log over 1 MiB is rotated to handoff.jsonl.1 when next opened)"
     )]
     handoff_report: bool,
     #[arg(long, short = 'd', help = "Enable debug logging")]
