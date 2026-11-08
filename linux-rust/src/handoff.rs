@@ -2891,7 +2891,13 @@ mod tests {
         }
         // Another host taking first changes nothing in this mode.
         let mut p = ready_in(Automatically);
-        assert_eq!(p.feed(100, Input::AudioSource(source(REMOTE, AudioSourceType::Media))), []);
+        assert_eq!(
+            p.feed(
+                100,
+                Input::AudioSource(source(REMOTE, AudioSourceType::Media))
+            ),
+            []
+        );
         assert_eq!(p.feed(200, Input::AudioSource(idle())), []);
         assert_eq!(p.play(500, true), [SendOwnership(true)]);
     }
@@ -2994,8 +3000,20 @@ mod tests {
         // Linux's own media and remote idle audio leave it the last owner.
         let mut p = ready_in(WhenLastConnected);
         assert_eq!(p.feed(20, Input::Ownership(vec![1])), []);
-        assert_eq!(p.feed(100, Input::AudioSource(source(LOCAL, AudioSourceType::Media))), []);
-        assert_eq!(p.feed(150, Input::AudioSource(source(REMOTE, AudioSourceType::None))), []);
+        assert_eq!(
+            p.feed(
+                100,
+                Input::AudioSource(source(LOCAL, AudioSourceType::Media))
+            ),
+            []
+        );
+        assert_eq!(
+            p.feed(
+                150,
+                Input::AudioSource(source(REMOTE, AudioSourceType::None))
+            ),
+            []
+        );
         assert_eq!(p.feed(200, Input::AudioSource(idle())), []);
         assert_eq!(p.play(500, true), [SendOwnership(true)]);
     }
@@ -3006,7 +3024,10 @@ mod tests {
         let mut p = last_owner_take();
         assert_eq!(p.feed(1100, Input::LocalCall(true)), [AdvertiseCall(true)]);
         assert_eq!(p.feed(1200, Input::RemoteOwnershipRequest), []);
-        assert_eq!(p.feed(1300, Input::LocalCall(false)), [AdvertiseCall(false)]);
+        assert_eq!(
+            p.feed(1300, Input::LocalCall(false)),
+            [AdvertiseCall(false)]
+        );
         assert_eq!(p.play(1500, false), [SendOwnership(false)]);
         assert_eq!(p.feed(1600, Input::Ownership(vec![0])), []);
         assert_eq!(p.play(2000, true), [SendOwnership(true)]);
@@ -3070,7 +3091,13 @@ mod tests {
         // it, so the ACK pauses (the deferred pause) instead.
         let mut p = last_owner_take();
         assert_eq!(p.play(1100, false), [SendOwnership(false)]);
-        assert_eq!(p.feed(1150, Input::AudioSource(source(REMOTE, AudioSourceType::Media))), []);
+        assert_eq!(
+            p.feed(
+                1150,
+                Input::AudioSource(source(REMOTE, AudioSourceType::Media))
+            ),
+            []
+        );
         assert_eq!(p.feed(1160, Input::AudioSource(idle())), []);
         assert_eq!(p.play(1200, true), []);
         assert_eq!(p.feed(1300, Input::Ownership(vec![0])), [PauseMedia]);
@@ -3080,7 +3107,10 @@ mod tests {
         let mut p = last_owner_take();
         assert_eq!(p.play(1100, false), [SendOwnership(false)]);
         assert_eq!(p.play(1200, true), []);
-        assert_eq!(p.feed(1300, Input::Ownership(vec![0])), [SendOwnership(true)]);
+        assert_eq!(
+            p.feed(1300, Input::Ownership(vec![0])),
+            [SendOwnership(true)]
+        );
         assert_eq!(skips(&mut p), 0);
     }
 

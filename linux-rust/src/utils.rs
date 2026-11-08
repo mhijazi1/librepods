@@ -603,7 +603,10 @@ mod tests {
     #[test]
     fn connect_mode_defaults_to_automatically() {
         assert_eq!(ConnectMode::default(), ConnectMode::Automatically);
-        assert_eq!(connect_mode_from_value(None, MAC), ConnectMode::Automatically);
+        assert_eq!(
+            connect_mode_from_value(None, MAC),
+            ConnectMode::Automatically
+        );
         for prefs in [
             "",
             "not json",
@@ -618,14 +621,21 @@ mod tests {
             r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":true}}"#,
             r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":["when_last_connected"]}}"#,
         ] {
-            assert_eq!(parse_connect_mode(prefs, MAC), ConnectMode::Automatically, "{prefs}");
+            assert_eq!(
+                parse_connect_mode(prefs, MAC),
+                ConnectMode::Automatically,
+                "{prefs}"
+            );
         }
     }
 
     #[test]
     fn connect_mode_reads_each_value() {
         assert_eq!(
-            parse_connect_mode(r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":"automatically"}}"#, MAC),
+            parse_connect_mode(
+                r#"{"AA:BB:CC:DD:EE:FF":{"connectMode":"automatically"}}"#,
+                MAC
+            ),
             ConnectMode::Automatically
         );
         assert_eq!(
@@ -646,7 +656,8 @@ mod tests {
 
     #[test]
     fn connect_mode_is_per_device() {
-        let prefs = r#"{"switching":"handoff","11:22:33:44:55:66":{"connectMode":"when_last_connected"}}"#;
+        let prefs =
+            r#"{"switching":"handoff","11:22:33:44:55:66":{"connectMode":"when_last_connected"}}"#;
         assert_eq!(parse_connect_mode(prefs, MAC), ConnectMode::Automatically);
         assert_eq!(
             parse_connect_mode(prefs, "11:22:33:44:55:66"),
