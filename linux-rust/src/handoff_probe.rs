@@ -1,8 +1,11 @@
 use crate::bluetooth::aacp::{
-    AACPEvent, AACPManager, AACPManagerState, AudioSourceType,
-    ControlCommandIdentifiers as Control, EarDetectionStatus,
+    AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control,
 };
-use crate::media_controller::MediaController;
+use crate::handoff::{Command, Handoff, Input, SessionFacts};
+use crate::media_controller::{
+    CaseRecovery, MediaController, TakeoverAction, TakeoverInputs, TakeoverTrigger,
+    decide_takeover, routing_snapshot_of,
+};
 use bluer::Address;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -10,22 +13,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type ControlSession = (AACPManager, tokio::sync::mpsc::UnboundedReceiver<AACPEvent>);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Recovery {
-    Immediate,
-    WaitingForPlayback,
-    PlaybackRequested,
-}
-
-impl Recovery {
-    fn playback(&mut self, fresh_play: bool, stopped: bool) {
-        match (*self, fresh_play, stopped) {
-            (Self::WaitingForPlayback, true, _) => *self = Self::PlaybackRequested,
-            (Self::PlaybackRequested, _, true) => *self = Self::WaitingForPlayback,
-            _ => {}
-        }
-    }
-}
+const A2DP_SINK: uuid::Uuid = uuid::Uuid::from_u128(0x0000110b00001000800000805f9b34fb);
 
 async fn connect_control(address: Address) -> Result<ControlSession> {
     let mut manager = AACPManager::new();
@@ -88,18 +76,25 @@ async fn announce(manager: &AACPManager, local: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a manual take would go ahead now, by the single takeover policy.
 fn take_allowed(state: &AACPManagerState, local: &str) -> bool {
-    state.sender.is_some()
-        && state.connected_devices.len() == 2
-        && state.connected_devices.iter().any(|d| d.mac == local)
-        && state.connected_devices.iter().any(|d| d.mac != local)
-        && state
-            .ear_detection_status
-            .contains(&EarDetectionStatus::InEar)
-        && state.audio_source.as_ref().is_some_and(|source| {
-            source.r#type == AudioSourceType::None
-                || (source.mac == local && source.r#type == AudioSourceType::Media)
-        })
+    let routing = routing_snapshot_of(state, local);
+    let inputs = TakeoverInputs::handoff(TakeoverTrigger::Manual, routing, CaseRecovery::Immediate);
+    decide_takeover(inputs).action == TakeoverAction::TakeOver
+}
+
+/// Copy a fresh session's routing, wear and ownership state for the core.
+fn session_facts(state: &AACPManagerState) -> SessionFacts {
+    SessionFacts {
+        hosts: state.connected_devices.clone(),
+        ears: state.ear_detection_status.clone(),
+        audio: state.audio_source.clone(),
+        owner: state
+            .control_command_status_list
+            .iter()
+            .find(|s| s.identifier == Control::OwnsConnection)
+            .map(|s| s.value.clone()),
+    }
 }
 
 async fn status(manager: &AACPManager, local: &str) {
@@ -147,11 +142,125 @@ async fn status(manager: &AACPManager, local: &str) {
     }
 }
 
+/// The probe's I/O: executes the commands of the handoff core.
+struct Io {
+    adapter: bluer::Adapter,
+    address: Address,
+    local: String,
+    media: MediaController,
+    manager: AACPManager,
+    events: tokio::sync::mpsc::UnboundedReceiver<AACPEvent>,
+    play_rx: tokio::sync::mpsc::Receiver<(Instant, bool)>,
+    retry: Option<tokio::task::JoinHandle<Result<ControlSession>>>,
+    /// Session made by the last reconnect, until the core adopts or cancels it.
+    candidate: Option<ControlSession>,
+}
+
+impl Io {
+    /// Execute the core's commands in order. Ok(true) when it asked to exit.
+    /// No AACP state guard is held here; the sends take their own.
+    async fn execute(&mut self, commands: Vec<Command>) -> Result<bool> {
+        for command in commands {
+            match command {
+                Command::SendOwnership(owns) => {
+                    self.manager
+                        .send_control_command(Control::OwnsConnection, &[u8::from(owns)])
+                        .await?
+                }
+                Command::Announce => announce(&self.manager, &self.local).await?,
+                Command::PauseMedia => self.media.pause_all_media().await,
+                Command::ConnectA2dp => {
+                    let device = self.adapter.device(self.address)?;
+                    device.connect_profile(&A2DP_SINK).await?;
+                }
+                Command::DropSession => {
+                    self.manager.disconnect().await;
+                    self.events.close();
+                    while self.events.try_recv().is_ok() {}
+                }
+                Command::Reconnect { audio } => {
+                    let adapter = self.adapter.clone();
+                    let address = self.address;
+                    self.retry = Some(tokio::spawn(async move {
+                        let result = connect_control(address).await?;
+                        if audio {
+                            let device = adapter.device(address)?;
+                            let connected = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                device.connect_profile(&A2DP_SINK),
+                            )
+                            .await;
+                            match connected {
+                                Ok(Ok(())) => {}
+                                _ => {
+                                    result.0.disconnect().await;
+                                    return Err("A2DP reconnection failed".into());
+                                }
+                            }
+                            result
+                                .0
+                                .send_control_command(Control::OwnsConnection, &[0])
+                                .await?;
+                        }
+                        Ok(result)
+                    }));
+                }
+                Command::AdoptSession => {
+                    if let Some((manager, events)) = self.candidate.take() {
+                        self.manager = manager;
+                        self.events = events;
+                    }
+                }
+                Command::CancelReconnect => {
+                    if let Some((manager, _)) = self.candidate.take() {
+                        manager.disconnect().await;
+                    }
+                    self.adapter.device(self.address)?.disconnect().await?;
+                }
+                Command::DrainPlayback => while self.play_rx.try_recv().is_ok() {},
+                Command::Exit => return Ok(true),
+                Command::Fail(reason) => return Err(reason.into()),
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Feed one input to the core, print its protocol lines and execute its
+/// commands. Ok(true) when the probe should stop.
+async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
+    let commands = core.handle(Instant::now(), input);
+    for line in core.take_lines() {
+        println!("{line}");
+    }
+    io.execute(commands).await
+}
+
+/// Tell the core when the control session died under it, before it acts on
+/// routing state that the disconnect already cleared.
+async fn sync_session(core: &mut Handoff, io: &mut Io) -> Result<bool> {
+    let alive = io.manager.state.lock().await.sender.is_some();
+    if core.connected() && !alive {
+        return step(core, io, Input::Disconnected).await;
+    }
+    Ok(false)
+}
+
+/// Wait for the running reconnect attempt; never resolves without one.
+async fn reconnect_result(
+    retry: &mut Option<tokio::task::JoinHandle<Result<ControlSession>>>,
+) -> std::result::Result<Result<ControlSession>, tokio::task::JoinError> {
+    match retry {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn run(address: Address, daemon: bool) -> Result<()> {
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
     let local = adapter.address().await?.to_string();
-    let (mut manager, mut events) = if daemon && !adapter.device(address)?.is_connected().await? {
+    let (manager, events) = if daemon && !adapter.device(address)?.is_connected().await? {
         // Do not race the iPhone to reconnect when starting with the buds in their case.
         let manager = AACPManager::new();
         let (tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -160,15 +269,12 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
     } else {
         connect_control(address).await?
     };
-    let mut disconnected = manager.state.lock().await.sender.is_none();
+    let connected = manager.state.lock().await.sender.is_some();
     if daemon {
-        if !disconnected {
+        if connected {
             let device = adapter.device(address)?;
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                device.connect_profile(&uuid::Uuid::from_u128(0x0000110b00001000800000805f9b34fb)),
-            )
-            .await??;
+            tokio::time::timeout(Duration::from_secs(5), device.connect_profile(&A2DP_SINK))
+                .await??;
             manager
                 .send_control_command(Control::OwnsConnection, &[0])
                 .await?;
@@ -180,7 +286,7 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
         println!("Automatic switching is disabled until the auto command.");
     }
     let media = MediaController::new(address.to_string(), local.clone());
-    let (play_tx, mut play_rx) = tokio::sync::mpsc::channel(1);
+    let (play_tx, play_rx) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {
         loop {
             let sampled_at = Instant::now();
@@ -193,285 +299,172 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
-    let mut automatic = daemon;
-    let mut was_playing = None;
-    let mut playback_baseline_at = Instant::now();
+    // Every handoff decision lives in the core; this loop only feeds it.
+    let mut core = Handoff::new(local.clone(), Instant::now(), daemon, connected);
+    let mut io = Io {
+        adapter,
+        address,
+        local,
+        media,
+        manager,
+        events,
+        play_rx,
+        retry: None,
+        candidate: None,
+    };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
-    let mut pending: Option<(bool, Instant)> = None;
-    let mut requested_take = false;
-    let mut quitting = false;
-    let mut retry: Option<tokio::task::JoinHandle<Result<ControlSession>>> = None;
-    let mut retry_at = Instant::now();
-    let mut retry_delay = Duration::from_secs(1);
-    let mut case_closed = false;
-    let mut recovery = if disconnected {
-        Recovery::WaitingForPlayback
-    } else {
-        Recovery::Immediate
-    };
     loop {
         tokio::select! {
             biased;
-            Some(event) = events.recv() => {
-                match event {
+            Some(event) = io.events.recv() => {
+                let (input, show_status) = match event {
                     AACPEvent::ControlCommand(s) if s.identifier == Control::OwnsConnection => {
-                        if s.value == vec![0] {
-                            if requested_take && automatic { media.pause_all_media().await; }
-                            requested_take = false;
-                        }
-                        if let Some((desired, started)) = pending {
-                            if s.value == vec![u8::from(desired)] {
-                                println!("ACK owner={} elapsed_ms={}",
-                                    if desired { "linux" } else { "not-linux" }, started.elapsed().as_millis());
-                                pending = None;
-                                if !desired { requested_take = false; }
-                                if quitting { break; }
-                            }
-                        }
-                        status(&manager, &local).await;
+                        (Some(Input::Ownership(s.value)), true)
                     }
                     AACPEvent::ConnectedDevices(old, new) => {
-                        if automatic && new.iter().any(|d| d.mac != local && !old.iter().any(|o| o.mac == d.mac)) {
-                            announce(&manager, &local).await?;
-                        }
-                        status(&manager, &local).await;
+                        (Some(Input::ConnectedDevices { old, new }), true)
                     }
-                    AACPEvent::EarDetection(_, new) => {
-                        if new.len() == 2 && new.iter().all(|s| *s == EarDetectionStatus::InCase) {
-                            case_closed = true;
-                        } else if new.iter().any(|s| matches!(s, EarDetectionStatus::InEar | EarDetectionStatus::OutOfEar)) {
-                            case_closed = false;
-                        }
-                        status(&manager, &local).await;
-                    }
-                    AACPEvent::AudioSource(_) => status(&manager, &local).await,
-                    AACPEvent::OwnershipToFalseRequest => {
-                        if automatic && requested_take { media.pause_all_media().await; }
-                        let already_released = manager.state.lock().await.control_command_status_list
-                            .iter().any(|s| s.identifier == Control::OwnsConnection && s.value == vec![0]);
-                        if already_released && !requested_take {
-                            println!("REMOTE requested ownership; Linux already yielded");
-                            continue;
-                        }
-                        println!("REMOTE requested ownership; yielding");
-                        manager.send_control_command(Control::OwnsConnection, &[0]).await?;
-                        pending = Some((false, Instant::now()));
-                    }
-                    _ => {}
+                    AACPEvent::EarDetection(_, new) => (Some(Input::EarState(new)), true),
+                    AACPEvent::AudioSource(source) => (Some(Input::AudioSource(source)), true),
+                    AACPEvent::OwnershipToFalseRequest => (Some(Input::RemoteOwnershipRequest), false),
+                    _ => (None, false),
+                };
+                if let Some(input) = input
+                    && step(&mut core, &mut io, input).await?
+                {
+                    break;
+                }
+                if show_status {
+                    status(&io.manager, &io.local).await;
                 }
             }
-            Some((sampled_at, playing)) = play_rx.recv() => {
-                if sampled_at < playback_baseline_at { continue; }
-                let fresh_play = was_playing == Some(false) && playing;
-                let stopped = was_playing == Some(true) && !playing;
-                was_playing = Some(playing);
-                if automatic && disconnected {
-                    recovery.playback(fresh_play, stopped);
-                    if fresh_play && recovery == Recovery::PlaybackRequested {
-                        retry_at = Instant::now();
-                        println!("AUTO new playback requested reconnection after case closure");
-                    }
-                }
-                if automatic && !disconnected && !quitting && pending.is_none() {
-                    if fresh_play {
-                        if take_allowed(&*manager.state.lock().await, &local) {
-                            requested_take = true;
-                            pending = Some((true, Instant::now()));
-                            manager.send_control_command(Control::OwnsConnection, &[1]).await?;
-                            println!("AUTO playback started; requested Linux ownership");
-                        } else {
-                            println!("AUTO takeover blocked by remote activity, wear, or missing host state");
-                        }
-                    } else if stopped && requested_take {
-                        pending = Some((false, Instant::now()));
-                        manager.send_control_command(Control::OwnsConnection, &[0]).await?;
-                        println!("AUTO playback stopped; releasing ownership");
-                    }
+            Some((sampled_at, playing)) = io.play_rx.recv() => {
+                if sync_session(&mut core, &mut io).await?
+                    || step(&mut core, &mut io, Input::Playback { sampled_at, playing }).await?
+                {
+                    break;
                 }
             }
-            result = async { retry.as_mut().unwrap().await }, if retry.is_some() => {
-                retry = None;
-                match result? {
-                    Ok((new_manager, new_events)) => {
-                        if recovery == Recovery::WaitingForPlayback {
-                            new_manager.disconnect().await;
-                            adapter.device(address)?.disconnect().await?;
-                            println!("RECONNECT cancelled because playback stopped");
-                            continue;
-                        }
-                        manager = new_manager;
-                        events = new_events;
-                        disconnected = false;
-                        if automatic {
-                            announce(&manager, &local).await?;
-                        }
-                        if recovery == Recovery::PlaybackRequested {
-                            if take_allowed(&*manager.state.lock().await, &local) {
-                                requested_take = true;
-                                pending = Some((true, Instant::now()));
-                                manager.send_control_command(Control::OwnsConnection, &[1]).await?;
-                                println!("AUTO reconnected for new playback; requested Linux ownership");
-                            } else {
-                                println!("AUTO reconnected; takeover blocked by remote activity, wear, or missing host state");
-                            }
-                        }
-                        recovery = Recovery::Immediate;
-                        was_playing = None;
-                        playback_baseline_at = Instant::now();
-                        while play_rx.try_recv().is_ok() {}
-                        retry_delay = Duration::from_secs(1);
-                        println!("RECONNECTED with fresh routing and wear state");
+            result = reconnect_result(&mut io.retry) => {
+                io.retry = None;
+                let input = match result? {
+                    Ok((manager, events)) => {
+                        let facts = session_facts(&*manager.state.lock().await);
+                        io.candidate = Some((manager, events));
+                        Input::Reconnected(facts)
                     }
-                    Err(error) => {
-                        println!("RECONNECT failed: {error}; retrying in {}s", retry_delay.as_secs());
-                        retry_at = Instant::now() + retry_delay;
-                        retry_delay = (retry_delay * 2).min(Duration::from_secs(8));
-                    }
+                    Err(error) => Input::ReconnectFailed(error.to_string()),
+                };
+                if step(&mut core, &mut io, input).await? {
+                    break;
                 }
             }
             _ = tick.tick() => {
-                if manager.state.lock().await.sender.is_none() {
-                    if !disconnected {
-                        println!("DISCONNECTED clearing ownership and playback baseline");
-                        if requested_take && automatic { media.pause_all_media().await; }
-                        manager.disconnect().await;
-                        events.close();
-                        while events.try_recv().is_ok() {}
-                        pending = None;
-                        requested_take = false;
-                        was_playing = None;
-                        disconnected = true;
-                        recovery = if automatic && case_closed {
-                            println!("CASE waiting for new Linux playback before reconnecting");
-                            Recovery::WaitingForPlayback
-                        } else {
-                            Recovery::Immediate
-                        };
-                        case_closed = false;
-                        retry_at = Instant::now() + Duration::from_secs(1);
-                    }
-                    if retry.is_none() && recovery != Recovery::WaitingForPlayback && Instant::now() >= retry_at && !quitting {
-                        let adapter = adapter.clone();
-                        retry = Some(tokio::spawn(async move {
-                            let result = connect_control(address).await?;
-                            if automatic {
-                                let profile = uuid::Uuid::from_u128(0x0000110b00001000800000805f9b34fb);
-                                let device = adapter.device(address)?;
-                                let audio = tokio::time::timeout(Duration::from_secs(5), device.connect_profile(&profile)).await;
-                                match audio {
-                                    Ok(Ok(())) => {}
-                                    _ => {
-                                        result.0.disconnect().await;
-                                        return Err("A2DP reconnection failed".into());
-                                    }
-                                }
-                                result.0.send_control_command(Control::OwnsConnection, &[0]).await?;
-                            }
-                            Ok(result)
-                        }));
-                    }
-                }
-                if pending.is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(5)) {
-                    println!("TIMEOUT ownership acknowledgement not received; audible handoff unconfirmed");
-                    pending = None;
-                    if quitting { return Err("release was not acknowledged".into()); }
+                if sync_session(&mut core, &mut io).await?
+                    || step(&mut core, &mut io, Input::Tick).await?
+                {
+                    break;
                 }
             }
-            _ = tokio::signal::ctrl_c(), if !quitting => { quitting = true; }
-            _ = terminate.recv(), if !quitting => { quitting = true; }
-            line = lines.next_line(), if !quitting && !daemon => {
+            _ = tokio::signal::ctrl_c(), if !core.quitting() => {
+                if step(&mut core, &mut io, Input::Quit).await? {
+                    break;
+                }
+            }
+            _ = terminate.recv(), if !core.quitting() => {
+                if step(&mut core, &mut io, Input::Quit).await? {
+                    break;
+                }
+            }
+            line = lines.next_line(), if !core.quitting() && !daemon => {
                 let line = line?;
                 let command = line.as_deref().map(str::trim).unwrap_or("quit");
-                if disconnected && !matches!(command, "status" | "quit" | "manual" | "") {
+                if !core.connected() && !matches!(command, "status" | "quit" | "manual" | "") {
                     println!("WAIT reconnecting; status, manual, and quit remain available");
                     continue;
                 }
-                match command {
-                    "auto" => {
-                        let device = adapter.device(address)?;
-                        device.connect_profile(&uuid::Uuid::from_u128(0x0000110b00001000800000805f9b34fb)).await?;
-                        if !requested_take {
-                            manager.send_control_command(Control::OwnsConnection, &[0]).await?;
-                        }
-                        automatic = true;
-                        announce(&manager, &local).await?;
-                        was_playing = None;
-                        playback_baseline_at = Instant::now();
-                        println!("AUTO enabled; waiting for a new playback start after the baseline");
+                let input = match command {
+                    "auto" => Input::Auto,
+                    "manual" => Input::Manual,
+                    "take" => Input::Take,
+                    "release" => Input::Release,
+                    "quit" => Input::Quit,
+                    "status" => {
+                        status(&io.manager, &io.local).await;
+                        continue;
                     }
-                    "manual" => { automatic = false; println!("AUTO disabled"); }
-                    "status" => status(&manager, &local).await,
-                    "refresh" => { manager.send_notification_request().await?; }
+                    "refresh" => {
+                        io.manager.send_notification_request().await?;
+                        continue;
+                    }
                     "announce" => {
-                        announce(&manager, &local).await?;
+                        announce(&io.manager, &io.local).await?;
                         println!("Announced Linux to connected remote hosts");
+                        continue;
                     }
-                    "take" | "release" if pending.is_some() => println!("WAIT ownership request pending"),
-                    "take" => {
-                        if !take_allowed(&*manager.state.lock().await, &local) {
-                            println!("BLOCKED take needs two hosts, an in-ear bud, and confirmed idle audio");
-                            continue;
-                        }
-                        requested_take = true;
-                        pending = Some((true, Instant::now()));
-                        manager.send_control_command(Control::OwnsConnection, &[1]).await?;
-                        println!("REQUEST owner=linux");
+                    "" => continue,
+                    _ => {
+                        println!("Commands: status, refresh, announce, take, release, auto, manual, quit");
+                        continue;
                     }
-                    "release" => {
-                        let already_released = manager.state.lock().await.control_command_status_list
-                            .iter().any(|s| s.identifier == Control::OwnsConnection && s.value == vec![0]);
-                        if already_released && !requested_take {
-                            println!("Ownership already released");
-                            continue;
-                        }
-                        pending = Some((false, Instant::now()));
-                        manager.send_control_command(Control::OwnsConnection, &[0]).await?;
-                        println!("REQUEST owner=not-linux");
-                    }
-                    "quit" => { quitting = true; }
-                    "" => {}
-                    _ => println!("Commands: status, refresh, announce, take, release, auto, manual, quit"),
+                };
+                if step(&mut core, &mut io, input).await? {
+                    break;
                 }
             }
         }
-        if quitting && !pending.is_some_and(|(desired, _)| !desired) {
-            if !requested_take {
-                break;
-            }
-            pending = Some((false, Instant::now()));
-            manager
-                .send_control_command(Control::OwnsConnection, &[0])
-                .await?;
-            println!("EXIT releasing ownership");
-        }
     }
-    if let Some(task) = retry {
+    if let Some(task) = io.retry {
         task.abort();
     }
-    manager.disconnect().await;
+    io.manager.disconnect().await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bluetooth::aacp::{AudioSourceType, EarDetectionStatus};
+    // Case recovery is part of the single takeover policy now.
+    use crate::media_controller::CaseRecovery as Recovery;
+
+    /// Whether the policy lets a reconnect take for playback in `recovery`,
+    /// with routing that is otherwise ready.
+    fn reconnect_take_allowed(recovery: Recovery) -> bool {
+        let routing = crate::media_controller::RoutingSnapshot {
+            has_session: true,
+            host_count: 2,
+            local_host: true,
+            remote_host: true,
+            bud_in_ear: true,
+            audio: Some(AudioSourceType::None),
+            audio_from_local: false,
+        };
+        let inputs =
+            TakeoverInputs::handoff(TakeoverTrigger::ReconnectedForPlayback, routing, recovery);
+        decide_takeover(inputs).action == TakeoverAction::TakeOver
+    }
 
     #[test]
     fn case_recovery_requires_new_playback_and_cancels_when_stopped() {
         let mut recovery = Recovery::WaitingForPlayback;
         recovery.playback(false, false);
         assert!(recovery == Recovery::WaitingForPlayback);
+        assert!(!reconnect_take_allowed(recovery));
         recovery.playback(true, false);
         assert!(recovery == Recovery::PlaybackRequested);
+        assert!(reconnect_take_allowed(recovery));
         recovery.playback(false, true);
         assert!(recovery == Recovery::WaitingForPlayback);
+        assert!(!reconnect_take_allowed(recovery));
         recovery.playback(true, false);
         assert!(recovery == Recovery::PlaybackRequested);
         recovery = Recovery::Immediate;
         recovery.playback(false, true);
         assert!(recovery == Recovery::Immediate);
+        assert!(!reconnect_take_allowed(recovery));
     }
 
     #[tokio::test]

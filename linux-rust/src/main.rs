@@ -1,5 +1,6 @@
 mod bluetooth;
 mod devices;
+mod handoff;
 mod handoff_probe;
 mod media_controller;
 mod ui;
