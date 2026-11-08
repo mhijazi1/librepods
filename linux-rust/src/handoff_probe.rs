@@ -32,7 +32,12 @@ struct InitBacklog {
     drained: bool,
 }
 
-/// Run `send` (the last "not owning"), take every event queued by the time it
+/// Take exactly the first `n` queued events.
+fn take_prefix<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>, n: usize) -> Vec<T> {
+    (0..n).map_while(|_| rx.try_recv().ok()).collect()
+}
+
+/// Run `send` (the last "not owning"), take the events queued when it
 /// returns, then take events up to and including the first OwnsConnection
 /// report, its echo. Without an echo within `INIT_ECHO_WAIT` the backlog is
 /// not drained.
@@ -44,12 +49,17 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     // Cut after `send` returns: it can wait on the state lock or the writer
-    // queue, and a report arriving meanwhile is not its echo.
+    // queue, and a report arriving meanwhile is not its echo. The cut is the
+    // queue length then, so an echo racing the prefix take (multi-thread
+    // runtime) stays eligible. Accepted gap: an echo landing between the
+    // return and `len()` counts as pre-send; exact needs sequence numbers in
+    // aacp.rs, and the echo needs a Bluetooth round trip after the write.
     send.await.map_err(Into::into)?;
-    let mut backlog = InitBacklog::default();
-    while let Ok(event) = events.try_recv() {
-        backlog.events.push(event);
-    }
+    let pre_send = events.len();
+    let mut backlog = InitBacklog {
+        events: take_prefix(events, pre_send),
+        drained: false,
+    };
     backlog.drained = tokio::time::timeout(INIT_ECHO_WAIT, async {
         while let Some(event) = events.recv().await {
             let echo = matches!(
@@ -1008,6 +1018,20 @@ mod tests {
             named(&backlog.events),
             named(&[hosts_event(), owns_event(0), owns_event(0), owns_event(0)])
         );
+    }
+
+    #[test]
+    fn init_backlog_takes_only_the_queue_prefix() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(hosts_event()).unwrap();
+        tx.send(owns_event(0)).unwrap();
+        tx.send(owns_event(1)).unwrap();
+        assert_eq!(
+            named(&take_prefix(&mut rx, 2)),
+            named(&[hosts_event(), owns_event(0)])
+        );
+        assert_eq!(named(&[rx.try_recv().unwrap()]), named(&[owns_event(1)]));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
