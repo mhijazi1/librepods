@@ -72,11 +72,14 @@ pub(crate) enum Input {
     /// whose acknowledgement timed out is that release's late
     /// acknowledgement, not a loss (#55); a later 0 is a loss (#62).
     Ownership(Vec<u8>),
-    /// Another host asked Linux to give up ownership. A repeat while Linux's
-    /// release for an earlier request is pending sends nothing; a repeat
-    /// after that release timed out re-sends it without pausing again (#61).
-    /// During a local call Linux keeps the AirPods it holds or is taking and
-    /// refuses (#11).
+    /// Another host asked Linux to give up ownership. While any Linux release
+    /// is pending (playback/auto, user, quit or remote) the request joins it
+    /// and sends no second "not owning" (#61, #137). The join pauses at most
+    /// once, in automatic mode when Linux had taken: for a user/quit release
+    /// or a playback restart during the release. While a local call holds or
+    /// is taking the AirPods only a pending remote release is joined;
+    /// otherwise Linux keeps them and refuses (#11). A repeat after Linux's
+    /// remote release timed out re-sends it without pausing again (#61).
     RemoteOwnershipRequest,
     /// The shell found the control session dead (the AACP receive loop
     /// cleared it without an event) while some of its events may still be
