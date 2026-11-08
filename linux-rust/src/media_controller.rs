@@ -259,6 +259,25 @@ pub(crate) fn decide_takeover(inputs: TakeoverInputs) -> TakeoverDecision {
     }
 }
 
+/// What a blocking MPRIS pause did.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PauseOutcome {
+    /// Players that reported `Playing` and paused.
+    pub(crate) paused: usize,
+    /// Players that reported `Playing` but whose `Pause` call failed.
+    pub(crate) failed: usize,
+    /// No session bus, so nothing could be checked.
+    pub(crate) bus_unavailable: bool,
+}
+
+/// Whether a pause counts as ours for `i_paused_the_media`: it paused or
+/// tried to pause a player, or could not look while we last saw playback.
+/// `was_playing` is `state.is_playing` from before the pause. A pause with
+/// nothing playing must not mark it, or the next genuine play is skipped.
+pub(crate) fn marks_self_pause(outcome: PauseOutcome, was_playing: bool) -> bool {
+    outcome.paused > 0 || outcome.failed > 0 || (outcome.bus_unavailable && was_playing)
+}
+
 /// The #841 guards, in order: case recovery, live session, Linux plus a
 /// remote host (this machine and at least one other device, so 2, 3, 4...
 /// hosts), audio source idle or local media.
@@ -771,6 +790,9 @@ impl MediaController {
             return;
         }
 
+        // Both buds out pauses twice (below and in the not-fully-in branch);
+        // the first pause is the one that finds the players playing.
+        let mut removal_self_paused = false;
         if new_has_at_least_one_in && old_all_out {
             debug!("Condition met: buds inserted, activating A2DP and checking play state");
             self.activate_a2dp_profile().await;
@@ -783,7 +805,9 @@ impl MediaController {
             }
         } else if new_all_out {
             debug!("Condition met: buds removed, pausing media");
-            self.pause().await;
+            let was_playing = self.state.lock().await.is_playing;
+            // shortcut: real D-Bus pause() is not injectable, so this path is untested end to end (#133)
+            removal_self_paused = marks_self_pause(self.pause().await, was_playing);
             {
                 let state = self.state.lock().await;
                 if state.disconnect_when_not_wearing {
@@ -820,8 +844,10 @@ impl MediaController {
                 self.state.lock().await.i_paused_the_media = false;
             } else if !old_all_out {
                 debug!("Pausing media as buds are not fully in ear");
-                self.pause().await;
-                self.state.lock().await.i_paused_the_media = true;
+                let was_playing = self.state.lock().await.is_playing;
+                let outcome = self.pause().await;
+                self.state.lock().await.i_paused_the_media |=
+                    removal_self_paused || marks_self_pause(outcome, was_playing);
             } else {
                 debug!("Playing media");
                 self.resume().await;
@@ -1001,46 +1027,10 @@ impl MediaController {
         }
     }
 
-    async fn pause(&self) {
+    async fn pause(&self) -> PauseOutcome {
         debug!("Pausing playback");
 
-        let paused_services = tokio::task::spawn_blocking(|| {
-            let conn = match Connection::new_session() {
-                Ok(c) => c,
-                Err(_) => return vec![],
-            };
-            let mut paused_services = Vec::new();
-
-            for service in Self::list_mpris_services(&conn) {
-                debug!("Checking playback status for service: {}", service);
-                let proxy = conn.with_proxy(
-                    &service,
-                    "/org/mpris/MediaPlayer2",
-                    Duration::from_secs(5),
-                );
-
-                if let Ok(playback_status) =
-                    proxy.get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                    && playback_status == "Playing"
-                {
-                    if proxy
-                        .method_call::<(), _, &str, &str>(
-                            "org.mpris.MediaPlayer2.Player",
-                            "Pause",
-                            (),
-                        )
-                        .is_ok()
-                    {
-                        info!("Paused playback for: {}", service);
-                        paused_services.push(service);
-                    } else {
-                        error!("Failed to pause {}", service);
-                    }
-                }
-            }
-
-            paused_services
-        })
+        let (paused_services, outcome) = tokio::task::spawn_blocking(Self::pause_mpris_players)
             .await
             .unwrap();
 
@@ -1052,6 +1042,7 @@ impl MediaController {
         } else {
             info!("No playing media players found to pause");
         }
+        outcome
     }
 
     pub async fn pause_all_media(&self) {
@@ -1063,33 +1054,42 @@ impl MediaController {
     /// marking can be tested without a session bus.
     pub(crate) async fn pause_all_media_with<F>(&self, pause_players: F)
     where
-        F: FnOnce() -> usize + Send + 'static,
+        F: FnOnce() -> PauseOutcome + Send + 'static,
     {
         debug!("Pausing all media (without tracking for resume)");
 
+        let was_playing = self.state.lock().await.is_playing;
+        let outcome = tokio::task::spawn_blocking(pause_players).await.unwrap();
+
+        let mut state = self.state.lock().await;
         // Remember that the pause came from us, so the playback listener does
         // not mistake the players coming back for the user starting something.
-        // Set before talking to D-Bus, so a failed pause still marks it.
-        self.state.lock().await.i_paused_the_media = true;
-
-        let paused_count = tokio::task::spawn_blocking(pause_players).await.unwrap();
-
-        if paused_count > 0 {
-            info!("Paused {} media player(s) due to ownership loss", paused_count);
-            self.state.lock().await.is_playing = false;
+        state.i_paused_the_media |= marks_self_pause(outcome, was_playing);
+        if outcome.paused > 0 {
+            info!(
+                "Paused {} media player(s) due to ownership loss",
+                outcome.paused
+            );
+            state.is_playing = false;
         } else {
             debug!("No playing media players found to pause");
         }
     }
 
-    /// Pause every MPRIS player that reports `Playing`; returns how many
-    /// paused. Blocking: run it on a blocking thread.
-    pub(crate) fn pause_playing_mpris_players() -> usize {
-        let conn = match Connection::new_session() {
-            Ok(c) => c,
-            Err(_) => return 0,
+    /// Pause every MPRIS player that reports `Playing`. Blocking: run it on a
+    /// blocking thread.
+    pub(crate) fn pause_playing_mpris_players() -> PauseOutcome {
+        Self::pause_mpris_players().1
+    }
+
+    /// `pause_playing_mpris_players`, also returning the paused services.
+    fn pause_mpris_players() -> (Vec<String>, PauseOutcome) {
+        let mut paused_services = Vec::new();
+        let mut outcome = PauseOutcome::default();
+        let Ok(conn) = Connection::new_session() else {
+            outcome.bus_unavailable = true;
+            return (paused_services, outcome);
         };
-        let mut paused_count = 0;
 
         for service in Self::list_mpris_services(&conn) {
             let proxy =
@@ -1103,13 +1103,15 @@ impl MediaController {
                     .is_ok()
                 {
                     info!("Paused playback for: {}", service);
-                    paused_count += 1;
+                    paused_services.push(service);
                 } else {
                     error!("Failed to pause {}", service);
+                    outcome.failed += 1;
                 }
             }
         }
-        paused_count
+        outcome.paused = paused_services.len();
+        (paused_services, outcome)
     }
 
     async fn resume(&self) {
@@ -2223,8 +2225,13 @@ mod tests {
         let controller = MediaController::new(String::new(), String::new());
         controller.state.lock().await.is_playing = true;
 
-        // D-Bus unavailable or nothing paused: still our pause.
-        controller.pause_all_media_with(|| 0).await;
+        // D-Bus unavailable while we last saw playback: still our pause.
+        controller
+            .pause_all_media_with(|| PauseOutcome {
+                bus_unavailable: true,
+                ..Default::default()
+            })
+            .await;
         {
             let state = controller.state.lock().await;
             assert!(state.i_paused_the_media);
@@ -2232,10 +2239,96 @@ mod tests {
         }
 
         controller.state.lock().await.i_paused_the_media = false;
-        controller.pause_all_media_with(|| 2).await;
+        controller
+            .pause_all_media_with(|| PauseOutcome {
+                paused: 2,
+                ..Default::default()
+            })
+            .await;
         let state = controller.state.lock().await;
         assert!(state.i_paused_the_media);
         assert!(!state.is_playing);
+    }
+
+    #[test]
+    fn marks_self_pause_rule() {
+        let outcome = |paused, failed, bus_unavailable| PauseOutcome {
+            paused,
+            failed,
+            bus_unavailable,
+        };
+        for (pause, was_playing, marks) in [
+            (outcome(0, 0, false), false, false),
+            (outcome(1, 0, false), false, true),
+            (outcome(0, 1, false), false, true),
+            (outcome(0, 0, true), true, true),
+            (outcome(0, 0, true), false, false),
+        ] {
+            assert_eq!(
+                marks_self_pause(pause, was_playing),
+                marks,
+                "{pause:?} {was_playing}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_all_media_idle_leaves_self_pause_unset() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.pause_all_media_with(PauseOutcome::default).await;
+        assert!(!controller.state.lock().await.i_paused_the_media);
+    }
+
+    #[tokio::test]
+    async fn pause_all_media_failed_pause_marks_self_pause() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller
+            .pause_all_media_with(|| PauseOutcome {
+                failed: 1,
+                ..Default::default()
+            })
+            .await;
+        assert!(controller.state.lock().await.i_paused_the_media);
+    }
+
+    #[tokio::test]
+    async fn pause_all_media_never_clears_self_pause() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.i_paused_the_media = true;
+        controller.pause_all_media_with(PauseOutcome::default).await;
+        assert!(controller.state.lock().await.i_paused_the_media);
+    }
+
+    #[tokio::test]
+    async fn takeover_after_idle_ownership_loss() {
+        // Ownership lost with `paused` players, then a genuine stopped->playing
+        // poll with a bud in ear.
+        async fn play_after_loss(paused: usize) -> TakeoverDecision {
+            let controller = MediaController::new(String::new(), String::new());
+            controller
+                .pause_all_media_with(move || PauseOutcome {
+                    paused,
+                    ..Default::default()
+                })
+                .await;
+            decide_takeover(TakeoverInputs {
+                baseline_taken: true,
+                was_playing: false,
+                is_playing: true,
+                i_paused_the_media: controller.state.lock().await.i_paused_the_media,
+                bud_in_ear: true,
+                trigger: TakeoverTrigger::PlaybackPoll,
+                handoff: None,
+            })
+        }
+
+        assert_eq!(play_after_loss(0).await.action, TakeoverAction::TakeOver);
+        let twin = play_after_loss(1).await;
+        assert_eq!(
+            twin.action,
+            TakeoverAction::Skip(TakeoverSkip::ResumeAfterOwnPause)
+        );
+        assert!(twin.clear_self_pause);
     }
 
     #[test]
