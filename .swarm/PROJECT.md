@@ -39,6 +39,8 @@ Put new issues in the milestone whose outcome they serve.
       issue then waits until mo has run the spike.
     - **The spike is blocked by the issue** when it validates that issue's code, so it can only run once the code is merged.
     - Use neither link when the spike only confirms behaviour the code already handles either way.
+  - Every groom also checks open spikes, hardware or not, against the issue it grooms (the swarm planner's **Spikes block work**
+    rule).
   - Its criteria are mo's exact steps, and what each possible outcome would mean for the code.
   - `lanes.sh` never starts `hardware` issues: mo runs them with the orchestrator, and the findings come back as follow-up issues.
 - Prefer extracting pure, testable logic (parsing, encoding, policy decisions) from I/O code over adding large mocks.
