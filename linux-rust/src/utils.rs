@@ -98,8 +98,15 @@ impl std::fmt::Display for PreferredCodec {
 /// Reads the preferred codec from the app settings file, falling back to AAC.
 pub fn load_preferred_codec() -> PreferredCodec {
     std::fs::read_to_string(get_app_settings_path())
+        .map(|s| parse_preferred_codec(&s))
+        .unwrap_or_default()
+}
+
+/// Extracts `preferred_codec` from the app settings JSON. Anything missing or
+/// unreadable gives the default (AAC). Split from the file read for testing.
+pub fn parse_preferred_codec(settings: &str) -> PreferredCodec {
+    serde_json::from_str::<serde_json::Value>(settings)
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("preferred_codec").cloned())
         .and_then(|c| serde_json::from_value(c).ok())
         .unwrap_or_default()
@@ -208,5 +215,50 @@ impl From<MyTheme> for Theme {
             MyTheme::Oxocarbon => Theme::Oxocarbon,
             MyTheme::Ferra => Theme::Ferra,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_codec_profile_order() {
+        assert_eq!(PreferredCodec::default(), PreferredCodec::Aac);
+        assert_eq!(
+            PreferredCodec::Aac.profile_order(),
+            ["a2dp-sink", "a2dp-sink-sbc_xq", "a2dp-sink-sbc"]
+        );
+        assert_eq!(
+            PreferredCodec::SbcXq.profile_order(),
+            ["a2dp-sink-sbc_xq", "a2dp-sink", "a2dp-sink-sbc"]
+        );
+        assert_eq!(
+            PreferredCodec::Sbc.profile_order(),
+            ["a2dp-sink-sbc", "a2dp-sink", "a2dp-sink-sbc_xq"]
+        );
+    }
+
+    #[test]
+    fn preferred_codec_parse_defaults_to_aac() {
+        assert_eq!(parse_preferred_codec("{}"), PreferredCodec::Aac);
+        assert_eq!(
+            parse_preferred_codec(r#"{"preferred_codec":"bogus"}"#),
+            PreferredCodec::Aac
+        );
+        assert_eq!(parse_preferred_codec("not json"), PreferredCodec::Aac);
+        assert_eq!(parse_preferred_codec(""), PreferredCodec::Aac);
+        assert_eq!(
+            parse_preferred_codec(r#"{"theme":"Dark","preferred_codec":null}"#),
+            PreferredCodec::Aac
+        );
+        assert_eq!(
+            parse_preferred_codec(r#"{"preferred_codec":"SbcXq"}"#),
+            PreferredCodec::SbcXq
+        );
+        assert_eq!(
+            parse_preferred_codec(r#"{"preferred_codec":"Sbc"}"#),
+            PreferredCodec::Sbc
+        );
     }
 }

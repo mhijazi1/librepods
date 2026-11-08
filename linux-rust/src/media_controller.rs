@@ -119,6 +119,111 @@ where
     None
 }
 
+/// What `activate_a2dp_profile` should do with the card's profile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProfileChoice {
+    /// An A2DP variant is already active. Switching would recreate the sink
+    /// and stop the stream that triggered the activation.
+    KeepActive(String),
+    /// Switch the card to this profile.
+    Activate(String),
+    /// The card offers none of the A2DP profiles we know.
+    Unavailable,
+}
+
+/// Pick the card profile to use. Pure, so the order is tested without a sound
+/// server: an active `a2dp*` profile is kept whatever its codec, then an
+/// available cached choice wins, then the first available entry of the
+/// preferred codec's order.
+fn select_a2dp_profile(
+    available: &[String],
+    active: Option<&str>,
+    cached: Option<&str>,
+    preferred: crate::utils::PreferredCodec,
+) -> ProfileChoice {
+    if let Some(active) = active
+        && active.starts_with("a2dp")
+    {
+        return ProfileChoice::KeepActive(active.to_string());
+    }
+    let is_available = |profile: &str| available.iter().any(|a| a == profile);
+    if let Some(cached) = cached.filter(|c| !c.is_empty() && is_available(c)) {
+        return ProfileChoice::Activate(cached.to_string());
+    }
+    preferred
+        .profile_order()
+        .into_iter()
+        .find(|profile| is_available(profile))
+        .map_or(ProfileChoice::Unavailable, |profile| {
+            ProfileChoice::Activate(profile.to_string())
+        })
+}
+
+/// Make sure the card offers an A2DP profile: check once, then wait up to
+/// `attempts` checks `interval` apart, then `restart` WirePlumber exactly once
+/// and wait the same way again. No sleep follows the final check of a wait.
+/// The check, the restart and the sleep are injected so the sequence is
+/// testable without a sound server.
+///
+/// Worst case in production (the check re-resolves the card by MAC, and
+/// `get_audio_device_index` itself polls for ~3 s when the card is missing):
+/// each wait is up to 5 × ~3 s lookups + 4 × 1 s sleeps ≈ 19 s, so with the
+/// first lookup (~3 s) and the restart (systemctl + 2 s) the whole call can
+/// take ~43 s. When the card is present but has no A2DP profile yet, the
+/// lookups are immediate and the bound is ~4 s + restart + ~4 s.
+async fn recover_a2dp_availability<C, CFut, R, RFut, S, SFut>(
+    attempts: u32,
+    interval: Duration,
+    mut available: C,
+    mut restart: R,
+    mut sleep: S,
+) -> bool
+where
+    C: FnMut() -> CFut,
+    CFut: std::future::Future<Output = bool>,
+    R: FnMut() -> RFut,
+    RFut: std::future::Future<Output = bool>,
+    S: FnMut(Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    if available().await {
+        return true;
+    }
+    // A freshly connected card can show up before its profiles are
+    // enumerated. Give that a grace period before restarting WirePlumber,
+    // which interrupts playback for several seconds.
+    warn!("A2DP profile not available yet, waiting for enumeration");
+    if wait_for_a2dp_profile(attempts, interval, &mut available, &mut sleep).await {
+        return true;
+    }
+    warn!("A2DP profile still missing, restarting WirePlumber as a last resort");
+    restart().await && wait_for_a2dp_profile(attempts, interval, &mut available, &mut sleep).await
+}
+
+/// Up to `attempts` checks, `interval` apart, never sleeping after the last one.
+async fn wait_for_a2dp_profile<C, CFut, S, SFut>(
+    attempts: u32,
+    interval: Duration,
+    available: &mut C,
+    sleep: &mut S,
+) -> bool
+where
+    C: FnMut() -> CFut,
+    CFut: std::future::Future<Output = bool>,
+    S: FnMut(Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    for attempt in 1..=attempts {
+        if available().await {
+            return true;
+        }
+        if attempt < attempts {
+            sleep(interval).await;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Debug)]
 struct OwnedCardProfileInfo {
     name: Option<String>,
@@ -471,17 +576,23 @@ impl MediaController {
 
     /// Number of one-second attempts to wait for A2DP profiles to be enumerated.
     const A2DP_ENUMERATION_ATTEMPTS: u32 = 5;
+    const A2DP_ENUMERATION_INTERVAL: Duration = Duration::from_secs(1);
 
-    /// Currently active profile of the card, used to avoid pointless switches.
-    async fn get_active_profile(&self, card_index: u32) -> Option<String> {
+    /// Profiles the card offers and its active profile, from one snapshot.
+    /// The active profile is used to avoid pointless switches.
+    async fn get_card_profiles(&self, card_index: u32) -> (Vec<String>, Option<String>) {
         tokio::task::spawn_blocking(move || {
             get_card_info_list_sync()
-                .iter()
+                .into_iter()
                 .find(|c| c.index == card_index)
-                .and_then(|c| c.active_profile.clone())
+                .map(|c| {
+                    let names = c.profiles.into_iter().filter_map(|p| p.name).collect();
+                    (names, c.active_profile)
+                })
+                .unwrap_or_default()
         })
         .await
-        .unwrap_or(None)
+        .unwrap_or_default()
     }
 
     /// Resolves the card by Bluetooth MAC and refreshes the cached index.
@@ -494,21 +605,6 @@ impl MediaController {
         let index = self.get_audio_device_index(&mac).await;
         self.state.lock().await.device_index = index;
         index
-    }
-
-    /// Waits for the card to expose an A2DP profile, re-resolving the card on
-    /// every attempt. Sleeps between attempts, but never after the last one.
-    async fn wait_for_a2dp_profile(&self, attempts: u32) -> bool {
-        for attempt in 0..attempts {
-            if self.refresh_device_index().await.is_some() && self.is_a2dp_profile_available().await
-            {
-                return true;
-            }
-            if attempt + 1 < attempts {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-        false
     }
 
     async fn restart_wire_plumber(&self) -> bool {
@@ -544,25 +640,26 @@ impl MediaController {
             return;
         }
 
-        if !self.is_a2dp_profile_available().await {
-            // A freshly connected card can show up before its profiles are
-            // enumerated. Give that a grace period before restarting
-            // WirePlumber, which interrupts playback for several seconds.
-            warn!("A2DP profile not available yet, waiting for enumeration");
-            if !self
-                .wait_for_a2dp_profile(Self::A2DP_ENUMERATION_ATTEMPTS)
-                .await
-            {
-                warn!("A2DP profile still missing, restarting WirePlumber as a last resort");
-                if !self.restart_wire_plumber().await
-                    || !self
-                        .wait_for_a2dp_profile(Self::A2DP_ENUMERATION_ATTEMPTS)
-                        .await
-                {
-                    error!("A2DP profile unavailable, skipping profile activation");
-                    return;
+        // The first check reuses the index resolved just above; every later
+        // check re-resolves the card by MAC, as a reconnect can change it.
+        let mut first_check = true;
+        let available = recover_a2dp_availability(
+            Self::A2DP_ENUMERATION_ATTEMPTS,
+            Self::A2DP_ENUMERATION_INTERVAL,
+            || {
+                let refresh = !std::mem::replace(&mut first_check, false);
+                async move {
+                    (!refresh || self.refresh_device_index().await.is_some())
+                        && self.is_a2dp_profile_available().await
                 }
-            }
+            },
+            || self.restart_wire_plumber(),
+            tokio::time::sleep,
+        )
+        .await;
+        if !available {
+            error!("A2DP profile unavailable, skipping profile activation");
+            return;
         }
 
         let Some(idx) = self.state.lock().await.device_index else {
@@ -570,21 +667,24 @@ impl MediaController {
             return;
         };
 
-        // Leave an already-active A2DP variant alone. Switching profiles
-        // recreates the PipeWire sink and stops the stream that triggered this
-        // activation, so players pause again right after the user pressed play.
-        if let Some(active) = self.get_active_profile(idx).await
-            && active.starts_with("a2dp")
-        {
-            debug!("A2DP profile {} already active, leaving it unchanged", active);
-            return;
-        }
-
-        let preferred_profile = self.get_preferred_a2dp_profile().await;
-        if preferred_profile.is_empty() {
-            error!("No suitable A2DP profile found");
-            return;
-        }
+        let preferred_profile = match self.get_preferred_a2dp_profile(idx).await {
+            // Leave an already-active A2DP variant alone. Switching profiles
+            // recreates the PipeWire sink and stops the stream that triggered
+            // this activation, so players pause again right after the user
+            // pressed play.
+            ProfileChoice::KeepActive(active) => {
+                debug!(
+                    "A2DP profile {} already active, leaving it unchanged",
+                    active
+                );
+                return;
+            }
+            ProfileChoice::Unavailable => {
+                error!("No suitable A2DP profile found");
+                return;
+            }
+            ProfileChoice::Activate(profile) => profile,
+        };
 
         info!("Activating A2DP profile for AirPods: {}", preferred_profile);
         let profile_name = preferred_profile.clone();
@@ -787,50 +887,30 @@ impl MediaController {
             .unwrap_or(false)
     }
 
-    async fn get_preferred_a2dp_profile(&self) -> String {
-        let state = self.state.lock().await;
-        let device_index = state.device_index;
-        let cached_profile = state.cached_a2dp_profile.clone();
-        drop(state);
+    /// Gathers the inputs of `select_a2dp_profile` (one card snapshot, the
+    /// cached choice and the codec setting) and caches a new choice.
+    async fn get_preferred_a2dp_profile(&self, card_index: u32) -> ProfileChoice {
+        let (available, active) = self.get_card_profiles(card_index).await;
+        let cached_profile = self.state.lock().await.cached_a2dp_profile.clone();
 
-        let index = match device_index {
-            Some(i) => i,
-            None => return String::new(),
-        };
-
-        if !cached_profile.is_empty() && self.is_profile_available(index, &cached_profile).await {
-            debug!("Using cached A2DP profile: {}", cached_profile);
-            return cached_profile;
-        }
-
-        for profile in crate::utils::load_preferred_codec().profile_order() {
-            if self.is_profile_available(index, profile).await {
-                info!("Selected best available A2DP profile: {}", profile);
-                self.state.lock().await.cached_a2dp_profile = profile.to_string();
-                return profile.to_string();
+        let choice = select_a2dp_profile(
+            &available,
+            active.as_deref(),
+            Some(&cached_profile),
+            crate::utils::load_preferred_codec(),
+        );
+        match &choice {
+            ProfileChoice::Activate(profile) if *profile == cached_profile => {
+                debug!("Using cached A2DP profile: {}", profile);
             }
+            ProfileChoice::Activate(profile) => {
+                info!("Selected best available A2DP profile: {}", profile);
+                self.state.lock().await.cached_a2dp_profile = profile.clone();
+            }
+            ProfileChoice::KeepActive(_) => {}
+            ProfileChoice::Unavailable => debug!("No suitable profile found"),
         }
-        debug!("No suitable profile found");
-        String::new()
-    }
-
-    async fn is_profile_available(&self, card_index: u32, profile: &str) -> bool {
-        let profile_name = profile.to_string();
-        tokio::task::spawn_blocking(move || {
-            let available = get_card_info_list_sync()
-                .iter()
-                .find(|c| c.index == card_index)
-                .map(|card| {
-                    card.profiles
-                        .iter()
-                        .any(|p| p.name.as_ref() == Some(&profile_name))
-                })
-                .unwrap_or(false);
-            debug!("Profile {} available: {}", profile_name, available);
-            available
-        })
-            .await
-            .unwrap_or(false)
+        choice
     }
 
     async fn get_audio_device_index(&self, mac: &str) -> Option<u32> {
@@ -1548,5 +1628,197 @@ mod tests {
         .await;
         assert_eq!(found, None);
         assert_eq!(calls, 12);
+    }
+
+    use crate::utils::PreferredCodec;
+
+    fn profiles(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    const ALL_A2DP: [&str; 3] = ["a2dp-sink-sbc", "a2dp-sink-sbc_xq", "a2dp-sink"];
+
+    #[test]
+    fn a2dp_profile_keeps_any_active_a2dp_variant() {
+        let available = profiles(&ALL_A2DP);
+        for active in ["a2dp-sink-sbc", "a2dp-sink-sbc_xq", "a2dp-sink"] {
+            for preferred in PreferredCodec::ALL {
+                assert_eq!(
+                    select_a2dp_profile(&available, Some(active), None, preferred),
+                    ProfileChoice::KeepActive(active.to_string())
+                );
+                // The cache does not override an active A2DP profile either.
+                assert_eq!(
+                    select_a2dp_profile(&available, Some(active), Some("a2dp-sink"), preferred),
+                    ProfileChoice::KeepActive(active.to_string())
+                );
+            }
+        }
+        assert_eq!(
+            select_a2dp_profile(&available, Some("a2dp-sink-sbc"), None, PreferredCodec::Aac),
+            ProfileChoice::KeepActive("a2dp-sink-sbc".to_string())
+        );
+    }
+
+    #[test]
+    fn a2dp_profile_activates_preferred_when_not_a2dp() {
+        let available = profiles(&["off", "headset-head-unit", "a2dp-sink-sbc", "a2dp-sink"]);
+        for active in [Some("off"), Some("headset-head-unit"), None] {
+            assert_eq!(
+                select_a2dp_profile(&available, active, None, PreferredCodec::Aac),
+                ProfileChoice::Activate("a2dp-sink".to_string())
+            );
+            assert_eq!(
+                select_a2dp_profile(&available, active, Some(""), PreferredCodec::Sbc),
+                ProfileChoice::Activate("a2dp-sink-sbc".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn a2dp_profile_falls_back_when_preferred_missing() {
+        // AAC missing: AAC order continues with SBC-XQ, then SBC.
+        let available = profiles(&["off", "a2dp-sink-sbc", "a2dp-sink-sbc_xq"]);
+        assert_eq!(
+            select_a2dp_profile(&available, Some("off"), None, PreferredCodec::Aac),
+            ProfileChoice::Activate("a2dp-sink-sbc_xq".to_string())
+        );
+        let available = profiles(&["off", "a2dp-sink-sbc"]);
+        assert_eq!(
+            select_a2dp_profile(&available, Some("off"), None, PreferredCodec::Aac),
+            ProfileChoice::Activate("a2dp-sink-sbc".to_string())
+        );
+        // SBC-XQ missing: its order falls back to AAC before SBC.
+        let available = profiles(&["off", "a2dp-sink-sbc", "a2dp-sink"]);
+        assert_eq!(
+            select_a2dp_profile(&available, Some("off"), None, PreferredCodec::SbcXq),
+            ProfileChoice::Activate("a2dp-sink".to_string())
+        );
+        // A cached profile that disappeared falls back to the codec order.
+        assert_eq!(
+            select_a2dp_profile(
+                &available,
+                Some("off"),
+                Some("a2dp-sink-sbc_xq"),
+                PreferredCodec::Sbc
+            ),
+            ProfileChoice::Activate("a2dp-sink-sbc".to_string())
+        );
+    }
+
+    #[test]
+    fn a2dp_profile_prefers_cached_when_available() {
+        // Upstream semantics: the cached choice wins over a changed codec
+        // preference until the controller is recreated.
+        let available = profiles(&ALL_A2DP);
+        assert_eq!(
+            select_a2dp_profile(
+                &available,
+                Some("off"),
+                Some("a2dp-sink-sbc"),
+                PreferredCodec::Aac
+            ),
+            ProfileChoice::Activate("a2dp-sink-sbc".to_string())
+        );
+    }
+
+    #[test]
+    fn a2dp_profile_unavailable_when_no_a2dp_profiles() {
+        let available = profiles(&["off", "headset-head-unit"]);
+        for preferred in PreferredCodec::ALL {
+            assert_eq!(
+                select_a2dp_profile(&available, Some("off"), Some("a2dp-sink"), preferred),
+                ProfileChoice::Unavailable
+            );
+        }
+        assert_eq!(
+            select_a2dp_profile(&[], None, None, PreferredCodec::Aac),
+            ProfileChoice::Unavailable
+        );
+    }
+
+    const TEST_INTERVAL: Duration = Duration::from_millis(1);
+
+    /// Runs the recovery sequence with an availability check that turns true
+    /// on call `available_on` (never if `None`), counting checks, restarts and
+    /// sleeps. Returns (result, checks, restarts, sleeps).
+    async fn run_recovery(available_on: Option<u32>, restart_ok: bool) -> (bool, u32, u32, u32) {
+        let checks = std::cell::Cell::new(0u32);
+        let restarts = std::cell::Cell::new(0u32);
+        let sleeps = std::cell::Cell::new(0u32);
+        let result = recover_a2dp_availability(
+            MediaController::A2DP_ENUMERATION_ATTEMPTS,
+            TEST_INTERVAL,
+            || {
+                checks.set(checks.get() + 1);
+                let now = checks.get();
+                async move { available_on.is_some_and(|k| now >= k) }
+            },
+            || {
+                restarts.set(restarts.get() + 1);
+                async move { restart_ok }
+            },
+            |interval| {
+                assert_eq!(interval, TEST_INTERVAL);
+                sleeps.set(sleeps.get() + 1);
+                tokio::time::sleep(interval)
+            },
+        )
+        .await;
+        (result, checks.get(), restarts.get(), sleeps.get())
+    }
+
+    #[test]
+    fn a2dp_recovery_production_budget() {
+        assert_eq!(MediaController::A2DP_ENUMERATION_ATTEMPTS, 5);
+        assert_eq!(
+            MediaController::A2DP_ENUMERATION_INTERVAL,
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a2dp_recovery_no_restart_when_available() {
+        assert_eq!(run_recovery(Some(1), true).await, (true, 1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a2dp_recovery_no_restart_when_profile_appears_in_grace() {
+        let attempts = MediaController::A2DP_ENUMERATION_ATTEMPTS;
+        // Check 1 is the initial one; checks 2..=1+attempts form the grace wait.
+        for k in 1..=attempts {
+            let (ok, checks, restarts, sleeps) = run_recovery(Some(1 + k), true).await;
+            assert!(ok);
+            assert_eq!(checks, 1 + k);
+            assert_eq!(restarts, 0);
+            assert_eq!(sleeps, k - 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a2dp_recovery_restarts_once_then_gives_up() {
+        let attempts = MediaController::A2DP_ENUMERATION_ATTEMPTS;
+        let (ok, checks, restarts, sleeps) = run_recovery(None, true).await;
+        assert!(!ok);
+        assert_eq!(restarts, 1);
+        assert_eq!(checks, 1 + 2 * attempts);
+        // No sleep after the final attempt of either wait.
+        assert_eq!(sleeps, 2 * (attempts - 1));
+    }
+
+    #[tokio::test]
+    async fn a2dp_recovery_succeeds_after_restart() {
+        let attempts = MediaController::A2DP_ENUMERATION_ATTEMPTS;
+        let (ok, checks, restarts, sleeps) = run_recovery(Some(2 + attempts), true).await;
+        assert!(ok);
+        assert_eq!((checks, restarts, sleeps), (2 + attempts, 1, attempts - 1));
+    }
+
+    #[tokio::test]
+    async fn a2dp_recovery_gives_up_when_restart_fails() {
+        let attempts = MediaController::A2DP_ENUMERATION_ATTEMPTS;
+        let (ok, checks, restarts, sleeps) = run_recovery(None, false).await;
+        assert!(!ok);
+        assert_eq!((checks, restarts, sleeps), (1 + attempts, 1, attempts - 1));
     }
 }
