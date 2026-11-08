@@ -1616,8 +1616,16 @@ mod tests {
 
         // ACK, then playback stops: exactly the release.
         h.emit(owns(1));
+        let stopped = Instant::now();
         h.play(false).await;
-        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
+        let hold = crate::handoff::RELEASE_HOLD;
+        let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
+            .await
+            .expect("expected the release")
+            .expect("send channel open");
+        assert!(stopped.elapsed() >= hold);
+        assert_eq!(release, expected_owns(0).await);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
 
@@ -2310,8 +2318,16 @@ mod tests {
         h.emit(owns(1));
         // Playback stops: the release is pending. Playback restarts during
         // it, so its ACK carries the deferred pause (#39 keeps that one).
+        let stopped = Instant::now();
         h.play(false).await;
-        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
+        let hold = crate::handoff::RELEASE_HOLD;
+        let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
+            .await
+            .expect("expected the release")
+            .expect("send channel open");
+        assert!(stopped.elapsed() >= hold);
+        assert_eq!(release, expected_owns(0).await);
         h.play(true).await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
@@ -3292,8 +3308,16 @@ mod tests {
 
         // ACK, then the stream ends: the core's usual release.
         h.emit(owns(1));
+        let stopped = Instant::now();
         streams.set(Vec::new());
-        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
+        let hold = crate::handoff::RELEASE_HOLD;
+        let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
+            .await
+            .expect("expected the release")
+            .expect("send channel open");
+        assert!(stopped.elapsed() >= hold);
+        assert_eq!(release, expected_owns(0).await);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
 
@@ -3806,6 +3830,38 @@ mod tests {
                 assert_eq!(p.step(later, false, &stream), [], "{later} ms");
             }
             assert_eq!(p.takes(), [vec![SendOwnership(true)]]);
+        }
+
+        /// #205: a track change's gap (MPRIS stopped, the old stream gone)
+        /// keeps the AirPods; a real stop releases after `RELEASE_HOLD`.
+        #[test]
+        fn non_event_track_change_keeps_ownership() {
+            let hold_ms = crate::handoff::RELEASE_HOLD.as_millis() as u64;
+            let sent = |p: &Pipeline, owner| {
+                let c = SendOwnership(owner);
+                p.log.iter().flatten().filter(|&x| *x == c).count()
+            };
+            let mut p = Pipeline::ready();
+            assert_eq!(p.step(EVENT_MS, true, &[music(1)]), [SendOwnership(true)]);
+            p.feed(EVENT_MS, Input::Ownership(vec![1]));
+            let gap = EVENT_MS + POLL_MS;
+            p.step(gap, false, &[]);
+            let next = gap + POLL_MS;
+            for ms in (next..=next + 2 * hold_ms).step_by(POLL_MS as usize) {
+                p.step(ms, true, &[music(2)]);
+                p.feed(ms, Input::Tick);
+            }
+            assert_eq!(sent(&p, true), 1);
+            assert_eq!(sent(&p, false), 0);
+
+            // The player stops.
+            let stop = next + 2 * hold_ms + POLL_MS;
+            for ms in (stop..=stop + hold_ms + POLL_MS).step_by(POLL_MS as usize) {
+                p.step(ms, false, &[]);
+                p.feed(ms, Input::Tick);
+            }
+            assert_eq!(sent(&p, true), 1);
+            assert_eq!(sent(&p, false), 1);
         }
     }
 
