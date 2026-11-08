@@ -148,11 +148,20 @@ pub(crate) trait PlaybackSource: Send {
 /// it starts over if it comes back. Stream playback is on while any stream
 /// counts. An app that keeps a silent stream open uncorked still counts;
 /// libpulse reports no level for sink inputs (#84).
+///
+/// The first successful listing is the baseline: streams already playing in
+/// it never count, as MPRIS playback running at the handoff core's baseline
+/// is no new start. Such a stream counts only once it has been corked (or
+/// reclassified) and plays again, and then only after `min`; a new stream
+/// counts as usual.
 #[derive(Debug)]
 pub(crate) struct PlaybackTracker {
     min: Duration,
     /// Worthy, uncorked streams by index: when each was first seen so.
     since: HashMap<u32, Instant>,
+    /// Worthy, uncorked streams of the first successful listing that have
+    /// stayed so ever since; None until that listing.
+    preexisting: Option<HashSet<u32>>,
     /// Whether a stream counts as playing (false before any change).
     playing: bool,
 }
@@ -162,6 +171,7 @@ impl PlaybackTracker {
         PlaybackTracker {
             min,
             since: HashMap::new(),
+            preexisting: None,
             playing: false,
         }
     }
@@ -174,9 +184,13 @@ impl PlaybackTracker {
             .filter(|s| !s.corked && is_takeover_worthy(s))
             .map(|s| s.index)
             .collect();
+        let preexisting = self.preexisting.get_or_insert_with(|| live.clone());
+        preexisting.retain(|index| live.contains(index));
         self.since.retain(|index, _| live.contains(index));
         for index in live {
-            self.since.entry(index).or_insert(now);
+            if !preexisting.contains(&index) {
+                self.since.entry(index).or_insert(now);
+            }
         }
         let playing = self
             .since
@@ -189,11 +203,18 @@ impl PlaybackTracker {
         Some(playing)
     }
 
-    /// Sample `source` once at `now`, as `observe`. A source error changes
-    /// nothing: the last state and the streams' timers are kept.
-    pub(crate) fn poll(&mut self, source: &mut dyn PlaybackSource, now: Instant) -> Option<bool> {
+    /// Sample `source` once, as `observe` at the time `clock` gives. `clock`
+    /// is read only once the listing has returned, so a slow listing can't
+    /// date a stream's start back to before the stream was seen. A source
+    /// error changes nothing: the last state and the streams' timers are
+    /// kept, and the baseline is still the first successful listing.
+    pub(crate) fn poll(
+        &mut self,
+        source: &mut dyn PlaybackSource,
+        clock: impl FnOnce() -> Instant,
+    ) -> Option<bool> {
         match source.playback_streams() {
-            Ok(streams) => self.observe(now, &streams),
+            Ok(streams) => self.observe(clock(), &streams),
             Err(e) => {
                 log::debug!("Stream monitor: playback stream listing failed: {e}");
                 None
@@ -203,10 +224,12 @@ impl PlaybackTracker {
 }
 
 /// Sample `source` every `interval` with a `PlaybackTracker` and publish the
-/// stream-playing state (initially false). Sampling runs on the blocking
-/// pool in its own task, so a sound server that never answers stalls only
-/// this state, never the caller. The task stops once every receiver is
-/// dropped; if sampling panics the state drops to false.
+/// stream-playing state (initially false; streams already playing in the
+/// first listing never make it true, see `PlaybackTracker`). Each listing is
+/// timed when it returns. Sampling runs on the blocking pool in its own
+/// task, so a sound server that never answers stalls only this state, never
+/// the caller. The task stops once every receiver is dropped; if sampling
+/// panics the state drops to false.
 pub(crate) fn spawn_stream_playback<S: PlaybackSource + 'static>(
     source: S,
     min: Duration,
@@ -220,7 +243,7 @@ pub(crate) fn spawn_stream_playback<S: PlaybackSource + 'static>(
                 break;
             };
             let sampled = tokio::task::spawn_blocking(move || {
-                let change = tracker.poll(&mut source, Instant::now());
+                let change = tracker.poll(&mut source, Instant::now);
                 (tracker, source, change)
             })
             .await;
@@ -723,7 +746,7 @@ mod tests {
     /// return each sample's report.
     fn track(listings: &[Vec<StreamProps>]) -> Vec<Option<bool>> {
         let start = Instant::now();
-        let mut tracker = PlaybackTracker::new(MIN);
+        let mut tracker = started(start);
         listings
             .iter()
             .enumerate()
@@ -731,6 +754,97 @@ mod tests {
             .collect()
     }
 
+    /// A tracker past its baseline: its first listing, at `start`, had no
+    /// stream, so every stream it sees later is a new one.
+    fn started(start: Instant) -> PlaybackTracker {
+        let mut tracker = PlaybackTracker::new(MIN);
+        assert_eq!(tracker.observe(start, &[]), None);
+        tracker
+    }
+
+    #[test]
+    fn preexisting_stream_counts_only_after_resuming() {
+        let start = Instant::now();
+        let mut tracker = PlaybackTracker::new(MIN);
+        // Already playing in the first listing: the baseline, never a start,
+        // however long it plays.
+        for i in 0..20 {
+            assert_eq!(tracker.observe(start + STEP * i, &[music(1)]), None, "{i}");
+        }
+        assert!(!tracker.playing);
+        // Paused, then playing again: a new start, counted after the
+        // minimum from the resume.
+        let paused = start + STEP * 20;
+        assert_eq!(tracker.observe(paused, &[corked_music(1)]), None);
+        let resumed = paused + STEP;
+        assert_eq!(tracker.observe(resumed, &[music(1)]), None);
+        assert_eq!(
+            tracker.observe(resumed + MIN - Duration::from_millis(1), &[music(1)]),
+            None
+        );
+        assert_eq!(tracker.observe(resumed + MIN, &[music(1)]), Some(true));
+        assert_eq!(tracker.observe(resumed + MIN * 2, &[]), Some(false));
+
+        // Reclassified and back: a new start too.
+        let mut tracker = PlaybackTracker::new(MIN);
+        assert_eq!(tracker.observe(start, &[music(1)]), None);
+        let event = sink_input(1, &[("media.role", "event")], false);
+        assert_eq!(tracker.observe(start + STEP, &[event]), None);
+        let back = start + STEP * 2;
+        assert_eq!(tracker.observe(back, &[music(1)]), None);
+        assert_eq!(
+            tracker.observe(back + MIN - Duration::from_millis(1), &[music(1)]),
+            None
+        );
+        assert_eq!(tracker.observe(back + MIN, &[music(1)]), Some(true));
+    }
+
+    #[test]
+    fn new_stream_counts_beside_preexisting() {
+        let start = Instant::now();
+        // A new stream next to one playing at the baseline.
+        let mut tracker = PlaybackTracker::new(MIN);
+        assert_eq!(tracker.observe(start, &[music(1)]), None);
+        let added = start + STEP;
+        assert_eq!(tracker.observe(added, &[music(1), music(2)]), None);
+        assert_eq!(tracker.observe(start + MIN, &[music(1), music(2)]), None);
+        assert_eq!(
+            tracker.observe(added + MIN, &[music(1), music(2)]),
+            Some(true)
+        );
+        // The new stream ends; the preexisting one alone does not count.
+        assert_eq!(tracker.observe(added + MIN * 2, &[music(1)]), Some(false));
+        assert_eq!(tracker.observe(added + MIN * 4, &[music(1)]), None);
+
+        // A stream corked in the first listing was not playing: once it
+        // plays, it is a new start.
+        let mut tracker = PlaybackTracker::new(MIN);
+        assert_eq!(tracker.observe(start, &[corked_music(3)]), None);
+        let played = start + STEP;
+        assert_eq!(tracker.observe(played, &[music(3)]), None);
+        assert_eq!(tracker.observe(played + MIN, &[music(3)]), Some(true));
+    }
+
+    #[test]
+    fn baseline_is_the_first_successful_listing() {
+        let start = Instant::now();
+        let mut source = FakePlayback::new(vec![
+            failure_streams(),
+            Ok(vec![music(1)]),
+            Ok(vec![music(1), music(2)]),
+        ]);
+        let mut tracker = PlaybackTracker::new(MIN);
+        // A failed listing is no baseline...
+        assert_eq!(tracker.poll(&mut source, || start), None);
+        assert!(tracker.preexisting.is_none());
+        // ...the first successful one is: music(1) never counts.
+        assert_eq!(tracker.poll(&mut source, || start + STEP), None);
+        assert_eq!(tracker.observe(start + MIN * 3, &[music(1)]), None);
+        // A stream new since then counts after the minimum.
+        let added = start + MIN * 4;
+        assert_eq!(tracker.poll(&mut source, || added), None);
+        assert_eq!(tracker.poll(&mut source, || added + MIN), Some(true));
+    }
     #[test]
     fn min_stream_playback_is_a_short_debounce() {
         assert!(MIN_STREAM_PLAYBACK >= Duration::from_secs(1));
@@ -740,7 +854,7 @@ mod tests {
     #[test]
     fn short_stream_never_counts() {
         let start = Instant::now();
-        let mut tracker = PlaybackTracker::new(MIN);
+        let mut tracker = started(start);
         assert_eq!(tracker.observe(start, &[music(7)]), None);
         // Just short of the minimum, then gone.
         let almost = start + MIN - Duration::from_millis(1);
@@ -764,7 +878,7 @@ mod tests {
     #[test]
     fn long_stream_reports_one_start_and_stop() {
         let start = Instant::now();
-        let mut tracker = PlaybackTracker::new(MIN);
+        let mut tracker = started(start);
         assert_eq!(tracker.observe(start, &[music(3)]), None);
         assert_eq!(tracker.observe(start + MIN / 2, &[music(3)]), None);
         assert_eq!(tracker.observe(start + MIN, &[music(3)]), Some(true));
@@ -802,7 +916,7 @@ mod tests {
     #[test]
     fn corked_stream_restarts_debounce() {
         let start = Instant::now();
-        let mut tracker = PlaybackTracker::new(MIN);
+        let mut tracker = started(start);
         assert_eq!(tracker.observe(start, &[music(1)]), None);
         assert_eq!(tracker.observe(start + STEP * 3, &[corked_music(1)]), None);
         // Uncorked again: the timer starts over from here.
@@ -816,7 +930,7 @@ mod tests {
         assert_eq!(tracker.observe(resumed + MIN, &[music(1)]), Some(true));
         // A stream that vanishes and comes back under a new index starts
         // over as well.
-        let mut tracker = PlaybackTracker::new(MIN);
+        let mut tracker = started(start);
         assert_eq!(tracker.observe(start, &[music(1)]), None);
         assert_eq!(tracker.observe(start + STEP * 3, &[music(2)]), None);
         assert_eq!(tracker.observe(start + MIN, &[music(2)]), None);
@@ -829,7 +943,7 @@ mod tests {
     #[test]
     fn reclassified_stream_restarts_debounce() {
         let start = Instant::now();
-        let mut tracker = PlaybackTracker::new(MIN);
+        let mut tracker = started(start);
         assert_eq!(tracker.observe(start, &[music(1)]), None);
         // The same index now reports an event role: forgotten.
         let event = sink_input(1, &[("media.role", "event")], false);
@@ -843,7 +957,7 @@ mod tests {
     #[test]
     fn event_stream_never_counts() {
         let start = Instant::now();
-        let mut tracker = PlaybackTracker::new(MIN);
+        let mut tracker = started(start);
         let streams = [
             event_sound(1),
             sink_input(
@@ -881,19 +995,19 @@ mod tests {
             failure_streams(),
             Ok(vec![]),
         ]);
-        let mut tracker = PlaybackTracker::new(MIN);
+        let mut tracker = started(start);
         // No state yet: an error reports nothing.
-        assert_eq!(tracker.poll(&mut source, start), None);
-        assert_eq!(tracker.poll(&mut source, start), None);
-        assert_eq!(tracker.poll(&mut source, start + STEP), None);
+        assert_eq!(tracker.poll(&mut source, || start), None);
+        assert_eq!(tracker.poll(&mut source, || start), None);
+        assert_eq!(tracker.poll(&mut source, || start + STEP), None);
         // An error neither restarts the stream's timer nor reports.
-        assert_eq!(tracker.poll(&mut source, start + MIN), None);
-        assert_eq!(tracker.poll(&mut source, start + MIN), Some(true));
+        assert_eq!(tracker.poll(&mut source, || start + MIN), None);
+        assert_eq!(tracker.poll(&mut source, || start + MIN), Some(true));
         // Errors neither end nor repeat the playback.
-        assert_eq!(tracker.poll(&mut source, start + MIN * 2), None);
-        assert_eq!(tracker.poll(&mut source, start + MIN * 3), None);
+        assert_eq!(tracker.poll(&mut source, || start + MIN * 2), None);
+        assert_eq!(tracker.poll(&mut source, || start + MIN * 3), None);
         assert!(tracker.playing);
-        assert_eq!(tracker.poll(&mut source, start + MIN * 4), Some(false));
+        assert_eq!(tracker.poll(&mut source, || start + MIN * 4), Some(false));
     }
 
     fn failure_streams() -> io::Result<Vec<StreamProps>> {
@@ -947,15 +1061,15 @@ mod tests {
             empty_cut,
             Ok(streams.clone()),
         ]);
-        let mut tracker = PlaybackTracker::new(MIN);
-        assert_eq!(tracker.poll(&mut source, start), None);
-        assert_eq!(tracker.poll(&mut source, start + MIN), Some(true));
+        let mut tracker = started(start);
+        assert_eq!(tracker.poll(&mut source, || start), None);
+        assert_eq!(tracker.poll(&mut source, || start + MIN), Some(true));
         // The failed listings do not end the playback...
-        assert_eq!(tracker.poll(&mut source, start + MIN * 2), None);
-        assert_eq!(tracker.poll(&mut source, start + MIN * 3), None);
+        assert_eq!(tracker.poll(&mut source, || start + MIN * 2), None);
+        assert_eq!(tracker.poll(&mut source, || start + MIN * 3), None);
         assert!(tracker.playing);
         // ...and the next good listing, still playing, is no change.
-        assert_eq!(tracker.poll(&mut source, start + MIN * 4), None);
+        assert_eq!(tracker.poll(&mut source, || start + MIN * 4), None);
         assert!(tracker.playing);
     }
 
@@ -981,5 +1095,55 @@ mod tests {
         script.lock().unwrap().push_back(Ok(vec![music(2)]));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(script.lock().unwrap().len(), 1);
+    }
+
+    /// A sound server slow to answer once: the first listing (the baseline)
+    /// has no stream, the second blocks for `delay` and returns a music
+    /// stream that only appeared as it returned (noting when), and every
+    /// later one returns that stream at once.
+    struct SlowListing {
+        calls: usize,
+        delay: Duration,
+        returned: Arc<Mutex<Option<Instant>>>,
+    }
+
+    impl PlaybackSource for SlowListing {
+        fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
+            self.calls += 1;
+            match self.calls {
+                1 => Ok(Vec::new()),
+                2 => {
+                    std::thread::sleep(self.delay);
+                    *self.returned.lock().unwrap() = Some(Instant::now());
+                    Ok(vec![music(1)])
+                }
+                _ => Ok(vec![music(1)]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_listing_does_not_shorten_debounce() {
+        let min = Duration::from_millis(300);
+        let returned = Arc::new(Mutex::new(None));
+        let source = SlowListing {
+            calls: 0,
+            // Longer than the minimum: timed from before the listing, the
+            // stream would count at once.
+            delay: min + Duration::from_millis(200),
+            returned: returned.clone(),
+        };
+        let mut rx = spawn_stream_playback(source, min, Duration::from_millis(5));
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|playing| *playing))
+            .await
+            .expect("stream playback")
+            .expect("monitor running");
+        let playing_seen = Instant::now();
+        let returned = returned.lock().unwrap().expect("the slow listing returned");
+        let counted_after = playing_seen.duration_since(returned);
+        assert!(
+            counted_after >= min,
+            "counted {counted_after:?} after the stream was first seen; the minimum is {min:?}"
+        );
     }
 }

@@ -1922,17 +1922,48 @@ mod tests {
 
     /// The sink inputs the test sets, listed as they are at each call.
     #[derive(Clone, Default)]
-    struct LiveStreams(Arc<StdMutex<Vec<StreamProps>>>);
+    struct LiveStreams {
+        streams: Arc<StdMutex<Vec<StreamProps>>>,
+        /// Listings returned so far.
+        listings: Arc<AtomicUsize>,
+    }
 
     impl LiveStreams {
         fn set(&self, streams: Vec<StreamProps>) {
-            *self.0.lock().unwrap() = streams;
+            *self.streams.lock().unwrap() = streams;
+        }
+
+        /// Wait until a listing that started after this call has returned,
+        /// so the stream monitor has seen what was set before it.
+        async fn settle(&self) {
+            let after = self.listings.load(Ordering::SeqCst) + 2;
+            wait_until("a stream listing", || {
+                self.listings.load(Ordering::SeqCst) >= after
+            })
+            .await;
         }
     }
 
     impl PlaybackSource for LiveStreams {
         fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
-            Ok(self.0.lock().unwrap().clone())
+            let streams = self.streams.lock().unwrap().clone();
+            self.listings.fetch_add(1, Ordering::SeqCst);
+            Ok(streams)
+        }
+    }
+
+    /// `LiveStreams` whose first listing waits until `gate` is released.
+    struct GatedFirst {
+        streams: LiveStreams,
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl PlaybackSource for GatedFirst {
+        fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.recv();
+            }
+            self.streams.playback_streams()
         }
     }
 
@@ -2024,6 +2055,8 @@ mod tests {
             STREAM_TEST_POLL,
         );
         assert!(!next_sample(&mut rx).await.1);
+        // The stream monitor's baseline has the event sound only.
+        streams.settle().await;
         let started = Instant::now();
         streams.set(vec![event_sound(1), music(2)]);
         let playing_at = sample_until(&mut rx, true).await;
@@ -2070,6 +2103,8 @@ mod tests {
             Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
         assert!(h.playback_started.load(Ordering::SeqCst));
         expect_startup(&h, &mut rx).await;
+        // The stream monitor's baseline has no stream.
+        streams.settle().await;
 
         // A music stream with no MPRIS player: one take once it lasted the
         // minimum, OwnsConnection [1] only.
@@ -2100,8 +2135,9 @@ mod tests {
         let h =
             Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
         expect_startup(&h, &mut rx).await;
+        streams.settle().await;
         tokio::time::sleep(STREAM_TEST_MIN).await;
-        // A music stream that ends well before the minimum.
+        // A new music stream that ends well before the minimum.
         streams.set(vec![event_sound(21), music(22)]);
         tokio::time::sleep(STREAM_TEST_MIN / 5).await;
         streams.set(vec![event_sound(21)]);
@@ -2111,5 +2147,66 @@ mod tests {
         assert_eq!(h.pauses(), 0);
         assert_eq!(h.activations(), 1);
         stop_handoff_task(mac);
+    }
+
+    /// A music stream already playing in the stream monitor's first listing,
+    /// optionally held until playback samples have reached the core: no
+    /// take while it keeps playing, one take once it is paused and resumed.
+    async fn preexisting_stream_case(mac: &str, delay_first_listing: bool) {
+        let (manager, mut rx, _tx) = ready_session().await;
+        let streams = LiveStreams::default();
+        streams.set(vec![music(31)]);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let source = GatedFirst {
+            streams: streams.clone(),
+            gate: delay_first_listing.then_some(gate),
+        };
+        let mpris_calls = Arc::new(AtomicUsize::new(0));
+        let calls = mpris_calls.clone();
+        let mpris = move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let h = Harness::start_streams(mac, &manager, mpris, source, STREAM_TEST_MIN).await;
+        expect_startup(&h, &mut rx).await;
+        if delay_first_listing {
+            // The third MPRIS sample is taken only once the core received
+            // the first (the channel holds one): the baseline sample came
+            // before any stream listing.
+            wait_until("MPRIS samples", || mpris_calls.load(Ordering::SeqCst) >= 3).await;
+            assert_eq!(streams.listings.load(Ordering::SeqCst), 0);
+            release.send(()).expect("first listing waiting");
+        }
+        streams.settle().await;
+
+        // Playing for more than twice the minimum: no new start, no take.
+        tokio::time::sleep(STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+
+        // Paused, then resumed: a new start, one take once it lasted the
+        // minimum from the resume, OwnsConnection [1] only.
+        streams.set(vec![StreamProps {
+            corked: true,
+            ..music(31)
+        }]);
+        streams.settle().await;
+        let resumed = Instant::now();
+        streams.set(vec![music(31)]);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert!(resumed.elapsed() >= STREAM_TEST_MIN);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_preexisting_stream_playback_never_takes() {
+        preexisting_stream_case("5A:00:00:00:00:0F", false).await;
+    }
+
+    #[tokio::test]
+    async fn handoff_preexisting_stream_late_first_listing_never_takes() {
+        preexisting_stream_case("5A:00:00:00:00:10", true).await;
     }
 }
