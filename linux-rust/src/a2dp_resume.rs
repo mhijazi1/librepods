@@ -110,12 +110,7 @@ impl Chain {
     /// over. `audible` and `playing` matter only when `senses()`; audible
     /// ends the chain there. Once the sink is suspended or the players
     /// paused, the next step always undoes it.
-    fn step(
-        &mut self,
-        now: Instant,
-        audible: bool,
-        playing: &[String],
-    ) -> Option<Vec<Action>> {
+    fn step(&mut self, now: Instant, audible: bool, playing: &[String]) -> Option<Vec<Action>> {
         if audible && self.senses() {
             self.stage = Stage::Done;
             return None;
@@ -176,23 +171,29 @@ pub(crate) trait A2dpResumeIo: Send + Sync {
 }
 
 /// Run the chain from now on `io`. `cancel` firing (or its sender dropping)
-/// stops it between steps.
+/// stops it between steps, including during a step's audio check.
 pub(crate) async fn run(io: impl A2dpResumeIo, mut cancel: oneshot::Receiver<()>) {
     let mut chain = Chain::new(Instant::now(), io.playing().await);
     loop {
-        tokio::select! {
+        let (due, senses) = (chain.due(), chain.senses());
+        // The audio check gives way to a cancel too, so a yield during it
+        // stops the chain before the step it decides.
+        let sensed = async {
+            tokio::time::sleep_until(due.into()).await;
+            if senses {
+                (io.audible().await, io.playing().await)
+            } else {
+                (false, Vec::new())
+            }
+        };
+        let (audible, playing) = tokio::select! {
             biased;
             _ = &mut cancel => {
                 info!("A2DP resume: cancelled");
                 act(&io, chain.cancel()).await;
                 return;
             }
-            _ = tokio::time::sleep_until(chain.due().into()) => {}
-        }
-        let (audible, playing) = if chain.senses() {
-            (io.audible().await, io.playing().await)
-        } else {
-            (false, Vec::new())
+            sensed = sensed => sensed,
         };
         let Some(actions) = chain.step(Instant::now(), audible, &playing) else {
             info!("A2DP resume: done (audible: {audible})");

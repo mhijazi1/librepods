@@ -1105,6 +1105,12 @@ mod tests {
         mac: String,
     }
 
+    /// AirPods MACs whose `FakeResume` audio check takes `HELD_CHECK`, like
+    /// the production peak sample, traced as `Audible check` then `Audible
+    /// checked`.
+    static HELD_CHECKS: LazyLock<StdMutex<Vec<String>>> = LazyLock::new(StdMutex::default);
+    const HELD_CHECK: Duration = Duration::from_secs(1);
+
     impl a2dp_resume::A2dpResumeIo for FakeResume {
         fn act(&self, action: a2dp_resume::Action) -> BoxFuture<'static, ()> {
             trace(&self.mac, format!("Resume {action:?}"));
@@ -1112,7 +1118,15 @@ mod tests {
         }
 
         fn audible(&self) -> BoxFuture<'static, bool> {
-            Box::pin(async { false })
+            let mac = self.mac.clone();
+            Box::pin(async move {
+                if HELD_CHECKS.lock().unwrap().contains(&mac) {
+                    trace(&mac, "Audible check".to_string());
+                    tokio::time::sleep(HELD_CHECK).await;
+                    trace(&mac, "Audible checked".to_string());
+                }
+                false
+            })
         }
 
         fn playing(&self) -> BoxFuture<'static, Vec<String>> {
@@ -1685,6 +1699,55 @@ mod tests {
         assert_eq!(h.pauses(), 1);
 
         stop_handoff_task(mac);
+    }
+
+    /// Another host takes the AirPods while the chain's `check`-th audio
+    /// check runs (2: after the kick, 3: after the profile cycle): the chain
+    /// acts no more after the yield's pause.
+    async fn yield_during_audio_check(mac: &str, check: usize) {
+        HELD_CHECKS.lock().unwrap().push(mac.to_string());
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        resumed_take(&h, &mut rx, mac).await;
+        let count = |trace: &[String], entry: &str| trace.iter().filter(|l| *l == entry).count();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while count(&traced(mac), "Audible check") < check {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the audio check");
+        h.emit(owns(0));
+        wait_until("the yield's pause", || h.pauses() == 1).await;
+        // Past the held check and what the chain would do after it.
+        tokio::time::sleep(HELD_CHECK * 2).await;
+        let trace = traced(mac);
+        let paused = position(&trace, "PauseMedia");
+        // The yield came during that check.
+        assert_eq!(
+            count(&trace[..paused], "Audible checked"),
+            check - 1,
+            "{trace:#?}"
+        );
+        let after: Vec<_> = trace[paused..]
+            .iter()
+            .filter(|l| l.starts_with("Resume "))
+            .collect();
+        assert_eq!(after, Vec::<&String>::new(), "{trace:#?}");
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn a2dp_resume_yield_during_check_before_cycle_stops_chain() {
+        yield_during_audio_check("5A:00:00:00:00:CA", 2).await;
+    }
+
+    #[tokio::test]
+    async fn a2dp_resume_yield_during_check_after_cycle_stops_chain() {
+        yield_during_audio_check("5A:00:00:00:00:CB", 3).await;
     }
 
     #[tokio::test]
