@@ -58,6 +58,71 @@ The Linux version runs as a system tray app. Connect your AirPods and enjoy:
 
 For installation and detailed info, see the [Linux README](/linux/README.md).
 
+#### NixOS and Home Manager
+
+The flake provides a NixOS module (`nixosModules.default`) and a Home Manager
+module (`homeManagerModules.default`, also exported as `homeModules.default`).
+Add the flake as an input:
+
+```nix
+{
+  inputs.librepods.url = "github:kavishdevar/librepods";
+  # Optional: reuse your own nixpkgs.
+  # inputs.librepods.inputs.nixpkgs.follows = "nixpkgs";
+}
+```
+
+NixOS configuration (installs the package and sets the BlueZ Device ID):
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.librepods.nixosModules.default ];
+  programs.librepods.enable = true;
+}
+```
+
+Home Manager configuration (runs LibrePods as a systemd user service with the
+graphical session):
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.librepods.homeManagerModules.default ];
+  services.librepods.enable = true;
+}
+```
+
+NixOS options (`programs.librepods`):
+
+| Option          | Default                     | Description                                                                                               |
+| --------------- | --------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `enable`        | `false`                     | Install LibrePods and apply the settings below.                                                           |
+| `package`       | this flake's `librepods`    | Package added to `environment.systemPackages`.                                                            |
+| `appleDeviceId` | `true`                      | Set `hardware.bluetooth.settings.General.DeviceID = "bluetooth:004C:0000:0000"` (Apple's vendor ID).      |
+
+Home Manager options (`services.librepods`):
+
+| Option                          | Default                  | Description                                                                                                                   |
+| ------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `enable`                        | `false`                  | Install LibrePods and start it as a user service with `graphical-session.target`, after `pipewire.service` and `wireplumber.service`. |
+| `package`                       | this flake's `librepods` | Package to install and run.                                                                                                   |
+| `extraArgs`                     | `[ ]`                    | Extra arguments for `librepods`, for example `[ "--no-tray" ]` or `[ "--start-minimized" ]`.                                  |
+| `wireplumber.dummyAvrcpPlayer`  | `true`                   | Add a WirePlumber drop-in that sets `bluez5.dummy-avrcp-player = true` in `monitor.bluez.properties`.                         |
+
+About `appleDeviceId`: AirPods only enable some features (such as multi-device
+connectivity and the hearing aid settings) when the host reports Apple's Device
+ID. The DeviceID is a property of the Bluetooth adapter, so with this option the
+adapter identifies as an Apple device to every device it talks to, not only to
+your AirPods. Set `programs.librepods.appleDeviceId = false;` if you don't want
+that. After changing the DeviceID (in either direction), rebuild, restart
+Bluetooth, then remove and re-pair your AirPods so they pick up the new
+identity.
+
+> [!NOTE]
+> These modules are checked by `nix flake check` at evaluation level only; they
+> have not yet been verified on real hardware.
+
 ### Android
 
 #### Screenshots
