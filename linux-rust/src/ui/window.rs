@@ -435,7 +435,7 @@ impl App {
         "LibrePods".to_string()
     }
 
-    /// Writes the app settings to settings.json and records the outcome on the Settings tab.
+    /// Writes the app settings to app_settings.json and records the outcome on the Settings tab.
     fn save_app_settings(&mut self) {
         let app_settings_path = get_app_settings_path();
         let settings = app_settings_json(
@@ -453,7 +453,11 @@ impl App {
         if let Err(e) = &result {
             error!("Failed to write {}: {}", app_settings_path.display(), e);
         }
-        apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
+        apply_save_result(
+            &mut self.save_statuses,
+            Tab::Settings,
+            result.map_err(SaveError::Io),
+        );
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
