@@ -154,7 +154,7 @@ impl AirPodsDevice {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        aacp_manager.set_event_channel(tx).await;
+        let stored_battery = aacp_manager.attach_event_channel(tx).await;
         if let Some(handle) = &tray_handle {
             handle
                 .update(|tray: &mut MyTray| tray.command_tx = Some(command_tx.clone()))
@@ -167,9 +167,11 @@ impl AirPodsDevice {
         // (#75). Seed both from the stored report through the same paths as
         // the event arm, before dispatch_events starts the handlers, so every
         // queued event is applied after the seed. The window seeds itself
-        // from state.battery_info. A report that is both in the seed and in
-        // the queue is applied twice, which is idempotent.
-        if let Some(seed) = battery_seed(&aacp_manager).await {
+        // from state.battery_info. attach_event_channel takes the snapshot
+        // under the same lock that attaches the channel (#92), so each report
+        // is either in the seed (before the attach) or queued (after), never
+        // both, and the seed is never older than a queued event.
+        if let Some(seed) = battery_seed(stored_battery) {
             debug!(
                 "Seeding tray and desktop battery from stored report: {:?}",
                 seed
@@ -402,16 +404,11 @@ impl AirPodsDevice {
     }
 }
 
-/// The last AACP battery report the manager stored, or None when none has
-/// arrived yet. Used to seed the tray and the desktop export with a report
-/// whose event was sent before the event channel was attached (#75). The
-/// state guard lives only inside the block, so nothing awaits while holding
-/// it.
-async fn battery_seed(manager: &AACPManager) -> Option<Vec<BatteryInfo>> {
-    let batteries = {
-        let state = manager.state.lock().await;
-        state.battery_info.clone()
-    };
+/// The battery seed from the snapshot `AACPManager::attach_event_channel`
+/// returns: None when no report had arrived before the attach. Used to seed
+/// the tray and the desktop export with a report whose event was sent before
+/// the event channel was attached (#75, #92).
+fn battery_seed(batteries: Vec<BatteryInfo>) -> Option<Vec<BatteryInfo>> {
     (!batteries.is_empty()).then_some(batteries)
 }
 
@@ -469,14 +466,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn battery_seed_recovers_report_sent_before_event_channel() {
+    async fn battery_seed_report_before_attach_is_seeded_not_queued() {
         let manager = AACPManager::new();
         // The report arrives while no event channel is attached.
         manager.receive_packet(&BATTERY_PACKET).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        manager.set_event_channel(tx).await;
-
-        let seed = battery_seed(&manager).await;
+        let seed = battery_seed(manager.attach_event_channel(tx).await);
         assert_eq!(seed, Some(expected()));
         // The event itself was lost: only the seed can recover it.
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
@@ -498,31 +493,96 @@ mod tests {
     #[tokio::test]
     async fn battery_seed_none_without_report() {
         let manager = AACPManager::new();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        manager.set_event_channel(tx).await;
-        assert_eq!(battery_seed(&manager).await, None);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let snapshot = manager.attach_event_channel(tx).await;
+        assert!(snapshot.is_empty());
+        assert_eq!(battery_seed(snapshot), None);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[tokio::test]
-    async fn battery_seed_report_after_channel_is_both_queued_and_seeded() {
-        // A report after set_event_channel is queued and also in the seed;
-        // applying both leaves the tray as the report says.
+    async fn battery_seed_report_after_attach_is_queued_not_seeded() {
+        // A report after the attach is only queued: the snapshot taken with
+        // the attach can't contain it, so it is applied exactly once (#92).
         let manager = AACPManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        manager.set_event_channel(tx).await;
+        let snapshot = manager.attach_event_channel(tx).await;
         manager.receive_packet(&BATTERY_PACKET).await;
 
-        let seed = battery_seed(&manager).await.unwrap_or_default();
-        assert_eq!(seed, expected());
-        let mut tray = MyTray::default();
-        tray.apply_battery(&seed);
+        assert!(snapshot.is_empty());
+        assert_eq!(battery_seed(snapshot), None);
         match rx.try_recv() {
-            Ok(AACPEvent::BatteryInfo(queued)) => tray.apply_battery(&queued),
-            other => panic!("expected a queued BatteryInfo event, got {other:?}"),
+            Ok(AACPEvent::BatteryInfo(queued)) => assert_eq!(queued, expected()),
+            other => panic!("expected Ok(AACPEvent::BatteryInfo(expected())), got {other:?}"),
         }
-        assert_eq!(tray.battery_l, Some(80));
-        assert_eq!(tray.battery_r, Some(60));
-        assert_eq!(tray.battery_c, Some(90));
-        assert_eq!(tray.battery_c_status, Some(BatteryStatus::Charging));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// One BATTERY_INFO report with a single Left entry at `level`.
+    fn left_battery_packet(level: u8) -> [u8; 12] {
+        [
+            0x04, 0x00, 0x04, 0x00, // header
+            0x04, 0x00, 0x01, // opcode, 0x00, count
+            0x04, 0x01, level, 0x02, 0x01, // Left, NotCharging
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn battery_seed_attach_race_splits_reports_exactly() {
+        // A feeder task delivers N reports with increasing levels while the
+        // attach runs concurrently. Every report must land exactly once: in
+        // the seed (level k, the last one before the attach) or in the queue
+        // (k+1..=N, in order), so the tray never steps back (#92).
+        const N: u8 = 200;
+        for _round in 0..20 {
+            let manager = AACPManager::new();
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let feeder = {
+                let manager = manager.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    for level in 1..=N {
+                        manager.receive_packet(&left_battery_packet(level)).await;
+                    }
+                })
+            };
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            barrier.wait().await;
+            let snapshot = manager.attach_event_channel(tx).await;
+            feeder.await.expect("feeder task panicked");
+
+            let seed = battery_seed(snapshot);
+            let k = match &seed {
+                Some(seed) => {
+                    assert_eq!(seed.len(), 1);
+                    assert_eq!(seed[0].component, BatteryComponent::Left);
+                    seed[0].level
+                }
+                None => 0,
+            };
+
+            let mut tray = MyTray::default();
+            if let Some(seed) = &seed {
+                tray.apply_battery(seed);
+            }
+            let mut drained = Vec::new();
+            loop {
+                match rx.try_recv() {
+                    Ok(AACPEvent::BatteryInfo(queued)) => {
+                        assert_eq!(queued.len(), 1);
+                        drained.push(queued[0].level);
+                        tray.apply_battery(&queued);
+                    }
+                    Ok(other) => panic!("unexpected event {other:?}"),
+                    Err(TryRecvError::Empty) => break,
+                    Err(e) => panic!("event channel closed: {e:?}"),
+                }
+            }
+
+            assert_eq!(drained, (k + 1..=N).collect::<Vec<u8>>(), "seed level {k}");
+            assert_eq!(tray.battery_l, Some(N));
+        }
     }
 }
