@@ -2,7 +2,9 @@ use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control,
 };
 use crate::handoff::{Command, Handoff, Input};
-use crate::switching::{announce, event_input, session_facts, spawn_playback_poller};
+use crate::switching::{
+    advertise_call, announce, event_input, session_facts, spawn_playback_poller,
+};
 use crate::media_controller::{
     CaseRecovery, MediaController, TakeoverAction, TakeoverInputs, TakeoverTrigger,
     decide_takeover, routing_snapshot_of,
@@ -167,6 +169,11 @@ impl Io {
                 }
                 Command::Announce => {
                     let sent = announce(&self.manager, &self.local).await;
+                    self.tolerate_lost_session(sent).await?
+                }
+                // The probe feeds no LocalCall, so the core never asks.
+                Command::AdvertiseCall(in_call) => {
+                    let sent = advertise_call(&self.manager, &self.local, in_call).await;
                     self.tolerate_lost_session(sent).await?
                 }
                 Command::PauseMedia => self.media.pause_all_media().await,
