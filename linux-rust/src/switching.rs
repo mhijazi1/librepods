@@ -23,6 +23,7 @@
 //! handler therefore never holds up ownership answers, and on session loss
 //! the handoff task can still drain every event the manager emitted.
 
+use crate::a2dp_resume;
 use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers,
     ControlCommandIdentifiers as Control,
@@ -92,6 +93,10 @@ pub(crate) trait MediaActions: Send + Sync {
     fn pause(&self) -> BoxFuture<'static, ()>;
     /// Activate the AirPods' A2DP profile.
     fn activate_a2dp(&self) -> BoxFuture<'static, ()>;
+    /// Run the A2DP resume chain (#200) until it ends, or until `cancel`
+    /// fires or its sender is dropped (checked between steps). It starts no
+    /// kick or profile cycle whose Play can't be due before `until`.
+    fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()>;
 }
 
 /// Blocking: pauses the local players and reports what it did.
@@ -124,6 +129,10 @@ impl MediaActions for ControllerMedia {
         Box::pin(async move {
             controller.activate_a2dp_profile().await;
         })
+    }
+
+    fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()> {
+        Box::pin(a2dp_resume::run(self.controller.clone(), until, cancel))
     }
 }
 
@@ -407,6 +416,10 @@ struct Shell {
     play_rx: PlaybackSamples,
     /// Local call state changes (#11).
     call_rx: CallSamples,
+    /// A2DP transport state changes (#200).
+    a2dp_rx: mpsc::Receiver<bool>,
+    /// Stops the running A2DP resume chain when dropped.
+    resume: Option<oneshot::Sender<()>>,
     /// Where the core's lines go after they are logged, if anywhere.
     lines: Option<LineSink>,
     /// The device's "Connect to this computer" (#16).
@@ -432,11 +445,14 @@ impl Shell {
     /// No AACP or MediaController guard is held here; the sends take their
     /// own, and the media actions never take the outer MediaController mutex
     /// the device handlers hold (`ControllerMedia`).
-    async fn execute(&mut self, commands: Vec<Command>) -> bool {
+    async fn execute(&mut self, now: Instant, commands: Vec<Command>) -> bool {
         let mut end = false;
         for command in commands {
             match command {
                 Command::SendOwnership(owns) => {
+                    if !owns {
+                        self.resume = None;
+                    }
                     if let Err(e) = self
                         .manager
                         .send_control_command(Control::OwnsConnection, &[u8::from(owns)])
@@ -455,13 +471,26 @@ impl Shell {
                         error!("Handoff: failed to advertise call state {in_call}: {e}");
                     }
                 }
-                Command::PauseMedia => self.media.pause().await,
+                Command::PauseMedia => {
+                    // Before the pause, so the chain plays nothing after it.
+                    self.resume = None;
+                    self.media.pause().await
+                }
                 // Activation can take tens of seconds; it must not stall
                 // ownership answers and events behind it.
                 Command::ConnectA2dp => {
                     tokio::spawn(self.media.activate_a2dp());
                 }
+                // Seconds of sleeps; replacing the sender stops a running one.
+                Command::ResumeA2dp => {
+                    let (cancel, cancelled) = oneshot::channel();
+                    self.resume = Some(cancel);
+                    // The core opened its hold window at `now`.
+                    let until = now + a2dp_resume::A2DP_RESUME_WINDOW;
+                    tokio::spawn(self.media.resume_a2dp(until, cancelled));
+                }
                 Command::DropSession => {
+                    self.resume = None;
                     info!(
                         "Handoff: control session of {} ended; the app reconnects it",
                         self.mac
@@ -506,7 +535,7 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
             sink(&line);
         }
     }
-    shell.execute(commands).await
+    shell.execute(now, commands).await
 }
 
 async fn on_event(core: &mut Handoff, shell: &mut Shell, event: AACPEvent) -> bool {
@@ -628,6 +657,10 @@ async fn run_handoff(mut shell: Shell) {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::LocalCall(in_call)).await
             }
+            Some(active) = shell.a2dp_rx.recv() => {
+                sync_session(&mut core, &mut shell).await
+                    || step(&mut core, &mut shell, Input::A2dpTransport { active }).await
+            }
             _ = tick.tick() => {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::Tick).await
@@ -659,6 +692,9 @@ pub(crate) struct Switching {
     lines: Option<LineSink>,
     /// Given to the handoff core; `start_with_calls` keeps the default.
     connect_mode: ConnectMode,
+    /// The A2DP transport poller (#200) for the handoff task; `start` sets
+    /// it in the handoff mode, `start_with_calls` sets none.
+    a2dp: Option<mpsc::Receiver<bool>>,
 }
 
 enum Policy {
@@ -695,15 +731,15 @@ impl Switching {
         media: Arc<dyn MediaActions>,
         playback: impl FnOnce() -> PlaybackSamples,
     ) -> Self {
-        let log = (setup.mode == SwitchingMode::Handoff)
-            .then(handoff_log::app_log)
-            .flatten();
+        let handoff = setup.mode == SwitchingMode::Handoff;
+        let log = handoff.then(handoff_log::app_log).flatten();
         let mac = setup.airpods_mac.clone();
         // shortcut: connect mode is read once at start; a live update is tracked in (#153)
-        let switching =
+        let mut switching =
             Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller)
                 .await
                 .with_connect_mode(utils::load_connect_mode(&mac));
+        switching.a2dp = handoff.then(|| a2dp_resume::spawn_transport_poller(&mac));
         match log {
             Some(log) => switching.with_line_sink(log.sink(mac)),
             None => switching,
@@ -759,6 +795,7 @@ impl Switching {
             policy,
             lines: None,
             connect_mode: ConnectMode::default(),
+            a2dp: None,
         }
     }
 
@@ -816,6 +853,9 @@ impl Switching {
                     flush: flush_tx,
                     play_rx,
                     call_rx,
+                    // No poller: a closed channel, so no take resumes A2DP.
+                    a2dp_rx: self.a2dp.unwrap_or_else(|| mpsc::channel(1).1),
+                    resume: None,
                     lines: self.lines,
                     connect_mode: self.connect_mode,
                 };
@@ -1050,6 +1090,55 @@ mod tests {
             self.records.activations.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }
+
+        fn resume_a2dp(
+            &self,
+            until: Instant,
+            cancel: oneshot::Receiver<()>,
+        ) -> BoxFuture<'static, ()> {
+            let io = FakeResume {
+                mac: self.mac.clone(),
+            };
+            Box::pin(a2dp_resume::run(io, until, cancel))
+        }
+    }
+
+    /// The one MPRIS player `FakeResume` reports Playing.
+    const PLAYER: &str = "org.mpris.MediaPlayer2.fake";
+
+    /// Resume chain I/O for tests: silent throughout, `PLAYER` always
+    /// Playing; each action is traced as `Resume <action>`.
+    struct FakeResume {
+        mac: String,
+    }
+
+    /// AirPods MACs whose `FakeResume` audio check takes `HELD_CHECK`, like
+    /// the production peak sample, traced as `Audible check` then `Audible
+    /// checked`.
+    static HELD_CHECKS: LazyLock<StdMutex<Vec<String>>> = LazyLock::new(StdMutex::default);
+    const HELD_CHECK: Duration = Duration::from_secs(1);
+
+    impl a2dp_resume::A2dpResumeIo for FakeResume {
+        fn act(&self, action: a2dp_resume::Action) -> BoxFuture<'static, ()> {
+            trace(&self.mac, format!("Resume {action:?}"));
+            Box::pin(async {})
+        }
+
+        fn audible(&self) -> BoxFuture<'static, bool> {
+            let mac = self.mac.clone();
+            Box::pin(async move {
+                if HELD_CHECKS.lock().unwrap().contains(&mac) {
+                    trace(&mac, "Audible check".to_string());
+                    tokio::time::sleep(HELD_CHECK).await;
+                    trace(&mac, "Audible checked".to_string());
+                }
+                false
+            })
+        }
+
+        fn playing(&self) -> BoxFuture<'static, Vec<String>> {
+            Box::pin(async { vec![PLAYER.to_string()] })
+        }
     }
 
     /// Stands in for the device's ear/CA/stem/tray/UI handler. Records each
@@ -1225,6 +1314,8 @@ mod tests {
         playback_started: Arc<AtomicBool>,
         /// The injected call monitor's sender (no sound server in tests).
         call_tx: mpsc::Sender<(Instant, bool)>,
+        /// The injected A2DP transport poller's sender (no BlueZ in tests).
+        a2dp_tx: mpsc::Sender<bool>,
         /// The sender given to `set_event_channel`.
         events: EventTx,
         handler: Arc<DeviceHandler>,
@@ -1365,7 +1456,8 @@ mod tests {
             let calls_for = mac.to_string();
             let traced_mac = mac.to_string();
             let sink: LineSink = Arc::new(move |line: &str| trace(&traced_mac, line.to_string()));
-            let switching = Switching::start_with_calls(
+            let (a2dp_tx, a2dp_rx) = mpsc::channel(8);
+            let mut switching = Switching::start_with_calls(
                 SwitchingSetup {
                     mode,
                     airpods_mac: mac.to_string(),
@@ -1386,12 +1478,14 @@ mod tests {
             )
             .await
             .with_line_sink(sink);
+            switching.a2dp = Some(a2dp_rx);
             switching.dispatch_events(events_rx, handler.clone().handle());
             Harness {
                 records,
                 play_tx,
                 playback_started,
                 call_tx,
+                a2dp_tx,
                 events,
                 handler,
             }
@@ -1410,6 +1504,11 @@ mod tests {
         /// A call state change from the call monitor.
         async fn call(&self, in_call: bool) {
             let _ = self.call_tx.send((Instant::now(), in_call)).await;
+        }
+
+        /// An A2DP transport state from the transport poller.
+        async fn a2dp(&self, active: bool) {
+            let _ = self.a2dp_tx.send(active).await;
         }
 
         async fn play(&self, playing: bool) {
@@ -1512,6 +1611,149 @@ mod tests {
         assert_eq!(h.activations(), 1);
 
         stop_handoff_task(mac);
+    }
+
+    /// The resume chain's actions traced so far, in order.
+    fn resume_actions(mac: &str) -> Vec<String> {
+        traced(mac)
+            .into_iter()
+            .filter(|l| l.starts_with("Resume "))
+            .collect()
+    }
+
+    /// An automatic take with the transport reported idle, acknowledged:
+    /// the core resumes A2DP.
+    async fn resumed_take(h: &Harness, rx: &mut mpsc::Receiver<Vec<u8>>, mac: &str) {
+        expect_startup(h, rx).await;
+        h.a2dp(false).await;
+        expect_take(h, rx).await;
+        h.emit(owns(1));
+        wait_until("the resume chain's start", || {
+            !resume_actions(mac).is_empty()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a2dp_resume_chain_runs_after_take_ack_without_release() {
+        let mac = "5A:00:00:00:00:C8";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        resumed_take(&h, &mut rx, mac).await;
+        let trace = traced(mac);
+        assert!(
+            position(&trace, "A2DP transport idle") < position(&trace, "Resume "),
+            "{trace:#?}"
+        );
+        // Playback stops inside the window: no release.
+        h.play(false).await;
+        let player = format!("{PLAYER:?}");
+        let expected = [
+            "SuspendSink(true)".to_string(),
+            "SuspendSink(false)".to_string(),
+            format!("Pause({player})"),
+            format!("Play({player})"),
+            "ProfileCycle".to_string(),
+            format!("Play({player})"),
+        ]
+        .map(|action| format!("Resume {action}"));
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while resume_actions(mac).len() < expected.len() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the whole resume chain");
+        assert_eq!(resume_actions(mac), expected);
+        // Still inside the window: no OwnsConnection at all.
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn a2dp_resume_chain_stops_after_yield() {
+        let mac = "5A:00:00:00:00:C9";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        resumed_take(&h, &mut rx, mac).await;
+        // Another host takes the AirPods while the kick has the player
+        // paused: the yield pauses, and the chain plays nothing after it.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !resume_actions(mac)
+                .iter()
+                .any(|a| a.starts_with("Resume Pause"))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the kick's Pause");
+        h.emit(owns(0));
+        wait_until("the yield's pause", || h.pauses() == 1).await;
+        // Longer than the rest of the chain would take.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let trace = traced(mac);
+        let paused = position(&trace, "PauseMedia");
+        let after: Vec<_> = trace[paused..]
+            .iter()
+            .filter(|l| l.starts_with("Resume "))
+            .collect();
+        assert_eq!(after, Vec::<&String>::new(), "{trace:#?}");
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+
+        stop_handoff_task(mac);
+    }
+
+    /// Another host takes the AirPods while the chain's `check`-th audio
+    /// check runs (2: after the kick, 3: after the profile cycle): the chain
+    /// acts no more after the yield's pause.
+    async fn yield_during_audio_check(mac: &str, check: usize) {
+        HELD_CHECKS.lock().unwrap().push(mac.to_string());
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        resumed_take(&h, &mut rx, mac).await;
+        let count = |trace: &[String], entry: &str| trace.iter().filter(|l| *l == entry).count();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while count(&traced(mac), "Audible check") < check {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the audio check");
+        h.emit(owns(0));
+        wait_until("the yield's pause", || h.pauses() == 1).await;
+        // Past the held check and what the chain would do after it.
+        tokio::time::sleep(HELD_CHECK * 2).await;
+        let trace = traced(mac);
+        let paused = position(&trace, "PauseMedia");
+        // The yield came during that check.
+        assert_eq!(
+            count(&trace[..paused], "Audible checked"),
+            check - 1,
+            "{trace:#?}"
+        );
+        let after: Vec<_> = trace[paused..]
+            .iter()
+            .filter(|l| l.starts_with("Resume "))
+            .collect();
+        assert_eq!(after, Vec::<&String>::new(), "{trace:#?}");
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn a2dp_resume_yield_during_check_before_cycle_stops_chain() {
+        yield_during_audio_check("5A:00:00:00:00:CA", 2).await;
+    }
+
+    #[tokio::test]
+    async fn a2dp_resume_yield_during_check_after_cycle_stops_chain() {
+        yield_during_audio_check("5A:00:00:00:00:CB", 3).await;
     }
 
     #[tokio::test]

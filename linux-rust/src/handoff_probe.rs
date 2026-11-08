@@ -323,6 +323,8 @@ impl Io {
                     self.adapter.device(self.address)?.disconnect().await?;
                 }
                 Command::DrainPlayback => self.play_rx.drain(),
+                // The probe feeds no A2dpTransport, so the core never asks.
+                Command::ResumeA2dp => println!("A2DP resume is not run by the probe"),
                 Command::Exit => return Ok(true),
                 Command::Fail(reason) => return Err(reason.into()),
             }

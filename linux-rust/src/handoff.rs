@@ -8,6 +8,7 @@
 //! runtime. Every take goes through `decide_takeover`, the single takeover
 //! policy in media_controller.rs.
 
+use crate::a2dp_resume::A2DP_RESUME_WINDOW;
 use crate::bluetooth::aacp::{AudioSource, ConnectedDevice, EarDetectionStatus};
 use crate::media_controller::{
     CaseRecovery, HandoffGuards, RoutingSnapshot, TakeoverAction, TakeoverDecision, TakeoverInputs,
@@ -136,6 +137,11 @@ pub(crate) enum Input {
     Quit,
     /// Periodic tick: reconnect backoff and acknowledgement timeouts.
     Tick,
+    /// Whether the AirPods' A2DP transport streams (BlueZ
+    /// `MediaTransport1.State` not idle), from the shell's poller (#200). A
+    /// local fact: the last report is kept. With no report yet, a take never
+    /// resumes A2DP.
+    A2dpTransport { active: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +169,11 @@ pub(crate) enum Command {
     /// stream playback: a stream still in its debounce counts only after it
     /// stops and plays again (#90).
     DrainPlayback,
+    /// Restore A2DP streaming after a take found the transport idle (#200):
+    /// nudge the sink, kick the players, cycle the profile as a last resort.
+    /// Runs alongside the core; a pause, a release or a dropped session
+    /// stops it.
+    ResumeA2dp,
     /// Stop the probe.
     Exit,
     /// Stop the probe with this error.
@@ -236,6 +247,12 @@ pub(crate) struct Handoff {
     /// Linux is in a call (#11): keep the AirPods Linux holds or is taking
     /// until it ends.
     local_call: bool,
+    /// Last `Input::A2dpTransport` report; None until one arrives.
+    a2dp_active: Option<bool>,
+    /// End of the A2DP resume window (#200): until then a playback stop
+    /// doesn't release and a play edge doesn't retake. Only in force while
+    /// `requested_take` holds, so a yield ends it; any request clears it.
+    resume_until: Option<Instant>,
     recovery: CaseRecovery,
     case_closed: bool,
     /// Playback stopped while a take was pending: release once it settles.
@@ -281,6 +298,8 @@ impl Handoff {
             reconnect_take_pending: false,
             timed_out_release: None,
             local_call: false,
+            a2dp_active: None,
+            resume_until: None,
             recovery: if connected {
                 CaseRecovery::Immediate
             } else {
@@ -538,6 +557,7 @@ impl Handoff {
             Input::Quit => self.quitting = true,
             Input::LocalCall(in_call) => self.local_call(now, in_call, out),
             Input::Tick => self.tick(now, out),
+            Input::A2dpTransport { active } => self.a2dp_active = Some(active),
         }
     }
 
@@ -572,8 +592,14 @@ impl Handoff {
         if self.quitting || self.session_lost {
             return;
         }
+        let resuming = self.requested_take && self.resume_until.is_some();
         match self.pending {
             None => match self.decide_poll(previous, playing).action {
+                // The resume chain's kick, or its Play after the profile
+                // cycle: Linux already owns the AirPods.
+                TakeoverAction::TakeOver if resuming => {
+                    self.say("AUTO playback restarted during the A2DP resume; Linux already owns")
+                }
                 TakeoverAction::TakeOver if !self.auto_take_allowed() => {
                     self.say(CONNECT_MODE_SKIP)
                 }
@@ -588,6 +614,11 @@ impl Handoff {
                             // them if playback is still stopped.
                             self.say(
                                 "AUTO playback stopped during a local call; keeping ownership",
+                            );
+                        } else if resuming {
+                            // The window's end releases if it is still stopped.
+                            self.say(
+                                "AUTO playback stopped during the A2DP resume; holding ownership",
                             );
                         } else {
                             self.request(now, false, Cause::Playback, out);
@@ -741,6 +772,21 @@ impl Handoff {
             // The retake was blocked: the AirPods went to the other host, so
             // stop playing here as upstream does.
             out.push(Command::PauseMedia);
+        }
+        // A take that found the transport idle gets its audio back (#200),
+        // unless the reconcile just released it. Not during a call: the card
+        // is on HFP, so the idle A2DP transport says nothing.
+        if pending.desired
+            && self.automatic
+            && self.live()
+            && self.requested_take
+            && !self.local_call
+            && self.pending.is_none()
+            && self.a2dp_active == Some(false)
+        {
+            self.resume_until = Some(now + A2DP_RESUME_WINDOW);
+            out.push(Command::ResumeA2dp);
+            self.say("A2DP transport idle after the take; resuming it");
         }
     }
 
@@ -927,6 +973,19 @@ impl Handoff {
             }
             self.reconcile(now, out);
         }
+        // The A2DP resume window ended: release a stop it held (#200).
+        if self.resume_until.take_if(|end| now >= *end).is_some()
+            && self.requested_take
+            && self.was_playing == Some(false)
+            && !self.local_call
+            && self.pending.is_none()
+            && self.automatic
+            && self.live()
+            && !self.quitting
+        {
+            self.request(now, false, Cause::Playback, out);
+            self.say("AUTO playback stopped; releasing ownership");
+        }
     }
 
     /// While quitting, release ownership Linux asked for, then exit once
@@ -957,6 +1016,7 @@ impl Handoff {
         self.play_during_release = false;
         self.reconnect_take_pending = false;
         self.timed_out_release = None;
+        self.resume_until = None;
         out.push(Command::SendOwnership(desired));
     }
 
@@ -1000,6 +1060,8 @@ impl Handoff {
             && self.pending.is_none()
             && self.was_playing != Some(true)
             && !self.quitting
+            // The A2DP resume window's end releases instead (#200).
+            && self.resume_until.is_none()
         {
             self.request(now, false, Cause::Playback, out);
             self.say("AUTO call ended with playback stopped; releasing ownership");
@@ -3263,5 +3325,204 @@ mod tests {
             assert_eq!(skips(&mut p), usize::from(!seeded), "seeded={seeded}");
             assert_eq!(p.core.last_owner_linux(), seeded);
         }
+    }
+
+    // #200: A2DP resume after a take that found the transport idle.
+
+    fn idle_transport() -> Input {
+        Input::A2dpTransport { active: false }
+    }
+
+    /// `Probe::ready`, an idle transport reported, then a take for playback
+    /// at 500 ms.
+    fn take_with_idle_transport() -> Probe {
+        let mut p = Probe::ready();
+        assert_eq!(p.feed(20, idle_transport()), []);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        p
+    }
+
+    /// `take_with_idle_transport`, acknowledged at 600 ms: the resume
+    /// window runs until `window_end()`.
+    fn resumed_take() -> Probe {
+        let mut p = take_with_idle_transport();
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), [ResumeA2dp]);
+        p
+    }
+
+    fn window_end() -> u64 {
+        600 + A2DP_RESUME_WINDOW.as_millis() as u64
+    }
+
+    #[test]
+    fn take_ack_with_idle_transport_resumes_a2dp_once() {
+        let mut p = take_with_idle_transport();
+        p.core.take_lines();
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), [ResumeA2dp]);
+        let lines = p.core.take_lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("ACK owner=linux"));
+        assert_eq!(lines[1], "A2DP transport idle after the take; resuming it");
+        // A duplicate [1] acknowledges nothing.
+        assert_eq!(p.feed(700, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(800, idle_transport()), []);
+        assert_eq!(p.feed(900, Input::Ownership(vec![1])), []);
+    }
+
+    #[test]
+    fn take_ack_with_active_transport_does_not_resume() {
+        let mut p = Probe::ready();
+        // The last report counts.
+        assert_eq!(p.feed(20, idle_transport()), []);
+        assert_eq!(p.feed(30, Input::A2dpTransport { active: true }), []);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        // No resume window: a stop releases at once.
+        assert_eq!(p.play(1000, false), [SendOwnership(false)]);
+    }
+
+    #[test]
+    fn take_ack_without_transport_report_does_not_resume() {
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1000, false), [SendOwnership(false)]);
+    }
+
+    #[test]
+    fn release_ack_never_resumes_a2dp() {
+        // A playback-stop release.
+        let mut p = Probe::ready();
+        assert_eq!(p.feed(20, Input::A2dpTransport { active: true }), []);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(700, idle_transport()), []);
+        assert_eq!(p.play(1000, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1100, Input::Ownership(vec![0])), []);
+
+        // A user release of AirPods Linux owns.
+        let mut p = Probe::ready();
+        assert_eq!(p.feed(20, idle_transport()), []);
+        assert_eq!(p.feed(30, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(100, Input::Release), [SendOwnership(false)]);
+        assert_eq!(p.feed(200, Input::Ownership(vec![0])), []);
+    }
+
+    #[test]
+    fn manual_take_ack_never_resumes_a2dp() {
+        let mut p = Probe::new(false, true);
+        p.routing(ready_facts());
+        assert_eq!(p.feed(50, idle_transport()), []);
+        assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
+        assert_eq!(p.feed(200, Input::Ownership(vec![1])), []);
+    }
+
+    #[test]
+    fn take_ack_during_local_call_does_not_resume() {
+        // The call starts while the take is pending.
+        let mut p = take_with_idle_transport();
+        assert_eq!(p.feed(550, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+
+        // The call started before the take.
+        let mut p = Probe::ready();
+        assert_eq!(p.feed(20, idle_transport()), []);
+        assert_eq!(p.feed(30, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+    }
+
+    #[test]
+    fn stop_during_take_releases_at_ack_without_resume() {
+        let mut p = take_with_idle_transport();
+        assert_eq!(p.play(550, false), []);
+        assert_eq!(
+            p.feed(600, Input::Ownership(vec![1])),
+            [SendOwnership(false)]
+        );
+        assert_eq!(p.feed(700, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(window_end(), Input::Tick), []);
+    }
+
+    #[test]
+    fn stop_during_a2dp_resume_window_does_not_release() {
+        let mut p = resumed_take();
+        p.core.take_lines();
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(
+            p.core.take_lines(),
+            ["AUTO playback stopped during the A2DP resume; holding ownership"]
+        );
+        for ms in [1500, 3000, window_end() - 1] {
+            assert_eq!(p.feed(ms, Input::Tick), []);
+            assert_eq!(p.play(ms, false), []);
+        }
+    }
+
+    #[test]
+    fn kick_pause_play_during_resume_window_sends_nothing() {
+        let mut p = resumed_take();
+        assert_eq!(p.play(1000, true), []);
+        // The kick's Pause and Play.
+        assert_eq!(p.play(2000, false), []);
+        assert_eq!(p.play(2500, true), []);
+        // The profile cycle pauses the player; the chain plays it again.
+        assert_eq!(p.play(4000, false), []);
+        assert_eq!(p.play(5500, true), []);
+        assert_eq!(p.feed(window_end(), Input::Tick), []);
+        assert_eq!(p.feed(window_end() + 200, Input::Tick), []);
+        // Linux still owns the AirPods: the next stop releases at once.
+        assert_eq!(p.play(window_end() + 500, false), [SendOwnership(false)]);
+    }
+
+    #[test]
+    fn stop_persisting_past_resume_window_releases_once() {
+        let mut p = resumed_take();
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(p.feed(window_end() - 1, Input::Tick), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(window_end(), Input::Tick), [SendOwnership(false)]);
+        assert_eq!(
+            p.core.take_lines(),
+            ["AUTO playback stopped; releasing ownership"]
+        );
+        assert_eq!(p.feed(window_end() + 200, Input::Tick), []);
+        assert_eq!(p.play(window_end() + 300, false), []);
+        assert_eq!(p.feed(window_end() + 400, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(window_end() + 600, Input::Tick), []);
+    }
+
+    #[test]
+    fn play_resumed_before_window_end_keeps_ownership() {
+        let mut p = resumed_take();
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(p.play(3000, true), []);
+        assert_eq!(p.feed(window_end(), Input::Tick), []);
+        assert_eq!(p.feed(window_end() + 200, Input::Tick), []);
+        assert_eq!(p.play(window_end() + 300, true), []);
+    }
+
+    #[test]
+    fn remote_take_during_resume_window_still_yields() {
+        let mut p = resumed_take();
+        assert_eq!(p.play(1000, false), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(1500, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
+        assert_eq!(p.feed(window_end(), Input::Tick), []);
+        assert_eq!(p.feed(window_end() + 200, Input::Tick), []);
+    }
+
+    #[test]
+    fn call_ending_during_resume_window_releases_at_window_end() {
+        let mut p = resumed_take();
+        assert_eq!(p.feed(700, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(
+            p.feed(2000, Input::LocalCall(false)),
+            [AdvertiseCall(false)]
+        );
+        assert_eq!(p.feed(window_end() - 1, Input::Tick), []);
+        assert_eq!(p.feed(window_end(), Input::Tick), [SendOwnership(false)]);
     }
 }
