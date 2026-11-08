@@ -604,7 +604,10 @@ impl Switching {
     /// Start the selected mode. `media` and `playback` are used only by the
     /// handoff mode; `playback` is called only in that mode. The handoff
     /// mode monitors local calls with `stream_monitor::spawn_call_poller`
-    /// and appends the core's lines to the handoff log (#21) if it opens.
+    /// and appends the core's lines to the handoff log (#21), which is
+    /// present unless no state directory is known (neither XDG_STATE_HOME
+    /// nor HOME set) or its writer thread failed to start. A failed open or
+    /// write warns once, then stops logging.
     pub(crate) async fn start(
         setup: SwitchingSetup,
         media: Arc<dyn MediaActions>,

@@ -139,7 +139,9 @@ struct Io {
     retry: Option<tokio::task::JoinHandle<Result<ControlSession>>>,
     /// Session made by the last reconnect, until the core adopts or cancels it.
     candidate: Option<ControlSession>,
-    /// The handoff log, if it opened (#21).
+    /// The handoff log (#21); None only if no state directory is known
+    /// (neither XDG_STATE_HOME nor HOME set) or its writer thread failed to
+    /// start. A failed open or write warns once, then stops logging.
     log: Option<handoff_log::Log>,
 }
 
