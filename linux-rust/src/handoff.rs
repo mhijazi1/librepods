@@ -305,6 +305,10 @@ impl Handoff {
                 // event's `old`: a report queued before the session snapshot
                 // (seed, Reconnected facts) is replayed with a stale `old`
                 // and must not announce a second time (#58).
+                // Known limit (#79): when two or more reports queue inside
+                // that window, the first replay regresses `self.hosts` and a
+                // later one re-announces; telling stale replays apart needs a
+                // shell queue-boundary signal (#49).
                 if self.automatic
                     && self.live()
                     && new
