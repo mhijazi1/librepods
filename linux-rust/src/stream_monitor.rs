@@ -593,8 +593,7 @@ fn wait<F: ?Sized>(mainloop: &mut Mainloop, op: &Operation<F>, what: &str) -> io
 /// Peak record streams' sample rate: one peak per 40 ms, as pavucontrol's
 /// meters use.
 const PEAK_RATE: u32 = 25;
-/// How often the peak thread takes a new candidate set and reads its
-/// streams.
+/// How often the peak thread reads its streams, while it has any.
 const PEAK_TICK: Duration = Duration::from_millis(40);
 /// How long the peak thread waits before retrying a stream it could not
 /// open: well under `SILENCE_HOLD`, so a counted stream whose record stream
@@ -664,7 +663,15 @@ fn peak_thread(candidates: &Receiver<HashSet<u32>>, peaks: &Mutex<HashMap<u32, f
     let mut streams: HashMap<u32, PeakStream> = HashMap::new();
     let mut retry: HashMap<u32, Instant> = HashMap::new();
     loop {
-        match candidates.recv_timeout(PEAK_TICK) {
+        // Idle (no stream to read) until the next candidate set.
+        let next = if streams.is_empty() {
+            candidates
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            candidates.recv_timeout(PEAK_TICK)
+        };
+        match next {
             Ok(wanted) => {
                 streams.retain(|index, _| wanted.contains(index));
                 retry.retain(|index, _| wanted.contains(index));
