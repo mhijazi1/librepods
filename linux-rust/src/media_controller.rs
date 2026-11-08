@@ -13,6 +13,7 @@ use log::{debug, error, info, warn};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -207,6 +208,9 @@ pub(crate) enum TakeoverSkip {
     /// #841: the audio source is not confirmed idle or local media (a remote
     /// call or remote media, unknown activity, or no report).
     AudioNotIdle,
+    /// Legacy listener: an ownership-loss pause is still running, so it has
+    /// not yet decided whether the players coming back are its own doing.
+    OwnPausePending,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +261,39 @@ pub(crate) fn decide_takeover(inputs: TakeoverInputs) -> TakeoverDecision {
     TakeoverDecision {
         action: TakeoverAction::TakeOver,
         clear_self_pause: false,
+    }
+}
+
+/// The legacy listener's policy: `decide_takeover`, except that a take is
+/// suppressed (not postponed) while an ownership-loss pause is in flight.
+pub(crate) fn decide_legacy_poll(
+    inputs: TakeoverInputs,
+    own_pause_pending: bool,
+) -> TakeoverDecision {
+    let decision = decide_takeover(inputs);
+    if own_pause_pending && decision.action == TakeoverAction::TakeOver {
+        return TakeoverDecision {
+            action: TakeoverAction::Skip(TakeoverSkip::OwnPausePending),
+            clear_self_pause: false,
+        };
+    }
+    decision
+}
+
+/// One `pause_all_media` in flight. Dropping it releases the count, so a
+/// panicking pauser or a dropped pause future cannot leave it set.
+struct OwnershipPause(Arc<AtomicUsize>);
+
+impl OwnershipPause {
+    fn start(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        OwnershipPause(count.clone())
+    }
+}
+
+impl Drop for OwnershipPause {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -601,6 +638,9 @@ impl MediaControllerState {
 #[derive(Clone)]
 pub struct MediaController {
     state: Arc<Mutex<MediaControllerState>>,
+    /// `pause_all_media` calls in flight. Released under `state` together
+    /// with the self-pause flag they set; read under `state` by the listener.
+    ownership_pauses: Arc<AtomicUsize>,
 }
 
 impl MediaController {
@@ -610,6 +650,7 @@ impl MediaController {
         state.local_mac = local_mac;
         MediaController {
             state: Arc::new(Mutex::new(state)),
+            ownership_pauses: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -678,27 +719,9 @@ impl MediaController {
                 )
             };
 
-            // Read and consume the self-pause flag under the same lock as the
-            // playback state, so a pause_all_media racing with this poll is not
-            // lost.
-            let mut state = self.state.lock().await;
-            let was_playing = state.is_playing;
-            state.is_playing = is_playing;
-            let local_mac = state.local_mac.clone();
-            let decision = decide_takeover(TakeoverInputs {
-                baseline_taken,
-                was_playing,
-                is_playing,
-                i_paused_the_media: state.i_paused_the_media,
-                bud_in_ear,
-                trigger: TakeoverTrigger::PlaybackPoll,
-                // The #841 routing guards are for the handoff core (#8/#9).
-                handoff: None,
-            });
-            if decision.clear_self_pause {
-                state.i_paused_the_media = false;
-            }
-            drop(state);
+            let (decision, local_mac) = self
+                .record_playback_poll(baseline_taken, is_playing, bud_in_ear)
+                .await;
             baseline_taken = true;
 
             if let TakeoverAction::Skip(reason) = decision.action {
@@ -722,6 +745,9 @@ impl MediaController {
                     }
                     TakeoverSkip::NoBudInEar => {
                         info!("Media playback started but buds not in ear, skipping takeover")
+                    }
+                    TakeoverSkip::OwnPausePending => {
+                        debug!("Playback started during our own pause; not taking ownership")
                     }
                     // Only produced by the #841 guards, which this loop does
                     // not supply (`handoff: None`).
@@ -764,6 +790,39 @@ impl MediaController {
 
             debug!("completed playback takeover process");
         }
+    }
+
+    /// The listener's per-poll state step: record `is_playing`, decide, and
+    /// consume the self-pause flag. The flag and the ownership-pause count
+    /// are read under one `state` lock, and `pause_all_media` releases its
+    /// count under the same lock as it sets the flag, so a poll never sees
+    /// the pause finished without its flag.
+    async fn record_playback_poll(
+        &self,
+        baseline_taken: bool,
+        is_playing: bool,
+        bud_in_ear: bool,
+    ) -> (TakeoverDecision, String) {
+        let mut state = self.state.lock().await;
+        let was_playing = state.is_playing;
+        state.is_playing = is_playing;
+        let decision = decide_legacy_poll(
+            TakeoverInputs {
+                baseline_taken,
+                was_playing,
+                is_playing,
+                i_paused_the_media: state.i_paused_the_media,
+                bud_in_ear,
+                trigger: TakeoverTrigger::PlaybackPoll,
+                // The #841 routing guards are for the handoff core (#8/#9).
+                handoff: None,
+            },
+            self.ownership_pauses.load(Ordering::SeqCst) > 0,
+        );
+        if decision.clear_self_pause {
+            state.i_paused_the_media = false;
+        }
+        (decision, state.local_mac.clone())
     }
 
     pub(crate) fn check_if_playing() -> bool {
@@ -1180,6 +1239,7 @@ impl MediaController {
     {
         debug!("Pausing all media (without tracking for resume)");
 
+        let pending = OwnershipPause::start(&self.ownership_pauses);
         let was_playing = self.state.lock().await.is_playing;
         let outcome = tokio::task::spawn_blocking(pause_players).await.unwrap();
 
@@ -1187,6 +1247,8 @@ impl MediaController {
         // Remember that the pause came from us, so the playback listener does
         // not mistake the players coming back for the user starting something.
         state.i_paused_the_media |= marks_self_pause(outcome, was_playing);
+        // Under the same lock as the flag; see record_playback_poll.
+        drop(pending);
         if outcome.paused > 0 {
             info!(
                 "Paused {} media player(s) due to ownership loss",
@@ -2537,6 +2599,192 @@ mod tests {
             TakeoverAction::Skip(TakeoverSkip::ResumeAfterOwnPause)
         );
         assert!(twin.clear_self_pause);
+    }
+
+    #[test]
+    fn takeover_skips_while_ownership_pause_pending() {
+        let play = takeover_inputs();
+        assert_eq!(
+            decide_legacy_poll(play, true),
+            TakeoverDecision {
+                action: TakeoverAction::Skip(TakeoverSkip::OwnPausePending),
+                clear_self_pause: false,
+            }
+        );
+        // Only a take is suppressed: everything else, and every decision
+        // without a pause in flight, is decide_takeover's.
+        for inputs in [
+            play,
+            TakeoverInputs {
+                baseline_taken: false,
+                ..play
+            },
+            TakeoverInputs {
+                was_playing: true,
+                ..play
+            },
+            TakeoverInputs {
+                is_playing: false,
+                ..play
+            },
+            TakeoverInputs {
+                i_paused_the_media: true,
+                ..play
+            },
+            TakeoverInputs {
+                bud_in_ear: false,
+                ..play
+            },
+        ] {
+            let decision = decide_takeover(inputs);
+            assert_eq!(decide_legacy_poll(inputs, false), decision, "{inputs:?}");
+            if decision.action != TakeoverAction::TakeOver {
+                assert_eq!(decide_legacy_poll(inputs, true), decision, "{inputs:?}");
+            }
+        }
+        let resume = TakeoverInputs {
+            i_paused_the_media: true,
+            ..play
+        };
+        assert_eq!(
+            decide_legacy_poll(resume, true),
+            TakeoverDecision {
+                action: TakeoverAction::Skip(TakeoverSkip::ResumeAfterOwnPause),
+                clear_self_pause: true,
+            }
+        );
+        let unworn = TakeoverInputs {
+            bud_in_ear: false,
+            ..play
+        };
+        assert_eq!(
+            decide_legacy_poll(unworn, true).action,
+            TakeoverAction::Skip(TakeoverSkip::NoBudInEar)
+        );
+    }
+
+    /// Runs `pause_all_media_with` on a task whose pauser blocks until the
+    /// returned sender sends or is dropped, then calls `pauser`. Returns once
+    /// the pauser is running.
+    async fn blocked_pause(
+        controller: &MediaController,
+        pauser: impl FnOnce() -> PauseOutcome + Send + 'static,
+    ) -> (tokio::task::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let controller = controller.clone();
+        let task = tokio::spawn(async move {
+            controller
+                .pause_all_media_with(move || {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    pauser()
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        (task, release_tx)
+    }
+
+    /// A listener poll that sees stopped -> playing with a bud in ear.
+    async fn stopped_to_playing(controller: &MediaController) -> TakeoverDecision {
+        controller.state.lock().await.is_playing = false;
+        controller.record_playback_poll(true, true, true).await.0
+    }
+
+    #[tokio::test]
+    async fn ownership_pause_in_flight_defers_takeover() {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A pause that paused a player, and an idle one. After either, the
+        // player that started during the pause is not taken: a paused player
+        // coming back is our resume, and a player that kept playing needs a
+        // fresh stopped -> playing.
+        for (outcome, next) in [
+            (
+                PauseOutcome {
+                    paused: 1,
+                    ..Default::default()
+                },
+                TakeoverSkip::ResumeAfterOwnPause,
+            ),
+            (PauseOutcome::default(), TakeoverSkip::NoTransition),
+        ] {
+            let controller = MediaController::new(String::new(), String::new());
+            let (task, release) = blocked_pause(&controller, move || outcome).await;
+            assert_eq!(controller.ownership_pauses.load(SeqCst), 1);
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), controller.state.lock())
+                    .await
+                    .expect("state is not held across the pauser"),
+            );
+            assert_eq!(
+                stopped_to_playing(&controller).await,
+                TakeoverDecision {
+                    action: TakeoverAction::Skip(TakeoverSkip::OwnPausePending),
+                    clear_self_pause: false,
+                }
+            );
+
+            release.send(()).unwrap();
+            task.await.unwrap();
+            assert_eq!(controller.ownership_pauses.load(SeqCst), 0);
+            assert_eq!(
+                controller.state.lock().await.i_paused_the_media,
+                marks_self_pause(outcome, false),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                controller
+                    .record_playback_poll(true, true, true)
+                    .await
+                    .0
+                    .action,
+                TakeoverAction::Skip(next)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_pause_marker_lifecycle() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let controller = MediaController::new(String::new(), String::new());
+        let pending = || controller.ownership_pauses.load(SeqCst);
+        let take = TakeoverAction::TakeOver;
+        let skip = TakeoverAction::Skip(TakeoverSkip::OwnPausePending);
+
+        // Overlapping pauses (OwnershipToFalseRequest and OwnsConnection=0):
+        // the marker holds until the last one finishes.
+        let (first, release_first) = blocked_pause(&controller, PauseOutcome::default).await;
+        let (second, release_second) = blocked_pause(&controller, PauseOutcome::default).await;
+        assert_eq!(pending(), 2);
+        release_first.send(()).unwrap();
+        first.await.unwrap();
+        assert_eq!(pending(), 1);
+        assert_eq!(stopped_to_playing(&controller).await.action, skip);
+        release_second.send(()).unwrap();
+        second.await.unwrap();
+        assert_eq!(pending(), 0);
+        assert_eq!(stopped_to_playing(&controller).await.action, take);
+
+        // A pause future dropped mid-pause.
+        let (task, release) = blocked_pause(&controller, PauseOutcome::default).await;
+        assert_eq!(pending(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(pending(), 0);
+        drop(release);
+        assert_eq!(stopped_to_playing(&controller).await.action, take);
+
+        // A panicking pauser.
+        let (task, release) = blocked_pause(&controller, || -> PauseOutcome {
+            panic!("pauser panicked")
+        })
+        .await;
+        assert_eq!(pending(), 1);
+        release.send(()).unwrap();
+        assert!(task.await.unwrap_err().is_panic());
+        assert_eq!(pending(), 0);
+        assert_eq!(stopped_to_playing(&controller).await.action, take);
     }
 
     #[test]
