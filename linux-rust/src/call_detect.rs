@@ -127,7 +127,9 @@ fn prop<'a>(props: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
 /// (games and browser tabs often set no role). No: capture streams, event
 /// and notification sounds (`media.role` event/notification, or an
 /// `event.id`), monitor streams (`stream.monitor`, or a target ending in
-/// `.monitor`), LibrePods' own streams, call audio (`media.role` phone or
+/// `.monitor`), virtual streams (`node.virtual` true: PipeWire plumbing such
+/// as loopback, filter-chain and combine, whatever their role or application
+/// name), LibrePods' own streams, call audio (`media.role` phone or
 /// Communication; taking the AirPods for calls is #12), any other role, and
 /// anonymous streams with neither a role nor an application name.
 pub(crate) fn is_takeover_worthy(stream: &StreamProps) -> bool {
@@ -141,6 +143,10 @@ fn is_takeover_worthy_for(stream: &StreamProps, own_pid: u32) -> bool {
     }
     let props = &stream.props;
     if stream.monitor || prop_is_true(props, "stream.monitor") {
+        return false;
+    }
+    // Plumbing (loopback, filter-chain, combine); real clients never set it (#97).
+    if prop_is_true(props, "node.virtual") {
         return false;
     }
     if TARGET_PROPS
@@ -457,6 +463,72 @@ mod tests {
                 ])),
                 "{key} to a sink"
             );
+        }
+    }
+
+    /// The live pw-loopback playback stream from #97, minus node.virtual.
+    const LOOPBACK: [(&str, &str); 5] = [
+        ("node.name", "output.pw-loopback-3412"),
+        ("node.group", "pw-loopback-3412"),
+        ("node.link-group", "pw-loopback-3412"),
+        ("stream.is-live", "true"),
+        (
+            "target.object",
+            "alsa_output.pci-0000_00_1f.3.analog-stereo",
+        ),
+    ];
+
+    /// `LOOPBACK` plus `extra`.
+    fn loopback(extra: &[(&str, &str)]) -> StreamProps {
+        playback(&[&LOOPBACK[..], extra].concat())
+    }
+
+    #[test]
+    fn takeover_worthy_rejects_virtual_with_application() {
+        let app = ("application.name", "X");
+        // Without node.virtual the same stream is worthy: node.virtual alone rejects it.
+        assert!(is_takeover_worthy(&loopback(&[app])));
+        for value in ["true", "TRUE", " true "] {
+            assert!(
+                !is_takeover_worthy(&loopback(&[app, ("node.virtual", value)])),
+                "node.virtual={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn takeover_worthy_rejects_virtual_with_media_role() {
+        for role in ["Music", "music", "MUSIC"] {
+            let role = ("media.role", role);
+            let app = ("application.name", "X");
+            assert!(is_takeover_worthy(&loopback(&[role])), "{role:?}");
+            assert!(is_takeover_worthy(&loopback(&[role, app])), "{role:?}");
+            let virt = ("node.virtual", "true");
+            assert!(!is_takeover_worthy(&loopback(&[role, virt])), "{role:?}");
+            assert!(
+                !is_takeover_worthy(&loopback(&[role, app, virt])),
+                "{role:?} with an application"
+            );
+        }
+    }
+
+    #[test]
+    fn takeover_worthy_keeps_real_clients() {
+        let firefox = [
+            ("application.name", "Firefox"),
+            ("application.process.binary", "firefox"),
+            ("media.name", "AudioStream"),
+        ];
+        let sdl = [("media.role", "Game"), ("application.name", "SuperTuxKart")];
+        let mpv_movie = [("application.name", "mpv"), ("media.role", "Movie")];
+        let mpv_music = [("application.name", "mpv"), ("media.role", "Music")];
+        for props in [&firefox[..], &sdl, &mpv_movie, &mpv_music] {
+            assert!(is_takeover_worthy(&playback(props)), "{props:?}");
+            // A false or blank node.virtual is not virtual.
+            for value in ["false", "", "  "] {
+                let props = [props, &[("node.virtual", value)]].concat();
+                assert!(is_takeover_worthy(&playback(&props)), "{props:?}");
+            }
         }
     }
 
