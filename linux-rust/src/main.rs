@@ -223,21 +223,31 @@ async fn async_main(
                 .await?
                 .unwrap_or_else(|| "Unknown".to_string());
             info!("Found connected AirPods: {}, initializing.", name);
-            let airpods_device =
-                AirPodsDevice::new(device.address(), tray_handle.clone(), ui_tx.clone()).await;
-
-            let mut managers = device_managers.write().await;
-            // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
-            let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
-            managers
-                .entry(device.address().to_string())
-                .or_insert(dev_managers)
-                .set_aacp(airpods_device.aacp_manager);
-            drop(managers);
-            if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceConnected(
-                device.address().to_string(),
-            )) {
-                warn!("Failed to send DeviceConnected UI message: {:?}", e);
+            match AirPodsDevice::new(device.address(), tray_handle.clone(), ui_tx.clone()).await {
+                Ok(airpods_device) => {
+                    let mut managers = device_managers.write().await;
+                    // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
+                    let dev_managers =
+                        DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
+                    managers
+                        .entry(device.address().to_string())
+                        .or_insert(dev_managers)
+                        .set_aacp(airpods_device.aacp_manager);
+                    drop(managers);
+                    if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceConnected(
+                        device.address().to_string(),
+                    )) {
+                        warn!("Failed to send DeviceConnected UI message: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    // new() already logged the cause; keep the app running.
+                    warn!(
+                        "Skipping connected AirPods {}: setup failed: {}",
+                        device.address(),
+                        e
+                    );
+                }
             }
         }
         Err(_) => {
@@ -365,7 +375,15 @@ async fn async_main(
         let ui_tx_clone = ui_tx.clone();
         let device_managers = device_managers.clone();
         tokio::spawn(async move {
-            let airpods_device = AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await;
+            let airpods_device =
+                match AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await {
+                    Ok(device) => device,
+                    Err(e) => {
+                        // new() already logged the cause.
+                        warn!("Skipping AirPods {}: setup failed: {}", addr_str, e);
+                        return;
+                    }
+                };
             let mut managers = device_managers.write().await;
             // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
             let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());

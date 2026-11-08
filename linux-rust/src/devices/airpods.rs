@@ -29,8 +29,35 @@ impl AirPodsDevice {
         mac_address: Address,
         tray_handle: Option<Handle<MyTray>>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
-    ) -> Self {
+    ) -> Result<Self, bluer::Error> {
         info!("Creating new AirPodsDevice for {}", mac_address);
+
+        // Resolve the local adapter before any side effect (AACP connect, tray
+        // update, spawned task), so a failure leaves nothing half set up.
+        let session = bluer::Session::new().await.inspect_err(|e| {
+            error!(
+                "Cannot set up AirPods {mac_address}: cannot talk to BlueZ over D-Bus: {e}. \
+                 Is the bluetooth service running? Check with `systemctl status bluetooth`."
+            )
+        })?;
+        let adapter = session.default_adapter().await.inspect_err(|e| {
+            error!(
+                "Cannot set up AirPods {mac_address}: no Bluetooth adapter available: {e}. \
+                 Make sure an adapter is present and not blocked - see `rfkill list bluetooth`."
+            )
+        })?;
+        let local_mac = adapter
+            .address()
+            .await
+            .inspect_err(|e| {
+                error!(
+                    "Cannot set up AirPods {mac_address}: cannot read the Bluetooth adapter \
+                     address: {e}. Is the bluetooth service running (`systemctl status \
+                     bluetooth`) and the adapter not blocked (`rfkill list bluetooth`)?"
+                )
+            })?
+            .to_string();
+
         let mut aacp_manager = AACPManager::new();
         aacp_manager.connect(mac_address).await;
 
@@ -108,19 +135,6 @@ impl AirPodsDevice {
                 error!("Failed to enable stem press detection: {}", e);
             }
         }
-
-        let session = bluer::Session::new()
-            .await
-            .expect("Failed to get bluer session");
-        let adapter = session
-            .default_adapter()
-            .await
-            .expect("Failed to get default adapter");
-        let local_mac = adapter
-            .address()
-            .await
-            .expect("Failed to get adapter address")
-            .to_string();
 
         // Desktop battery (BlueZ BatteryProvider1, battery_provider.rs). The
         // exporter registers lazily on the first known level; a registration
@@ -392,13 +406,13 @@ impl AirPodsDevice {
             }
         });
 
-        AirPodsDevice {
+        Ok(AirPodsDevice {
             mac_address,
             aacp_manager,
             // att_manager,
             media_controller,
             // command_tx: Some(command_tx.clone()),
-        }
+        })
     }
 }
 
