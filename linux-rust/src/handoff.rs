@@ -445,7 +445,7 @@ impl Handoff {
                     self.say(NO_SESSION);
                     return;
                 }
-                // Nothing announces before Auto, so the #79 exemption ends here.
+                // Queued replays are fed before REPL input, so the #79 exemption can end here.
                 self.snapshot_hosts.clear();
                 out.push(Command::ConnectA2dp);
                 if !self.requested_take && self.pending.is_none() {
