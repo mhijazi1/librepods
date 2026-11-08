@@ -1,7 +1,7 @@
 use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control,
 };
-use crate::handoff::{Command, Handoff, Input};
+use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::handoff_log;
 use crate::media_controller::{
     CaseRecovery, MediaController, TakeoverAction, TakeoverInputs, TakeoverTrigger,
@@ -76,6 +76,23 @@ where
     .await
     .unwrap_or(false);
     Ok(backlog)
+}
+
+/// Read the session facts and move every event queued at that moment to the
+/// end of the backlog, under one state guard (#143). The CONNECTED_DEVICES
+/// arm stores and sends under the same lock, so each report is either in the
+/// facts and the backlog, or applied after the facts and still queued.
+async fn cut_facts(
+    (manager, mut events): ControlSession,
+    mut backlog: InitBacklog,
+) -> (Reconnection, SessionFacts) {
+    let facts = {
+        let state = manager.state.lock().await;
+        let queued = events.len();
+        backlog.events.extend(take_prefix(&mut events, queued));
+        session_facts(&state)
+    };
+    (((manager, events), backlog), facts)
 }
 
 /// The core inputs an adopted session's backlog feeds before any later
@@ -205,7 +222,7 @@ struct Io {
     manager: AACPManager,
     events: tokio::sync::mpsc::UnboundedReceiver<AACPEvent>,
     play_rx: tokio::sync::mpsc::Receiver<(Instant, bool)>,
-    retry: Option<tokio::task::JoinHandle<Result<Reconnection>>>,
+    retry: Option<tokio::task::JoinHandle<Result<(Reconnection, SessionFacts)>>>,
     /// Session made by the last reconnect, until the core adopts or cancels it.
     candidate: Option<Reconnection>,
     /// The adopted session's backlog inputs, fed right after the step that
@@ -269,7 +286,8 @@ impl Io {
                     self.retry = Some(tokio::spawn(async move {
                         let (manager, mut events) = connect_control(address).await?;
                         if !audio {
-                            return Ok(((manager, events), InitBacklog::default()));
+                            let session = (manager, events);
+                            return Ok(cut_facts(session, InitBacklog::default()).await);
                         }
                         let device = adapter.device(address)?;
                         let connected = tokio::time::timeout(
@@ -289,7 +307,7 @@ impl Io {
                             manager.send_control_command(Control::OwnsConnection, &[0]),
                         )
                         .await?;
-                        Ok(((manager, events), backlog))
+                        Ok(cut_facts((manager, events), backlog).await)
                     }));
                 }
                 Command::AdoptSession => {
@@ -390,8 +408,8 @@ async fn feed_adopted(core: &mut Handoff, io: &mut Io) -> Result<bool> {
 
 /// Wait for the running reconnect attempt; never resolves without one.
 async fn reconnect_result(
-    retry: &mut Option<tokio::task::JoinHandle<Result<Reconnection>>>,
-) -> std::result::Result<Result<Reconnection>, tokio::task::JoinError> {
+    retry: &mut Option<tokio::task::JoinHandle<Result<(Reconnection, SessionFacts)>>>,
+) -> std::result::Result<Result<(Reconnection, SessionFacts)>, tokio::task::JoinError> {
     match retry {
         Some(task) => task.await,
         None => std::future::pending().await,
@@ -470,9 +488,8 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
             result = reconnect_result(&mut io.retry) => {
                 io.retry = None;
                 let input = match result? {
-                    Ok(((manager, events), backlog)) => {
-                        let facts = session_facts(&*manager.state.lock().await);
-                        io.candidate = Some(((manager, events), backlog));
+                    Ok((reconnection, facts)) => {
+                        io.candidate = Some(reconnection);
                         Input::Reconnected(facts)
                     }
                     Err(error) => Input::ReconnectFailed(error.to_string()),
@@ -1075,5 +1092,161 @@ mod tests {
         assert_eq!(adoption_inputs(backlog(true)), drained);
         assert_eq!(adoption_inputs(backlog(false)), events);
         assert_eq!(adoption_inputs(InitBacklog::default()), []);
+    }
+
+    /// A CONNECTED_DEVICES packet listing `macs`, with zero flags.
+    fn hosts_packet(macs: &[[u8; 6]]) -> Vec<u8> {
+        let mut packet = vec![4, 0, 4, 0, 0x2e, 0, 0, 0, macs.len() as u8];
+        for mac in macs {
+            packet.extend(mac);
+            packet.extend([0, 0]);
+        }
+        packet
+    }
+
+    fn drain(events: &mut tokio::sync::mpsc::UnboundedReceiver<AACPEvent>) -> Vec<AACPEvent> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    /// The (old, new) host lists of the ConnectedDevices events, in order.
+    fn host_reports(events: &[AACPEvent]) -> Vec<(&[ConnectedDevice], &[ConnectedDevice])> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AACPEvent::ConnectedDevices(old, new) => Some((&old[..], &new[..])),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_facts_cut_splits_reports_exactly() {
+        let mut splits = 0;
+        for _ in 0..200 {
+            let manager = AACPManager::new();
+            let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+            manager.set_event_channel(tx).await;
+            let reporter = manager.clone();
+            let reporting = tokio::spawn(async move {
+                for n in 1..=8u8 {
+                    let macs: Vec<[u8; 6]> = (1..=n).map(|i| [i; 6]).collect();
+                    reporter.receive_packet(&hosts_packet(&macs)).await;
+                }
+            });
+            // Cut mid-stream: once the first report is queued.
+            while events.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let (((_, mut events), backlog), facts) =
+                cut_facts((manager, events), InitBacklog::default()).await;
+            reporting.await.unwrap();
+            let cut = host_reports(&backlog.events);
+            assert_eq!(cut.last().unwrap().1, facts.hosts);
+            let rest = drain(&mut events);
+            if let Some((old, _)) = host_reports(&rest).first() {
+                assert_eq!(*old, facts.hosts);
+                splits += 1;
+            }
+            assert_eq!(cut.len() + host_reports(&rest).len(), 8);
+        }
+        assert!(splits > 0, "no cut landed mid-stream");
+    }
+
+    const L_MAC: [u8; 6] = [1, 2, 3, 4, 5, 6];
+    const R_MAC: [u8; 6] = [7, 8, 9, 10, 11, 12];
+    const R2_MAC: [u8; 6] = [13, 14, 15, 16, 17, 18];
+    const M_MAC: [u8; 6] = [19, 20, 21, 22, 23, 24];
+
+    fn hosts_input(old: &[&str], new: &[&str]) -> Input {
+        let hosts = |macs: &[&str]| macs.iter().map(|m| core_device(m)).collect();
+        Input::ConnectedDevices {
+            old: hosts(old),
+            new: hosts(new),
+        }
+    }
+
+    /// #143: a session at [L] echoes the last "not owning", then reports
+    /// A=[L]->[L,R] and B=[L,R]->[L,R,R2] before the facts are read; `late`
+    /// lands after the cut. An automatic core reconnects and adopts it, and
+    /// the Announce counts before and after the boundary are returned.
+    async fn post_echo_reports_announces(late: Option<&[[u8; 6]]>) -> (usize, usize) {
+        let (l, r, r2) = (CORE_LOCAL, CORE_REMOTE, "0D:0E:0F:10:11:12");
+        let manager = AACPManager::new();
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_channel(tx).await;
+        manager.receive_packet(&hosts_packet(&[L_MAC])).await;
+        let (returned, after) = tokio::sync::oneshot::channel::<()>();
+        let reporter = manager.clone();
+        let reports = tokio::spawn(async move {
+            after.await.unwrap();
+            // The echo: OwnsConnection = 0.
+            reporter
+                .receive_packet(&[4, 0, 4, 0, 9, 0, 6, 0, 0, 0, 0])
+                .await;
+            reporter
+                .receive_packet(&hosts_packet(&[L_MAC, R_MAC]))
+                .await;
+            reporter
+                .receive_packet(&hosts_packet(&[L_MAC, R_MAC, R2_MAC]))
+                .await;
+        });
+        let send = async {
+            returned.send(()).unwrap();
+            Ok::<(), std::io::Error>(())
+        };
+        let backlog = collect_init_backlog(&mut events, send).await.unwrap();
+        reports.await.unwrap();
+        let (((manager, mut events), backlog), facts) = cut_facts((manager, events), backlog).await;
+        assert_eq!(facts.hosts, [l, r, r2].map(core_device));
+        if let Some(late) = late {
+            manager.receive_packet(&hosts_packet(late)).await;
+        }
+
+        let mut inputs = vec![Input::Reconnected(facts)];
+        inputs.extend(adoption_inputs(backlog));
+        let boundary = inputs
+            .iter()
+            .position(|i| *i == Input::InitBacklogDrained)
+            .unwrap();
+        let a = inputs.iter().position(|i| *i == hosts_input(&[l], &[l, r]));
+        let b = inputs
+            .iter()
+            .position(|i| *i == hosts_input(&[l, r], &[l, r, r2]));
+        assert!(a.is_some() && a < b && b < Some(boundary), "{inputs:?}");
+        inputs.extend(drain(&mut events).into_iter().filter_map(event_input));
+
+        let t0 = Instant::now();
+        let mut core = Handoff::new(CORE_LOCAL.to_string(), t0, true, true);
+        assert_eq!(core.handle(t0, Input::Disconnected), [Command::DropSession]);
+        let at = t0 + Duration::from_secs(1);
+        assert_eq!(
+            core.handle(at, Input::Tick),
+            [Command::Reconnect { audio: true }]
+        );
+        let mut announces = (0, 0);
+        for (i, input) in inputs.into_iter().enumerate() {
+            let n = core
+                .handle(at, input)
+                .iter()
+                .filter(|c| **c == Command::Announce)
+                .count();
+            if i < boundary {
+                announces.0 += n;
+            } else {
+                announces.1 += n;
+            }
+        }
+        announces
+    }
+
+    #[tokio::test]
+    async fn reconnect_post_echo_reports_announce_once() {
+        assert_eq!(post_echo_reports_announces(None).await, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn reconnect_post_echo_reports_then_new_host_announce_twice() {
+        let late = [L_MAC, R_MAC, R2_MAC, M_MAC];
+        assert_eq!(post_echo_reports_announces(Some(&late)).await, (1, 1));
     }
 }
