@@ -153,14 +153,15 @@ fn with_connect_mode(
 /// parent directory is created. On error the temp file is removed and the
 /// target is untouched.
 fn write_settings_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    write_settings_file_with(path, contents, |_| Ok(()))
+    write_settings_file_with(path, contents, |p| std::fs::metadata(p), |_| Ok(()))
 }
 
-/// `write_settings_file` with `before_rename` run on the fsynced temp file, so
-/// tests can fail the write at that point.
+/// `write_settings_file` with the target's `stat` and a `before_rename` step
+/// run on the fsynced temp file injectable, so tests can fail the write there.
 fn write_settings_file_with(
     path: &std::path::Path,
     contents: &str,
+    stat: impl FnOnce(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
     before_rename: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::io::Write;
@@ -204,8 +205,12 @@ fn write_settings_file_with(
     let result = (|| {
         file.write_all(contents.as_bytes())?;
         // After the write: a write by a non-root user clears setuid/setgid.
-        if let Ok(meta) = std::fs::metadata(&target) {
-            file.set_permissions(meta.permissions())?;
+        // Only a missing target (a new file) keeps 0600; any other stat error
+        // aborts, or the rename would silently drop the target's mode.
+        match stat(&target) {
+            Ok(meta) => file.set_permissions(meta.permissions())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         file.sync_all()?;
         before_rename(&tmp)?;
@@ -1680,7 +1685,7 @@ mod tests {
         let target = dir.join("settings.json");
         std::fs::write(&target, "original").unwrap();
 
-        let err = write_settings_file_with(&target, "new", |tmp| {
+        let err = write_settings_file_with(&target, "new", |p| std::fs::metadata(p), |tmp| {
             // The hook runs after the temp file is fully written.
             assert_eq!(std::fs::read_to_string(tmp).unwrap(), "new");
             Err(std::io::Error::other("injected"))
@@ -1689,6 +1694,29 @@ mod tests {
 
         assert_eq!(err.to_string(), "injected");
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(dir_names(&dir), ["settings.json"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_write_stat_failure_keeps_original() {
+        let dir = settings_dir("stat");
+        let target = dir.join("settings.json");
+        std::fs::write(&target, "original").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let err = write_settings_file_with(
+            &target,
+            "new",
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_| panic!("renamed after a failed stat"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o640);
         assert_eq!(dir_names(&dir), ["settings.json"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1768,7 +1796,7 @@ mod tests {
         let target = dir.join("devices.json");
 
         // The temp file is already private while it holds the contents.
-        write_settings_file_with(&target, "{}", |tmp| {
+        write_settings_file_with(&target, "{}", |p| std::fs::metadata(p), |tmp| {
             let mode = std::fs::metadata(tmp)?.permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
             Ok(())
