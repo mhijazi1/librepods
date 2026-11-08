@@ -303,6 +303,8 @@ impl Log {
             .name("handoff-log".to_string())
             .spawn(move || {
                 let _done = done_tx;
+                // Drops before _done, so a disconnected done means try_send sees Disconnected.
+                let rx = rx;
                 let path = path.display();
                 let mut writer = match opener() {
                     Ok(writer) => writer,
