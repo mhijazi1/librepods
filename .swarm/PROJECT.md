@@ -44,7 +44,7 @@ Put new issues in the milestone whose outcome they serve.
 - Prefer extracting pure, testable logic (parsing, encoding, policy decisions) from I/O code over adding large mocks.
 - Don't break the existing app: the tray, the window UI, Nothing devices and the non-handoff path must still build and behave as before
   unless a ticket says otherwise.
-- `cargo fmt --check` fails on upstream code; don't reformat unrelated files. Format only the code you touch.
+- The crate stays rustfmt-clean; run `cargo fmt` before committing; CI enforces it.
 - Licence: GPL-3.0 (AGPL per README); keep upstream copyright headers.
 
 ## Non-goals

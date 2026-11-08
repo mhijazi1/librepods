@@ -6,6 +6,7 @@ use crate::media_controller::MediaController;
 use crate::switching::{Switching, SwitchingSetup, device_media, spawn_playback_poller};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
+use crate::utils::{get_app_settings_path, load_export_battery, load_switching_mode};
 use bluer::Address;
 use ksni::Handle;
 use log::{debug, error, info, warn};
@@ -13,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
-use crate::utils::{get_app_settings_path, load_export_battery, load_switching_mode};
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
@@ -140,7 +140,9 @@ impl AirPodsDevice {
         // failure logs one warning and leaves the export off.
         let battery_exporter = if load_export_battery() {
             let provider = BluezBatteryProvider::new(adapter.name(), &mac_address.to_string());
-            Some(Arc::new(std::sync::Mutex::new(BatteryExporter::new(provider))))
+            Some(Arc::new(std::sync::Mutex::new(BatteryExporter::new(
+                provider,
+            ))))
         } else {
             info!("Desktop battery export disabled by preferences (exportBattery)");
             None
@@ -359,10 +361,7 @@ impl AirPodsDevice {
                     AACPEvent::ConnectedDevices(..) | AACPEvent::OwnershipToFalseRequest => {}
                     AACPEvent::StemPress(press_type, bud_type) => {
                         use crate::bluetooth::aacp::StemPressType;
-                        info!(
-                            "Received Stem Press: {:?} on {:?}",
-                            press_type, bud_type
-                        );
+                        info!("Received Stem Press: {:?} on {:?}", press_type, bud_type);
                         if stem_control {
                             let controller = mc_clone.lock().await;
                             match press_type {

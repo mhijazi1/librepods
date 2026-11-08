@@ -41,6 +41,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-nix-cargo-
 
+      - name: cargo fmt --check
+        working-directory: linux-rust
+        run: nix develop .. -c cargo fmt --check
+
       - name: cargo build --locked
         working-directory: linux-rust
         run: nix develop .. -c cargo build --locked

@@ -14,16 +14,19 @@ use crate::utils::{
     ConnectMode, MyTheme, PreferredCodec, get_app_settings_path, get_devices_path,
     get_preferences_path,
 };
-use bluer::{Address};
+use bluer::Address;
 use iced::border::Radius;
 use iced::overlay::menu;
 use iced::widget::button::Style;
 use iced::widget::rule::FillMode;
 use iced::widget::{
     Space, button, column, combo_box, container, pane_grid, pick_list, row, rule, scrollable, text,
-    text_input, toggler
+    text_input, toggler,
 };
-use iced::{Background, Border, Center, Element, Font, Length, Padding, Size, Subscription, Task, Theme, daemon, window, Settings, Program};
+use iced::{
+    Background, Border, Center, Element, Font, Length, Padding, Program, Settings, Size,
+    Subscription, Task, Theme, daemon, window,
+};
 use log::{debug, error};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -246,7 +249,11 @@ pub fn start_ui(
     .title(App::title)
     .settings(Settings {
         id: Some("librepods".to_string()),
-        fonts: vec![include_bytes!("../../assets/font/sf_pro.otf").as_slice().into()],
+        fonts: vec![
+            include_bytes!("../../assets/font/sf_pro.otf")
+                .as_slice()
+                .into(),
+        ],
         default_font: Font::with_name("SF Pro Text"),
         ..Settings::default()
     })
@@ -337,7 +344,6 @@ impl App {
         let (mut panes, first_pane) = pane_grid::State::new(Pane::Sidebar);
         let split = panes.split(pane_grid::Axis::Vertical, first_pane, Pane::Content);
         panes.resize(split.unwrap().1, 0.2);
-
 
         let wait_task = Task::perform(wait_for_message(Arc::clone(&ui_rx)), |msg| msg);
 
@@ -642,7 +648,8 @@ impl App {
 
                         self.device_states.remove(&mac);
 
-                        if matches!(&self.selected_tab, Tab::Device(selected_mac) if selected_mac == &mac) {
+                        if matches!(&self.selected_tab, Tab::Device(selected_mac) if selected_mac == &mac)
+                        {
                             self.selected_tab = Tab::Device("none".to_string());
                         }
 
@@ -857,7 +864,11 @@ impl App {
                     Ok(content) => Some(content),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(e) => {
-                        error!("Not saving connectMode: failed to read {}: {}", path.display(), e);
+                        error!(
+                            "Not saving connectMode: failed to read {}: {}",
+                            path.display(),
+                            e
+                        );
                         apply_save_result(&mut self.save_statuses, scope, Err(SaveError::Io(e)));
                         return Task::none();
                     }
@@ -867,7 +878,11 @@ impl App {
                         "Not saving connectMode: {} is not a JSON object with an object per device",
                         path.display()
                     );
-                    apply_save_result(&mut self.save_statuses, scope, Err(SaveError::NotSettingsJson));
+                    apply_save_result(
+                        &mut self.save_statuses,
+                        scope,
+                        Err(SaveError::NotSettingsJson),
+                    );
                     return Task::none();
                 };
                 let result = write_settings_file(&path, &format!("{prefs:#}"));
@@ -877,7 +892,11 @@ impl App {
                     }
                     Err(e) => error!("Failed to write {}: {}", path.display(), e),
                 }
-                apply_save_result(&mut self.save_statuses, scope, result.map_err(SaveError::Io));
+                apply_save_result(
+                    &mut self.save_statuses,
+                    scope,
+                    result.map_err(SaveError::Io),
+                );
                 Task::none()
             }
             Message::StemControlChanged(is_enabled) => {
@@ -1830,7 +1849,11 @@ mod tests {
     #[test]
     fn merge_battery_appends_new_component() {
         let prev = vec![info(BatteryComponent::Left, 80, BatteryStatus::NotCharging)];
-        let update = vec![info(BatteryComponent::Headphone, 90, BatteryStatus::NotCharging)];
+        let update = vec![info(
+            BatteryComponent::Headphone,
+            90,
+            BatteryStatus::NotCharging,
+        )];
         let merged = merge_battery(&prev, &update);
         assert_eq!(
             merged,
@@ -1972,13 +1995,21 @@ mod tests {
 
     #[test]
     fn battery_tab_label_headphone_disconnected_shows_dashes() {
-        let battery = vec![info(BatteryComponent::Headphone, 85, BatteryStatus::Disconnected)];
+        let battery = vec![info(
+            BatteryComponent::Headphone,
+            85,
+            BatteryStatus::Disconnected,
+        )];
         assert_eq!(battery_tab_label(&battery), "\u{100EB9} --");
     }
 
     #[test]
     fn battery_tab_label_headphone_known_level() {
-        let battery = vec![info(BatteryComponent::Headphone, 85, BatteryStatus::NotCharging)];
+        let battery = vec![info(
+            BatteryComponent::Headphone,
+            85,
+            BatteryStatus::NotCharging,
+        )];
         assert_eq!(battery_tab_label(&battery), "\u{100EB9} 85%");
     }
 
@@ -2038,13 +2069,18 @@ mod tests {
             }))
         );
         // A device without an entry gets one; an existing value is replaced.
-        let prefs = r#"{"switching":"off","AA:BB:CC:DD:EE:FF":{"connectMode":"when_last_connected"}}"#;
+        let prefs =
+            r#"{"switching":"off","AA:BB:CC:DD:EE:FF":{"connectMode":"when_last_connected"}}"#;
         assert_eq!(
             with_connect_mode(Some(prefs), MAC, ConnectMode::Automatically),
             Some(serde_json::json!({"switching": "off", MAC: {"connectMode": "automatically"}}))
         );
         assert_eq!(
-            with_connect_mode(Some(r#"{"switching":"off"}"#), MAC, ConnectMode::Automatically),
+            with_connect_mode(
+                Some(r#"{"switching":"off"}"#),
+                MAC,
+                ConnectMode::Automatically
+            ),
             Some(serde_json::json!({"switching": "off", MAC: {"connectMode": "automatically"}}))
         );
     }
@@ -2149,7 +2185,11 @@ mod tests {
         apply_save_result(&mut statuses, Tab::Settings, denied());
         assert!(statuses[&Tab::Settings].starts_with("Couldn't save: "));
         let device = Tab::Device(MAC.to_string());
-        apply_save_result(&mut statuses, device.clone(), Err(SaveError::NotSettingsJson));
+        apply_save_result(
+            &mut statuses,
+            device.clone(),
+            Err(SaveError::NotSettingsJson),
+        );
         assert_eq!(
             statuses[&device],
             save_status_text(&SaveError::NotSettingsJson)
@@ -2180,4 +2220,3 @@ mod tests {
         assert_eq!(statuses.keys().collect::<Vec<_>>(), vec![&other]);
     }
 }
-
