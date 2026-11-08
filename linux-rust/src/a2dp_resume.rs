@@ -198,10 +198,29 @@ pub(crate) trait A2dpResumeIo: Send + Sync {
     fn playing(&self) -> BoxFuture<'static, Vec<String>>;
 }
 
-/// Run the chain from now on `io`, starting no kick or cycle that can't end
-/// before `until`. `cancel` firing (or its sender dropping) stops it between
-/// steps, including during a step's audio check.
-pub(crate) async fn run(io: impl A2dpResumeIo, until: Instant, mut cancel: oneshot::Receiver<()>) {
+/// Run the chain on `io` once `routed` resolves (the default sink route
+/// queued before it, #40), starting no kick or cycle that can't end before
+/// `until`. `cancel` firing (or its sender dropping) stops it between steps,
+/// including during a step's audio check; during the wait for `routed`, it
+/// or `until` ends the run with no action.
+pub(crate) async fn run(
+    io: impl A2dpResumeIo,
+    until: Instant,
+    mut cancel: oneshot::Receiver<()>,
+    routed: impl Future<Output = ()>,
+) {
+    tokio::select! {
+        biased;
+        _ = &mut cancel => {
+            info!("A2DP resume: cancelled before the default sink route ended");
+            return;
+        }
+        _ = routed => {}
+        _ = tokio::time::sleep_until(until.into()) => {
+            info!("A2DP resume: the default sink route outlasted the window");
+            return;
+        }
+    }
     // Tokio's clock, so tests can pause it; the same as std's otherwise.
     let clock = || tokio::time::Instant::now().into_std();
     let mut chain = Chain::new(clock(), until, io.playing().await);
@@ -634,7 +653,13 @@ mod tests {
         };
         let (_cancel, cancelled) = oneshot::channel();
         let start = tokio::time::Instant::now();
-        run(io, start.into_std() + A2DP_RESUME_WINDOW, cancelled).await;
+        run(
+            io,
+            start.into_std() + A2DP_RESUME_WINDOW,
+            cancelled,
+            std::future::ready(()),
+        )
+        .await;
         let actions = acted.lock().unwrap().clone();
         (actions, start.elapsed())
     }
@@ -677,6 +702,71 @@ mod tests {
         assert_eq!(acted[4..], [ProfileCycle, Play(P.into())]);
         // The replay Play ends the run, at 6 s, in time for the poll.
         assert!(ran + PLAY_EDGE_MARGIN < A2DP_RESUME_WINDOW, "{ran:?}");
+    }
+
+    /// Spawn the chain, with instant reads, for a take acknowledged now and
+    /// a route that ends with `routed`; returns its recorded actions.
+    fn spawn_after_route(
+        routed: impl Future<Output = ()> + Send + 'static,
+        cancel: oneshot::Receiver<()>,
+    ) -> (Arc<StdMutex<Vec<Action>>>, tokio::task::JoinHandle<()>) {
+        let acted = Arc::new(StdMutex::new(Vec::new()));
+        let io = SlowIo {
+            read: |_| Duration::ZERO,
+            reads: AtomicUsize::new(0),
+            acted: acted.clone(),
+        };
+        let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
+        (acted, tokio::spawn(run(io, until, cancel, routed)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chain_waits_for_route_before_any_step() {
+        let (route_done, route) = oneshot::channel::<()>();
+        let (_cancel, cancelled) = oneshot::channel();
+        let (acted, chain) = spawn_after_route(
+            async {
+                let _ = route.await;
+            },
+            cancelled,
+        );
+        // Well past the first audibility check (NUDGE_GAP + AUDIBLE_WAIT).
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(*acted.lock().unwrap(), []);
+        route_done.send(()).unwrap();
+        chain.await.unwrap();
+        assert_eq!(
+            acted.lock().unwrap()[..2],
+            [SuspendSink(true), SuspendSink(false)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_while_waiting_for_route_acts_nothing() {
+        for drop_sender in [false, true] {
+            let (cancel, cancelled) = oneshot::channel();
+            let (acted, chain) = spawn_after_route(std::future::pending(), cancelled);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if drop_sender {
+                drop(cancel);
+            } else {
+                cancel.send(()).unwrap();
+            }
+            let cancelled_at = tokio::time::Instant::now();
+            chain.await.unwrap();
+            assert_eq!(cancelled_at.elapsed(), Duration::ZERO);
+            assert_eq!(*acted.lock().unwrap(), []);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_never_settling_ends_at_window_without_acting() {
+        let (_cancel, cancelled) = oneshot::channel();
+        let start = tokio::time::Instant::now();
+        let (acted, chain) = spawn_after_route(std::future::pending(), cancelled);
+        chain.await.unwrap();
+        assert_eq!(start.elapsed(), A2DP_RESUME_WINDOW);
+        assert_eq!(*acted.lock().unwrap(), []);
     }
 
     #[test]
