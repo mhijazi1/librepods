@@ -26,20 +26,12 @@ fn decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 }
 
 fn verify_rpa(addr: &str, irk: &[u8; 16]) -> bool {
-    let rpa: Vec<u8> = addr
-        .split(':')
-        .map(|s| u8::from_str_radix(s, 16).unwrap())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if rpa.len() != 6 {
+    let Some(mut rpa) = crate::bluetooth::aacp::parse_mac(addr) else {
         return false;
-    }
-    let prand_slice = &rpa[3..6];
-    let prand: [u8; 3] = prand_slice.try_into().unwrap();
-    let hash_slice = &rpa[0..3];
-    let hash: [u8; 3] = hash_slice.try_into().unwrap();
+    };
+    rpa.reverse();
+    let prand = [rpa[3], rpa[4], rpa[5]];
+    let hash = [rpa[0], rpa[1], rpa[2]];
     let computed_hash = ah(irk, &prand);
     debug!(
         "Verifying RPA: addr={}, hash={:?}, computed_hash={:?}",
@@ -413,4 +405,56 @@ pub async fn start_le_monitor(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IRK: [u8; 16] = [
+        0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1,
+        0xF0,
+    ];
+
+    // The address string verify_rpa reads for a given hash and prand: the
+    // 6-byte little-endian array is hash then prand, and the string is that
+    // array reversed.
+    fn rpa_string(hash: [u8; 3], prand: [u8; 3]) -> String {
+        let le = [hash[0], hash[1], hash[2], prand[0], prand[1], prand[2]];
+        le.iter()
+            .rev()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    #[test]
+    fn verify_rpa_rejects_malformed_addresses() {
+        for bad in [
+            "ZZ:BB:CC:DD:EE:FF",
+            "",
+            "AA:BB",
+            "AA:BB:CC:DD:EE:FF:00",
+            "+A:BB:CC:DD:EE:FF",
+        ] {
+            assert!(!verify_rpa(bad, &IRK), "{bad:?} must not verify");
+        }
+    }
+
+    #[test]
+    fn verify_rpa_accepts_valid_rpa_and_rejects_bad_hash() {
+        // prand's top two bits are 01, as an RPA's are.
+        let prand = [0x01, 0x02, 0x5A];
+        let hash = ah(&IRK, &prand);
+        let addr = rpa_string(hash, prand);
+        assert!(verify_rpa(&addr, &IRK), "valid RPA {addr} must verify");
+
+        let mut bad_hash = hash;
+        bad_hash[0] ^= 0x01;
+        let forged = rpa_string(bad_hash, prand);
+        assert!(
+            !verify_rpa(&forged, &IRK),
+            "flipped hash {forged} must not verify"
+        );
+    }
 }
