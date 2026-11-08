@@ -1646,8 +1646,7 @@ mod tests {
             "SuspendSink(false)".to_string(),
             format!("Pause({player})"),
             format!("Play({player})"),
-            "ProfileOff".to_string(),
-            "ProfileA2dp".to_string(),
+            "ProfileCycle".to_string(),
             format!("Play({player})"),
         ]
         .map(|action| format!("Resume {action}"));

@@ -61,10 +61,9 @@ pub(crate) enum Action {
     Pause(String),
     /// MPRIS Play to this player service.
     Play(String),
-    /// Set the AirPods card profile to off.
-    ProfileOff,
-    /// Set the AirPods card's preferred A2DP profile.
-    ProfileA2dp,
+    /// Set the AirPods card profile to off, then back to its A2DP profile,
+    /// in one I/O call so nothing can stop it with the card off.
+    ProfileCycle,
 }
 
 enum Stage {
@@ -140,7 +139,7 @@ impl Chain {
                 KICK_WAIT,
             ),
             Stage::Kicked => (
-                vec![Action::ProfileOff, Action::ProfileA2dp],
+                vec![Action::ProfileCycle],
                 Stage::Cycled(still_playing()),
                 CYCLE_SETTLE,
             ),
@@ -380,18 +379,17 @@ mod tests {
                 Pause(Q.into()),
                 Play(P.into()),
                 Play(Q.into()),
-                ProfileOff,
-                ProfileA2dp,
+                ProfileCycle,
                 Play(Q.into()),
             ]
         );
         let cycle = (NUDGE_GAP + AUDIBLE_WAIT + KICK_GAP + KICK_WAIT).as_millis();
-        assert_eq!(steps[4], (cycle, vec![ProfileOff, ProfileA2dp]));
+        assert_eq!(steps[4], (cycle, vec![ProfileCycle]));
         assert_eq!(steps[5].0, cycle + CYCLE_SETTLE.as_millis());
 
         // Audible once the profile is back: no Play after the cycle.
         let steps = drive(&[P], |ms| (ms > cycle, players(&[P])));
-        assert_eq!(actions(&steps).last(), Some(&ProfileA2dp));
+        assert_eq!(actions(&steps).last(), Some(&ProfileCycle));
     }
 
     #[test]
@@ -405,8 +403,7 @@ mod tests {
                 all.extend(actions);
             }
         }
-        assert_eq!(all.iter().filter(|a| **a == ProfileOff).count(), 1);
-        assert_eq!(all.iter().filter(|a| **a == ProfileA2dp).count(), 1);
+        assert_eq!(all.iter().filter(|a| **a == ProfileCycle).count(), 1);
         assert_eq!(chain.step(chain.due(), false, &[]), None);
     }
 

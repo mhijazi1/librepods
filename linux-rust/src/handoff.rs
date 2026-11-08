@@ -774,11 +774,13 @@ impl Handoff {
             out.push(Command::PauseMedia);
         }
         // A take that found the transport idle gets its audio back (#200),
-        // unless the reconcile just released it.
+        // unless the reconcile just released it. Not during a call: the card
+        // is on HFP, so the idle A2DP transport says nothing.
         if pending.desired
             && self.automatic
             && self.live()
             && self.requested_take
+            && !self.local_call
             && self.pending.is_none()
             && self.a2dp_active == Some(false)
         {
@@ -3413,6 +3415,21 @@ mod tests {
         assert_eq!(p.feed(50, idle_transport()), []);
         assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
         assert_eq!(p.feed(200, Input::Ownership(vec![1])), []);
+    }
+
+    #[test]
+    fn take_ack_during_local_call_does_not_resume() {
+        // The call starts while the take is pending.
+        let mut p = take_with_idle_transport();
+        assert_eq!(p.feed(550, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+
+        // The call started before the take.
+        let mut p = Probe::ready();
+        assert_eq!(p.feed(20, idle_transport()), []);
+        assert_eq!(p.feed(30, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
     }
 
     #[test]

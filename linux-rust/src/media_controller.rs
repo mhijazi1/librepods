@@ -1730,31 +1730,48 @@ impl MediaController {
             },
             Action::Pause(service) => blocking(move || Self::mpris_call(&service, "Pause")).await,
             Action::Play(service) => blocking(move || Self::mpris_call(&service, "Play")).await,
-            // Set directly: no WirePlumber restart or availability wait.
-            Action::ProfileOff | Action::ProfileA2dp => {
+            // One card lookup and one choice for both sets, made before the
+            // card goes off. Set directly: no WirePlumber restart or wait.
+            Action::ProfileCycle => {
                 let Some(index) = find_card_index(mac).await else {
                     return false;
                 };
-                let choice = self.get_preferred_a2dp_profile(index).await;
-                let available = choice != ProfileChoice::Unavailable;
-                match resume_profile(action == Action::ProfileOff, choice) {
-                    Some(profile) => blocking(move || set_card_profile_sync(index, &profile)).await,
-                    None => available,
+                let (available, active) = self.get_card_profiles(index).await;
+                let cached = self.state.lock().await.cached_a2dp_profile.clone();
+                let profiles = resume_profiles(
+                    &available,
+                    active.as_deref(),
+                    &cached,
+                    crate::utils::load_preferred_codec(),
+                );
+                if profiles.is_empty() {
+                    info!("A2DP resume: no profile cycle from {active:?}");
                 }
+                blocking(move || profiles.iter().all(|p| set_card_profile_sync(index, p))).await
             }
         }
     }
 }
 
-/// The profile a step of the resume chain's profile cycle (#200) sets, from
-/// the A2DP choice resolved before it; None sets nothing. ProfileOff needs
-/// an A2DP profile to come back to, so a card without one never goes off.
-fn resume_profile(off: bool, choice: ProfileChoice) -> Option<String> {
-    match choice {
-        ProfileChoice::Unavailable => None,
-        _ if off => Some("off".to_string()),
-        ProfileChoice::Activate(profile) => Some(profile),
-        ProfileChoice::KeepActive(_) => None,
+/// The profiles the resume chain's profile cycle (#200) sets, in order:
+/// off, then the A2DP profile to return to (the active one if it is A2DP).
+/// Nothing without an A2DP profile to return to, and nothing on a call
+/// profile, so a call that started meanwhile keeps its audio. The card
+/// stays off only if setting the A2DP profile fails (logged as failed).
+fn resume_profiles(
+    available: &[String],
+    active: Option<&str>,
+    cached: &str,
+    preferred: crate::utils::PreferredCodec,
+) -> Vec<String> {
+    if crate::call_detect::is_call_profile(active) {
+        return Vec::new();
+    }
+    match select_a2dp_profile(available, active, Some(cached), preferred) {
+        ProfileChoice::KeepActive(profile) | ProfileChoice::Activate(profile) => {
+            vec!["off".to_string(), profile]
+        }
+        ProfileChoice::Unavailable => Vec::new(),
     }
 }
 
@@ -3506,24 +3523,31 @@ mod tests {
     }
 
     #[test]
-    fn resume_profile_cycle_never_turns_off_a_card_without_a2dp() {
-        // On HFP with no A2DP profile listed: neither step sets anything.
-        let available = profiles(&["off", "headset-head-unit"]);
+    fn resume_profile_cycle_returns_to_the_profile_it_left() {
+        let cycle = |available: &[&str], active, cached| {
+            resume_profiles(&profiles(available), active, cached, PreferredCodec::Aac)
+        };
+        // An active A2DP profile outside the codec order, empty cache.
+        assert_eq!(
+            cycle(&["off", "a2dp_sink"], Some("a2dp_sink"), ""),
+            ["off", "a2dp_sink"]
+        );
+        // Kept active with AAC preferred: back to the same codec.
+        let available = ["off", "a2dp-sink", "a2dp-sink-sbc"];
+        assert_eq!(
+            cycle(&available, Some("a2dp-sink-sbc"), ""),
+            ["off", "a2dp-sink-sbc"]
+        );
+        // Off already: to the cached choice.
+        assert_eq!(
+            cycle(&available, Some("off"), "a2dp-sink-sbc"),
+            ["off", "a2dp-sink-sbc"]
+        );
+        // No A2DP profile to return to: no cycle.
+        assert!(cycle(&["off", "headset-head-unit"], Some("off"), "").is_empty());
+        // A call on HFP: no cycle, even with A2DP available.
         let hfp = Some("headset-head-unit");
-        let choice = || select_a2dp_profile(&available, hfp, None, PreferredCodec::Aac);
-        assert_eq!(resume_profile(true, choice()), None);
-        assert_eq!(resume_profile(false, choice()), None);
-
-        // With A2DP to come back to: off, then the chosen profile.
-        let available = profiles(&["off", "headset-head-unit", "a2dp-sink"]);
-        let choice = |active| select_a2dp_profile(&available, active, None, PreferredCodec::Aac);
-        let off = Some("off".to_string());
-        assert_eq!(resume_profile(true, choice(Some("a2dp-sink"))), off);
-        assert_eq!(resume_profile(true, choice(hfp)), off);
-        let a2dp = Some("a2dp-sink".to_string());
-        assert_eq!(resume_profile(false, choice(Some("off"))), a2dp);
-        // Already back on A2DP: nothing to set.
-        assert_eq!(resume_profile(false, choice(Some("a2dp-sink"))), None);
+        assert!(cycle(&["off", "headset-head-unit", "a2dp-sink"], hfp, "").is_empty());
     }
 
     const TEST_INTERVAL: Duration = Duration::from_millis(1);
