@@ -15,7 +15,6 @@ use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
@@ -913,9 +912,10 @@ impl MediaController {
 
     async fn restart_wire_plumber(&self) -> bool {
         info!("Restarting WirePlumber to rediscover A2DP profiles");
-        let result = Command::new("systemctl")
+        let result = tokio::process::Command::new("systemctl")
             .args(["--user", "restart", "wireplumber"])
-            .output();
+            .output()
+            .await;
 
         match result {
             Ok(output) if output.status.success() => {
@@ -1251,28 +1251,47 @@ impl MediaController {
     }
 
     pub async fn deactivate_a2dp_profile(&self) {
+        self.deactivate_a2dp_profile_with(
+            |mac| async move { self.get_audio_device_index(&mac).await },
+            |index| set_card_profile_sync(index, "off"),
+        )
+        .await
+    }
+
+    /// `lookup` resolves the card by MAC; `set_off` turns the profile off.
+    async fn deactivate_a2dp_profile_with<L, LFut, S>(&self, lookup: L, set_off: S)
+    where
+        L: FnOnce(String) -> LFut,
+        LFut: std::future::Future<Output = Option<u32>>,
+        S: FnOnce(u32) -> bool + Send + 'static,
+    {
         debug!("Entering deactivate_a2dp_profile");
-        let mut state = self.state.lock().await;
+        // Snapshot and drop the guard: the lookup can poll for ~3 s (#33).
+        let (mac, cached) = {
+            let state = self.state.lock().await;
+            (state.connected_device_mac.clone(), state.device_index)
+        };
+        let index = match cached {
+            Some(index) => Some(index),
+            None => {
+                let index = lookup(mac.clone()).await;
+                self.state.lock().await.device_index = index;
+                index
+            }
+        };
 
-        if state.device_index.is_none() {
-            state.device_index = self
-                .get_audio_device_index(&state.connected_device_mac)
-                .await;
-        }
-
-        if state.connected_device_mac.is_empty() || state.device_index.is_none() {
-            warn!("Connected device MAC or index is empty, cannot deactivate A2DP profile");
-            return;
-        }
-        let device_index = state.device_index.unwrap();
-        drop(state);
+        let device_index = match index {
+            Some(index) if !mac.is_empty() => index,
+            _ => {
+                warn!("Connected device MAC or index is empty, cannot deactivate A2DP profile");
+                return;
+            }
+        };
 
         info!("Deactivating A2DP profile for AirPods by setting to off");
 
         let success = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                set_card_profile_sync(device_index, "off")
-            }))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| set_off(device_index)))
                 .unwrap_or_else(|e| {
                     warn!("Panic in set_card_profile_sync: {:?}", e);
                     false
@@ -2462,6 +2481,54 @@ mod tests {
             (false, CARD_LOOKUP_ATTEMPTS_PER_CHECK, 0, false)
         );
         assert_eq!(controller.state.lock().await.device_index, None);
+    }
+
+    #[tokio::test]
+    async fn deactivate_releases_state_during_card_lookup() {
+        let controller = MediaController::new("00:00:00:00:00:01".to_string(), String::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let set_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn({
+            let controller = controller.clone();
+            let set_called = set_called.clone();
+            async move {
+                controller
+                    .deactivate_a2dp_profile_with(
+                        |_| async move {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.await;
+                            None
+                        },
+                        move |_| {
+                            set_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                            true
+                        },
+                    )
+                    .await
+            }
+        });
+
+        started_rx.await.unwrap();
+        assert!(controller.state.try_lock().is_ok());
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(controller.state.lock().await.device_index, None);
+        assert!(!set_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn deactivate_cached_index_skips_lookup() {
+        let controller = MediaController::new("00:00:00:00:00:01".to_string(), String::new());
+        controller.state.lock().await.device_index = Some(7);
+        let (set_tx, set_rx) = std::sync::mpsc::channel();
+        controller
+            .deactivate_a2dp_profile_with(
+                |_| async { panic!("cached index must skip the lookup") },
+                move |index| set_tx.send(index).is_ok(),
+            )
+            .await;
+        assert_eq!(set_rx.try_recv(), Ok(7));
     }
 
     use crate::utils::PreferredCodec;
