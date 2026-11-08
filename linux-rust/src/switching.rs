@@ -748,7 +748,7 @@ impl Switching {
                 let owns = value.first().copied().unwrap_or(0) != 0;
                 if !owns {
                     info!("Lost ownership, pausing media and disconnecting audio");
-                    let controller = mc_clone_owns.lock().await;
+                    let controller = mc_clone_owns.lock().await.clone();
                     controller.pause_all_media().await;
                     controller.deactivate_a2dp_profile().await;
                 }
@@ -858,7 +858,7 @@ impl Legacy {
                 );
                 let _ =
                     command_tx_clone.send((ControlCommandIdentifiers::OwnsConnection, vec![0x00]));
-                let controller = mc_clone.lock().await;
+                let controller = mc_clone.lock().await.clone();
                 controller.pause_all_media().await;
                 controller.deactivate_a2dp_profile().await;
             }
