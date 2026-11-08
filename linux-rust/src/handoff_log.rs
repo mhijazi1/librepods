@@ -227,11 +227,14 @@ pub(crate) struct Report {
 }
 
 /// The report of the records after the last session_start, or None when
-/// the log has none. Lines that are not records (a torn last write) are
-/// skipped.
-pub(crate) fn report(log: &str) -> Option<Report> {
+/// the log has none. Lines that are not records (a torn last write, even
+/// one cut inside a UTF-8 character) are skipped.
+pub(crate) fn report(log: &[u8]) -> Option<Report> {
     let mut report = None;
-    for record in log.lines().filter_map(|l| serde_json::from_str(l).ok()) {
+    for record in log
+        .split(|&b| b == b'\n')
+        .filter_map(|l| serde_json::from_slice(l).ok())
+    {
         match record {
             Record::SessionStart { ts_ms, .. } => {
                 report = Some(Report {
@@ -283,7 +286,7 @@ pub(crate) fn report_message(path: Option<&Path>) -> String {
     let Some(path) = path else {
         return "No handoff log: neither XDG_STATE_HOME nor HOME is set.".to_string();
     };
-    match std::fs::read_to_string(path) {
+    match std::fs::read(path) {
         Ok(log) => match report(&log) {
             Some(report) => report.to_string(),
             None => format!("The handoff log {} has no session yet.", path.display()),
@@ -473,7 +476,7 @@ mod tests {
         Log::open(&path, Source::App).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1, "{text}");
-        assert!(report(&text).is_some());
+        assert!(report(text.as_bytes()).is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -499,9 +502,37 @@ mod tests {
         let Ok(Record::SessionStart { ts_ms, .. }) = serde_json::from_str(new_start) else {
             panic!("the new session_start is not a line of its own:\n{text}");
         };
-        let report = report(&text).unwrap();
+        let report = report(text.as_bytes()).unwrap();
         assert_eq!(report.started_ms, ts_ms, "{text}");
         assert_eq!(report.takeovers, 1, "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_reopen_after_torn_utf8_tail() {
+        let dir = temp_dir("torn-utf8");
+        let path = dir.join("handoff.jsonl");
+        let mut old = concat!(
+            r#"{"record":"session_start","ts_ms":1000,"version":"0.1.0","source":"app"}"#,
+            "\n",
+            r#"{"record":"line","ts_ms":2000,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_linux","line":"ACK owner=linux elapsed_ms=1"}"#,
+            "\n",
+            r#"{"record":"line","ts_ms":2500,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_linux","line":"ACK owner=linux elapsed_ms=2"}"#,
+            "\n",
+            r#"{"record":"line","ts_ms":3000,"mac":"AA:BB:CC:DD:EE:FF","kind":"reconnect_failed","line":"RECONNECT failed: caf"#,
+        )
+        .as_bytes()
+        .to_vec();
+        // The first byte of "é": the write was cut inside the character.
+        old.push(0xC3);
+        std::fs::write(&path, old).unwrap();
+        let log = Log::open(&path, Source::App).unwrap();
+        log.line("AA:BB:CC:DD:EE:FF", "ACK owner=linux elapsed_ms=5");
+        drop(log);
+        let message = report_message(Some(&path));
+        assert!(!message.starts_with("Cannot read"), "{message}");
+        assert!(message.starts_with("Last handoff session"), "{message}");
+        assert!(message.contains("takeovers:     1\n"), "{message}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -518,7 +549,7 @@ mod tests {
     fn report_counts_only_the_last_session_of_the_fixture() {
         let fixture = include_str!("../tests/fixtures/handoff_session.jsonl");
         assert_eq!(
-            report(fixture),
+            report(fixture.as_bytes()),
             Some(Report {
                 started_ms: 1_762_590_000_000,
                 duration_ms: 95_500,
@@ -609,7 +640,7 @@ mod tests {
         );
 
         assert_eq!(
-            report(&log),
+            report(log.as_bytes()),
             Some(Report {
                 started_ms: 0,
                 duration_ms: timeout + 200,
