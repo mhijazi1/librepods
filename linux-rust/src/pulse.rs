@@ -80,7 +80,7 @@ pub(crate) fn wait<F: ?Sized>(
 /// since `Operation::from_raw` keeps no pointer for a non-null callback.
 /// So the collected items go when the caller drops `state`.
 // shortcut: each operation `wait` gives up on leaks its boxed callback and
-// the emptied Rc allocation of `state`, a few dozen bytes (#TBD).
+// the emptied Rc allocation of `state`, a few dozen bytes (#125).
 pub(crate) fn update<T>(state: &Weak<RefCell<T>>, f: impl FnOnce(&mut T)) {
     if let Some(state) = state.upgrade() {
         f(&mut state.borrow_mut());
