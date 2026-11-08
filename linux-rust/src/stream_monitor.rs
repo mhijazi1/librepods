@@ -127,52 +127,48 @@ impl StreamSource for PulseStreams {
         let (mut mainloop, context) = connect()?;
         let introspector = context.introspect();
 
-        let monitors: Rc<RefCell<HashSet<u32>>> = Rc::default();
+        let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
         let op = introspector.get_source_info_list({
             let monitors = monitors.clone();
             move |result| {
-                if let ListResult::Item(source) = result
-                    && source.monitor_of_sink.is_some()
-                {
-                    monitors.borrow_mut().insert(source.index);
-                }
+                monitors.borrow_mut().record(result, |source| {
+                    source.monitor_of_sink.is_some().then_some(source.index)
+                })
             }
         });
         wait(&mut mainloop, &op, "source list")?;
+        let monitors: HashSet<u32> = monitors.take().finish("source list")?.into_iter().collect();
 
-        let outputs: Rc<RefCell<Vec<(u32, BTreeMap<String, String>)>>> = Rc::default();
+        let outputs: Rc<RefCell<ListAccumulator<(u32, BTreeMap<String, String>)>>> = Rc::default();
         let op = introspector.get_source_output_info_list({
             let outputs = outputs.clone();
             move |result| {
-                if let ListResult::Item(output) = result {
-                    outputs
-                        .borrow_mut()
-                        .push((output.source, props(&output.proplist)));
-                }
+                outputs.borrow_mut().record(result, |output| {
+                    Some((output.source, props(&output.proplist)))
+                })
             }
         });
         wait(&mut mainloop, &op, "source output list")?;
+        let outputs = outputs.take().finish("source output list")?;
 
-        let cards: Rc<RefCell<Vec<(String, Option<String>)>>> = Rc::default();
+        let cards: Rc<RefCell<ListAccumulator<(String, Option<String>)>>> = Rc::default();
         let op = introspector.get_card_info_list({
             let cards = cards.clone();
             move |result| {
-                if let ListResult::Item(card) = result
-                    && let Some(name) = &card.name
-                {
+                cards.borrow_mut().record(result, |card| {
+                    let name = card.name.as_ref()?.to_string();
                     let profile = card
                         .active_profile
                         .as_ref()
                         .and_then(|p| p.name.as_ref().map(|n| n.to_string()));
-                    cards.borrow_mut().push((name.to_string(), profile));
-                }
+                    Some((name, profile))
+                })
             }
         });
         wait(&mut mainloop, &op, "card list")?;
+        let cards = cards.take().finish("card list")?;
 
-        let monitors = monitors.take();
         let streams = outputs
-            .take()
             .into_iter()
             .map(|(source, props)| StreamProps {
                 direction: StreamDirection::Capture,
@@ -180,10 +176,59 @@ impl StreamSource for PulseStreams {
                 monitor: monitors.contains(&source),
             })
             .collect();
-        Ok(AudioSnapshot {
-            streams,
-            cards: cards.take(),
-        })
+        Ok(AudioSnapshot { streams, cards })
+    }
+}
+
+/// The results of one libpulse list query, shared by every list callback so
+/// that a failed or truncated listing is an error rather than a short list.
+/// libpulse delivers each entry as `Item`, then exactly one `End` on success
+/// or one `Error` on failure; an operation can also finish (or be cancelled)
+/// without either.
+#[derive(Debug)]
+struct ListAccumulator<T> {
+    items: Vec<T>,
+    failed: bool,
+    ended: bool,
+}
+
+impl<T> Default for ListAccumulator<T> {
+    fn default() -> Self {
+        ListAccumulator {
+            items: Vec::new(),
+            failed: false,
+            ended: false,
+        }
+    }
+}
+
+impl<T> ListAccumulator<T> {
+    /// Record one callback result. `keep` maps an item to the value to keep,
+    /// or None to skip that item (it is not an error).
+    fn record<I>(&mut self, result: ListResult<I>, keep: impl FnOnce(I) -> Option<T>) {
+        match result {
+            ListResult::Item(item) => {
+                if let Some(value) = keep(item) {
+                    self.items.push(value);
+                }
+            }
+            ListResult::End => self.ended = true,
+            ListResult::Error => self.failed = true,
+        }
+    }
+
+    /// The kept items once the operation is over: Err if the server reported
+    /// an error or the list never reached its end.
+    fn finish(self, what: &str) -> io::Result<Vec<T>> {
+        if self.failed {
+            return Err(io::Error::other(format!(
+                "PulseAudio {what} reported an error"
+            )));
+        }
+        if !self.ended {
+            return Err(io::Error::other(format!("PulseAudio {what} ended early")));
+        }
+        Ok(self.items)
     }
 }
 
@@ -349,6 +394,63 @@ mod tests {
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), Some(false));
+    }
+
+    #[test]
+    fn list_accumulator_items_then_end_is_ok() {
+        let mut list = ListAccumulator::default();
+        list.record(ListResult::Item(1), Some);
+        list.record(ListResult::Item(2), Some);
+        list.record(ListResult::End, Some);
+        assert_eq!(list.finish("test list").unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn list_accumulator_skips_unkept_items() {
+        let mut list = ListAccumulator::default();
+        list.record(ListResult::Item(1), |n: i32| (n > 1).then_some(n));
+        list.record(ListResult::Item(2), |n: i32| (n > 1).then_some(n));
+        list.record(ListResult::End, |n: i32| Some(n));
+        assert_eq!(list.finish("test list").unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn list_accumulator_error_is_err() {
+        let mut list = ListAccumulator::default();
+        list.record(ListResult::Item(1), Some);
+        list.record(ListResult::Error, Some);
+        list.record(ListResult::End, Some);
+        assert!(list.finish("test list").is_err());
+    }
+
+    #[test]
+    fn list_accumulator_without_end_is_err() {
+        let mut list = ListAccumulator::default();
+        list.record(ListResult::Item(1), Some);
+        assert!(list.finish("test list").is_err());
+        assert!(
+            ListAccumulator::<i32>::default()
+                .finish("test list")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poller_holds_call_through_failed_snapshot() {
+        // A card listing that never reached End, as PulseStreams sees it.
+        let mut truncated = ListAccumulator::default();
+        truncated.record(ListResult::Item(()), Some);
+        let failed = truncated
+            .finish("card list")
+            .map(|_| AudioSnapshot::default());
+        assert!(failed.is_err());
+        let mut source = FakeSource::new(vec![in_call(), failed, in_call()]);
+        let mut poller = CallPoller::default();
+        assert_eq!(poller.poll(&mut source, MAC), Some(true));
+        // The failed snapshot does not end the call...
+        assert_eq!(poller.poll(&mut source, MAC), None);
+        // ...and the next good snapshot, still in the call, is no change.
+        assert_eq!(poller.poll(&mut source, MAC), None);
     }
 
     #[tokio::test]
