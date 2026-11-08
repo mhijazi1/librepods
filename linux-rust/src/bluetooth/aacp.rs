@@ -1138,6 +1138,13 @@ fn opack_write_true(out: &mut Vec<u8>) {
     out.push(0x01);
 }
 
+// Back-reference to an earlier object in the same dict (0xA0 + index, index
+// < 32). Apple's captured Hijackv2 payload uses 0xA5 for remotescore (301).
+fn opack_write_ref(out: &mut Vec<u8>, index: u8) {
+    debug_assert!(index < 0x20);
+    out.push(0xA0 + index);
+}
+
 // Dictionary header for `count` key/value pairs (count < 15).
 fn opack_write_dict_header(out: &mut Vec<u8>, count: u8) {
     debug_assert!(count < 0x0F);
@@ -1198,10 +1205,18 @@ pub(crate) fn tipi_body(
 
 // Smart-routing data packet: opcode, reversed target MAC, u16 LE length of
 // what follows (the 0x01 byte plus the dict), 0x01, then the dict with no
-// padding.
+// padding. A dict too long for the u16 length field is an InvalidInput error.
 fn smart_routing_packet(target_mac_address: &str, dict: &[u8]) -> std::io::Result<Vec<u8>> {
     let mac = reversed_mac_bytes(target_mac_address)?;
-    let length = u16::try_from(1 + dict.len()).expect("smart-routing dict exceeds u16 length");
+    let length = u16::try_from(1 + dict.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "smart-routing dict of {} bytes does not fit the u16 length field",
+                dict.len()
+            ),
+        )
+    })?;
     let mut packet = Vec::with_capacity(11 + dict.len());
     packet.extend_from_slice(&[opcodes::SMART_ROUTING, 0x00]);
     packet.extend_from_slice(&mac);
@@ -1232,32 +1247,19 @@ pub(crate) fn encode_media_information_new_device(
 }
 
 pub(crate) fn encode_hijack_request(target_mac_address: &str) -> std::io::Result<Vec<u8>> {
-    let opcode = [opcodes::SMART_ROUTING, 0x00];
-    let mut buffer = Vec::with_capacity(106);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address)?);
-    buffer.extend_from_slice(&[0x62, 0x00]);
-    buffer.extend_from_slice(&[0x01, 0xE5]);
-    buffer.push(0x4A);
-    buffer.extend_from_slice(b"localscore");
-    buffer.extend_from_slice(&[0x30, 0x64]);
-    buffer.push(0x46);
-    buffer.extend_from_slice(b"reason");
-    buffer.push(0x48);
-    buffer.extend_from_slice(b"Hijackv2");
-    buffer.push(0x51);
-    buffer.extend_from_slice(b"audioRoutingScore");
-    buffer.extend_from_slice(&[0x31, 0x2D, 0x01, 0x5F]);
-    buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-    buffer.push(0x01);
-    buffer.push(0x4B);
-    buffer.extend_from_slice(b"remotescore");
-    buffer.push(0xA5);
-
-    while buffer.len() < 106 {
-        buffer.push(0x00);
-    }
-
-    Ok([opcode.as_slice(), buffer.as_slice()].concat())
+    let mut dict = Vec::with_capacity(97);
+    opack_write_dict_header(&mut dict, 5);
+    opack_write_str(&mut dict, "localscore");
+    opack_write_uint(&mut dict, 100);
+    opack_write_str(&mut dict, "reason");
+    opack_write_str(&mut dict, "Hijackv2");
+    opack_write_str(&mut dict, "audioRoutingScore");
+    opack_write_uint(&mut dict, 301);
+    opack_write_str(&mut dict, "audioRoutingSetOwnershipToFalse");
+    opack_write_true(&mut dict);
+    opack_write_str(&mut dict, "remotescore");
+    opack_write_ref(&mut dict, 5);
+    smart_routing_packet(target_mac_address, &dict)
 }
 
 pub(crate) fn encode_media_information(
@@ -1276,59 +1278,37 @@ pub(crate) fn encode_media_information(
 }
 
 pub(crate) fn encode_smart_routing_show_ui(target_mac_address: &str) -> std::io::Result<Vec<u8>> {
-    let opcode = [opcodes::SMART_ROUTING, 0x00];
-    let mut buffer = Vec::with_capacity(134);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address)?);
-    buffer.extend_from_slice(&[0x7E, 0x00]);
-    buffer.extend_from_slice(&[0x01, 0xE6, 0x5B]);
-    buffer.extend_from_slice(b"SmartRoutingKeyShowNearbyUI");
-    buffer.push(0x01);
-    buffer.push(0x4A);
-    buffer.extend_from_slice(b"localscore");
-    buffer.extend_from_slice(&[0x31, 0x2D]);
-    buffer.push(0x01);
-    buffer.push(0x46);
-    buffer.extend_from_slice(b"reasonHhijackv2");
-    buffer.push(0x51);
-    buffer.extend_from_slice(b"audioRoutingScore");
-    buffer.push(0xA2);
-    buffer.push(0x5F);
-    buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-    buffer.push(0x01);
-    buffer.push(0x4B);
-    buffer.extend_from_slice(b"remotescore");
-    buffer.push(0xA2);
-
-    while buffer.len() < 134 {
-        buffer.push(0x00);
-    }
-
-    Ok([opcode.as_slice(), buffer.as_slice()].concat())
+    let mut dict = Vec::with_capacity(125);
+    opack_write_dict_header(&mut dict, 6);
+    opack_write_str(&mut dict, "SmartRoutingKeyShowNearbyUI");
+    opack_write_true(&mut dict);
+    opack_write_str(&mut dict, "localscore");
+    opack_write_uint(&mut dict, 301);
+    opack_write_str(&mut dict, "reason");
+    // Lower-case "hijackv2" is deliberate. The old literal "reasonHhijackv2"
+    // was the key "reason" followed by the string-length tag for eight bytes
+    // and "hijackv2", so this writes the same bytes. Don't capitalise it.
+    opack_write_str(&mut dict, "hijackv2");
+    opack_write_str(&mut dict, "audioRoutingScore");
+    opack_write_ref(&mut dict, 2);
+    opack_write_str(&mut dict, "audioRoutingSetOwnershipToFalse");
+    opack_write_true(&mut dict);
+    opack_write_str(&mut dict, "remotescore");
+    opack_write_ref(&mut dict, 2);
+    smart_routing_packet(target_mac_address, &dict)
 }
 
 // Caller arrives with #17 (Undo notification).
 pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> std::io::Result<Vec<u8>> {
-    let opcode = [opcodes::SMART_ROUTING, 0x00];
-    let mut buffer = Vec::with_capacity(97);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address)?);
-    buffer.extend_from_slice(&[0x59, 0x00]);
-    buffer.extend_from_slice(&[0x01, 0xE3]);
-    buffer.push(0x5F);
-    buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-    buffer.push(0x01);
-    buffer.push(0x59);
-    buffer.extend_from_slice(b"audioRoutingShowReverseUI");
-    buffer.push(0x01);
-    buffer.push(0x46);
-    buffer.extend_from_slice(b"reason");
-    buffer.push(0x53);
-    buffer.extend_from_slice(b"ReverseBannerTapped");
-
-    while buffer.len() < 97 {
-        buffer.push(0x00);
-    }
-
-    Ok([opcode.as_slice(), buffer.as_slice()].concat())
+    let mut dict = Vec::with_capacity(88);
+    opack_write_dict_header(&mut dict, 3);
+    opack_write_str(&mut dict, "audioRoutingSetOwnershipToFalse");
+    opack_write_true(&mut dict);
+    opack_write_str(&mut dict, "audioRoutingShowReverseUI");
+    opack_write_true(&mut dict);
+    opack_write_str(&mut dict, "reason");
+    opack_write_str(&mut dict, "ReverseBannerTapped");
+    smart_routing_packet(target_mac_address, &dict)
 }
 
 pub(crate) fn encode_add_tipi_device(
@@ -2022,6 +2002,45 @@ mod tests {
         assert_eq!(t, [0x01]);
     }
 
+    #[test]
+    fn opack_value_writer_long_strings() {
+        // 0x62 <u16 LE len> from 256 bytes, 0x63 <u24 LE len> from 65536.
+        let s256 = "a".repeat(256);
+        let enc256 = opack_str(&s256);
+        assert_eq!(enc256[..3], [0x62, 0x00, 0x01]);
+        assert_eq!(&enc256[3..], s256.as_bytes());
+
+        let s65535 = "b".repeat(65535);
+        let enc65535 = opack_str(&s65535);
+        assert_eq!(enc65535[..3], [0x62, 0xFF, 0xFF]);
+        assert_eq!(enc65535.len(), 3 + 65535);
+
+        let s65536 = "c".repeat(65536);
+        let enc65536 = opack_str(&s65536);
+        assert_eq!(enc65536[..4], [0x63, 0x00, 0x00, 0x01]);
+        assert_eq!(&enc65536[4..], s65536.as_bytes());
+
+        // The walker reads each long form back to its exact end.
+        assert_eq!(opack_walk(&enc256, 0), Ok(enc256.len()));
+        assert_eq!(opack_walk(&enc65535, 0), Ok(enc65535.len()));
+        assert_eq!(opack_walk(&enc65536, 0), Ok(enc65536.len()));
+    }
+
+    #[test]
+    fn opack_write_ref_boundaries() {
+        let mut out = Vec::new();
+        opack_write_ref(&mut out, 0);
+        assert_eq!(out, [0xA0]);
+
+        let mut out = Vec::new();
+        opack_write_ref(&mut out, 5);
+        assert_eq!(out, [0xA5]);
+
+        let mut out = Vec::new();
+        opack_write_ref(&mut out, 31);
+        assert_eq!(out, [0xBF]);
+    }
+
     // Apple's relay payloads from #35 (mo's "Decision (mo, 2026-11-07):
     // option (b)" comment): audioaccessoryd / BTSmartRoutingDaemon hex dumps
     // of the OPACK dicts the iPhone sent through the AirPods, copied verbatim.
@@ -2183,7 +2202,8 @@ mod tests {
     // Test-only OPACK walker. Returns the offset just past the object that
     // starts at `pos`, or an error for an unknown tag or a truncated value.
     // Handles bools 0x01/0x02, ints 0x08-0x2F and 0x30/0x31/0x32, strings
-    // 0x40-0x60 and 0x61 <u8 len>, back-references 0xA0-0xBF and dicts
+    // 0x40-0x60, 0x61 <u8 len>, 0x62 <u16 len>, 0x63 <u24 len> and 0x64 <u32
+    // len>, back-references 0xA0-0xBF and dicts
     // 0xE0-0xEE (0xEF: until 0x03). Dict keys must be strings.
     fn opack_walk(buf: &[u8], pos: usize) -> WalkResult<usize> {
         let tag = *buf
@@ -2207,7 +2227,7 @@ mod tests {
         };
         let dict_key = |p: usize| -> WalkResult<usize> {
             match buf.get(p) {
-                Some(0x40..=0x61) => opack_walk(buf, p),
+                Some(0x40..=0x64) => opack_walk(buf, p),
                 Some(t) => Err(format!("dict key at {p} has non-string tag {t:#04x}")),
                 None => Err(format!("truncated: no dict key at {p}")),
             }
@@ -2224,6 +2244,16 @@ mod tests {
                     .get(pos + 1)
                     .ok_or_else(|| format!("truncated: no string length at {}", pos + 1))?;
                 string(pos + 2, n as usize)
+            }
+            0x62..=0x64 => {
+                // Little-endian length of 2, 3 or 4 bytes.
+                let width = (tag - 0x60) as usize;
+                let end = take(pos + 1, width)?;
+                let n = buf[pos + 1..end]
+                    .iter()
+                    .enumerate()
+                    .fold(0usize, |acc, (i, b)| acc | ((*b as usize) << (8 * i)));
+                string(end, n)
             }
             0xA0..=0xBF => Ok(pos + 1),
             0xE0..=0xEE => {
@@ -2320,6 +2350,25 @@ mod tests {
                 panic!("{name}: {e}");
             }
         }
+    }
+
+    #[test]
+    fn smart_routing_packet_rejects_oversized_dict_without_panicking() {
+        // 1 + 65535 does not fit the u16 length field.
+        let err = smart_routing_packet(GOLDEN_TARGET_MAC, &vec![0u8; 65535])
+            .expect_err("an oversized dict must be an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn smart_routing_packet_largest_dict_frames_correctly() {
+        // 1 + 65534 == 0xFFFF is the largest length the field can carry.
+        let packet = smart_routing_packet(GOLDEN_TARGET_MAC, &vec![0u8; 65534])
+            .expect("the largest dict that fits must frame");
+        assert_eq!(packet.len(), 11 + 65534);
+        assert_eq!(packet[..2], [opcodes::SMART_ROUTING, 0x00]);
+        assert_eq!(packet[8..10], [0xFF, 0xFF]);
+        assert_eq!(packet[10], 0x01);
     }
 
     #[test]
