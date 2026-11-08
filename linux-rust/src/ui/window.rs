@@ -99,6 +99,15 @@ fn charging_marker(entry: Option<&BatteryInfo>) -> &'static str {
     }
 }
 
+/// Note under the "Connect to this computer" picker: connectMode is only
+/// acted on in handoff switching mode, so other modes say so.
+fn connect_mode_hint(mode: crate::utils::SwitchingMode) -> Option<&'static str> {
+    match mode {
+        crate::utils::SwitchingMode::Handoff => None,
+        _ => Some("Applies only when switching mode is handoff"),
+    }
+}
+
 /// Text under a connected AirPods tab. If a Headphone entry exists (any status) only
 /// that is shown; otherwise Left, Right and Case. Every level goes through
 /// `battery_label`, so a missing or Disconnected entry is `--`, never its raw byte.
@@ -199,6 +208,8 @@ pub struct App {
     /// Each AirPods' "Connect to this computer" (#16), read from
     /// preferences.json when the device connects.
     connect_modes: HashMap<String, ConnectMode>,
+    /// Switching mode as of the last AirPods connection, for the picker's hint.
+    switching_mode: crate::utils::SwitchingMode,
 }
 
 pub struct BluetoothState {
@@ -345,6 +356,7 @@ impl App {
                 stem_control,
                 preferred_codec,
                 connect_modes: HashMap::new(),
+                switching_mode: crate::utils::SwitchingMode::default(),
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -475,6 +487,7 @@ impl App {
                                 };
                                 self.connect_modes
                                     .insert(mac.clone(), crate::utils::load_connect_mode(&mac));
+                                self.switching_mode = crate::utils::load_switching_mode();
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
                                     battery: state.battery_info.clone(),
@@ -1025,7 +1038,7 @@ impl App {
                                                 DeviceState::AirPods(state) => {
                                                     device_managers.get(id).and_then(|managers| {
                                                         managers.get_aacp().map(|aacp_manager| container(column![
-                                                            container(
+                                                            container(column![
                                                                 row![
                                                                     text("Connect to this computer").size(16).width(Length::Fill),
                                                                     pick_list(
@@ -1035,8 +1048,16 @@ impl App {
                                                                     )
                                                                 ]
                                                                     .align_y(Center)
-                                                                    .spacing(12)
-                                                            )
+                                                                    .spacing(12),
+                                                                // Void (skipped) when None.
+                                                                connect_mode_hint(self.switching_mode).map(|hint| text(hint).size(12).style(
+                                                                    |theme: &Theme| {
+                                                                        let mut style = text::Style::default();
+                                                                        style.color = Some(theme.palette().text.scale_alpha(0.7));
+                                                                        style
+                                                                    }
+                                                                )),
+                                                            ])
                                                                 .padding(Padding {
                                                                     top: 20.0,
                                                                     bottom: 0.0,
@@ -1922,6 +1943,16 @@ mod tests {
                     mode
                 );
             }
+        }
+    }
+
+    #[test]
+    fn connect_mode_hint_only_outside_handoff() {
+        use crate::utils::SwitchingMode;
+        assert_eq!(connect_mode_hint(SwitchingMode::Handoff), None);
+        for mode in [SwitchingMode::Legacy, SwitchingMode::Off] {
+            let hint = connect_mode_hint(mode).unwrap();
+            assert!(hint.to_lowercase().contains("handoff"), "{mode:?}: {hint}");
         }
     }
 }
