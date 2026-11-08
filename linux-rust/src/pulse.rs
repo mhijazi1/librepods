@@ -219,8 +219,11 @@ fn query<T>(
         eol: 0,
     }));
     let op = start(context.0, list.cast());
-    let result = if op.is_null() {
-        Err(pulse_error(what))
+    // SAFETY: `list` came from `Box::into_raw` above; each path below calls
+    // this once, when no callback can touch `list` any more.
+    let free = || unsafe { Box::from_raw(list) };
+    let (result, list) = if op.is_null() {
+        (Err(pulse_error(what)), free())
     } else {
         let result = run_until(
             OPERATION_TIMEOUT,
@@ -230,20 +233,17 @@ fn query<T>(
             || operation_done(unsafe { sys::pa_operation_get_state(op) }, what),
             |left| iterate(&mut mainloop, left),
         );
-        // SAFETY: `op` is live until the unref. A Done or Cancelled
-        // operation never calls back again, and cancelling a Running one
-        // unlinks its callback, so nothing reaches `list` after this.
-        unsafe {
-            if sys::pa_operation_get_state(op) == OperationState::Running {
-                sys::pa_operation_cancel(op);
-            }
-            sys::pa_operation_unref(op);
-        }
-        result
+        // SAFETY (all three): `op` is live until the unref. A Done or
+        // Cancelled operation never calls back again, and cancelling a
+        // Running one unlinks its callback, so nothing reaches `list` after.
+        let list = finish_op(
+            || unsafe { sys::pa_operation_get_state(op) },
+            || unsafe { sys::pa_operation_cancel(op) },
+            || unsafe { sys::pa_operation_unref(op) },
+            free,
+        );
+        (result, list)
     };
-    // SAFETY: `list` came from `Box::into_raw` above and, per the block
-    // above, no callback can touch it any more.
-    let list = unsafe { Box::from_raw(list) };
     result?;
     match list.eol {
         0 => Err(io::Error::other(format!("PulseAudio {what} ended early"))),
@@ -252,6 +252,22 @@ fn query<T>(
         ))),
         _ => Ok(list.items),
     }
+}
+
+/// End an operation `query` waited on: cancel it if still Running, so its
+/// callback is unlinked, unref it, and only then `free` the callback's
+/// userdata.
+fn finish_op<R>(
+    state: impl FnOnce() -> OperationState,
+    cancel: impl FnOnce(),
+    unref: impl FnOnce(),
+    free: impl FnOnce() -> R,
+) -> R {
+    if state() == OperationState::Running {
+        cancel();
+    }
+    unref();
+    free()
 }
 
 /// Add one callback's entry, or its end mark if it has none, to `list`.
@@ -432,6 +448,39 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         // A step that blocks for all it is given ends the wait after one.
         assert_eq!(steps, [OPERATION_TIMEOUT]);
+    }
+
+    /// Runs `finish_op` on an operation in `state` and returns the calls it
+    /// made, in order.
+    fn finish_calls(state: OperationState) -> Vec<&'static str> {
+        let calls = RefCell::new(Vec::new());
+        let call = |name| calls.borrow_mut().push(name);
+        finish_op(
+            || state,
+            || call("cancel"),
+            || call("unref"),
+            || call("free"),
+        );
+        calls.into_inner()
+    }
+
+    #[test]
+    fn query_cancels_timed_out_op_before_free() {
+        let (result, _) = virtual_run(OPERATION_TIMEOUT, Duration::MAX, || {
+            operation_done(OperationState::Running, "test")
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            finish_calls(OperationState::Running),
+            ["cancel", "unref", "free"]
+        );
+    }
+
+    #[test]
+    fn query_frees_ended_op_after_unref_without_cancel() {
+        for state in [OperationState::Done, OperationState::Cancelled] {
+            assert_eq!(finish_calls(state), ["unref", "free"], "{state:?}");
+        }
     }
 
     #[test]
