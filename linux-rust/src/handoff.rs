@@ -3220,6 +3220,25 @@ mod tests {
         assert_eq!(p.play(2000, true), []);
         assert_eq!(skips(&mut p), 1);
 
+        // A remote request after Linux's playback release was acknowledged.
+        let mut p = last_owner_take();
+        assert_eq!(p.play(1100, false), []);
+        assert_eq!(p.hold_ends(1100), [SendOwnership(false)]);
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(1300, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.play(2000, true), []);
+        assert_eq!(skips(&mut p), 1);
+
+        // A remote request after Linux's user release was acknowledged.
+        let mut p = ready_in(WhenLastConnected);
+        assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
+        assert_eq!(p.feed(200, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(300, Input::Release), [SendOwnership(false)]);
+        assert_eq!(p.feed(400, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(p.feed(500, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.play(1000, true), []);
+        assert_eq!(skips(&mut p), 1);
+
         // A remote host already given the AirPods asks again.
         let mut p = ready_in(WhenLastConnected);
         assert_eq!(p.feed(20, Input::Ownership(vec![1])), []);
