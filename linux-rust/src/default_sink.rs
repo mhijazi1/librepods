@@ -80,32 +80,39 @@ impl DefaultSinkRouter {
     }
 }
 
-/// Plan and apply each event in order. The memory changes only when every
-/// action succeeded, so a failed take remembers nothing new.
+/// Plan and apply each event in order.
 async fn run(io: impl DefaultSinkIo, mut events: mpsc::UnboundedReceiver<SinkEvent>) {
     let mut remembered: Option<String> = None;
     while let Some(event) = events.recv().await {
-        let airpods = io.airpods_sink().await;
-        let current = io.current_default().await;
-        let (actions, next) = plan_default_sink(
-            remembered.as_deref(),
-            airpods.as_deref(),
-            current.as_deref(),
-            event,
-        );
-        let mut ok = true;
-        for SinkAction::SetDefault(name) in actions {
-            if io.set_default(name.clone()).await {
-                info!("Default sink: {event:?} set {name}");
-            } else {
-                warn!("Default sink: {event:?} failed to set {name}");
-                ok = false;
-            }
-        }
-        if ok {
-            remembered = next;
+        remembered = apply(&io, remembered, event).await;
+    }
+}
+
+/// One event; returns the new memory, which is empty unless every action
+/// succeeded, so a failed take or restore remembers nothing.
+async fn apply(
+    io: &impl DefaultSinkIo,
+    remembered: Option<String>,
+    event: SinkEvent,
+) -> Option<String> {
+    let airpods = io.airpods_sink().await;
+    let current = io.current_default().await;
+    let (actions, next) = plan_default_sink(
+        remembered.as_deref(),
+        airpods.as_deref(),
+        current.as_deref(),
+        event,
+    );
+    let mut ok = true;
+    for SinkAction::SetDefault(name) in actions {
+        if io.set_default(name.clone()).await {
+            info!("Default sink: {event:?} set {name}");
+        } else {
+            warn!("Default sink: {event:?} failed to set {name}");
+            ok = false;
         }
     }
+    if ok { next } else { None }
 }
 
 /// Production I/O on the controller clone `ControllerMedia` holds; it never
@@ -156,6 +163,7 @@ mod tests {
     use super::SinkAction::SetDefault;
     use super::SinkEvent::{Take, Yield};
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -241,7 +249,7 @@ mod tests {
     struct FakeSinks {
         default: Arc<Mutex<String>>,
         sets: Arc<Mutex<Vec<String>>>,
-        fail: bool,
+        fail: Arc<AtomicBool>,
     }
 
     impl FakeSinks {
@@ -249,7 +257,7 @@ mod tests {
             FakeSinks {
                 default: Arc::new(Mutex::new(DAC.to_string())),
                 sets: Arc::default(),
-                fail,
+                fail: Arc::new(AtomicBool::new(fail)),
             }
         }
 
@@ -270,10 +278,10 @@ mod tests {
 
         fn set_default(&self, name: String) -> BoxFuture<'static, bool> {
             self.sets.lock().unwrap().push(name.clone());
-            if !self.fail {
+            let ok = !self.fail.load(Ordering::SeqCst);
+            if ok {
                 *self.default.lock().unwrap() = name;
             }
-            let ok = !self.fail;
             Box::pin(async move { ok })
         }
     }
@@ -325,6 +333,34 @@ mod tests {
         })
         .await;
         assert_eq!(sinks.sets(), [AIRPODS]);
+    }
+
+    #[tokio::test]
+    async fn failed_restore_forgets_the_default() {
+        let sinks = FakeSinks::new(false);
+        let memory = apply(&sinks, None, Take).await;
+        sinks.fail.store(true, Ordering::SeqCst);
+        let memory = apply(&sinks, memory, Yield).await;
+        sinks.fail.store(false, Ordering::SeqCst);
+        // The AirPods are still default: the retake keeps the empty memory.
+        let memory = apply(&sinks, memory, Take).await;
+        assert_eq!(apply(&sinks, memory, Yield).await, None);
+        assert_eq!(sinks.sets(), [AIRPODS, DAC]);
+    }
+
+    #[tokio::test]
+    async fn failed_take_forgets_an_earlier_default() {
+        let sinks = FakeSinks::new(false);
+        let memory = apply(&sinks, None, Take).await;
+        assert_eq!(memory.as_deref(), Some(DAC));
+        *sinks.default.lock().unwrap() = "speakers".to_string();
+        sinks.fail.store(true, Ordering::SeqCst);
+        let memory = apply(&sinks, memory, Take).await;
+        assert_eq!(memory, None);
+        sinks.fail.store(false, Ordering::SeqCst);
+        *sinks.default.lock().unwrap() = AIRPODS.to_string();
+        assert_eq!(apply(&sinks, memory, Yield).await, None);
+        assert_eq!(sinks.sets(), [AIRPODS, AIRPODS]);
     }
 
     #[tokio::test]

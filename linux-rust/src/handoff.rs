@@ -284,6 +284,9 @@ pub(crate) struct Handoff {
     lines: Vec<String>,
     /// Emit `RouteToAirPods`/`RouteAway` (#40).
     default_sink_routing: bool,
+    /// This take already sent `RouteAway`; the next `RouteToAirPods` clears
+    /// it, so a timed-out remote release's later loss sends no second one.
+    routed_away: bool,
 }
 
 impl Handoff {
@@ -326,6 +329,7 @@ impl Handoff {
             owner: None,
             lines: Vec::new(),
             default_sink_routing: false,
+            routed_away: false,
         }
     }
 
@@ -462,11 +466,11 @@ impl Handoff {
                     }
                     // The first remote request to join a release Linux sent
                     // while holding a take loses it (#40).
-                    if self.default_sink_routing && self.requested_take && p.cause != Cause::Remote
-                    {
-                        out.push(Command::RouteAway);
-                    }
+                    let route_away = self.requested_take && p.cause != Cause::Remote;
                     p.cause = Cause::Remote;
+                    if route_away {
+                        self.route_away(out);
+                    }
                     self.play_during_release = false;
                     self.last_owner_linux = false;
                     self.say("REMOTE requested ownership; release already pending");
@@ -492,8 +496,8 @@ impl Handoff {
                 if self.automatic && self.requested_take {
                     out.push(Command::PauseMedia);
                 }
-                if self.default_sink_routing && self.requested_take {
-                    out.push(Command::RouteAway);
+                if self.requested_take {
+                    self.route_away(out);
                 }
                 if self.owner.as_deref() == Some(&[0]) && !self.requested_take {
                     self.say("REMOTE requested ownership; Linux already yielded");
@@ -803,6 +807,7 @@ impl Handoff {
         // Before the resume, so its audible check finds the stream on the
         // AirPods sink (#40).
         if held && self.default_sink_routing {
+            self.routed_away = false;
             out.push(Command::RouteToAirPods);
         }
         // A take that found the transport idle gets its audio back (#200).
@@ -831,9 +836,7 @@ impl Handoff {
         if self.automatic {
             out.push(Command::PauseMedia);
         }
-        if self.default_sink_routing {
-            out.push(Command::RouteAway);
-        }
+        self.route_away(out);
         self.say(format!(
             "YIELD owner=not-linux; another host has the AirPods; Linux gave up its {}take{}",
             if dropped { "pending " } else { "" },
@@ -843,6 +846,13 @@ impl Handoff {
                 ""
             },
         ));
+    }
+
+    /// `RouteAway`, once per take (#40).
+    fn route_away(&mut self, out: &mut Vec<Command>) {
+        if self.default_sink_routing && !std::mem::replace(&mut self.routed_away, true) {
+            out.push(Command::RouteAway);
+        }
     }
 
     /// The pending request settled (acknowledged or timed out): act on a
@@ -3653,6 +3663,26 @@ mod tests {
         let mut p = routed_take();
         assert_eq!(p.feed(700, Input::LocalCall(true)), [AdvertiseCall(true)]);
         assert_eq!(p.feed(1100, Input::RemoteOwnershipRequest), []);
+    }
+
+    #[test]
+    fn timed_out_remote_release_then_loss_routes_away_once() {
+        let mut p = routed_take();
+        assert_eq!(
+            p.feed(1100, Input::RemoteOwnershipRequest),
+            [PauseMedia, RouteAway, SendOwnership(false)]
+        );
+        assert_eq!(p.play(1500, false), []);
+        assert_eq!(p.feed(6200, Input::Tick), []);
+        // Past LATE_ACK_WINDOW: a genuine loss of the same take.
+        assert_eq!(p.feed(11101, Input::Ownership(vec![0])), [PauseMedia]);
+        // The next take routes and can route away again.
+        assert_eq!(p.play(12000, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(12100, Input::Ownership(vec![1])), [RouteToAirPods]);
+        assert_eq!(
+            p.feed(12500, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
     }
 
     #[test]
