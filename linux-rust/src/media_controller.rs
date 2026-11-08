@@ -1,5 +1,6 @@
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
+use crate::bluetooth::aacp::{AACPManagerState, AudioSource, AudioSourceType, ConnectedDevice};
 use dbus::arg::RefArg;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
@@ -26,21 +27,157 @@ use tokio::task::AbortHandle;
 static PLAYBACK_LISTENERS: LazyLock<StdMutex<HashMap<String, AbortHandle>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// What asked for a takeover decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakeoverTrigger {
+    /// A playback poll. Needs the baseline, a stopped-to-playing transition
+    /// and no pending self-pause.
+    PlaybackPoll,
+    /// The control session came back for playback that started while it was
+    /// down after a case-closed disconnect (#841 case recovery).
+    ReconnectedForPlayback,
+    /// The user asked for the AirPods (handoff probe `take`).
+    Manual,
+}
+
+/// #841 case recovery: after the buds were put in the case, Linux does not
+/// race the other host to reconnect until new local playback asks for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaseRecovery {
+    /// Reconnect as usual.
+    Immediate,
+    /// Disconnected with the case closed; waiting for new playback.
+    WaitingForPlayback,
+    /// New playback started while waiting; reconnect and take for it.
+    PlaybackRequested,
+}
+
+impl CaseRecovery {
+    /// Advance on a playback poll taken while disconnected: a new
+    /// stopped-to-playing playback requests the reconnection, and a stop
+    /// before it completes withdraws the request.
+    pub(crate) fn playback(&mut self, fresh_play: bool, stopped: bool) {
+        match (*self, fresh_play, stopped) {
+            (Self::WaitingForPlayback, true, _) => *self = Self::PlaybackRequested,
+            (Self::PlaybackRequested, _, true) => *self = Self::WaitingForPlayback,
+            _ => {}
+        }
+    }
+}
+
+/// Whether both buds are in the case after a wear report. A bud in or out of
+/// an ear opens it again; any other report keeps `was_closed`.
+pub(crate) fn case_closed_after(ears: &[EarDetectionStatus], was_closed: bool) -> bool {
+    if ears.len() == 2 && ears.iter().all(|s| *s == EarDetectionStatus::InCase) {
+        true
+    } else if ears
+        .iter()
+        .any(|s| matches!(s, EarDetectionStatus::InEar | EarDetectionStatus::OutOfEar))
+    {
+        false
+    } else {
+        was_closed
+    }
+}
+
+/// The AACP routing facts the #841 handoff guards look at. Only copied from
+/// the AACP state (see `routing_snapshot`); `decide_takeover` judges them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RoutingSnapshot {
+    /// The AACP control session is up.
+    pub(crate) has_session: bool,
+    /// Number of hosts the AirPods report as connected.
+    pub(crate) host_count: usize,
+    /// One of those hosts is this machine.
+    pub(crate) local_host: bool,
+    /// One of those hosts is another device.
+    pub(crate) remote_host: bool,
+    /// At least one bud reports `InEar`.
+    pub(crate) bud_in_ear: bool,
+    /// Activity of the reported audio source; None when nothing is reported.
+    pub(crate) audio: Option<AudioSourceType>,
+    /// The reported audio source is this machine.
+    pub(crate) audio_from_local: bool,
+}
+
+/// Copy the routing facts out of the AACP fields. Pure and decision-free so
+/// the handoff core can feed it from its own event mirror.
+pub(crate) fn routing_snapshot(
+    has_session: bool,
+    hosts: &[ConnectedDevice],
+    ears: &[EarDetectionStatus],
+    audio: Option<&AudioSource>,
+    local: &str,
+) -> RoutingSnapshot {
+    RoutingSnapshot {
+        has_session,
+        host_count: hosts.len(),
+        local_host: hosts.iter().any(|d| d.mac == local),
+        remote_host: hosts.iter().any(|d| d.mac != local),
+        bud_in_ear: ears.contains(&EarDetectionStatus::InEar),
+        audio: audio.map(|a| a.r#type),
+        audio_from_local: audio.is_some_and(|a| a.mac == local),
+    }
+}
+
+/// `routing_snapshot` of a locked AACP state. Callers drop the guard before
+/// any await.
+pub(crate) fn routing_snapshot_of(state: &AACPManagerState, local: &str) -> RoutingSnapshot {
+    routing_snapshot(
+        state.sender.is_some(),
+        &state.connected_devices,
+        &state.ear_detection_status,
+        state.audio_source.as_ref(),
+        local,
+    )
+}
+
+/// The #841 handoff guards. Absent on the legacy playback listener path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HandoffGuards {
+    pub(crate) routing: RoutingSnapshot,
+    pub(crate) recovery: CaseRecovery,
+}
+
 /// What one playback poll observed, as far as the takeover decision cares.
 #[derive(Clone, Copy, Debug)]
-struct TakeoverInputs {
+pub(crate) struct TakeoverInputs {
     /// Whether an earlier poll already recorded the initial playback state.
-    baseline_taken: bool,
-    was_playing: bool,
-    is_playing: bool,
+    pub(crate) baseline_taken: bool,
+    pub(crate) was_playing: bool,
+    pub(crate) is_playing: bool,
     /// Set when LibrePods paused the players itself (ear removal, lost ownership).
-    i_paused_the_media: bool,
+    pub(crate) i_paused_the_media: bool,
     /// At least one bud reports `InEar`.
-    bud_in_ear: bool,
+    pub(crate) bud_in_ear: bool,
+    /// The playback fields above only count for `PlaybackPoll`.
+    pub(crate) trigger: TakeoverTrigger,
+    /// #841 routing and case-recovery guards; None skips them (legacy path).
+    pub(crate) handoff: Option<HandoffGuards>,
+}
+
+impl TakeoverInputs {
+    /// Inputs for a take that is not a playback poll (manual take, reconnect
+    /// for requested playback), with the #841 guards.
+    pub(crate) fn handoff(
+        trigger: TakeoverTrigger,
+        routing: RoutingSnapshot,
+        recovery: CaseRecovery,
+    ) -> Self {
+        TakeoverInputs {
+            baseline_taken: true,
+            was_playing: false,
+            is_playing: true,
+            i_paused_the_media: false,
+            bud_in_ear: routing.bud_in_ear,
+            trigger,
+            handoff: Some(HandoffGuards { routing, recovery }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TakeoverSkip {
+pub(crate) enum TakeoverSkip {
     /// First poll: `was_playing` is a placeholder, not an observation.
     InitialState,
     /// Playback did not go from stopped to playing.
@@ -49,40 +186,58 @@ enum TakeoverSkip {
     ResumeAfterOwnPause,
     /// Playback started but nobody is wearing the buds.
     NoBudInEar,
+    /// #841: case recovery has not seen new playback asking for this take.
+    AwaitingNewPlayback,
+    /// #841: no live AACP control session, so the routing state is stale.
+    NoSession,
+    /// #841: the AirPods do not report exactly this machine plus one remote host.
+    NotTwoHosts,
+    /// #841: the audio source is not confirmed idle or local media (a remote
+    /// call or remote media, unknown activity, or no report).
+    AudioNotIdle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TakeoverAction {
+pub(crate) enum TakeoverAction {
     TakeOver,
     Skip(TakeoverSkip),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TakeoverDecision {
-    action: TakeoverAction,
+pub(crate) struct TakeoverDecision {
+    pub(crate) action: TakeoverAction,
     /// Consume `i_paused_the_media`: the resume it was waiting for has happened.
-    clear_self_pause: bool,
+    pub(crate) clear_self_pause: bool,
 }
 
-/// Decide whether a playback poll should take the AirPods away from another
-/// device. Pure, so the order of the guards (baseline, transition, self-pause,
-/// ear detection) is tested without D-Bus or AACP.
-fn decide_takeover(inputs: TakeoverInputs) -> TakeoverDecision {
+/// Decide whether to take the AirPods away from another device. Pure, so the
+/// order of the guards is tested without D-Bus or AACP. For a playback poll:
+/// baseline, transition, self-pause; then the #841 guards when supplied (case
+/// recovery, session, hosts, audio source); then ear detection. Without
+/// `handoff` this is exactly the legacy listener's policy.
+pub(crate) fn decide_takeover(inputs: TakeoverInputs) -> TakeoverDecision {
     let skip = |reason| TakeoverDecision {
         action: TakeoverAction::Skip(reason),
         clear_self_pause: false,
     };
-    if !inputs.baseline_taken {
-        return skip(TakeoverSkip::InitialState);
+    if inputs.trigger == TakeoverTrigger::PlaybackPoll {
+        if !inputs.baseline_taken {
+            return skip(TakeoverSkip::InitialState);
+        }
+        if inputs.was_playing || !inputs.is_playing {
+            return skip(TakeoverSkip::NoTransition);
+        }
+        if inputs.i_paused_the_media {
+            return TakeoverDecision {
+                action: TakeoverAction::Skip(TakeoverSkip::ResumeAfterOwnPause),
+                clear_self_pause: true,
+            };
+        }
     }
-    if inputs.was_playing || !inputs.is_playing {
-        return skip(TakeoverSkip::NoTransition);
-    }
-    if inputs.i_paused_the_media {
-        return TakeoverDecision {
-            action: TakeoverAction::Skip(TakeoverSkip::ResumeAfterOwnPause),
-            clear_self_pause: true,
-        };
+    if let Some(guards) = inputs.handoff
+        && let Some(reason) = handoff_block(inputs.trigger, guards)
+    {
+        return skip(reason);
     }
     if !inputs.bud_in_ear {
         return skip(TakeoverSkip::NoBudInEar);
@@ -90,6 +245,31 @@ fn decide_takeover(inputs: TakeoverInputs) -> TakeoverDecision {
     TakeoverDecision {
         action: TakeoverAction::TakeOver,
         clear_self_pause: false,
+    }
+}
+
+/// The #841 guards, in order: case recovery, live session, exactly two hosts
+/// (this machine and one remote), audio source idle or local media.
+fn handoff_block(trigger: TakeoverTrigger, guards: HandoffGuards) -> Option<TakeoverSkip> {
+    let recovery_allows = match trigger {
+        TakeoverTrigger::ReconnectedForPlayback => {
+            guards.recovery == CaseRecovery::PlaybackRequested
+        }
+        _ => guards.recovery != CaseRecovery::WaitingForPlayback,
+    };
+    let routing = guards.routing;
+    if !recovery_allows {
+        Some(TakeoverSkip::AwaitingNewPlayback)
+    } else if !routing.has_session {
+        Some(TakeoverSkip::NoSession)
+    } else if routing.host_count != 2 || !routing.local_host || !routing.remote_host {
+        Some(TakeoverSkip::NotTwoHosts)
+    } else {
+        match routing.audio {
+            Some(AudioSourceType::None) => None,
+            Some(AudioSourceType::Media) if routing.audio_from_local => None,
+            _ => Some(TakeoverSkip::AudioNotIdle),
+        }
     }
 }
 
@@ -376,6 +556,9 @@ impl MediaController {
                 is_playing,
                 i_paused_the_media: state.i_paused_the_media,
                 bud_in_ear,
+                trigger: TakeoverTrigger::PlaybackPoll,
+                // The #841 routing guards are for the handoff core (#8/#9).
+                handoff: None,
             });
             if decision.clear_self_pause {
                 state.i_paused_the_media = false;
@@ -405,6 +588,12 @@ impl MediaController {
                     TakeoverSkip::NoBudInEar => {
                         info!("Media playback started but buds not in ear, skipping takeover")
                     }
+                    // Only produced by the #841 guards, which this loop does
+                    // not supply (`handoff: None`).
+                    TakeoverSkip::AwaitingNewPlayback
+                    | TakeoverSkip::NoSession
+                    | TakeoverSkip::NotTwoHosts
+                    | TakeoverSkip::AudioNotIdle => {}
                 }
                 continue;
             }
@@ -1462,6 +1651,8 @@ mod tests {
             is_playing: true,
             i_paused_the_media: false,
             bud_in_ear: true,
+            trigger: TakeoverTrigger::PlaybackPoll,
+            handoff: None,
         }
     }
 
@@ -1551,6 +1742,276 @@ mod tests {
                 "was_playing={was_playing} is_playing={is_playing}"
             );
         }
+    }
+
+    const LOCAL: &str = "01:02:03:04:05:06";
+    const REMOTE: &str = "07:08:09:0A:0B:0C";
+
+    /// Routing a #841 take accepts: live session, this machine plus one
+    /// remote host, a bud in an ear, idle audio.
+    fn ready_routing() -> RoutingSnapshot {
+        let hosts = [LOCAL, REMOTE].map(|mac| ConnectedDevice {
+            mac: mac.to_string(),
+            info1: 0,
+            info2: 0,
+            r#type: None,
+        });
+        let idle = AudioSource {
+            mac: "00:00:00:00:00:00".to_string(),
+            r#type: AudioSourceType::None,
+        };
+        routing_snapshot(
+            true,
+            &hosts,
+            &[EarDetectionStatus::InEar, EarDetectionStatus::OutOfEar],
+            Some(&idle),
+            LOCAL,
+        )
+    }
+
+    fn guards(routing: RoutingSnapshot) -> Option<HandoffGuards> {
+        Some(HandoffGuards {
+            routing,
+            recovery: CaseRecovery::Immediate,
+        })
+    }
+
+    #[test]
+    fn takeover_legacy_ignores_routing_guards() {
+        // Three hosts and a remote call: the #841 guards block this take.
+        let blocking = RoutingSnapshot {
+            host_count: 3,
+            audio: Some(AudioSourceType::Call),
+            audio_from_local: false,
+            ..ready_routing()
+        };
+        assert_eq!(
+            decide_takeover(TakeoverInputs {
+                handoff: guards(blocking),
+                ..takeover_inputs()
+            })
+            .action,
+            TakeoverAction::Skip(TakeoverSkip::NotTwoHosts)
+        );
+        assert_eq!(
+            decide_takeover(TakeoverInputs {
+                handoff: guards(RoutingSnapshot {
+                    host_count: 2,
+                    ..blocking
+                }),
+                ..takeover_inputs()
+            })
+            .action,
+            TakeoverAction::Skip(TakeoverSkip::AudioNotIdle)
+        );
+
+        // The legacy listener does not supply them: a genuine play takes over
+        // and the baseline -> transition -> self-pause -> ear table holds.
+        let legacy = TakeoverInputs {
+            handoff: None,
+            ..takeover_inputs()
+        };
+        assert_eq!(
+            decide_takeover(legacy),
+            TakeoverDecision {
+                action: TakeoverAction::TakeOver,
+                clear_self_pause: false,
+            }
+        );
+        let table = [
+            (
+                TakeoverInputs {
+                    baseline_taken: false,
+                    ..legacy
+                },
+                TakeoverSkip::InitialState,
+                false,
+            ),
+            (
+                TakeoverInputs {
+                    was_playing: true,
+                    ..legacy
+                },
+                TakeoverSkip::NoTransition,
+                false,
+            ),
+            (
+                TakeoverInputs {
+                    is_playing: false,
+                    ..legacy
+                },
+                TakeoverSkip::NoTransition,
+                false,
+            ),
+            (
+                TakeoverInputs {
+                    i_paused_the_media: true,
+                    ..legacy
+                },
+                TakeoverSkip::ResumeAfterOwnPause,
+                true,
+            ),
+            (
+                TakeoverInputs {
+                    bud_in_ear: false,
+                    ..legacy
+                },
+                TakeoverSkip::NoBudInEar,
+                false,
+            ),
+        ];
+        for (inputs, reason, clear_self_pause) in table {
+            assert_eq!(
+                decide_takeover(inputs),
+                TakeoverDecision {
+                    action: TakeoverAction::Skip(reason),
+                    clear_self_pause,
+                },
+                "{inputs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn takeover_handoff_guards_follow_841() {
+        let poll = |routing: RoutingSnapshot| TakeoverInputs {
+            handoff: guards(routing),
+            bud_in_ear: routing.bud_in_ear,
+            ..takeover_inputs()
+        };
+        assert_eq!(
+            decide_takeover(poll(ready_routing())).action,
+            TakeoverAction::TakeOver
+        );
+        let blocked = [
+            (
+                RoutingSnapshot {
+                    has_session: false,
+                    ..ready_routing()
+                },
+                TakeoverSkip::NoSession,
+            ),
+            (
+                RoutingSnapshot {
+                    host_count: 1,
+                    remote_host: false,
+                    ..ready_routing()
+                },
+                TakeoverSkip::NotTwoHosts,
+            ),
+            (
+                RoutingSnapshot {
+                    local_host: false,
+                    ..ready_routing()
+                },
+                TakeoverSkip::NotTwoHosts,
+            ),
+            (
+                RoutingSnapshot {
+                    audio: Some(AudioSourceType::Call),
+                    ..ready_routing()
+                },
+                TakeoverSkip::AudioNotIdle,
+            ),
+            (
+                RoutingSnapshot {
+                    audio: Some(AudioSourceType::Media),
+                    audio_from_local: false,
+                    ..ready_routing()
+                },
+                TakeoverSkip::AudioNotIdle,
+            ),
+            (
+                RoutingSnapshot {
+                    audio: Some(AudioSourceType::Unknown),
+                    ..ready_routing()
+                },
+                TakeoverSkip::AudioNotIdle,
+            ),
+            (
+                RoutingSnapshot {
+                    audio: None,
+                    ..ready_routing()
+                },
+                TakeoverSkip::AudioNotIdle,
+            ),
+            (
+                RoutingSnapshot {
+                    bud_in_ear: false,
+                    ..ready_routing()
+                },
+                TakeoverSkip::NoBudInEar,
+            ),
+        ];
+        for (routing, reason) in blocked {
+            assert_eq!(
+                decide_takeover(poll(routing)).action,
+                TakeoverAction::Skip(reason),
+                "{routing:?}"
+            );
+        }
+        // Local media is not remote activity.
+        let local_media = RoutingSnapshot {
+            audio: Some(AudioSourceType::Media),
+            audio_from_local: true,
+            ..ready_routing()
+        };
+        assert_eq!(
+            decide_takeover(poll(local_media)).action,
+            TakeoverAction::TakeOver
+        );
+        // The playback guards still come first for a poll.
+        assert_eq!(
+            decide_takeover(TakeoverInputs {
+                was_playing: true,
+                ..poll(ready_routing())
+            })
+            .action,
+            TakeoverAction::Skip(TakeoverSkip::NoTransition)
+        );
+    }
+
+    #[test]
+    fn takeover_case_recovery_gates_takes() {
+        let take = |trigger, recovery| {
+            decide_takeover(TakeoverInputs::handoff(trigger, ready_routing(), recovery)).action
+        };
+        use CaseRecovery::*;
+        use TakeoverTrigger::*;
+        assert_eq!(take(Manual, Immediate), TakeoverAction::TakeOver);
+        assert_eq!(
+            take(Manual, WaitingForPlayback),
+            TakeoverAction::Skip(TakeoverSkip::AwaitingNewPlayback)
+        );
+        assert_eq!(
+            take(ReconnectedForPlayback, PlaybackRequested),
+            TakeoverAction::TakeOver
+        );
+        for recovery in [Immediate, WaitingForPlayback] {
+            assert_eq!(
+                take(ReconnectedForPlayback, recovery),
+                TakeoverAction::Skip(TakeoverSkip::AwaitingNewPlayback)
+            );
+        }
+        // Manual and reconnect takes need no playback transition.
+        let manual = TakeoverInputs {
+            was_playing: true,
+            is_playing: false,
+            baseline_taken: false,
+            ..TakeoverInputs::handoff(Manual, ready_routing(), Immediate)
+        };
+        assert_eq!(decide_takeover(manual).action, TakeoverAction::TakeOver);
+    }
+
+    #[test]
+    fn case_closed_tracks_both_buds_in_case() {
+        use EarDetectionStatus::*;
+        assert!(case_closed_after(&[InCase, InCase], false));
+        assert!(!case_closed_after(&[InCase, OutOfEar], true));
+        assert!(!case_closed_after(&[InEar, InCase], true));
+        assert!(case_closed_after(&[InCase, Disconnected], true));
+        assert!(!case_closed_after(&[InCase, Disconnected], false));
+        assert!(case_closed_after(&[], true));
     }
 
     #[tokio::test]
