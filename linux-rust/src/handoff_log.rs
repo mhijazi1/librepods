@@ -167,30 +167,43 @@ impl Log {
             let mut rotated = path.as_os_str().to_owned();
             rotated.push(".1");
             let rotated = PathBuf::from(rotated);
-            // Move only the file measured above: a process that lost a race
-            // with another rotator must not move that one's fresh log over .1.
-            let moved = std::fs::metadata(path).and_then(|now| {
-                if (now.dev(), now.ino()) != (measured.dev(), measured.ino()) {
-                    return Ok(false);
+            // The directory lock (dropped, so released, after the reopen)
+            // makes check, rename and reopen one step for other openers.
+            let fresh = File::open(path.parent().unwrap_or(Path::new("."))).and_then(|dir| {
+                dir.lock()?;
+                // Move only the file measured above: a process that lost a race
+                // with another rotator must not move that one's fresh log over .1.
+                let moved = std::fs::metadata(path).and_then(|now| {
+                    if (now.dev(), now.ino()) != (measured.dev(), measured.ino()) {
+                        return Ok(false);
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = tests::BEFORE_RENAME.take() {
+                        hook();
+                    }
+                    std::fs::rename(path, &rotated).map(|()| true)
+                });
+                match moved {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                    moved => {
+                        if let Ok(true) = moved {
+                            info!(
+                                "Handoff log: rotated {} to {}",
+                                path.display(),
+                                rotated.display()
+                            );
+                        }
+                        open()
+                    }
                 }
-                std::fs::rename(path, &rotated).map(|()| true)
             });
-            match moved {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => warn!(
+            match fresh {
+                Ok(fresh) => file = fresh,
+                Err(e) => warn!(
                     "Handoff log: cannot rotate {} to {}: {e}; appending to it",
                     path.display(),
                     rotated.display()
                 ),
-                moved => {
-                    if let Ok(true) = moved {
-                        info!(
-                            "Handoff log: rotated {} to {}",
-                            path.display(),
-                            rotated.display()
-                        );
-                    }
-                    file = open()?;
-                }
             }
         }
         let len = file.metadata()?.len();
@@ -365,7 +378,9 @@ mod tests {
         AudioSource, AudioSourceType, ConnectedDevice, EarDetectionStatus,
     };
     use crate::handoff::{ACK_TIMEOUT, Handoff, Input};
+    use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     /// A fresh directory under the system temp dir.
@@ -641,6 +656,80 @@ mod tests {
         );
         let report = report(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(report.take_requests, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    thread_local! {
+        /// Runs in Log::open between the inode check and the rename.
+        pub(super) static BEFORE_RENAME: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+    }
+
+    #[test]
+    fn handoff_log_concurrent_rotation_keeps_rotated_log() {
+        let dir = temp_dir("rotate-race");
+        let path = dir.join("handoff.jsonl");
+        let rotated = dir.join("handoff.jsonl.1");
+        let mut filler = vec![b'x'; MAX_LOG_BYTES as usize - 1];
+        *filler.last_mut().unwrap() = b'\n';
+        std::fs::write(&path, filler).unwrap();
+        let app = Log::open(&path, Source::App).unwrap();
+        // The review's GDB interleaving: a rival opener measures the same
+        // oversized log while the probe sits between its check and rename.
+        let (go, rival_go) = mpsc::channel();
+        let (done, rival_done) = mpsc::channel();
+        let rival = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                rival_go.recv().unwrap();
+                let log = Log::open(&path, Source::Probe).unwrap();
+                let _ = done.send(());
+                log
+            }
+        });
+        BEFORE_RENAME.set(Some(Box::new(move || {
+            go.send(()).unwrap();
+            assert!(
+                rival_done.recv_timeout(Duration::from_millis(200)).is_err(),
+                "the rival rotated while the probe held the directory lock"
+            );
+        })));
+        let _probe = Log::open(&path, Source::Probe).unwrap();
+        let _rival = rival.join().unwrap();
+        app.line("AA:BB:CC:DD:EE:FF", "REQUEST owner=linux");
+        let old = records(&rotated);
+        assert!(
+            matches!(
+                old.as_slice(),
+                [
+                    Record::SessionStart {
+                        source: Source::App,
+                        ..
+                    },
+                    Record::Line {
+                        kind: Kind::TakeRequest,
+                        ..
+                    },
+                ]
+            ),
+            "{old:?}"
+        );
+        let new = records(&path);
+        assert!(
+            matches!(
+                new.as_slice(),
+                [
+                    Record::SessionStart {
+                        source: Source::Probe,
+                        ..
+                    },
+                    Record::SessionStart {
+                        source: Source::Probe,
+                        ..
+                    },
+                ]
+            ),
+            "{new:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
