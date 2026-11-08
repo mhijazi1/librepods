@@ -1260,11 +1260,12 @@ pub(crate) fn encode_media_information_new_device(
 
 // otherDeviceAudioCategory for a host in a call (#11).
 //
-// PROVISIONAL and unverified: no Apple in-call relay has been captured yet.
-// #35's captures show only 100 (idle) and 301 (media); 401 is the next step
-// of that scale. Replace it once mo captures the relay an iPhone or Mac sends
-// during a call (hardware validation of #11).
-pub(crate) const AUDIO_CATEGORY_CALL: u32 = 401;
+// From mo's iPhone phone-call capture on #74 (2026-11-07): during a cellular
+// call the iPhone relays otherDeviceAudioCategory 501, OPACK `31 f5 01`
+// (pinned as APPLE_MEDIA_INFORMATION_CALL_YES_501). The same capture shows 100
+// for idle and 301 for media. A VoIP/FaceTime call has not been captured yet
+// and may use another value.
+pub(crate) const AUDIO_CATEGORY_CALL: u32 = 501;
 
 // Media information that tells the other hosts Linux is in a call: the same
 // dict as `encode_media_information_new_device` (playingApp "NA"), with
@@ -1678,9 +1679,9 @@ mod tests {
     // - length 0x68 -> 0x6A: the dict grows by two bytes (one each below).
     // - "NO" `42 4E 4F` -> "YES" `43 59 45 53`: hostStreamingState YES, a
     //   3-byte string as in Apple's streaming captures (#35).
-    // - otherDeviceAudioCategory `30 64` (100) -> `31 91 01`: the u16 LE form
-    //   of AUDIO_CATEGORY_CALL (401 = 0x0191). 401 is provisional and
-    //   unverified until an Apple in-call relay is captured.
+    // - otherDeviceAudioCategory `30 64` (100) -> `31 F5 01`: the u16 LE form
+    //   of AUDIO_CATEGORY_CALL (501 = 0x01F5), the value the iPhone relays
+    //   during a phone call (#74 capture, APPLE_MEDIA_INFORMATION_CALL_YES_501).
     const GOLDEN_MEDIA_INFORMATION_CALL: &[u8] = &[
         0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x6A, 0x00, 0x01,
         0xE5, 0x4A, 0x70, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x42, 0x4E, 0x41,
@@ -1689,7 +1690,7 @@ mod tests {
         0x65, 0x73, 0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A, 0x33, 0x33, 0x3A, 0x34, 0x34,
         0x3A, 0x35, 0x35, 0x3A, 0x36, 0x36, 0x46, 0x62, 0x74, 0x4E, 0x61, 0x6D, 0x65, 0x43, 0x4D,
         0x61, 0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76, 0x69, 0x63, 0x65, 0x41,
-        0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72, 0x79, 0x31, 0x91, 0x01,
+        0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72, 0x79, 0x31, 0xF5, 0x01,
     ];
     const GOLDEN_ADD_TIPI_DEVICE: &[u8] = &[
         0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x4E, 0x00, 0x01,
@@ -1809,7 +1810,7 @@ mod tests {
 
     #[test]
     fn golden_encode_media_information_call() {
-        assert_eq!(AUDIO_CATEGORY_CALL, 401);
+        assert_eq!(AUDIO_CATEGORY_CALL, 501);
         let packet = encode_media_information_call(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
             .expect("encode_media_information_call");
         assert_eq!(packet, without_header(GOLDEN_MEDIA_INFORMATION_CALL));
@@ -2130,6 +2131,11 @@ mod tests {
     const APPLE_MEDIA_INFORMATION_INSTAGRAM_NO_301: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 53 63 6f 6d 2e 62 75 72 62 6e 2e 69 6e 73 74 61 67 72 61 6d 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 42 4e 4f 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 31 2d 01";
     const APPLE_MEDIA_INFORMATION_INSTAGRAM_YES_301: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 53 63 6f 6d 2e 62 75 72 62 6e 2e 69 6e 73 74 61 67 72 61 6d 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 43 59 45 53 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 31 2d 01";
     const APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 52 63 6f 6d 2e 73 70 6f 74 69 66 79 2e 63 6c 69 65 6e 74 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 43 59 45 53 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 31 2d 01";
+    // mo's iPhone phone-call capture from #74 (2026-11-07 23:44:57.833): the
+    // media information the iPhone relayed during a cellular call, with the
+    // iPhone's address zeroed. 145 bytes; playingApp is 38 bytes (`61 26`, the
+    // OPACK long-string tag) and the category is 501 (`31 f5 01`).
+    const APPLE_MEDIA_INFORMATION_CALL_YES_501: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 61 26 63 6f 6d 2e 61 70 70 6c 65 2e 69 70 54 65 6c 65 70 68 6f 6e 79 2e 43 61 6c 6c 41 75 64 69 6f 53 65 72 76 69 63 65 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 43 59 45 53 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 31 f5 01";
 
     const APPLE_TIPI_IDLE0_NEW_SCORE2: &str = "e5 48 69 64 6c 65 54 69 6d 65 08 47 6e 65 77 54 69 70 69 01 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 0a";
     const APPLE_TIPI_IDLE0_NEW_SCORE6: &str = "e5 48 69 64 6c 65 54 69 6d 65 08 47 6e 65 77 54 69 70 69 01 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 0e";
@@ -2219,6 +2225,20 @@ mod tests {
             true,
             301,
             APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301,
+        );
+    }
+
+    #[test]
+    fn golden_apple_media_information_call_streaming_501() {
+        assert_media_information_matches_apple(
+            "com.apple.ipTelephony.CallAudioService",
+            true,
+            AUDIO_CATEGORY_CALL,
+            APPLE_MEDIA_INFORMATION_CALL_YES_501,
+        );
+        assert_eq!(
+            capture_bytes(APPLE_MEDIA_INFORMATION_CALL_YES_501).len(),
+            145
         );
     }
 
@@ -2461,6 +2481,7 @@ mod tests {
             APPLE_MEDIA_INFORMATION_INSTAGRAM_NO_301,
             APPLE_MEDIA_INFORMATION_INSTAGRAM_YES_301,
             APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301,
+            APPLE_MEDIA_INFORMATION_CALL_YES_501,
             APPLE_TIPI_IDLE0_NEW_SCORE2,
             APPLE_TIPI_IDLE0_NEW_SCORE6,
             APPLE_TIPI_IDLE13_NEW_SCORE1,
