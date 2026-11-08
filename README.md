@@ -81,6 +81,21 @@ features on. If the desktop shows no AirPods battery, set
 Bluetooth. Without it, LibrePods logs one warning and carries on without the
 export.
 
+PipeWire's bluez5 plugin also registers a battery with BlueZ for HFP headsets,
+from the headset's own battery reports. BlueZ keeps the first battery provided
+for a device and ignores later ones, so the desktop may show PipeWire's HFP
+level instead of LibrePods' value. To check which one BlueZ shows, read the
+`Source` of the AirPods' `org.bluez.Battery1` (use your adapter and the AirPods'
+address):
+
+```sh
+busctl get-property org.bluez /org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX org.bluez.Battery1 Source
+```
+
+`s "LibrePods"` means LibrePods' value is shown. When LibrePods sees another
+`Source` there (or none), it logs one info line per connection saying that its
+level is not shown.
+
 To turn the export off, add `"exportBattery": false` at the top level of
 `~/.config/librepods/preferences.json`:
 

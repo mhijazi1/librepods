@@ -14,7 +14,7 @@
 //!   blocks on D-Bus.
 
 use crate::bluetooth::aacp::{BatteryComponent, BatteryInfo, BatteryStatus};
-use dbus::arg::{PropMap, RefArg, Variant};
+use dbus::arg::{ArgType, PropMap, RefArg, Variant};
 use dbus::blocking::Connection;
 use dbus::message::MessageType;
 use dbus::strings::ErrorName;
@@ -33,6 +33,7 @@ pub const PROVIDER_SOURCE: &str = "LibrePods";
 const BLUEZ_SERVICE: &str = "org.bluez";
 const PROVIDER_MANAGER_IFACE: &str = "org.bluez.BatteryProviderManager1";
 const PROVIDER_IFACE: &str = "org.bluez.BatteryProvider1";
+const BATTERY1_IFACE: &str = "org.bluez.Battery1";
 const OBJECT_MANAGER_IFACE: &str = "org.freedesktop.DBus.ObjectManager";
 const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
 const INTROSPECTABLE_IFACE: &str = "org.freedesktop.DBus.Introspectable";
@@ -95,9 +96,76 @@ pub fn export_percentage(levels: &BudLevels) -> Option<u8> {
     Some(level.min(100))
 }
 
+/// What reading `org.bluez.Battery1.Source` on the device object returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Battery1Read {
+    /// The device has no Battery1 (yet): BlueZ has not shown any battery.
+    Absent,
+    /// Battery1 exists but has no Source property.
+    NoSource,
+    /// Battery1 exists with this Source.
+    Source(String),
+}
+
+/// Whose battery BlueZ shows for the device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatteryOwner {
+    /// No Battery1 yet; ask again later.
+    Unknown,
+    /// BlueZ shows the LibrePods battery.
+    Ours,
+    /// BlueZ shows another provider's battery (its Source, or `<none>`).
+    Foreign(String),
+}
+
+/// Placeholder Source carried by `BatteryOwner::Foreign` when Battery1 has
+/// no Source property.
+pub const NO_SOURCE: &str = "<none>";
+
+/// Decides whose battery BlueZ shows. BlueZ keeps the first battery provided
+/// for a device and ignores later ones, so a Battery1 whose Source is not
+/// exactly `PROVIDER_SOURCE` belongs to another provider.
+pub fn battery_owner(read: &Battery1Read) -> BatteryOwner {
+    match read {
+        Battery1Read::Absent => BatteryOwner::Unknown,
+        Battery1Read::Source(s) if s == PROVIDER_SOURCE => BatteryOwner::Ours,
+        Battery1Read::Source(s) => BatteryOwner::Foreign(s.clone()),
+        Battery1Read::NoSource => BatteryOwner::Foreign(NO_SOURCE.to_string()),
+    }
+}
+
+const DBUS_ERROR_PREFIX: &str = "org.freedesktop.DBus.Error.";
+
+/// Maps the D-Bus error of `Properties.Get("org.bluez.Battery1", "Source")`
+/// on the device object. BlueZ's gdbus answers `InvalidArgs` with
+/// "No such interface '…'" when the device has no Battery1, and with
+/// "No such property '…'" when Battery1 has no Source; the standard
+/// Unknown* names are accepted too. Anything else (timeouts, NoReply,
+/// ServiceUnknown, …) is an error, so the read is retried later.
+pub fn battery1_read_from_error(name: &str, message: &str) -> Result<Battery1Read, String> {
+    let short = name.strip_prefix(DBUS_ERROR_PREFIX).unwrap_or("");
+    match short {
+        "UnknownObject" | "UnknownInterface" | "UnknownMethod" => Ok(Battery1Read::Absent),
+        "UnknownProperty" => Ok(Battery1Read::NoSource),
+        "InvalidArgs" if message.contains("No such interface") => Ok(Battery1Read::Absent),
+        "InvalidArgs" if message.contains("No such property") => Ok(Battery1Read::NoSource),
+        _ => Err(format!("reading Battery1.Source failed: {name}: {message}")),
+    }
+}
+
+/// Maps the value of a successful Battery1.Source read; a non-string value
+/// is an error.
+pub fn battery1_read_from_value(value: &dyn RefArg) -> Result<Battery1Read, String> {
+    match (value.arg_type(), value.as_str()) {
+        (ArgType::String, Some(s)) => Ok(Battery1Read::Source(s.to_string())),
+        _ => Err(format!("Battery1.Source is not a string (type {})", value.signature())),
+    }
+}
+
 /// Where an exported percentage goes. Implemented by the BlueZ provider and by
 /// the recording fake in the tests. Calls must not block for long: the real
-/// sink only blocks in `register` (one local D-Bus round trip).
+/// sink only blocks in `register` and `battery_source` (one local D-Bus round
+/// trip each, bounded by a timeout).
 pub trait BatterySink {
     /// Registers the provider; called at most once per exporter.
     fn register(&mut self) -> Result<(), String>;
@@ -105,6 +173,21 @@ pub trait BatterySink {
     fn set(&mut self, pct: u8) -> Result<(), String>;
     /// Withdraws the exported battery.
     fn remove(&mut self) -> Result<(), String>;
+    /// Reads `org.bluez.Battery1.Source` on the device object, to tell
+    /// whether BlueZ shows our battery or another provider's.
+    fn battery_source(&mut self) -> Result<Battery1Read, String>;
+}
+
+/// Receives the one-per-exporter line about a foreign battery.
+pub type LineSink = Box<dyn FnMut(&str) + Send>;
+
+/// The line logged when BlueZ shows another provider's battery.
+fn foreign_battery_line(source: &str) -> String {
+    format!(
+        "BlueZ shows another provider's battery for the AirPods (Battery1 Source \"{source}\"), \
+         so the LibrePods level is not shown on the desktop; see \"Desktop battery (BlueZ \
+         BatteryProvider)\" in the README"
+    )
 }
 
 /// Lifecycle of a `BatteryExporter`.
@@ -124,15 +207,27 @@ pub struct BatteryExporter<S: BatterySink> {
     levels: BudLevels,
     state: ExporterState,
     exported: Option<u8>,
+    /// Whether BlueZ's Battery1 owner was resolved (Ours or Foreign) in this
+    /// exporter; once true, Battery1 is not read again.
+    owner_resolved: bool,
+    log: LineSink,
 }
 
 impl<S: BatterySink> BatteryExporter<S> {
+    /// An exporter that logs the foreign-battery line through `info!`.
     pub fn new(sink: S) -> Self {
+        Self::with_log(sink, Box::new(|line: &str| info!("{line}")))
+    }
+
+    /// An exporter that sends the foreign-battery line to `log`.
+    pub fn with_log(sink: S, log: LineSink) -> Self {
         Self {
             sink,
             levels: BudLevels::default(),
             state: ExporterState::Unregistered,
             exported: None,
+            owner_resolved: false,
+            log,
         }
     }
 
@@ -145,16 +240,46 @@ impl<S: BatterySink> BatteryExporter<S> {
     /// first percentage registers the sink once; an unchanged percentage
     /// makes no call; losing every known level removes the battery. A failed
     /// registration logs one warning and disables the exporter. Sink errors
-    /// never propagate.
+    /// never propagate. Afterwards, while a percentage is exported and
+    /// BlueZ's Battery1 owner is not resolved yet, Battery1's Source is read
+    /// once per update (see `resolve_owner`).
     pub fn update(&mut self, infos: &[BatteryInfo]) {
         self.levels.apply(infos);
         if self.state == ExporterState::Disabled {
             return;
         }
         let pct = export_percentage(&self.levels);
-        if pct == self.exported {
+        if pct != self.exported {
+            self.export(pct);
+        }
+        self.resolve_owner();
+    }
+
+    /// Reads Battery1's Source once if the owner is unresolved, the sink is
+    /// registered and a percentage is exported. A foreign Source logs one
+    /// line through the line sink; ours resolves silently; an absent
+    /// Battery1 or a read error leaves it unresolved for the next update.
+    fn resolve_owner(&mut self) {
+        if self.owner_resolved
+            || self.state != ExporterState::Registered
+            || self.exported.is_none()
+        {
             return;
         }
+        match self.sink.battery_source() {
+            Ok(read) => match battery_owner(&read) {
+                BatteryOwner::Unknown => {}
+                BatteryOwner::Ours => self.owner_resolved = true,
+                BatteryOwner::Foreign(source) => {
+                    self.owner_resolved = true;
+                    (self.log)(&foreign_battery_line(&source));
+                }
+            },
+            Err(e) => debug!("Cannot read the AirPods' Battery1 Source: {e}"),
+        }
+    }
+
+    fn export(&mut self, pct: Option<u8>) {
         match pct {
             Some(p) => {
                 if self.state == ExporterState::Unregistered {
@@ -210,12 +335,22 @@ pub fn battery_object_path(mac: &str) -> String {
 enum Command {
     Set(u8),
     Remove,
+    /// Read `org.bluez.Battery1.Source` on the device object and send the
+    /// result back. Queued behind any earlier `Set`, so its signal is flushed
+    /// to BlueZ before the read.
+    ReadSource(mpsc::Sender<Result<Battery1Read, String>>),
 }
+
+/// How long `battery_source` waits for the provider thread's answer: the
+/// D-Bus call timeout plus one poll interval and a small margin.
+const READ_SOURCE_WAIT: Duration =
+    BLUEZ_CALL_TIMEOUT.saturating_add(POLL_INTERVAL).saturating_add(Duration::from_millis(400));
 
 /// The real sink: serves one `org.bluez.BatteryProvider1` object under
 /// `PROVIDER_ROOT` on the system bus and registers it with the adapter's
 /// `BatteryProviderManager1`. All D-Bus traffic runs on a dedicated thread;
-/// `set`/`remove` only queue a command. Dropping the sink stops the thread,
+/// `set`/`remove` only queue a command, and `battery_source` queues a read and
+/// waits (bounded) for its answer. Dropping the sink stops the thread,
 /// which unregisters the provider (BlueZ also drops a provider's batteries
 /// when its connection goes away).
 pub struct BluezBatteryProvider {
@@ -284,6 +419,23 @@ impl BatterySink for BluezBatteryProvider {
     fn remove(&mut self) -> Result<(), String> {
         self.send(Command::Remove)
     }
+
+    /// Asks the provider thread to read Battery1's Source and waits for the
+    /// answer (bounded by `READ_SOURCE_WAIT`). Errors before `register` and
+    /// after the thread stopped.
+    fn battery_source(&mut self) -> Result<Battery1Read, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.send(Command::ReadSource(reply_tx))?;
+        match reply_rx.recv_timeout(READ_SOURCE_WAIT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err("battery provider thread did not answer the Source read".to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("battery provider thread has stopped".to_string())
+            }
+        }
+    }
 }
 
 /// The provider's objects and the exported value, with the D-Bus messages
@@ -344,6 +496,8 @@ impl ProviderObjects {
                 Some(_) => Message::new_signal(&*self.root, OBJECT_MANAGER_IFACE, "InterfacesRemoved")
                     .map(|m| Some(m.append2(self.battery.clone(), vec![PROVIDER_IFACE.to_string()]))),
             },
+            // A read changes none of our objects; `ProviderThread` answers it.
+            Command::ReadSource(_) => Ok(None),
         }
     }
 
@@ -505,10 +659,28 @@ impl ProviderThread {
     }
 
     fn apply(&mut self, command: Command) {
+        if let Command::ReadSource(reply) = command {
+            // The sink may have timed out and gone; nothing to do then.
+            let _ = reply.send(self.read_source());
+            return;
+        }
         match self.objects.apply(command) {
             Ok(Some(signal)) => self.send(signal),
             Ok(None) => {}
             Err(e) => warn!("Cannot build the battery provider signal: {e}"),
+        }
+    }
+
+    /// `Properties.Get("org.bluez.Battery1", "Source")` on the AirPods'
+    /// BlueZ device object, over this thread's connection.
+    fn read_source(&self) -> Result<Battery1Read, String> {
+        let result: Result<(Variant<Box<dyn RefArg>>,), dbus::Error> = self
+            .conn
+            .with_proxy(BLUEZ_SERVICE, self.objects.device.clone(), BLUEZ_CALL_TIMEOUT)
+            .method_call(PROPERTIES_IFACE, "Get", (BATTERY1_IFACE, "Source"));
+        match result {
+            Ok((value,)) => battery1_read_from_value(&*value.0),
+            Err(e) => battery1_read_from_error(e.name().unwrap_or(""), e.message().unwrap_or("")),
         }
     }
 
@@ -642,11 +814,15 @@ mod tests {
     }
 
     /// Records every sink call into a log shared with the test, so calls made
-    /// from `Drop` are visible too.
+    /// from `Drop` are visible too. Battery1 reads are counted separately (so
+    /// the #18 call sequences are unchanged) and answered from `sources`, then
+    /// with our own Source once the script runs out.
     struct FakeSink {
         calls: std::rc::Rc<std::cell::RefCell<Vec<Call>>>,
         fail_register: bool,
         fail_set: bool,
+        sources: std::collections::VecDeque<Result<Battery1Read, String>>,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
     }
 
     impl BatterySink for FakeSink {
@@ -666,6 +842,12 @@ mod tests {
             self.calls.borrow_mut().push(Call::Remove);
             Ok(())
         }
+        fn battery_source(&mut self) -> Result<Battery1Read, String> {
+            self.reads.set(self.reads.get() + 1);
+            self.sources
+                .pop_front()
+                .unwrap_or_else(|| Ok(Battery1Read::Source(PROVIDER_SOURCE.to_string())))
+        }
     }
 
     fn exporter(
@@ -677,6 +859,8 @@ mod tests {
             calls: calls.clone(),
             fail_register,
             fail_set,
+            sources: Default::default(),
+            reads: Default::default(),
         };
         (BatteryExporter::new(sink), calls)
     }
@@ -821,6 +1005,258 @@ mod tests {
             .append1(PROVIDER_IFACE);
         let reply = objects.reply(&get_all);
         assert_eq!(reply.map(|r| r.msg_type()), Some(MessageType::Error));
+        Ok(())
+    }
+
+    // --- #70: whose Battery1 does BlueZ show? ---
+
+    #[test]
+    fn owner_absent_battery1_is_unknown() {
+        assert_eq!(battery_owner(&Battery1Read::Absent), BatteryOwner::Unknown);
+    }
+
+    #[test]
+    fn owner_librepods_source_is_ours() {
+        let read = Battery1Read::Source(PROVIDER_SOURCE.to_string());
+        assert_eq!(battery_owner(&read), BatteryOwner::Ours);
+        assert_eq!(PROVIDER_SOURCE, "LibrePods");
+    }
+
+    #[test]
+    fn owner_foreign_source_carries_it() {
+        let read = Battery1Read::Source("HFP".to_string());
+        assert_eq!(battery_owner(&read), BatteryOwner::Foreign("HFP".to_string()));
+        // Exact match only.
+        for other in ["librepods", "LibrePods ", ""] {
+            let read = Battery1Read::Source(other.to_string());
+            assert_eq!(battery_owner(&read), BatteryOwner::Foreign(other.to_string()));
+        }
+    }
+
+    #[test]
+    fn owner_no_source_is_foreign() {
+        assert_eq!(
+            battery_owner(&Battery1Read::NoSource),
+            BatteryOwner::Foreign(NO_SOURCE.to_string())
+        );
+    }
+
+    #[test]
+    fn owner_read_maps_bluez_errors() {
+        use Battery1Read::{Absent, NoSource};
+        let e = |name: &str| format!("org.freedesktop.DBus.Error.{name}");
+        // BlueZ 5.86 gdbus Properties.Get replies.
+        assert_eq!(
+            battery1_read_from_error(&e("InvalidArgs"), "No such interface 'org.bluez.Battery1'"),
+            Ok(Absent)
+        );
+        assert_eq!(
+            battery1_read_from_error(&e("InvalidArgs"), "No such property 'Source'"),
+            Ok(NoSource)
+        );
+        // Standard names.
+        for name in ["UnknownObject", "UnknownInterface", "UnknownMethod"] {
+            assert_eq!(battery1_read_from_error(&e(name), "whatever"), Ok(Absent), "{name}");
+        }
+        assert_eq!(battery1_read_from_error(&e("UnknownProperty"), ""), Ok(NoSource));
+        // Everything else is an error, retried later.
+        for name in ["InvalidArgs", "NoReply", "Timeout", "ServiceUnknown", "Failed", "AccessDenied"] {
+            assert!(battery1_read_from_error(&e(name), "Something else").is_err(), "{name}");
+        }
+        assert!(battery1_read_from_error("org.bluez.Error.Failed", "No such property").is_err());
+        assert!(battery1_read_from_error("", "").is_err());
+    }
+
+    #[test]
+    fn owner_read_maps_values() {
+        let s: Box<dyn RefArg> = Box::new("HFP".to_string());
+        assert_eq!(battery1_read_from_value(&*s), Ok(Battery1Read::Source("HFP".to_string())));
+        let n: Box<dyn RefArg> = Box::new(42u8);
+        assert!(battery1_read_from_value(&*n).is_err());
+        let o: Box<dyn RefArg> = Box::new(Path::from("/org/bluez"));
+        assert!(battery1_read_from_value(&*o).is_err());
+    }
+
+    type Lines = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    struct Owned {
+        ex: BatteryExporter<FakeSink>,
+        calls: std::rc::Rc<std::cell::RefCell<Vec<Call>>>,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+        lines: Lines,
+    }
+
+    /// An exporter whose sink answers Battery1 reads from `sources`, with a
+    /// recording line sink (shared through `lines`).
+    fn owned_with(
+        fail_register: bool,
+        sources: Vec<Result<Battery1Read, String>>,
+        lines: Lines,
+    ) -> Owned {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let sink = FakeSink {
+            calls: calls.clone(),
+            fail_register,
+            fail_set: false,
+            sources: sources.into(),
+            reads: reads.clone(),
+        };
+        let recorder = lines.clone();
+        let log: LineSink = Box::new(move |line: &str| recorder.lock().unwrap().push(line.to_string()));
+        Owned {
+            ex: BatteryExporter::with_log(sink, log),
+            calls,
+            reads,
+            lines,
+        }
+    }
+
+    fn owned(sources: Vec<Result<Battery1Read, String>>) -> Owned {
+        owned_with(false, sources, Lines::default())
+    }
+
+    fn src(s: &str) -> Result<Battery1Read, String> {
+        Ok(Battery1Read::Source(s.to_string()))
+    }
+
+    #[test]
+    fn exporter_owner_foreign_after_unknown_logs_once() {
+        let mut o = owned(vec![Ok(Battery1Read::Absent), src("HFP")]);
+        o.ex.update(&[b(Left, 80, NotCharging)]);
+        assert_eq!(o.reads.get(), 1);
+        assert!(o.lines.lock().unwrap().is_empty());
+        // Unchanged level: no sink call, but the owner is read again.
+        o.ex.update(&[b(Left, 80, NotCharging)]);
+        assert_eq!(o.reads.get(), 2);
+        o.ex.update(&[b(Left, 70, NotCharging)]);
+        o.ex.update(&[b(Left, 70, NotCharging)]);
+        o.ex.update(&[b(Left, 60, NotCharging)]);
+        assert_eq!(o.reads.get(), 2);
+        let lines = o.lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("\"HFP\""), "{}", lines[0]);
+        assert!(lines[0].contains("not shown"), "{}", lines[0]);
+        assert!(lines[0].contains("Desktop battery (BlueZ BatteryProvider)"), "{}", lines[0]);
+        assert_eq!(
+            *o.calls.borrow(),
+            [Call::Register, Call::Set(80), Call::Set(70), Call::Set(60)]
+        );
+    }
+
+    #[test]
+    fn exporter_owner_ours_reads_once_and_stays_quiet() {
+        let mut o = owned(vec![src(PROVIDER_SOURCE), src("HFP")]);
+        o.ex.update(&[b(Left, 80, NotCharging)]);
+        o.ex.update(&[b(Left, 80, NotCharging)]);
+        o.ex.update(&[b(Left, 50, NotCharging)]);
+        o.ex.update(&[b(Right, 40, NotCharging)]);
+        assert_eq!(o.reads.get(), 1);
+        assert!(o.lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exporter_owner_read_error_retries_without_logging() {
+        let mut o = owned(vec![Err("NoReply".into()), Err("Timeout".into()), src("HFP")]);
+        o.ex.update(&[b(Left, 80, NotCharging)]);
+        assert_eq!(o.reads.get(), 1);
+        o.ex.update(&[b(Left, 70, NotCharging)]);
+        assert_eq!(o.reads.get(), 2);
+        assert!(o.lines.lock().unwrap().is_empty());
+        assert_eq!(*o.calls.borrow(), [Call::Register, Call::Set(80), Call::Set(70)]);
+        assert_eq!(o.ex.state(), ExporterState::Registered);
+        // The next update reads again and resolves.
+        o.ex.update(&[b(Left, 60, NotCharging)]);
+        assert_eq!(o.reads.get(), 3);
+        assert_eq!(o.lines.lock().unwrap().len(), 1);
+        assert_eq!(
+            *o.calls.borrow(),
+            [Call::Register, Call::Set(80), Call::Set(70), Call::Set(60)]
+        );
+    }
+
+    #[test]
+    fn exporter_owner_not_read_before_export_or_when_disabled() {
+        let mut o = owned(vec![src("HFP")]);
+        o.ex.update(&[]);
+        o.ex.update(&[b(Case, 90, Charging)]);
+        o.ex.update(&[b(Left, 50, Disconnected)]);
+        assert_eq!(o.reads.get(), 0);
+        assert!(o.calls.borrow().is_empty());
+
+        let mut o = owned_with(true, vec![src("HFP")], Lines::default());
+        o.ex.update(&[b(Left, 80, NotCharging)]);
+        o.ex.update(&[b(Left, 70, NotCharging)]);
+        assert_eq!(o.ex.state(), ExporterState::Disabled);
+        assert_eq!(o.reads.get(), 0);
+        assert!(o.lines.lock().unwrap().is_empty());
+
+        // A failed set exports nothing, so there is nothing to look for yet.
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let sink = FakeSink {
+            calls,
+            fail_register: false,
+            fail_set: true,
+            sources: vec![src("HFP")].into(),
+            reads: reads.clone(),
+        };
+        let mut ex = BatteryExporter::with_log(sink, Box::new(|_: &str| {}));
+        ex.update(&[b(Left, 80, NotCharging)]);
+        assert_eq!(reads.get(), 0);
+    }
+
+    #[test]
+    fn exporter_owner_foreign_logs_once_per_exporter() {
+        let lines = Lines::default();
+        for _ in 0..2 {
+            let mut o = owned_with(false, vec![src("HFP")], lines.clone());
+            o.ex.update(&[b(Left, 80, NotCharging)]);
+            o.ex.update(&[b(Left, 70, NotCharging)]);
+            assert_eq!(o.reads.get(), 1);
+        }
+        assert_eq!(lines.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn exporter_owner_foreign_survives_remove_and_set() {
+        let mut o = owned(vec![Battery1Read::NoSource].into_iter().map(Ok).collect());
+        o.ex.update(&[b(Left, 80, NotCharging)]);
+        assert_eq!(o.reads.get(), 1);
+        o.ex.update(&[b(Left, 80, Disconnected)]);
+        o.ex.update(&[b(Left, 60, NotCharging)]);
+        o.ex.update(&[b(Left, 50, NotCharging)]);
+        assert_eq!(o.reads.get(), 1);
+        let lines = o.lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(NO_SOURCE), "{}", lines[0]);
+        assert_eq!(
+            *o.calls.borrow(),
+            [Call::Register, Call::Set(80), Call::Remove, Call::Set(60), Call::Set(50)]
+        );
+    }
+
+    #[test]
+    fn exporter_owner_real_exporter_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<BatteryExporter<BluezBatteryProvider>>();
+    }
+
+    #[test]
+    fn owner_read_before_register_is_an_error() {
+        let mut provider = BluezBatteryProvider::new("hci0", "AA:BB:CC:DD:EE:FF");
+        assert!(provider.battery_source().is_err());
+    }
+
+    #[test]
+    fn provider_objects_ignore_source_read() -> Result<(), String> {
+        let mut objects = ProviderObjects::new("hci0", "AA:BB:CC:DD:EE:FF")?;
+        let (tx, _rx) = mpsc::channel();
+        assert!(objects.apply(Command::ReadSource(tx))?.is_none());
+        signal(&mut objects, Command::Set(30))?;
+        let (tx, _rx) = mpsc::channel();
+        assert!(objects.apply(Command::ReadSource(tx))?.is_none());
+        assert_eq!(objects.percentage, Some(30));
         Ok(())
     }
 }
