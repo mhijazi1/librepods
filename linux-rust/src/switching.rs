@@ -34,7 +34,7 @@ use crate::stream_monitor::{
     self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PulsePeaks,
     PulsePlaybackStreams,
 };
-use crate::utils::SwitchingMode;
+use crate::utils::{self, ConnectMode, SwitchingMode};
 use futures::future::BoxFuture;
 use log::{error, info};
 use std::collections::HashMap;
@@ -362,6 +362,8 @@ struct Shell {
     call_rx: CallSamples,
     /// Where the core's lines go after they are logged, if anywhere.
     lines: Option<LineSink>,
+    /// The device's "Connect to this computer" (#16).
+    connect_mode: ConnectMode,
 }
 
 /// Receives each line the handoff core emits, in order, right after it is
@@ -521,7 +523,8 @@ async fn run_handoff(mut shell: Shell) {
         }
         (session_facts(&state), backlog)
     };
-    let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true);
+    let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true)
+        .with_connect_mode(shell.connect_mode);
     for input in seed_inputs(facts) {
         if step(&mut core, &mut shell, input).await {
             return;
@@ -597,6 +600,8 @@ pub(crate) struct Switching {
     policy: Policy,
     /// Given to the handoff task's `Shell`; `start_with_calls` sets none.
     lines: Option<LineSink>,
+    /// Given to the handoff core; `start_with_calls` keeps the default.
+    connect_mode: ConnectMode,
 }
 
 enum Policy {
@@ -638,7 +643,9 @@ impl Switching {
             .flatten();
         let mac = setup.airpods_mac.clone();
         let switching =
-            Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller).await;
+            Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller)
+                .await
+                .with_connect_mode(utils::load_connect_mode(&mac));
         match log {
             Some(log) => switching.with_line_sink(log.sink(mac)),
             None => switching,
@@ -693,7 +700,14 @@ impl Switching {
             airpods_mac,
             policy,
             lines: None,
+            connect_mode: ConnectMode::default(),
         }
+    }
+
+    /// Run the handoff core in `mode` ("Connect to this computer", #16).
+    pub(crate) fn with_connect_mode(mut self, mode: ConnectMode) -> Self {
+        self.connect_mode = mode;
+        self
     }
 
     /// Also hand every line of the handoff core to `sink`, after it is
@@ -745,6 +759,7 @@ impl Switching {
                     play_rx,
                     call_rx,
                     lines: self.lines,
+                    connect_mode: self.connect_mode,
                 };
                 spawn_handoff_task(self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
