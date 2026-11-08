@@ -390,37 +390,139 @@ pub(crate) fn playback_stream(
     }
 }
 
-/// The production source: a short-lived libpulse connection per snapshot
-/// (PipeWire's pulse server included), as media_controller.rs makes one per
-/// query. For calls it lists the source outputs (capture streams) with their
+/// The production call source: a short-lived libpulse connection per
+/// snapshot (PipeWire's pulse server included), as media_controller.rs makes
+/// one per query. It lists the source outputs (capture streams) with their
 /// property lists, marking those recording a monitor source, and the cards
-/// with their active profile; for playback it lists the sink inputs.
+/// with their active profile.
 pub(crate) struct PulseStreams;
 
-impl PlaybackSource for PulseStreams {
-    fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
-        let (mut mainloop, context) = pulse::connect("LibrePods call monitor")?;
-        let introspector = context.introspect();
-        let inputs: Rc<RefCell<ListAccumulator<StreamProps>>> = Rc::default();
-        let mut op = introspector.get_sink_input_info_list({
-            let inputs = Rc::downgrade(&inputs);
-            move |result| {
-                pulse::update(&inputs, |inputs| {
-                    inputs.record(result, |input| {
-                        Some(playback_stream(
-                            input.index,
-                            &input.proplist,
-                            input.corked,
-                            input.mute,
-                            &input.volume,
-                        ))
-                    })
-                })
+/// How long `PulsePlaybackStreams` waits for one listing: a reconnect and a
+/// listing, plus a margin.
+const PLAYBACK_LIST_BOUND: Duration = pulse::CONNECT_TIMEOUT
+    .saturating_add(pulse::OPERATION_TIMEOUT)
+    .saturating_add(Duration::from_millis(500));
+
+/// What a listing request carries: where its own reply goes, so a late
+/// reply to a request that gave up is dropped, never read by the next one.
+type ListingReply = std::sync::mpsc::SyncSender<io::Result<Vec<StreamProps>>>;
+
+/// The production `PlaybackSource`: lists the sink inputs on one libpulse
+/// connection that it keeps across listings (#124). libpulse's mainloop and
+/// context can't move between threads, so they live on one dedicated
+/// thread, which exits once this is dropped. `playback_streams` waits for
+/// its own request at most `bound`; at most one request waits for the
+/// thread, and a dead thread is an error at once.
+pub(crate) struct PulsePlaybackStreams {
+    requests: std::sync::mpsc::SyncSender<ListingReply>,
+    bound: Duration,
+}
+
+/// A libpulse connection kept between listings. `context` is declared
+/// first, so it is dropped before its mainloop.
+struct PulseConnection {
+    context: Context,
+    mainloop: Mainloop,
+}
+
+impl PulsePlaybackStreams {
+    pub(crate) fn new() -> Self {
+        Self::spawn(PLAYBACK_LIST_BOUND, || {
+            let mut connection = None;
+            move || {
+                list_reusing(
+                    &mut connection,
+                    || {
+                        let (mainloop, context) = pulse::connect("LibrePods call monitor")?;
+                        Ok(PulseConnection { context, mainloop })
+                    },
+                    // Introspecting a context that isn't Ready panics.
+                    |c| c.context.get_state() == ContextState::Ready,
+                    |c| sink_inputs(&mut c.mainloop, &c.context),
+                )
             }
-        });
-        pulse::wait(&mut mainloop, &mut op, "sink input list")?;
-        inputs.take().finish("sink input list")
+        })
     }
+
+    /// Run the listings `make` builds, on the thread, for at most `bound`
+    /// each.
+    fn spawn<L>(bound: Duration, make: impl FnOnce() -> L + Send + 'static) -> Self
+    where
+        L: FnMut() -> io::Result<Vec<StreamProps>>,
+    {
+        let (requests, rx) = std::sync::mpsc::sync_channel::<ListingReply>(1);
+        if let Err(e) = std::thread::Builder::new()
+            .name("librepods-streams".to_string())
+            .spawn(move || {
+                let mut list = make();
+                for reply in rx {
+                    // The asker may have given up; its reply goes nowhere.
+                    let _ = reply.send(list());
+                }
+            })
+        {
+            log::warn!("Stream monitor: no playback stream thread, so listings fail: {e}");
+        }
+        PulsePlaybackStreams { requests, bound }
+    }
+}
+
+impl PlaybackSource for PulsePlaybackStreams {
+    fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
+        let thread_error =
+            |e: &dyn std::fmt::Display| io::Error::other(format!("playback stream thread: {e}"));
+        let (reply, listing) = std::sync::mpsc::sync_channel(1);
+        self.requests
+            .try_send(reply)
+            .map_err(|e| thread_error(&e))?;
+        listing
+            .recv_timeout(self.bound)
+            .map_err(|e| thread_error(&e))?
+    }
+}
+
+/// List on the connection in `slot`: reuse it while `ready`, else replace
+/// it with one `connect`. Any error drops it, so the next listing
+/// reconnects and a cancelled operation's late reply is never read.
+fn list_reusing<C, T>(
+    slot: &mut Option<C>,
+    connect: impl FnOnce() -> io::Result<C>,
+    ready: impl FnOnce(&C) -> bool,
+    list: impl FnOnce(&mut C) -> io::Result<T>,
+) -> io::Result<T> {
+    let connection = match slot.take().filter(ready) {
+        Some(connection) => slot.insert(connection),
+        None => slot.insert(connect()?),
+    };
+    let result = list(connection);
+    if result.is_err() {
+        *slot = None;
+    }
+    result
+}
+
+/// Every sink input on `context`, which must be Ready.
+fn sink_inputs(mainloop: &mut Mainloop, context: &Context) -> io::Result<Vec<StreamProps>> {
+    let introspector = context.introspect();
+    let inputs: Rc<RefCell<ListAccumulator<StreamProps>>> = Rc::default();
+    let mut op = introspector.get_sink_input_info_list({
+        let inputs = Rc::downgrade(&inputs);
+        move |result| {
+            pulse::update(&inputs, |inputs| {
+                inputs.record(result, |input| {
+                    Some(playback_stream(
+                        input.index,
+                        &input.proplist,
+                        input.corked,
+                        input.mute,
+                        &input.volume,
+                    ))
+                })
+            })
+        }
+    });
+    pulse::wait(mainloop, &mut op, "sink input list")?;
+    inputs.take().finish("sink input list")
 }
 
 impl StreamSource for PulseStreams {
@@ -2122,5 +2224,168 @@ mod tests {
         drop(tx);
         assert_eq!(rx.take_timeout(PEAK_TICK), Ok(HashSet::from([7])));
         assert_eq!(rx.take(), Err(RecvTimeoutError::Disconnected));
+    }
+
+    /// Fake connections for `list_reusing`, numbered from 1 by each connect;
+    /// a listing returns the connection it ran on.
+    #[derive(Default)]
+    struct FakeConnections {
+        slot: Option<u32>,
+        connects: u32,
+        connect_fails: bool,
+        not_ready: HashSet<u32>,
+    }
+
+    impl FakeConnections {
+        /// One listing that ends with `outcome`.
+        fn list(&mut self, outcome: io::Result<()>) -> io::Result<u32> {
+            let FakeConnections {
+                slot,
+                connects,
+                connect_fails,
+                not_ready,
+            } = self;
+            list_reusing(
+                slot,
+                || {
+                    *connects += 1;
+                    match connect_fails {
+                        true => Err(io::Error::other("no sound server")),
+                        false => Ok(*connects),
+                    }
+                },
+                |c| !not_ready.contains(c),
+                |c| outcome.map(|()| *c),
+            )
+        }
+    }
+
+    #[test]
+    fn playback_listing_reuses_connection() {
+        let mut fake = FakeConnections::default();
+        for _ in 0..5 {
+            assert_eq!(fake.list(Ok(())).unwrap(), 1);
+        }
+        assert_eq!(fake.connects, 1);
+    }
+
+    #[test]
+    fn playback_listing_reconnects_after_error() {
+        let mut fake = FakeConnections::default();
+        assert_eq!(fake.list(Ok(())).unwrap(), 1);
+        assert!(fake.list(failure_streams().map(drop)).is_err());
+        assert_eq!(fake.list(Ok(())).unwrap(), 2);
+        assert_eq!(fake.list(Ok(())).unwrap(), 2);
+        assert_eq!(
+            fake.list(timed_out()).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(fake.list(Ok(())).unwrap(), 3);
+        assert_eq!(fake.list(Ok(())).unwrap(), 3);
+        assert_eq!(fake.connects, 3);
+    }
+
+    #[test]
+    fn playback_listing_reconnects_when_not_ready() {
+        let mut fake = FakeConnections::default();
+        assert_eq!(fake.list(Ok(())).unwrap(), 1);
+        fake.not_ready.insert(1);
+        // Never listed on 1 again: replaced by one connect.
+        assert_eq!(fake.list(Ok(())).unwrap(), 2);
+        assert_eq!(fake.list(Ok(())).unwrap(), 2);
+        assert_eq!(fake.connects, 2);
+    }
+
+    #[test]
+    fn playback_listing_reconnects_after_failed_connect() {
+        let mut fake = FakeConnections {
+            connect_fails: true,
+            ..Default::default()
+        };
+        assert!(fake.list(Ok(())).is_err());
+        assert_eq!(fake.connects, 1);
+        fake.connect_fails = false;
+        assert_eq!(fake.list(Ok(())).unwrap(), 2);
+        assert_eq!(fake.list(Ok(())).unwrap(), 2);
+        assert_eq!(fake.connects, 2);
+    }
+
+    #[test]
+    fn playback_thread_stall_is_bounded_and_late_reply_dropped() {
+        let bound = Duration::from_millis(300);
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        // Listing n has the one stream n; the first stalls until released.
+        let mut source = PulsePlaybackStreams::spawn(bound, move || {
+            let mut n = 0;
+            move || {
+                n += 1;
+                if n == 1 {
+                    let _ = stalled.recv();
+                }
+                Ok(vec![music(n)])
+            }
+        });
+        let start = Instant::now();
+        assert!(source.playback_streams().is_err());
+        let waited = start.elapsed();
+        assert!(waited >= bound, "{waited:?}");
+        assert!(waited < bound + Duration::from_millis(500), "{waited:?}");
+        release.send(()).unwrap();
+        // The stalled listing answers nobody; each request gets its own.
+        assert_eq!(source.playback_streams().unwrap(), vec![music(2)]);
+        assert_eq!(source.playback_streams().unwrap(), vec![music(3)]);
+    }
+
+    #[test]
+    fn playback_thread_requests_never_pile_up() {
+        let bound = Duration::from_millis(100);
+        let (_release, stalled) = std::sync::mpsc::channel::<()>();
+        let mut source = PulsePlaybackStreams::spawn(bound, move || {
+            move || {
+                let _ = stalled.recv();
+                Ok(Vec::new())
+            }
+        });
+        // The first request stalls the thread, the second waits in the queue.
+        assert!(source.playback_streams().is_err());
+        assert!(source.playback_streams().is_err());
+        // A full queue is an error at once.
+        let start = Instant::now();
+        assert!(source.playback_streams().is_err());
+        assert!(start.elapsed() < bound, "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn playback_thread_dead_is_error_at_once() {
+        let mut source = PulsePlaybackStreams::spawn(Duration::from_secs(5), || {
+            || -> io::Result<Vec<StreamProps>> { panic!("listing thread dies") }
+        });
+        for _ in 0..2 {
+            let start = Instant::now();
+            assert!(source.playback_streams().is_err());
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn playback_thread_exits_when_dropped() {
+        let alive = Arc::new(());
+        let held = alive.clone();
+        let mut source = PulsePlaybackStreams::spawn(Duration::from_secs(5), move || {
+            move || {
+                let _ = &held;
+                Ok(Vec::new())
+            }
+        });
+        assert_eq!(source.playback_streams().unwrap(), Vec::new());
+        drop(source);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&alive) > 1 {
+            assert!(
+                Instant::now() < deadline,
+                "playback stream thread still running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
