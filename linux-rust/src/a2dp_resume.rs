@@ -1334,17 +1334,6 @@ mod tests {
         Duration::from_millis(ms)
     }
 
-    /// Every call's timeout is above 0 and within the budget left then.
-    fn assert_within_budget(calls: &[(Duration, Duration)]) {
-        for &(at, timeout) in calls {
-            assert!(!timeout.is_zero(), "{calls:?}");
-            assert!(
-                timeout <= TRANSPORT_READ_TIMEOUT.saturating_sub(at),
-                "{calls:?}"
-            );
-        }
-    }
-
     #[test]
     fn fresh_read_budget_fast_calls_read_like_unbudgeted() {
         let fakes = || {
@@ -1390,11 +1379,11 @@ mod tests {
         };
         let (active, calls) = bluez.read_fresh(ms(200));
         assert_eq!(active, None);
+        // Each timeout is the budget left at its call: 500 ms less its time.
         assert_eq!(
             calls,
             [(ms(0), ms(500)), (ms(200), ms(300)), (ms(400), ms(100))]
         );
-        assert_within_budget(&calls);
         assert_eq!((bluez.lookups, bluez.reads), (2, 1));
 
         // Spent before the second lookup: it fails like the bus.
@@ -1405,7 +1394,6 @@ mod tests {
         let (active, calls) = bluez.read_fresh(ms(300));
         assert_eq!(active, None);
         assert_eq!(calls, [(ms(0), ms(500)), (ms(300), ms(200))]);
-        assert_within_budget(&calls);
         assert_eq!((bluez.lookups, bluez.reads), (1, 1));
     }
 
