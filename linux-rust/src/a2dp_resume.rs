@@ -313,10 +313,11 @@ struct TransportReader {
 impl TransportReader {
     /// Whether any transport is not idle; no transport reads idle. Looks the
     /// paths up when none are cached or one is gone, in the same read. None
-    /// when `lookup` or `state` fails on the bus; that clears the cache.
+    /// when `lookup` or `state` fails on the bus, or paths keep going; that
+    /// clears the cache.
     fn read(
         &mut self,
-        lookup: impl FnOnce() -> Option<Vec<String>>,
+        mut lookup: impl FnMut() -> Option<Vec<String>>,
         mut state: impl FnMut(&str) -> Result<Option<bool>, Gone>,
     ) -> Option<bool> {
         if !self.paths.is_empty()
@@ -324,26 +325,38 @@ impl TransportReader {
         {
             return active;
         }
-        self.paths = lookup()?;
-        // A path gone right after its lookup reads idle; the next read looks
-        // it up again.
-        self.states(&mut state).unwrap_or(Some(false))
+        // A path can go between its lookup and its read: look up once more,
+        // then give up on this read rather than guess idle.
+        for _ in 0..2 {
+            self.paths = lookup()?;
+            if let Ok(active) = self.states(&mut state) {
+                return active;
+            }
+        }
+        None
     }
 
-    /// Any cached path's State not idle; on a failure or a gone path, the
-    /// cache is cleared.
+    /// Any cached path's State not idle. Gone when a path is gone and no
+    /// other is active. On a failure or a gone path, the cache is cleared.
     fn states(
         &mut self,
         state: &mut impl FnMut(&str) -> Result<Option<bool>, Gone>,
     ) -> Result<Option<bool>, Gone> {
-        let mut active = false;
+        let (mut active, mut gone) = (false, false);
         for path in &self.paths {
             match state(path) {
                 Ok(Some(path_active)) => active |= path_active,
-                failed => {
+                Ok(None) => {
                     self.paths.clear();
-                    return failed;
+                    return Ok(None);
                 }
+                Err(Gone) => gone = true,
+            }
+        }
+        if gone {
+            self.paths.clear();
+            if !active {
+                return Err(Gone);
             }
         }
         Ok(Some(active))
@@ -781,12 +794,69 @@ mod tests {
         assert_eq!(bluez.read(&mut reader), Some(false));
         assert_eq!(bluez.read(&mut reader), Some(false));
         assert_eq!((bluez.lookups, bluez.reads), (2, 0));
-        // Gone again right after its lookup: idle, looked up next tick.
         bluez.paths = Some(vec![FD0]);
-        assert_eq!(bluez.read(&mut reader), Some(false));
         bluez.states = vec![(FD0, Some("pending"))];
         assert_eq!(bluez.read(&mut reader), Some(true));
-        assert_eq!((bluez.lookups, bluez.reads), (4, 2));
+        assert_eq!((bluez.lookups, bluez.reads), (3, 1));
+    }
+
+    #[test]
+    fn transport_reader_gone_path_never_reads_idle() {
+        // Gone right after both lookups of a read: inconclusive, not idle.
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0]),
+            ..Default::default()
+        };
+        let mut reader = TransportReader::default();
+        assert_eq!(bluez.read(&mut reader), None);
+        assert!(reader.paths.is_empty());
+        assert_eq!((bluez.lookups, bluez.reads), (2, 2));
+        bluez.states = vec![(FD0, Some("idle"))];
+        assert_eq!(bluez.read(&mut reader), Some(false));
+        assert_eq!((bluez.lookups, bluez.reads), (3, 3));
+
+        // Replaced (fd0 -> fd1) between the lookup and its read: seen this read.
+        let mut reader = TransportReader::default();
+        let mut found = [vec![FD0], vec![FD1]].into_iter();
+        let mut lookups = 0;
+        let active = reader.read(
+            || {
+                lookups += 1;
+                found
+                    .next()
+                    .map(|p| p.iter().map(|p| p.to_string()).collect())
+            },
+            |path| {
+                if path == FD1 {
+                    Ok(Some(true))
+                } else {
+                    Err(Gone)
+                }
+            },
+        );
+        assert_eq!((active, lookups), (Some(true), 2));
+        assert_eq!(reader.paths, [FD1]);
+    }
+
+    #[test]
+    fn transport_reader_active_beside_gone_path_is_active() {
+        // Either order, fresh or cached: the active path wins, every path
+        // is read, and the next read looks up again.
+        for (gone, live) in [(FD1, FD0), (FD0, FD1)] {
+            let mut bluez = FakeBlueZ {
+                paths: Some(vec![FD0, FD1]),
+                states: vec![(live, Some("active"))],
+                ..Default::default()
+            };
+            let mut reader = TransportReader::default();
+            assert_eq!(bluez.read(&mut reader), Some(true), "{gone} gone");
+            assert_eq!((bluez.lookups, bluez.reads), (1, 2), "{gone} gone");
+            bluez.states = vec![(FD0, Some("idle")), (FD1, Some("idle"))];
+            assert_eq!(bluez.read(&mut reader), Some(false), "{gone} gone");
+            bluez.states = vec![(live, Some("pending"))];
+            assert_eq!(bluez.read(&mut reader), Some(true), "{gone} gone");
+            assert_eq!((bluez.lookups, bluez.reads), (2, 6), "{gone} gone");
+        }
     }
 
     #[test]
