@@ -336,13 +336,13 @@ impl TransportReader {
         None
     }
 
-    /// Any cached path's State not idle. Gone when a path is gone and no
-    /// other is active. On a failure or a gone path, the cache is cleared.
+    /// Any cached path's State not idle. Gone when any path is gone. On a
+    /// failure or a gone path, the cache is cleared.
     fn states(
         &mut self,
         state: &mut impl FnMut(&str) -> Result<Option<bool>, Gone>,
     ) -> Result<Option<bool>, Gone> {
-        let (mut active, mut gone) = (false, false);
+        let mut active = false;
         for path in &self.paths {
             match state(path) {
                 Ok(Some(path_active)) => active |= path_active,
@@ -350,13 +350,10 @@ impl TransportReader {
                     self.paths.clear();
                     return Ok(None);
                 }
-                Err(Gone) => gone = true,
-            }
-        }
-        if gone {
-            self.paths.clear();
-            if !active {
-                return Err(Gone);
+                Err(Gone) => {
+                    self.paths.clear();
+                    return Err(Gone);
+                }
             }
         }
         Ok(Some(active))
@@ -742,6 +739,7 @@ mod tests {
 
     const FD0: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/fd0";
     const FD1: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/fd1";
+    const FD2: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/fd2";
 
     #[test]
     fn transport_reader_looks_up_path_once_then_reads_state() {
@@ -839,24 +837,51 @@ mod tests {
     }
 
     #[test]
-    fn transport_reader_active_beside_gone_path_is_active() {
-        // Either order, fresh or cached: the active path wins, every path
-        // is read, and the next read looks up again.
-        for (gone, live) in [(FD1, FD0), (FD0, FD1)] {
-            let mut bluez = FakeBlueZ {
-                paths: Some(vec![FD0, FD1]),
-                states: vec![(live, Some("active"))],
-                ..Default::default()
-            };
-            let mut reader = TransportReader::default();
-            assert_eq!(bluez.read(&mut reader), Some(true), "{gone} gone");
-            assert_eq!((bluez.lookups, bluez.reads), (1, 2), "{gone} gone");
-            bluez.states = vec![(FD0, Some("idle")), (FD1, Some("idle"))];
-            assert_eq!(bluez.read(&mut reader), Some(false), "{gone} gone");
-            bluez.states = vec![(live, Some("pending"))];
-            assert_eq!(bluez.read(&mut reader), Some(true), "{gone} gone");
-            assert_eq!((bluez.lookups, bluez.reads), (2, 6), "{gone} gone");
-        }
+    fn transport_reader_gone_beside_live_path_relooks_up_same_read() {
+        // Cached fd1 is re-created as fd2 beside a live fd0: the read that
+        // finds fd1 gone looks up again and reads fd2.
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0, FD1]),
+            states: vec![(FD0, Some("idle")), (FD1, Some("idle"))],
+            ..Default::default()
+        };
+        let mut reader = TransportReader::default();
+        assert_eq!(bluez.read(&mut reader), Some(false));
+        bluez.paths = Some(vec![FD0, FD2]);
+        bluez.states = vec![(FD0, Some("idle")), (FD2, Some("active"))];
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        assert_eq!((bluez.lookups, bluez.reads), (2, 6));
+        assert_eq!(reader.paths, [FD0, FD2]);
+
+        // Fresh lookup lists an active fd0 beside a gone fd1; the next
+        // lookup drops fd1: active in the same read.
+        let mut reader = TransportReader::default();
+        let mut found = [vec![FD0, FD1], vec![FD0]].into_iter();
+        let active = reader.read(
+            || {
+                found
+                    .next()
+                    .map(|p| p.iter().map(|p| p.to_string()).collect())
+            },
+            |path| {
+                if path == FD0 {
+                    Ok(Some(true))
+                } else {
+                    Err(Gone)
+                }
+            },
+        );
+        assert_eq!(active, Some(true));
+        assert_eq!(reader.paths, [FD0]);
+
+        // Every lookup still lists the gone fd1: inconclusive, never idle.
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0, FD1]),
+            states: vec![(FD0, Some("active"))],
+            ..Default::default()
+        };
+        assert_eq!(bluez.read(&mut TransportReader::default()), None);
+        assert_eq!((bluez.lookups, bluez.reads), (2, 4));
     }
 
     #[test]
