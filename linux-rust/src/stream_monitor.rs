@@ -6,9 +6,10 @@
 //! the pure `call_detect` rules; `spawn_call_poller` samples once per
 //! `CALL_POLL` and sends each change to the handoff task.
 //!
-//! `PlaybackSource` lists the playback streams (sink inputs);
-//! `PlaybackTracker` debounces the takeover-worthy ones with an injected
-//! clock, and `spawn_stream_playback` publishes its state for
+//! `PlaybackSource` lists the playback streams (sink inputs) and
+//! `PeakSource` measures how loud the candidates among them are (#88);
+//! `PlaybackTracker` debounces the takeover-worthy, audible ones with an
+//! injected clock, and `spawn_stream_playback` publishes its state for
 //! `switching::spawn_playback_poller`, which combines it with MPRIS. Tests
 //! use fake sources, so no sound server is needed.
 
@@ -17,14 +18,21 @@ use crate::call_detect::{
 };
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
+use libpulse_binding::def::BufferAttr;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::operation::{Operation, State as OperationState};
 use libpulse_binding::proplist::Proplist;
+use libpulse_binding::sample::{Format, Spec};
+use libpulse_binding::stream::{
+    FlagSet as StreamFlagSet, PeekResult, State as StreamState, Stream,
+};
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
@@ -39,6 +47,16 @@ pub(crate) const CALL_POLL: Duration = Duration::from_secs(1);
 /// fast as a person notices which device plays. Samples are taken every
 /// poll interval, so the effective delay is 2 s up to 2 s plus one interval.
 pub(crate) const MIN_STREAM_PLAYBACK: Duration = Duration::from_secs(2);
+
+/// The peak level (0.0 to 1.0) a playback stream must exceed in a sample to
+/// carry sound (#88): -60 dBFS. A paused SDL game or idle WebAudio context
+/// writes digital silence, while quiet music stays well above it.
+pub(crate) const AUDIBLE_PEAK: f32 = 0.001;
+
+/// How long a counted stream may stay silent and still count (#88): long
+/// enough for gaps between tracks and quiet passages, short enough that a
+/// paused game or an idle tab hands the AirPods back soon.
+pub(crate) const SILENCE_HOLD: Duration = Duration::from_secs(5);
 
 /// Call-state changes: whether Linux was in a call at the instant.
 pub(crate) type CallSamples = mpsc::Receiver<(Instant, bool)>;
@@ -141,26 +159,53 @@ pub(crate) trait PlaybackSource: Send {
     fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>>;
 }
 
-/// Debounces takeover-worthy playback streams into a stream-playing state.
+/// How loud playback streams are (#88): the sinks' monitors in production
+/// (`PulsePeaks`), a fake in tests.
+pub(crate) trait PeakSource: Send {
+    /// Each candidate's highest peak level (0.0 to 1.0) since the previous
+    /// call. A candidate missing from the result is silent. Never waits on
+    /// the sound server.
+    fn levels(&mut self, candidates: &HashSet<u32>) -> HashMap<u32, f32>;
+}
+
+/// Where a candidate stream is in the peak gate (#88).
+#[derive(Clone, Copy, Debug)]
+enum Gate {
+    /// Audible in every sample since this one, its first audible sample.
+    Debounce(Instant),
+    /// Counts; this was its last audible sample.
+    Counting(Instant),
+}
+
+/// Debounces takeover-worthy playback streams that carry sound into a
+/// stream-playing state.
 ///
-/// A stream, keyed by its sound server index, counts once it has been seen
-/// worthy (`call_detect::is_takeover_worthy`) and uncorked in every sample
-/// for at least `min`. Corking, vanishing or reclassification forgets it, so
-/// it starts over if it comes back. Stream playback is on while any stream
-/// counts. A muted or zero-volume stream is treated as corked, so it never
-/// counts (#84). An app that keeps a silent stream open uncorked and unmuted
-/// still counts; libpulse reports no level for sink inputs (#88).
+/// A stream, keyed by its sound server index, is a candidate while it is
+/// worthy (`call_detect::is_takeover_worthy`), uncorked and not part of the
+/// baseline. A muted or zero-volume stream is treated as corked (#84).
+/// Corking, vanishing or reclassification forgets it, so it starts over if
+/// it comes back. A candidate counts only while it carries sound (#88): the
+/// `min` debounce starts at its first sample whose peak level is above
+/// `AUDIBLE_PEAK`, any silent sample before `min` restarts it (so one
+/// notification ping on an idle WebAudio stream never counts), and it
+/// counts once it has been audible in every sample for `min`. A counted
+/// stream keeps counting through silence shorter than `SILENCE_HOLD` and
+/// stops once it has been silent that long; then it needs a new debounce.
+/// A stream that stays silent (a paused SDL game, an idle Electron app) or
+/// has no level at all never counts. Stream playback is on while any
+/// stream counts.
 ///
 /// The first successful listing is the baseline: streams already playing in
-/// it never count, as MPRIS playback running at the handoff core's baseline
-/// is no new start. Such a stream counts only once it has been corked (or
-/// reclassified) and plays again, and then only after `min`; a new stream
-/// counts as usual.
+/// it (worthy, uncorked and unmuted, whatever their level) never count, as
+/// MPRIS playback running at the handoff core's baseline is no new start,
+/// and they are not measured. Such a stream becomes a candidate only once it
+/// has been corked (or reclassified) and plays again, and then counts only
+/// after an audible `min`; a new stream is a candidate as usual.
 #[derive(Debug)]
 pub(crate) struct PlaybackTracker {
     min: Duration,
-    /// Worthy, uncorked streams by index: when each was first seen so.
-    since: HashMap<u32, Instant>,
+    /// Candidates that are debouncing or counting, by index.
+    gates: HashMap<u32, Gate>,
     /// Worthy, uncorked streams of the first successful listing that have
     /// stayed so ever since; None until that listing.
     preexisting: Option<HashSet<u32>>,
@@ -168,36 +213,75 @@ pub(crate) struct PlaybackTracker {
     playing: bool,
 }
 
+/// The worthy, uncorked, unmuted streams of a listing.
+fn live_streams(streams: &[StreamProps]) -> HashSet<u32> {
+    streams
+        .iter()
+        .filter(|s| !s.corked && !s.muted && is_takeover_worthy(s))
+        .map(|s| s.index)
+        .collect()
+}
+
 impl PlaybackTracker {
     pub(crate) fn new(min: Duration) -> Self {
         PlaybackTracker {
             min,
-            since: HashMap::new(),
+            gates: HashMap::new(),
             preexisting: None,
             playing: false,
         }
     }
 
-    /// Take the playback streams present at `now`. Some(playing) only when
-    /// the aggregate stream-playing state changed.
-    pub(crate) fn observe(&mut self, now: Instant, streams: &[StreamProps]) -> Option<bool> {
-        let live: HashSet<u32> = streams
-            .iter()
-            .filter(|s| !s.corked && !s.muted && is_takeover_worthy(s))
-            .map(|s| s.index)
-            .collect();
+    /// The streams of a listing whose levels count: worthy, uncorked,
+    /// unmuted and not part of the baseline (so none before the baseline).
+    pub(crate) fn candidates(&self, streams: &[StreamProps]) -> HashSet<u32> {
+        let Some(preexisting) = &self.preexisting else {
+            return HashSet::new();
+        };
+        live_streams(streams)
+            .into_iter()
+            .filter(|index| !preexisting.contains(index))
+            .collect()
+    }
+
+    /// Take the playback streams present at `now`, with each candidate's
+    /// peak `level` since the previous sample. Some(playing) only when the
+    /// aggregate stream-playing state changed.
+    pub(crate) fn observe_levels(
+        &mut self,
+        now: Instant,
+        streams: &[StreamProps],
+        level: impl Fn(u32) -> f32,
+    ) -> Option<bool> {
+        let live = live_streams(streams);
         let preexisting = self.preexisting.get_or_insert_with(|| live.clone());
         preexisting.retain(|index| live.contains(index));
-        self.since.retain(|index, _| live.contains(index));
-        for index in live {
-            if !preexisting.contains(&index) {
-                self.since.entry(index).or_insert(now);
-            }
+        let candidates = self.candidates(streams);
+        self.gates.retain(|index, _| candidates.contains(index));
+        for index in candidates {
+            let audible = level(index) > AUDIBLE_PEAK;
+            let since = |at: Instant| now.saturating_duration_since(at);
+            let gate = match (self.gates.get(&index).copied(), audible) {
+                (None, true) => Some(Gate::Debounce(now)),
+                (Some(Gate::Debounce(start)), true) if since(start) >= self.min => {
+                    Some(Gate::Counting(now))
+                }
+                (debounce @ Some(Gate::Debounce(_)), true) => debounce,
+                (Some(Gate::Counting(_)), true) => Some(Gate::Counting(now)),
+                (Some(Gate::Counting(last)), false) if since(last) < SILENCE_HOLD => {
+                    Some(Gate::Counting(last))
+                }
+                (_, false) => None,
+            };
+            match gate {
+                Some(gate) => self.gates.insert(index, gate),
+                None => self.gates.remove(&index),
+            };
         }
         let playing = self
-            .since
+            .gates
             .values()
-            .any(|&since| now.saturating_duration_since(since) >= self.min);
+            .any(|gate| matches!(gate, Gate::Counting(_)));
         if playing == self.playing {
             return None;
         }
@@ -205,18 +289,26 @@ impl PlaybackTracker {
         Some(playing)
     }
 
-    /// Sample `source` once, as `observe` at the time `clock` gives. `clock`
-    /// is read only once the listing has returned, so a slow listing can't
-    /// date a stream's start back to before the stream was seen. A source
-    /// error changes nothing: the last state and the streams' timers are
-    /// kept, and the baseline is still the first successful listing.
-    pub(crate) fn poll(
+    /// Sample `source` once, ask `peaks` for the levels of that listing's
+    /// candidates only, and `observe_levels` at the time `clock` gives.
+    /// `clock` is read only once the listing and the levels have returned,
+    /// so a slow listing can't date a stream's start back to before the
+    /// stream was seen. A source error changes nothing and asks for no
+    /// levels: the last state and the streams' timers are kept, and the
+    /// baseline is still the first successful listing.
+    pub(crate) fn poll_levels(
         &mut self,
         source: &mut dyn PlaybackSource,
+        peaks: &mut dyn PeakSource,
         clock: impl FnOnce() -> Instant,
     ) -> Option<bool> {
         match source.playback_streams() {
-            Ok(streams) => self.observe(clock(), &streams),
+            Ok(streams) => {
+                let levels = peaks.levels(&self.candidates(&streams));
+                self.observe_levels(clock(), &streams, |index| {
+                    levels.get(&index).copied().unwrap_or(0.0)
+                })
+            }
             Err(e) => {
                 log::debug!("Stream monitor: playback stream listing failed: {e}");
                 None
@@ -225,36 +317,42 @@ impl PlaybackTracker {
     }
 }
 
-/// Sample `source` every `interval` with a `PlaybackTracker` and publish the
-/// stream-playing state (initially false; streams already playing in the
-/// first listing never make it true, see `PlaybackTracker`). Each listing is
-/// timed when it returns. Sampling runs on the blocking pool in its own
-/// task, so a sound server that never answers stalls only this state, never
-/// the caller. The task stops once every receiver is dropped; if sampling
-/// panics the state drops to false.
-pub(crate) fn spawn_stream_playback<S: PlaybackSource + 'static>(
+/// Sample `source` and `peaks` every `interval` with a `PlaybackTracker`
+/// and publish the stream-playing state (initially false; streams already
+/// playing in the first listing never make it true, see `PlaybackTracker`).
+/// Each sample is timed when the listing and levels return. Sampling runs on
+/// the blocking pool in its own task, so a sound server that never answers
+/// stalls only this state, never the caller. The task stops once every
+/// receiver is dropped, dropping `peaks`; if sampling panics the state
+/// drops to false.
+pub(crate) fn spawn_stream_playback<S, P>(
     source: S,
+    peaks: P,
     min: Duration,
     interval: Duration,
-) -> watch::Receiver<bool> {
+) -> watch::Receiver<bool>
+where
+    S: PlaybackSource + 'static,
+    P: PeakSource + 'static,
+{
     let (tx, rx) = watch::channel(false);
     tokio::spawn(async move {
-        let mut state = Some((PlaybackTracker::new(min), source));
+        let mut state = Some((PlaybackTracker::new(min), source, peaks));
         while !tx.is_closed() {
-            let Some((mut tracker, mut source)) = state.take() else {
+            let Some((mut tracker, mut source, mut peaks)) = state.take() else {
                 break;
             };
             let sampled = tokio::task::spawn_blocking(move || {
-                let change = tracker.poll(&mut source, Instant::now);
-                (tracker, source, change)
+                let change = tracker.poll_levels(&mut source, &mut peaks, Instant::now);
+                (tracker, source, peaks, change)
             })
             .await;
-            let Ok((tracker, source, change)) = sampled else {
+            let Ok((tracker, source, peaks, change)) = sampled else {
                 log::error!("Stream playback monitor stopped: sampling panicked");
                 tx.send_replace(false);
                 break;
             };
-            state = Some((tracker, source));
+            state = Some((tracker, source, peaks));
             if let Some(playing) = change {
                 tx.send_replace(playing);
             }
@@ -299,7 +397,7 @@ pub(crate) struct PulseStreams;
 
 impl PlaybackSource for PulseStreams {
     fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
-        let (mut mainloop, context) = connect()?;
+        let (mut mainloop, context) = connect("LibrePods call monitor")?;
         let introspector = context.introspect();
         let inputs: Rc<RefCell<ListAccumulator<StreamProps>>> = Rc::default();
         let op = introspector.get_sink_input_info_list({
@@ -323,7 +421,7 @@ impl PlaybackSource for PulseStreams {
 
 impl StreamSource for PulseStreams {
     fn snapshot(&mut self) -> io::Result<AudioSnapshot> {
-        let (mut mainloop, context) = connect()?;
+        let (mut mainloop, context) = connect("LibrePods call monitor")?;
         let introspector = context.introspect();
 
         let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
@@ -448,12 +546,18 @@ fn pulse_error(what: &str) -> io::Error {
     io::Error::other(format!("PulseAudio {what} failed"))
 }
 
-/// Connect to the sound server, blocking until the context is ready.
-// shortcut: duplicates media_controller.rs's pulse_connect; fold the two together (#73)
-fn connect() -> io::Result<(Mainloop, Context)> {
+/// Connect to the sound server as `name`, blocking until the context is
+/// ready.
+// shortcut: duplicates media_controller.rs's pulse_connect, and the peak thread keeps one more connection per measured stream; fold them together (#73)
+fn connect(name: &str) -> io::Result<(Mainloop, Context)> {
     let mut mainloop = Mainloop::new().ok_or_else(|| pulse_error("mainloop"))?;
-    let mut context =
-        Context::new(&mainloop, "LibrePods call monitor").ok_or_else(|| pulse_error("context"))?;
+    let context = connect_on(&mut mainloop, name)?;
+    Ok((mainloop, context))
+}
+
+/// `connect` on an existing mainloop.
+fn connect_on(mainloop: &mut Mainloop, name: &str) -> io::Result<Context> {
+    let mut context = Context::new(mainloop, name).ok_or_else(|| pulse_error("context"))?;
     context
         .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
         .map_err(|_| pulse_error("connection"))?;
@@ -462,7 +566,7 @@ fn connect() -> io::Result<(Mainloop, Context)> {
             return Err(pulse_error("mainloop iteration"));
         }
         match context.get_state() {
-            ContextState::Ready => return Ok((mainloop, context)),
+            ContextState::Ready => return Ok(context),
             ContextState::Failed | ContextState::Terminated => {
                 return Err(pulse_error("connection"));
             }
@@ -472,7 +576,7 @@ fn connect() -> io::Result<(Mainloop, Context)> {
 }
 
 /// Run the mainloop until the operation is done.
-// shortcut: no timeout; a sound server that never answers stalls the call and stream-playback monitors (not the handoff task or MPRIS samples) until restart (#73)
+// shortcut: no timeout; a sound server that never answers stalls the call and stream-playback monitors (not the handoff task or MPRIS samples) and the peak thread (its streams then read silent) until restart (#73)
 fn wait<F: ?Sized>(mainloop: &mut Mainloop, op: &Operation<F>, what: &str) -> io::Result<()> {
     loop {
         match op.get_state() {
@@ -483,6 +587,233 @@ fn wait<F: ?Sized>(mainloop: &mut Mainloop, op: &Operation<F>, what: &str) -> io
         if !matches!(mainloop.iterate(true), IterateResult::Success(_)) {
             return Err(pulse_error(what));
         }
+    }
+}
+
+/// Peak record streams' sample rate: one peak per 40 ms, as pavucontrol's
+/// meters use.
+const PEAK_RATE: u32 = 25;
+/// How often the peak thread reads its streams, while it has any.
+const PEAK_TICK: Duration = Duration::from_millis(40);
+/// How long the peak thread waits before retrying a stream it could not
+/// open: well under `SILENCE_HOLD`, so a counted stream whose record stream
+/// is reopened (its sink input moved) keeps counting.
+const PEAK_RETRY: Duration = Duration::from_secs(2);
+
+/// The production `PeakSource`: per-stream peak detection on the sinks'
+/// monitors, as pavucontrol meters a stream. libpulse's standard mainloop
+/// can't move between threads, so it, its connections and the record
+/// streams live on one dedicated thread, which exits once this is dropped.
+/// `levels` only hands the candidates to that thread and takes the peaks it
+/// has collected; it never waits on the sound server, so a stalled or dead
+/// peak thread leaves every stream silent (stream playback never counts;
+/// MPRIS still does).
+pub(crate) struct PulsePeaks {
+    candidates: Sender<HashSet<u32>>,
+    peaks: Arc<Mutex<HashMap<u32, f32>>>,
+}
+
+impl PulsePeaks {
+    pub(crate) fn new() -> Self {
+        let (candidates, rx) = std::sync::mpsc::channel();
+        let peaks: Arc<Mutex<HashMap<u32, f32>>> = Arc::default();
+        let thread_peaks = peaks.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("librepods-peaks".to_string())
+            .spawn(move || peak_thread(&rx, &thread_peaks))
+        {
+            log::warn!("Stream monitor: no peak thread, so streams read silent: {e}");
+        }
+        PulsePeaks { candidates, peaks }
+    }
+}
+
+impl PeakSource for PulsePeaks {
+    fn levels(&mut self, candidates: &HashSet<u32>) -> HashMap<u32, f32> {
+        // A dead peak thread only leaves the streams silent.
+        let _ = self.candidates.send(candidates.clone());
+        let mut peaks =
+            std::mem::take(&mut *self.peaks.lock().unwrap_or_else(PoisonError::into_inner));
+        peaks.retain(|index, _| candidates.contains(index));
+        peaks
+    }
+}
+
+/// A sink input's peak record stream on its own connection: PipeWire's pulse
+/// server (1.6.6) delivers data for only one of several such streams on one
+/// connection. `stream` is declared first, so it is dropped (disconnected)
+/// before its context.
+struct PeakStream {
+    stream: Stream,
+    context: Context,
+}
+
+/// The peak thread: keeps a `PeakStream` for each index of the latest
+/// candidate set, drops it once the index leaves the set, and adds each
+/// stream's highest peak to `peaks`, until `PulsePeaks` is dropped. A
+/// stream that failed (its connection dropped, or its sink input moved or
+/// ended) is reopened with the next candidate set; one that could not be
+/// opened is retried after `PEAK_RETRY`.
+fn peak_thread(candidates: &Receiver<HashSet<u32>>, peaks: &Mutex<HashMap<u32, f32>>) {
+    let Some(mut mainloop) = Mainloop::new() else {
+        log::warn!("Stream monitor: no peak mainloop, so streams read silent");
+        return;
+    };
+    // Declared after the mainloop, so dropped before it.
+    let mut streams: HashMap<u32, PeakStream> = HashMap::new();
+    let mut retry: HashMap<u32, Instant> = HashMap::new();
+    loop {
+        // Idle (no stream to read) until the next candidate set.
+        let next = if streams.is_empty() {
+            candidates
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            candidates.recv_timeout(PEAK_TICK)
+        };
+        match next {
+            Ok(wanted) => {
+                streams.retain(|index, _| wanted.contains(index));
+                retry.retain(|index, _| wanted.contains(index));
+                let now = Instant::now();
+                for index in wanted {
+                    if streams.contains_key(&index) || retry.get(&index).is_some_and(|&at| now < at)
+                    {
+                        continue;
+                    }
+                    match peak_stream(&mut mainloop, index) {
+                        Ok(stream) => {
+                            streams.insert(index, stream);
+                        }
+                        Err(e) => {
+                            log::debug!("Stream monitor: no peaks for sink input {index}: {e}");
+                            retry.insert(index, now + PEAK_RETRY);
+                        }
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        // Dispatch everything that arrived since the last tick.
+        loop {
+            match mainloop.iterate(false) {
+                IterateResult::Success(0) => break,
+                IterateResult::Success(_) => {}
+                _ => {
+                    log::debug!("Stream monitor: peak mainloop failed");
+                    streams.clear();
+                    break;
+                }
+            }
+        }
+        let mut peaks = peaks.lock().unwrap_or_else(PoisonError::into_inner);
+        streams.retain(|&index, peak| {
+            if peak.context.get_state() != ContextState::Ready
+                || matches!(
+                    peak.stream.get_state(),
+                    StreamState::Failed | StreamState::Terminated
+                )
+            {
+                return false;
+            }
+            if let Some(level) = drain_peak(&mut peak.stream) {
+                let max = peaks.entry(index).or_insert(0.0);
+                *max = max.max(level);
+            }
+            true
+        });
+    }
+}
+
+/// A record stream of sink input `index`'s peaks, on a new connection:
+/// mono FLOAT32 at `PEAK_RATE` on the monitor of the sink it plays to. It
+/// sets no `media.role`, so it is no call input (#11) and gives the session
+/// manager no reason to switch to a headset profile.
+fn peak_stream(mainloop: &mut Mainloop, index: u32) -> io::Result<PeakStream> {
+    let mut context = connect_on(mainloop, "LibrePods")?;
+    let introspector = context.introspect();
+    let sinks: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
+    let op = introspector.get_sink_input_info(index, {
+        let sinks = sinks.clone();
+        move |result| sinks.borrow_mut().record(result, |input| Some(input.sink))
+    });
+    wait(mainloop, &op, "sink input info")?;
+    let sink = sinks.take().finish("sink input info")?.pop();
+    let sink = sink.ok_or_else(|| pulse_error("sink input info"))?;
+
+    let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
+    let op = introspector.get_sink_info_by_index(sink, {
+        let monitors = monitors.clone();
+        move |result| {
+            monitors
+                .borrow_mut()
+                .record(result, |sink| Some(sink.monitor_source))
+        }
+    });
+    wait(mainloop, &op, "sink info")?;
+    let monitor = monitors.take().finish("sink info")?.pop();
+    let monitor = monitor.ok_or_else(|| pulse_error("sink info"))?;
+
+    let spec = Spec {
+        format: Format::FLOAT32NE,
+        rate: PEAK_RATE,
+        channels: 1,
+    };
+    let mut stream =
+        Stream::new(&mut context, "LibrePods", &spec, None).ok_or_else(|| pulse_error("stream"))?;
+    stream
+        .set_monitor_stream(index)
+        .map_err(|_| pulse_error("set_monitor_stream"))?;
+    let attr = BufferAttr {
+        maxlength: u32::MAX,
+        tlength: u32::MAX,
+        prebuf: u32::MAX,
+        minreq: u32::MAX,
+        fragsize: size_of::<f32>() as u32,
+    };
+    stream
+        .connect_record(
+            Some(&monitor.to_string()),
+            Some(&attr),
+            StreamFlagSet::PEAK_DETECT
+                | StreamFlagSet::ADJUST_LATENCY
+                | StreamFlagSet::DONT_MOVE
+                | StreamFlagSet::DONT_INHIBIT_AUTO_SUSPEND,
+        )
+        .map_err(|_| pulse_error("record stream"))?;
+    Ok(PeakStream { stream, context })
+}
+/// The highest peak a stream has recorded since the last call, None when it
+/// has nothing new (or isn't ready yet).
+fn drain_peak(stream: &mut Stream) -> Option<f32> {
+    let mut peak: Option<f32> = None;
+    loop {
+        match stream.peek() {
+            Ok(PeekResult::Data(data)) => {
+                let level = data
+                    .chunks_exact(size_of::<f32>())
+                    .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]).abs())
+                    .fold(peak.unwrap_or(0.0), f32::max);
+                peak = Some(level);
+            }
+            Ok(PeekResult::Hole(_)) => {}
+            Ok(PeekResult::Empty) | Err(_) => return peak,
+        }
+        if stream.discard().is_err() {
+            return peak;
+        }
+    }
+}
+
+/// A `PeakSource` for tests that makes every candidate audible.
+#[cfg(test)]
+pub(crate) struct AllAudible;
+
+#[cfg(test)]
+impl PeakSource for AllAudible {
+    fn levels(&mut self, candidates: &HashSet<u32>) -> HashMap<u32, f32> {
+        candidates.iter().map(|&index| (index, 1.0)).collect()
     }
 }
 
@@ -774,6 +1105,22 @@ mod tests {
 
     const MIN: Duration = MIN_STREAM_PLAYBACK;
     const STEP: Duration = Duration::from_millis(500);
+
+    impl PlaybackTracker {
+        /// `observe_levels` with every candidate audible.
+        fn observe(&mut self, now: Instant, streams: &[StreamProps]) -> Option<bool> {
+            self.observe_levels(now, streams, |_| 1.0)
+        }
+
+        /// `poll_levels` with every candidate audible.
+        fn poll(
+            &mut self,
+            source: &mut dyn PlaybackSource,
+            clock: impl FnOnce() -> Instant,
+        ) -> Option<bool> {
+            self.poll_levels(source, &mut AllAudible, clock)
+        }
+    }
 
     /// Feed `listings` to a fresh tracker, one per `STEP` from `start`, and
     /// return each sample's report.
@@ -1186,8 +1533,12 @@ mod tests {
     async fn spawned_stream_playback_publishes_and_stops_when_dropped() {
         let source = FakePlayback::new(vec![Ok(vec![]), Ok(vec![music(1)])]);
         let script = source.script.clone();
-        let mut rx =
-            spawn_stream_playback(source, Duration::from_millis(50), Duration::from_millis(5));
+        let mut rx = spawn_stream_playback(
+            source,
+            AllAudible,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
         assert!(!*rx.borrow());
         tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
             .await
@@ -1242,7 +1593,7 @@ mod tests {
             delay: min + Duration::from_millis(200),
             returned: returned.clone(),
         };
-        let mut rx = spawn_stream_playback(source, min, Duration::from_millis(5));
+        let mut rx = spawn_stream_playback(source, AllAudible, min, Duration::from_millis(5));
         tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|playing| *playing))
             .await
             .expect("stream playback")
@@ -1254,5 +1605,325 @@ mod tests {
             counted_after >= min,
             "counted {counted_after:?} after the stream was first seen; the minimum is {min:?}"
         );
+    }
+
+    const LOUD: f32 = 0.5;
+    const SILENT: f32 = 0.0;
+
+    /// Records each candidate set it is asked for (sorted) and gives every
+    /// candidate `level`, or no level at all when None.
+    struct RecordingPeaks {
+        asked: Vec<Vec<u32>>,
+        level: Option<f32>,
+    }
+
+    impl RecordingPeaks {
+        fn new(level: Option<f32>) -> Self {
+            RecordingPeaks {
+                asked: Vec::new(),
+                level,
+            }
+        }
+    }
+
+    impl PeakSource for RecordingPeaks {
+        fn levels(&mut self, candidates: &HashSet<u32>) -> HashMap<u32, f32> {
+            let mut asked: Vec<u32> = candidates.iter().copied().collect();
+            asked.sort();
+            self.asked.push(asked);
+            let Some(level) = self.level else {
+                return HashMap::new();
+            };
+            candidates.iter().map(|&index| (index, level)).collect()
+        }
+    }
+
+    /// A paused SDL game's stream: role Game with an application name.
+    fn game(index: u32) -> StreamProps {
+        sink_input(
+            index,
+            &[
+                ("media.role", "Game"),
+                ("application.name", "SDL Application"),
+            ],
+            false,
+        )
+    }
+
+    /// A tracker whose new stream `music(1)`, audible from `start`, counts
+    /// from `start + MIN`.
+    fn counting(start: Instant) -> PlaybackTracker {
+        let mut tracker = started(start);
+        assert_eq!(tracker.observe_levels(start, &[music(1)], |_| LOUD), None);
+        assert_eq!(
+            tracker.observe_levels(start + MIN, &[music(1)], |_| LOUD),
+            Some(true)
+        );
+        tracker
+    }
+
+    #[test]
+    fn silent_stream_never_counts() {
+        let start = Instant::now();
+        let samples = (4 * MIN.as_millis() / STEP.as_millis()) as u32 + 1;
+        // Digital silence, and peaks at (not above) the threshold.
+        for level in [SILENT, AUDIBLE_PEAK] {
+            let mut tracker = started(start);
+            for i in 1..=samples {
+                let now = start + STEP * i;
+                assert_eq!(
+                    tracker.observe_levels(now, &[game(1)], |_| level),
+                    None,
+                    "{level} {i}"
+                );
+            }
+            assert!(!tracker.playing);
+        }
+        // No level at all, through `poll_levels`: a candidate every sample
+        // after the empty baseline, never counted.
+        let mut source = FakePlayback::new(vec![Ok(vec![]), Ok(vec![game(1)])]);
+        let mut peaks = RecordingPeaks::new(None);
+        let mut tracker = PlaybackTracker::new(MIN);
+        for i in 0..=samples {
+            let now = start + STEP * i;
+            assert_eq!(tracker.poll_levels(&mut source, &mut peaks, || now), None);
+        }
+        assert_eq!(peaks.asked[0], Vec::<u32>::new());
+        assert!(peaks.asked[1..].iter().all(|asked| asked == &[1]));
+        assert!(!tracker.playing);
+    }
+
+    #[test]
+    fn audible_blip_never_counts() {
+        let start = Instant::now();
+        let tab = sink_input(1, &[("application.name", "Chromium")], false);
+        let mut tracker = started(start);
+        let samples = (2 * MIN.as_millis() / STEP.as_millis()) as u32 + 2;
+        for i in 1..=samples {
+            let level = if i == 1 { LOUD } else { SILENT };
+            let now = start + STEP * i;
+            assert_eq!(
+                tracker.observe_levels(now, std::slice::from_ref(&tab), |_| level),
+                None,
+                "{i}"
+            );
+        }
+        assert!(!tracker.playing);
+    }
+
+    #[test]
+    fn audible_stream_starts_debounce() {
+        let start = Instant::now();
+        let mut tracker = started(start);
+        for i in 1..=4 {
+            let now = start + STEP * i;
+            assert_eq!(tracker.observe_levels(now, &[music(1)], |_| SILENT), None);
+        }
+        let audible = start + STEP * 5;
+        let mut now = audible;
+        while now < audible + MIN {
+            assert_eq!(tracker.observe_levels(now, &[music(1)], |_| LOUD), None);
+            now += STEP;
+        }
+        let almost = audible + MIN - Duration::from_millis(1);
+        assert_eq!(tracker.observe_levels(almost, &[music(1)], |_| LOUD), None);
+        assert_eq!(
+            tracker.observe_levels(audible + MIN, &[music(1)], |_| LOUD),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn silent_sample_restarts_debounce() {
+        let start = Instant::now();
+        let mut tracker = started(start);
+        let first = start + STEP;
+        assert_eq!(tracker.observe_levels(first, &[music(1)], |_| LOUD), None);
+        let next = first + STEP;
+        assert_eq!(tracker.observe_levels(next, &[music(1)], |_| LOUD), None);
+        let dip = next + STEP;
+        assert_eq!(tracker.observe_levels(dip, &[music(1)], |_| SILENT), None);
+        // Audible again: the debounce starts over from here, so the first
+        // run's MIN passes without a count.
+        let second = dip + STEP;
+        let mut now = second;
+        while now < second + MIN {
+            assert_eq!(tracker.observe_levels(now, &[music(1)], |_| LOUD), None);
+            now += STEP;
+        }
+        assert!(first + MIN < second + MIN);
+        assert_eq!(
+            tracker.observe_levels(second + MIN, &[music(1)], |_| LOUD),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn silence_stops_counting_after_hold() {
+        let start = Instant::now();
+        let mut tracker = counting(start);
+        let last = start + MIN;
+        let mut now = last + STEP;
+        while now < last + SILENCE_HOLD {
+            assert_eq!(tracker.observe_levels(now, &[music(1)], |_| SILENT), None);
+            now += STEP;
+        }
+        let almost = last + SILENCE_HOLD - Duration::from_millis(1);
+        assert_eq!(
+            tracker.observe_levels(almost, &[music(1)], |_| SILENT),
+            None
+        );
+        assert_eq!(
+            tracker.observe_levels(last + SILENCE_HOLD, &[music(1)], |_| SILENT),
+            Some(false)
+        );
+        assert!(!tracker.playing);
+    }
+
+    #[test]
+    fn short_dip_keeps_counting() {
+        let start = Instant::now();
+        let mut tracker = counting(start);
+        let last = start + MIN;
+        let mut now = last + STEP;
+        while now < last + SILENCE_HOLD {
+            assert_eq!(tracker.observe_levels(now, &[music(1)], |_| SILENT), None);
+            now += STEP;
+        }
+        // Sound resumes just short of the hold: no new debounce, no stop.
+        let resumed = last + SILENCE_HOLD - Duration::from_millis(1);
+        let mut now = resumed;
+        while now < resumed + MIN * 2 {
+            assert_eq!(tracker.observe_levels(now, &[music(1)], |_| LOUD), None);
+            now += STEP;
+        }
+        assert!(tracker.playing);
+    }
+
+    #[test]
+    fn resumed_after_hold_needs_new_debounce() {
+        let start = Instant::now();
+        let mut tracker = counting(start);
+        let stopped = start + MIN + SILENCE_HOLD;
+        assert_eq!(
+            tracker.observe_levels(stopped, &[music(1)], |_| SILENT),
+            Some(false)
+        );
+        let resumed = stopped + STEP;
+        let mut now = resumed;
+        while now < resumed + MIN {
+            assert_eq!(tracker.observe_levels(now, &[music(1)], |_| LOUD), None);
+            now += STEP;
+        }
+        assert_eq!(
+            tracker.observe_levels(resumed + MIN, &[music(1)], |_| LOUD),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn peak_gate_constants_are_bounded() {
+        assert!(AUDIBLE_PEAK > 0.0);
+        assert!(AUDIBLE_PEAK <= 0.01);
+        assert!(SILENCE_HOLD >= Duration::from_secs(3));
+        assert!(SILENCE_HOLD <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn baseline_audible_stream_never_counts() {
+        let start = Instant::now();
+        let mut source = FakePlayback::new(vec![Ok(vec![music(1)])]);
+        let script = source.script.clone();
+        let mut peaks = RecordingPeaks::new(Some(LOUD));
+        let mut tracker = PlaybackTracker::new(MIN);
+        for i in 0..20 {
+            let now = start + STEP * i;
+            assert_eq!(tracker.poll_levels(&mut source, &mut peaks, || now), None);
+        }
+        assert!(peaks.asked.iter().all(Vec::is_empty), "{:?}", peaks.asked);
+        script.lock().unwrap().push_back(Ok(vec![corked_music(1)]));
+        let corked = start + STEP * 20;
+        assert_eq!(
+            tracker.poll_levels(&mut source, &mut peaks, || corked),
+            None
+        );
+        assert_eq!(peaks.asked.last(), Some(&vec![]));
+        // Uncorked: a candidate now, counted after an audible MIN.
+        script.lock().unwrap().push_back(Ok(vec![music(1)]));
+        let resumed = corked + STEP;
+        assert_eq!(
+            tracker.poll_levels(&mut source, &mut peaks, || resumed),
+            None
+        );
+        assert_eq!(peaks.asked.last(), Some(&vec![1]));
+        let counted = resumed + MIN;
+        assert_eq!(
+            tracker.poll_levels(&mut source, &mut peaks, || counted),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn peak_candidates_are_only_live_streams() {
+        let others = vec![
+            corked_music(1),
+            muted_music(2),
+            event_sound(3),
+            sink_input(4, &[], false),
+        ];
+        let listing = |live: &[StreamProps]| Ok([others.clone(), live.to_vec()].concat());
+        let mut source = FakePlayback::new(vec![
+            Ok(vec![]),
+            listing(&[music(5), music(6)]),
+            listing(&[corked_music(5), music(6)]),
+            listing(&[corked_music(5)]),
+        ]);
+        let mut peaks = RecordingPeaks::new(Some(LOUD));
+        let mut tracker = PlaybackTracker::new(MIN);
+        let start = Instant::now();
+        for i in 0..4 {
+            let now = start + STEP * i;
+            tracker.poll_levels(&mut source, &mut peaks, || now);
+        }
+        assert_eq!(peaks.asked, [vec![], vec![5, 6], vec![6], vec![]]);
+    }
+
+    /// Fails if the clock was read before the levels were asked for.
+    struct ClockAfterLevels(Arc<Mutex<bool>>);
+
+    impl PeakSource for ClockAfterLevels {
+        fn levels(&mut self, _: &HashSet<u32>) -> HashMap<u32, f32> {
+            assert!(!*self.0.lock().unwrap(), "clock read before the levels");
+            HashMap::new()
+        }
+    }
+
+    #[test]
+    fn poll_reads_clock_after_levels() {
+        let read = Arc::new(Mutex::new(false));
+        let mut peaks = ClockAfterLevels(read.clone());
+        let mut source = FakePlayback::new(vec![Ok(vec![music(1)])]);
+        let mut tracker = PlaybackTracker::new(MIN);
+        let clock = || {
+            *read.lock().unwrap() = true;
+            Instant::now()
+        };
+        tracker.poll_levels(&mut source, &mut peaks, clock);
+        assert!(*read.lock().unwrap());
+    }
+
+    #[test]
+    fn pulse_peaks_thread_exits_when_dropped() {
+        let mut peaks = PulsePeaks::new();
+        let shared = peaks.peaks.clone();
+        // No candidates: no record stream, and nothing to wait for.
+        assert!(peaks.levels(&HashSet::new()).is_empty());
+        drop(peaks);
+        // The thread holds the other reference until it exits.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&shared) > 1 {
+            assert!(Instant::now() < deadline, "peak thread still running");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

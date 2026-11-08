@@ -268,6 +268,25 @@ mod tests {
     }
 
     #[test]
+    fn peak_stream_is_not_call_input() {
+        // stream_monitor's PulsePeaks record stream (#88): a monitor
+        // capture with no role. PipeWire lists it on no monitor source (it
+        // links to the sink input directly), so neither flag may matter.
+        for monitor in [true, false] {
+            let s = stream(
+                StreamDirection::Capture,
+                &[
+                    ("application.name", "LibrePods"),
+                    ("media.name", "LibrePods"),
+                ],
+                monitor,
+            );
+            assert!(!is_call_stream(&s), "monitor={monitor}");
+            assert!(!call_active(&[s], None), "monitor={monitor}");
+        }
+    }
+
+    #[test]
     fn playback_with_phone_role_is_not_a_call() {
         let s = stream(StreamDirection::Playback, &[("media.role", "phone")], false);
         assert!(!is_call_stream(&s));
