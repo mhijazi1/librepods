@@ -774,7 +774,6 @@ impl Switching {
             }
         });
     }
-
 }
 
 /// Forward each AACP event to the switching mode, if it takes events, then
@@ -1428,10 +1427,8 @@ mod tests {
         // Standard base64 of IRK and ENC, without the padding.
         const BASE64: [&str; 2] = ["obLD1OX2BxgpOktcbX6PkA", "Dx4tPEtaaXiHlqW0w9Lh8A"];
         let mac = "5A:00:00:00:00:21";
-        let dir = std::env::temp_dir().join(format!(
-            "librepods-handoff-log-keys-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("librepods-handoff-log-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("librepods/handoff.jsonl");
         let log = Arc::new(handoff_log::Log::open(&path, handoff_log::Source::App).unwrap());
@@ -1477,7 +1474,10 @@ mod tests {
             .unwrap();
         play_tx.send((Instant::now(), false)).await.unwrap();
         play_tx.send((Instant::now(), true)).await.unwrap();
-        wait_until("the take", || logged().contains("requested Linux ownership")).await;
+        wait_until("the take", || {
+            logged().contains("requested Linux ownership")
+        })
+        .await;
         events.send(owns(1)).unwrap();
         events
             .send(AACPEvent::ConnectedDevices(
@@ -1805,7 +1805,10 @@ mod tests {
         .await;
         let task = handoff_task(mac).expect("handoff task");
         assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
-        assert_eq!(next_packet(&mut rx).await, expected_new_device(REMOTE).await);
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(REMOTE).await
+        );
         assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         expect_take(&h, &mut rx).await;
