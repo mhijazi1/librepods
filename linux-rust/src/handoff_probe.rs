@@ -1,7 +1,8 @@
 use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control,
 };
-use crate::handoff::{Command, Handoff, Input, SessionFacts};
+use crate::handoff::{Command, Handoff, Input};
+use crate::switching::{announce, event_input, session_facts, spawn_playback_poller};
 use crate::media_controller::{
     CaseRecovery, MediaController, TakeoverAction, TakeoverInputs, TakeoverTrigger,
     decide_takeover, routing_snapshot_of,
@@ -65,36 +66,11 @@ async fn wait_routing_ready(manager: &AACPManager) -> Result<()> {
     .map_err(|_| "AirPods did not provide fresh routing and wear state")?
 }
 
-async fn announce(manager: &AACPManager, local: &str) -> Result<()> {
-    let peers = manager.state.lock().await.connected_devices.clone();
-    for peer in peers.iter().filter(|d| d.mac != local) {
-        manager
-            .send_media_information_new_device(local, &peer.mac)
-            .await?;
-        manager.send_add_tipi_device(local, &peer.mac).await?;
-    }
-    Ok(())
-}
-
 /// Whether a manual take would go ahead now, by the single takeover policy.
 fn take_allowed(state: &AACPManagerState, local: &str) -> bool {
     let routing = routing_snapshot_of(state, local);
     let inputs = TakeoverInputs::handoff(TakeoverTrigger::Manual, routing, CaseRecovery::Immediate);
     decide_takeover(inputs).action == TakeoverAction::TakeOver
-}
-
-/// Copy a fresh session's routing, wear and ownership state for the core.
-fn session_facts(state: &AACPManagerState) -> SessionFacts {
-    SessionFacts {
-        hosts: state.connected_devices.clone(),
-        ears: state.ear_detection_status.clone(),
-        audio: state.audio_source.clone(),
-        owner: state
-            .control_command_status_list
-            .iter()
-            .find(|s| s.identifier == Control::OwnsConnection)
-            .map(|s| s.value.clone()),
-    }
 }
 
 async fn status(manager: &AACPManager, local: &str) {
@@ -264,16 +240,11 @@ async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
 /// Feed one AACP event to the core and print STATUS after routing reports.
 /// Ok(true) when the probe should stop.
 async fn on_event(core: &mut Handoff, io: &mut Io, event: AACPEvent) -> Result<bool> {
-    let (input, show_status) = match event {
-        AACPEvent::ControlCommand(s) if s.identifier == Control::OwnsConnection => {
-            (Some(Input::Ownership(s.value)), true)
-        }
-        AACPEvent::ConnectedDevices(old, new) => (Some(Input::ConnectedDevices { old, new }), true),
-        AACPEvent::EarDetection(_, new) => (Some(Input::EarState(new)), true),
-        AACPEvent::AudioSource(source) => (Some(Input::AudioSource(source)), true),
-        AACPEvent::OwnershipToFalseRequest => (Some(Input::RemoteOwnershipRequest), false),
-        _ => (None, false),
-    };
+    let input = event_input(event);
+    // STATUS follows routing and ownership reports, not a remote request.
+    let show_status = input
+        .as_ref()
+        .is_some_and(|input| *input != Input::RemoteOwnershipRequest);
     if let Some(input) = input
         && step(core, io, input).await?
     {
@@ -355,19 +326,7 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
         println!("Automatic switching is disabled until the auto command.");
     }
     let media = MediaController::new(address.to_string(), local.clone());
-    let (play_tx, play_rx) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move {
-        loop {
-            let sampled_at = Instant::now();
-            let playing = tokio::task::spawn_blocking(MediaController::check_if_playing)
-                .await
-                .unwrap_or(false);
-            if play_tx.send((sampled_at, playing)).await.is_err() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    });
+    let play_rx = spawn_playback_poller();
     // Every handoff decision lives in the core; this loop only feeds it.
     let mut core = Handoff::new(local.clone(), Instant::now(), daemon, connected);
     let mut io = Io {

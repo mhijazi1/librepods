@@ -27,6 +27,20 @@ use tokio::task::AbortHandle;
 static PLAYBACK_LISTENERS: LazyLock<StdMutex<HashMap<String, AbortHandle>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// Stop the legacy playback listener of this AirPods MAC, if one runs. Used
+/// when a replacement device runs another switching mode (switching.rs).
+pub(crate) fn stop_playback_listener(mac: &str) {
+    if let Some(listener) = PLAYBACK_LISTENERS.lock().unwrap().remove(mac) {
+        listener.abort();
+    }
+}
+
+/// Whether a legacy playback listener is registered for this AirPods MAC.
+#[cfg(test)]
+pub(crate) fn playback_listener_registered(mac: &str) -> bool {
+    PLAYBACK_LISTENERS.lock().unwrap().contains_key(mac)
+}
+
 /// What asked for a takeover decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TakeoverTrigger {
@@ -949,7 +963,7 @@ impl MediaController {
 
     /// `pause_all_media` with the D-Bus side injected, so the self-pause
     /// marking can be tested without a session bus.
-    async fn pause_all_media_with<F>(&self, pause_players: F)
+    pub(crate) async fn pause_all_media_with<F>(&self, pause_players: F)
     where
         F: FnOnce() -> usize + Send + 'static,
     {
@@ -972,7 +986,7 @@ impl MediaController {
 
     /// Pause every MPRIS player that reports `Playing`; returns how many
     /// paused. Blocking: run it on a blocking thread.
-    fn pause_playing_mpris_players() -> usize {
+    pub(crate) fn pause_playing_mpris_players() -> usize {
         let conn = match Connection::new_session() {
             Ok(c) => c,
             Err(_) => return 0,

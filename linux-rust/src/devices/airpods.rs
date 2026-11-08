@@ -1,6 +1,7 @@
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
 use crate::media_controller::MediaController;
+use crate::switching::{Switching, SwitchingSetup, device_media, spawn_playback_poller};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
 use bluer::Address;
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
-use crate::utils::get_app_settings_path;
+use crate::utils::{get_app_settings_path, load_switching_mode};
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
@@ -118,12 +119,12 @@ impl AirPodsDevice {
             .expect("Failed to get adapter address")
             .to_string();
 
-        let media_controller = Arc::new(Mutex::new(MediaController::new(
-            mac_address.to_string(),
-            local_mac.clone(),
-        )));
+        // The handoff media adapter shares the controller's state without
+        // taking the outer mutex the handlers below lock (switching.rs).
+        let (media_controller, handoff_media) =
+            device_media(mac_address.to_string(), local_mac.clone());
         let mc_clone = media_controller.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
 
         aacp_manager.set_event_channel(tx).await;
@@ -157,12 +158,21 @@ impl AirPodsDevice {
             mc.activate_a2dp_profile().await;
         });
 
-        let mc_listener = media_controller.lock().await;
-        let aacp_manager_clone_listener = aacp_manager.clone();
-        mc_listener
-            .start_playback_listener(aacp_manager_clone_listener, command_tx.clone())
-            .await;
-        drop(mc_listener);
+        // Who answers AirPods ownership: the handoff core (default), the
+        // legacy eager takeover, or nobody (switching.rs).
+        let switching = Switching::start(
+            SwitchingSetup {
+                mode: load_switching_mode(),
+                airpods_mac: mac_address.to_string(),
+                local_mac: local_mac.clone(),
+                manager: aacp_manager.clone(),
+                media_controller: media_controller.clone(),
+                command_tx: command_tx.clone(),
+            },
+            handoff_media,
+            spawn_playback_poller,
+        )
+        .await;
 
         let (listening_mode_tx, mut listening_mode_rx) = tokio::sync::mpsc::unbounded_channel();
         aacp_manager
@@ -222,32 +232,14 @@ impl AirPodsDevice {
             }
         });
 
-        let (owns_connection_tx, mut owns_connection_rx) = tokio::sync::mpsc::unbounded_channel();
-        aacp_manager
-            .subscribe_to_control_command(
-                ControlCommandIdentifiers::OwnsConnection,
-                owns_connection_tx,
-            )
-            .await;
-        let mc_clone_owns = media_controller.clone();
-        tokio::spawn(async move {
-            while let Some(value) = owns_connection_rx.recv().await {
-                let owns = value.first().copied().unwrap_or(0) != 0;
-                if !owns {
-                    info!("Lost ownership, pausing media and disconnecting audio");
-                    let controller = mc_clone_owns.lock().await;
-                    controller.pause_all_media().await;
-                    controller.deactivate_a2dp_profile().await;
-                }
-            }
-        });
-
-        let aacp_manager_clone_events = aacp_manager.clone();
-        let local_mac_events = local_mac.clone();
         let ui_tx_clone = ui_tx.clone();
-        let command_tx_clone = command_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
+        // The switching mode gets every event first, independently of these
+        // handlers (switching.rs).
+        switching.dispatch_events(rx, move |event: AACPEvent| {
+            let mc_clone = mc_clone.clone();
+            let tray_handle = tray_handle.clone();
+            let ui_tx_clone = ui_tx_clone.clone();
+            async move {
                 let event_clone = event.clone();
                 match event {
                     AACPEvent::EarDetection(old_status, new_status) => {
@@ -314,57 +306,8 @@ impl AirPodsDevice {
                         let controller = mc_clone.lock().await;
                         controller.handle_conversational_awareness(status).await;
                     }
-                    AACPEvent::ConnectedDevices(old_devices, new_devices) => {
-                        let local_mac = local_mac_events.clone();
-                        let new_devices_filtered = new_devices.iter().filter(|new_device| {
-                            let not_in_old = old_devices
-                                .iter()
-                                .all(|old_device| old_device.mac != new_device.mac);
-                            let not_local = new_device.mac != local_mac;
-                            not_in_old && not_local
-                        });
-
-                        for device in new_devices_filtered {
-                            info!(
-                                "New connected device: {}, info1: {}, info2: {}",
-                                device.mac, device.info1, device.info2
-                            );
-                            info!(
-                                "Sending new Tipi packet for device {}, and sending media info to the device",
-                                device.mac
-                            );
-                            let aacp_manager_clone = aacp_manager_clone_events.clone();
-                            let local_mac_clone = local_mac.clone();
-                            let device_mac_clone = device.mac.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = aacp_manager_clone
-                                    .send_media_information_new_device(
-                                        &local_mac_clone,
-                                        &device_mac_clone,
-                                    )
-                                    .await
-                                {
-                                    error!("Failed to send media info new device: {}", e);
-                                }
-                                if let Err(e) = aacp_manager_clone
-                                    .send_add_tipi_device(&local_mac_clone, &device_mac_clone)
-                                    .await
-                                {
-                                    error!("Failed to send add tipi device: {}", e);
-                                }
-                            });
-                        }
-                    }
-                    AACPEvent::OwnershipToFalseRequest => {
-                        info!(
-                            "Received ownership to false request. Setting ownership to false and pausing media."
-                        );
-                        let _ = command_tx_clone
-                            .send((ControlCommandIdentifiers::OwnsConnection, vec![0x00]));
-                        let controller = mc_clone.lock().await;
-                        controller.pause_all_media().await;
-                        controller.deactivate_a2dp_profile().await;
-                    }
+                    // Ownership and announcements: the switching mode.
+                    AACPEvent::ConnectedDevices(..) | AACPEvent::OwnershipToFalseRequest => {}
                     AACPEvent::StemPress(press_type, bud_type) => {
                         use crate::bluetooth::aacp::StemPressType;
                         info!(

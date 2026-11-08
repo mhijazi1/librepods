@@ -3,6 +3,7 @@ mod devices;
 mod handoff;
 mod handoff_probe;
 mod media_controller;
+mod switching;
 mod ui;
 mod utils;
 
