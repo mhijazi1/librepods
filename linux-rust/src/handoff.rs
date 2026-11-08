@@ -51,7 +51,12 @@ pub(crate) enum Input {
         new: Vec<ConnectedDevice>,
     },
     /// OwnsConnection report; an acknowledgement when it matches the pending
-    /// request.
+    /// request. A 0 that acknowledges no release of Linux's, while Linux
+    /// holds or is taking the AirPods, is a loss: Linux yields once (pauses
+    /// in automatic mode, forgets the take and its pending request). The 0
+    /// that acknowledges Linux's own playback-stop or remote-request release
+    /// pauses nothing (#39). During the reconnect take a 0 only updates the
+    /// cached owner (#43).
     Ownership(Vec<u8>),
     /// Another host asked Linux to give up ownership.
     RemoteOwnershipRequest,
@@ -223,8 +228,8 @@ impl Handoff {
         self.quitting
     }
 
-    /// Protocol lines (READY/AUTO/ACK/TIMEOUT/RECONNECT...) produced since
-    /// the last call, for the shell to print.
+    /// Protocol lines (READY/AUTO/ACK/TIMEOUT/YIELD/RECONNECT...) produced
+    /// since the last call, for the shell to print.
     pub(crate) fn take_lines(&mut self) -> Vec<String> {
         std::mem::take(&mut self.lines)
     }
@@ -421,6 +426,15 @@ impl Handoff {
         }
     }
 
+    /// An OwnsConnection report. Rules for a 0 (#39), in order:
+    /// - during the reconnect take it is the session's stale init report and
+    ///   only updates `owner` (#43);
+    /// - the acknowledgement of Linux's own release pauses only after a user
+    ///   or quit release (upstream #841), or as the deferred pause of a
+    ///   blocked retake; a playback-stop or remote-request release left
+    ///   nothing playing to pause;
+    /// - otherwise, while Linux holds or is taking the AirPods, another host
+    ///   took them: `yield_take` yields once.
     fn ownership(&mut self, now: Instant, value: Vec<u8>, out: &mut Vec<Command>) {
         let acked = self
             .pending
@@ -445,12 +459,29 @@ impl Handoff {
         }
         let mut deferred_pause = false;
         if value == [0] {
-            if self.requested_take && self.automatic {
-                if replay_play {
-                    deferred_pause = true;
-                } else {
-                    out.push(Command::PauseMedia);
+            match acked {
+                // The acknowledgement of Linux's own release (#39). A release
+                // for stopped playback or for a remote request already left
+                // nothing to pause: the players were stopped, or
+                // RemoteOwnershipRequest paused them when it yielded. Only
+                // the deferred pause of a blocked retake remains. A user or
+                // quit release may leave Linux playing, so upstream #841's
+                // pause stays.
+                Some(release) => {
+                    if self.requested_take && self.automatic {
+                        match release.cause {
+                            Cause::User | Cause::Quit => out.push(Command::PauseMedia),
+                            Cause::Playback | Cause::Remote => deferred_pause = replay_play,
+                        }
+                    }
                 }
+                // Another host took the AirPods from a take Linux made or
+                // was making: yield once and forget the take.
+                None if self.requested_take => {
+                    self.yield_take(out);
+                    return;
+                }
+                None => {}
             }
             self.requested_take = false;
         }
@@ -485,6 +516,32 @@ impl Handoff {
             // stop playing here as upstream does.
             out.push(Command::PauseMedia);
         }
+    }
+
+    /// The AirPods reported OwnsConnection=0 while Linux held, or was
+    /// taking, them and the report acknowledges no release of Linux's: the
+    /// take is lost. Give it up once: pause in automatic mode, forget the
+    /// take and its pending request, so neither a stop nor the request's
+    /// timeout acts on it later.
+    fn yield_take(&mut self, out: &mut Vec<Command>) {
+        // `ownership` only yields on a report that is not a release's
+        // acknowledgement, so a pending request here is the take.
+        let dropped = self.pending.take_if(|p| p.desired).is_some();
+        self.requested_take = false;
+        self.stop_during_take = false;
+        self.play_during_release = false;
+        if self.automatic {
+            out.push(Command::PauseMedia);
+        }
+        self.say(format!(
+            "YIELD owner=not-linux; another host has the AirPods; Linux gave up its {}take{}",
+            if dropped { "pending " } else { "" },
+            if self.automatic {
+                " and paused local playback"
+            } else {
+                ""
+            },
+        ));
     }
 
     /// The pending request settled (acknowledged or timed out): act on a
@@ -803,7 +860,8 @@ mod tests {
         assert_eq!(p.play(1000, true), []);
         // Stopping gives the AirPods back.
         assert_eq!(p.play(1500, false), [SendOwnership(false)]);
-        assert_eq!(p.feed(1600, Input::Ownership(vec![0])), [PauseMedia]);
+        // #39: the release's ACK pauses nothing; playback already stopped.
+        assert_eq!(p.feed(1600, Input::Ownership(vec![0])), []);
         assert_eq!(p.play(2000, false), []);
     }
 
@@ -929,7 +987,9 @@ mod tests {
             [PauseMedia, SendOwnership(false)]
         );
         // Upstream #841 also pauses when the AirPods report the loss.
-        assert_eq!(p.feed(800, Input::Ownership(vec![0])), [PauseMedia]);
+        // #39: this [0] acknowledges the remote yield, which already paused,
+        // so it pauses nothing.
+        assert_eq!(p.feed(800, Input::Ownership(vec![0])), []);
         assert_eq!(p.play(1000, false), []);
         assert_eq!(p.feed(9000, Input::Tick), []);
     }
@@ -1022,7 +1082,8 @@ mod tests {
         for ms in [1500, 2000, 2500] {
             assert_eq!(p.play(ms, false), []);
         }
-        assert_eq!(p.feed(2600, Input::Ownership(vec![0])), [PauseMedia]);
+        // #39: the release's ACK pauses nothing; playback already stopped.
+        assert_eq!(p.feed(2600, Input::Ownership(vec![0])), []);
         for ms in [3000, 3500, 4000] {
             assert_eq!(p.play(ms, false), []);
         }
@@ -1075,7 +1136,8 @@ mod tests {
         assert_eq!(p.play(1000, false), [SendOwnership(false)]);
         assert_eq!(p.play(1500, true), []);
         assert_eq!(p.play(2000, false), []);
-        assert_eq!(p.feed(2100, Input::Ownership(vec![0])), [PauseMedia]);
+        // #39: the release's ACK pauses nothing; playback already stopped.
+        assert_eq!(p.feed(2100, Input::Ownership(vec![0])), []);
         assert_eq!(p.play(2500, false), []);
     }
 
@@ -1102,7 +1164,8 @@ mod tests {
             assert_eq!(p.play(ms, false), []);
         }
         assert_eq!(p.feed(3600, Input::Tick), []);
-        assert_eq!(p.feed(3700, Input::Ownership(vec![0])), [PauseMedia]);
+        // #39: the release's ACK pauses nothing; playback already stopped.
+        assert_eq!(p.feed(3700, Input::Ownership(vec![0])), []);
         for ms in [4000, 4500, 5000] {
             assert_eq!(p.play(ms, false), []);
         }
@@ -1419,5 +1482,161 @@ mod tests {
         assert_eq!(p.feed(6000, Input::Tick), []);
         assert_eq!(p.feed(6300, Input::Tick), []);
         assert_eq!(p.feed(6400, Input::Ownership(vec![0])), [PauseMedia]);
+    }
+
+    fn count_lines(lines: &[String], prefix: &str) -> usize {
+        lines.iter().filter(|l| l.starts_with(prefix)).count()
+    }
+
+    /// Automatic take for playback, acknowledged, playback still running at
+    /// 1000 ms.
+    fn acked_auto_take() -> Probe {
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1000, true), []);
+        p
+    }
+
+    #[test]
+    fn yield_on_owns_connection_zero() {
+        // (a) Linux owns the AirPods and another host takes them: yield once.
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        assert_eq!(p.feed(1100, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
+        // The take is forgotten: the stop the pause causes releases nothing,
+        // and no timeout fires for it.
+        assert_eq!(p.play(1500, false), []);
+        assert_eq!(p.feed(7000, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 0);
+        // Not stuck: a new stopped-to-playing edge takes again.
+        assert_eq!(p.play(7500, true), [SendOwnership(true)]);
+
+        // (b) The pending take resolves to not-linux before any [1].
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        p.core.take_lines();
+        assert_eq!(p.feed(600, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
+        assert_eq!(p.play(1000, false), []);
+        // Past the take's ACK_TIMEOUT: no TIMEOUT, no reconcile.
+        assert_eq!(p.feed(6000, Input::Tick), []);
+        assert_eq!(p.feed(9000, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 0);
+        // A late [1] is no acknowledgement of a request.
+        assert_eq!(p.feed(9100, Input::Ownership(vec![1])), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "ACK"), 0);
+        // Nothing is left pending: a take is not answered with WAIT.
+        assert_eq!(p.feed(9200, Input::Take), [SendOwnership(true)]);
+        assert_eq!(count_lines(&p.core.take_lines(), "WAIT"), 0);
+
+        // (c) Manual mode: the take is given up without pausing.
+        let mut p = Probe::new(false, true);
+        p.routing(ready_facts());
+        assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
+        assert_eq!(p.feed(200, Input::Ownership(vec![1])), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(300, Input::Ownership(vec![0])), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
+        assert_eq!(p.feed(400, Input::Release), []);
+        assert!(
+            p.core
+                .take_lines()
+                .iter()
+                .any(|l| l == "Ownership already released")
+        );
+    }
+
+    #[test]
+    fn yield_on_set_ownership_false() {
+        // Linux took the AirPods for playback: pause and hand them over.
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(
+            p.feed(700, Input::RemoteOwnershipRequest),
+            [PauseMedia, SendOwnership(false)]
+        );
+
+        // Linux owns them without having taken them: hand over, no pause.
+        let mut p = Probe::ready();
+        assert_eq!(p.feed(20, Input::Ownership(vec![1])), []);
+        assert_eq!(
+            p.feed(100, Input::RemoteOwnershipRequest),
+            [SendOwnership(false)]
+        );
+    }
+
+    #[test]
+    fn no_double_yield_remote_then_ack() {
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        let mut all = p.feed(1100, Input::RemoteOwnershipRequest);
+        all.extend(p.feed(1200, Input::Ownership(vec![0])));
+        all.extend(p.play(1500, false));
+        all.extend(p.feed(9000, Input::Tick));
+        assert_eq!(all.iter().filter(|c| **c == PauseMedia).count(), 1);
+        assert_eq!(
+            all.iter().filter(|c| **c == SendOwnership(false)).count(),
+            1
+        );
+        assert!(!all.contains(&SendOwnership(true)));
+        assert_eq!(all, [PauseMedia, SendOwnership(false)]);
+        // The [0] acknowledged the yield; it is not a second one.
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+    }
+
+    #[test]
+    fn no_double_yield_loss_then_remote() {
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        let mut all = p.feed(1100, Input::Ownership(vec![0]));
+        all.extend(p.feed(1200, Input::RemoteOwnershipRequest));
+        all.extend(p.play(1500, false));
+        all.extend(p.feed(9000, Input::Tick));
+        assert_eq!(all.iter().filter(|c| **c == PauseMedia).count(), 1);
+        assert!(!all.iter().any(|c| matches!(c, SendOwnership(_))));
+        assert_eq!(all, [PauseMedia]);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "YIELD"), 1);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "REMOTE requested ownership; Linux already yielded")
+        );
+    }
+
+    #[test]
+    fn owns_connection_zero_after_own_release_is_noop() {
+        // (a) The ACK of an automatic playback-stop release.
+        let mut p = acked_auto_take();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        p.core.take_lines();
+        assert_eq!(p.feed(1600, Input::Ownership(vec![0])), []);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "YIELD"), 0);
+        assert_eq!(count_lines(&lines, "ACK owner=not-linux"), 1);
+
+        // (b) The ACK of the yield to a remote request.
+        let mut p = acked_auto_take();
+        assert_eq!(
+            p.feed(1100, Input::RemoteOwnershipRequest),
+            [PauseMedia, SendOwnership(false)]
+        );
+        p.core.take_lines();
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "YIELD"), 0);
+        assert_eq!(count_lines(&lines, "ACK owner=not-linux"), 1);
+
+        // (c) #43's stale init report during the reconnect take: the take is
+        // not forgotten, so a stop after its ACK still releases.
+        let mut p = reconnect_take();
+        p.core.take_lines();
+        assert_eq!(p.feed(1300, Input::Ownership(vec![0])), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+        assert_eq!(p.feed(1600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(2000, false), [SendOwnership(false)]);
     }
 }
