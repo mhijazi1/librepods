@@ -1426,6 +1426,40 @@ mod tests {
                     rx: play_rx,
                     rebaseline: Default::default(),
                 }),
+                ConnectMode::default(),
+            )
+            .await
+        }
+
+        /// `start` in handoff mode with "Connect to this computer" set to
+        /// `connect_mode` (#16).
+        async fn start_connect(
+            connect_mode: ConnectMode,
+            mac: &str,
+            manager: &AACPManager,
+        ) -> Self {
+            let records = Arc::new(Records::default());
+            let media = Arc::new(FakeMedia {
+                records: records.clone(),
+                mac: mac.to_string(),
+            });
+            let media_controller = Arc::new(Mutex::new(MediaController::new(
+                mac.to_string(),
+                LOCAL.to_string(),
+            )));
+            let (play_tx, play_rx) = mpsc::channel(8);
+            Self::start_playback(
+                SwitchingMode::Handoff,
+                mac,
+                manager,
+                (media_controller, media),
+                records,
+                Arc::new(DeviceHandler::default()),
+                (play_tx, move || PlaybackSamples {
+                    rx: play_rx,
+                    rebaseline: Default::default(),
+                }),
+                connect_mode,
             )
             .await
         }
@@ -1471,11 +1505,13 @@ mod tests {
                         |_| (),
                     )
                 }),
+                ConnectMode::default(),
             )
             .await
         }
 
-        /// Start with the given playback samples and the sender `play` uses.
+        /// Start with the given playback samples and the sender `play` uses,
+        /// in `connect_mode`.
         async fn start_playback(
             mode: SwitchingMode,
             mac: &str,
@@ -1487,6 +1523,7 @@ mod tests {
                 mpsc::Sender<(Instant, bool)>,
                 impl FnOnce() -> PlaybackSamples,
             ),
+            connect_mode: ConnectMode,
         ) -> Self {
             let playback_started = Arc::new(AtomicBool::new(false));
             let started = playback_started.clone();
@@ -1527,7 +1564,8 @@ mod tests {
                 },
             )
             .await
-            .with_line_sink(sink);
+            .with_line_sink(sink)
+            .with_connect_mode(connect_mode);
             switching.a2dp = Some(a2dp_rx);
             switching.dispatch_events(events_rx, handler.clone().handle());
             Harness {
@@ -1599,6 +1637,47 @@ mod tests {
         assert_eq!(next_packet(rx).await, expected_owns(1).await);
         let rest = rest(rx).await;
         assert_eq!(rest, Vec::<Vec<u8>>::new());
+    }
+
+    /// The core's connect-mode skip lines traced for `mac` (#16).
+    fn connect_mode_skips(mac: &str) -> usize {
+        traced(mac)
+            .iter()
+            .filter(|line| {
+                line.starts_with("AUTO takeover skipped: connect mode is when-last-connected")
+            })
+            .count()
+    }
+
+    /// "When last connected" on a fresh session (Linux not the last owner):
+    /// new local playback is skipped, not taken.
+    #[tokio::test]
+    async fn handoff_when_last_connected_skips_new_playback() {
+        let mac = "5A:00:00:00:01:52";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start_connect(ConnectMode::WhenLastConnected, mac, &manager).await;
+        expect_startup(&h, &mut rx).await;
+
+        h.emit(owns(0));
+        h.play(false).await;
+        h.play(true).await;
+        wait_until("the connect-mode skip", || connect_mode_skips(mac) > 0).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(connect_mode_skips(mac), 1);
+        stop_handoff_task(mac);
+    }
+
+    /// The twin in "Automatically": the same scenario takes.
+    #[tokio::test]
+    async fn handoff_automatically_takes_new_playback() {
+        let mac = "5A:00:00:00:01:53";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start_connect(ConnectMode::Automatically, mac, &manager).await;
+        expect_startup(&h, &mut rx).await;
+
+        expect_take(&h, &mut rx).await;
+        assert_eq!(connect_mode_skips(mac), 0);
+        stop_handoff_task(mac);
     }
 
     #[tokio::test]
