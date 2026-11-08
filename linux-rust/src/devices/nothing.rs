@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NothingInformation {
     pub serial_number: String,
     pub firmware_version: String,
@@ -44,21 +44,9 @@ impl NothingDevice {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let device_key = mac_address.to_string();
-        let information = if let Some(device_data) = devices.get(&device_key) {
-            let info = device_data.information.clone();
-            if let Some(DeviceInformation::Nothing(ref nothing_info)) = info {
-                nothing_info.clone()
-            } else {
-                NothingInformation {
-                    serial_number: String::new(),
-                    firmware_version: String::new(),
-                }
-            }
-        } else {
-            NothingInformation {
-                serial_number: String::new(),
-                firmware_version: String::new(),
-            }
+        let information = match devices.get(&device_key).map(|d| &d.information) {
+            Some(Some(DeviceInformation::Nothing(info))) => info.clone(),
+            _ => NothingInformation::default(),
         };
 
         // Request version information
@@ -157,10 +145,7 @@ fn devices_with_nothing_info(
     });
     let mut info = match device.information.take() {
         Some(DeviceInformation::Nothing(info)) => info,
-        _ => NothingInformation {
-            serial_number: String::new(),
-            firmware_version: String::new(),
-        },
+        _ => NothingInformation::default(),
     };
     update(&mut info);
     device.information = Some(DeviceInformation::Nothing(info));
