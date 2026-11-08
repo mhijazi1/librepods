@@ -439,8 +439,22 @@ impl AACPManager {
     }
 
     async fn send_packet(&self, data: &[u8]) -> Result<()> {
-        let state = self.state.lock().await;
-        if let Some(sender) = &state.sender {
+        // The sender is cloned and the lock released before awaiting. Holding
+        // the state mutex across a full channel blocks every other task,
+        // including the receive loop, and the manager stops responding
+        // entirely. The timeout turns a stuck mutex into a logged error
+        // instead of a hang with no diagnosis.
+        let sender = match tokio::time::timeout(Duration::from_secs(2), self.state.lock()).await {
+            Ok(state) => state.sender.clone(),
+            Err(_) => {
+                error!("send_packet: state mutex held for over 2s, giving up");
+                return Err(Error::from(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "state mutex busy",
+                )));
+            }
+        };
+        if let Some(sender) = sender {
             sender.send(data.to_vec()).await.map_err(|e| {
                 error!("Failed to send packet to channel: {}", e);
                 Error::from(std::io::Error::new(
@@ -1253,4 +1267,76 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
         }
     }
     info!("Send thread finished.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A full send channel must not keep the state mutex locked: other tasks
+    // (receive loop, tray, control commands) need the state while the send
+    // waits for capacity.
+    #[tokio::test]
+    async fn send_packet_full_channel_does_not_hold_state_lock() {
+        let manager = AACPManager::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(vec![0xAA])
+            .expect("filling the single slot should succeed");
+        manager.state.lock().await.sender = Some(tx);
+
+        let sender_manager = manager.clone();
+        let handle =
+            tokio::spawn(async move { sender_manager.send_packet(&[0x01, 0x02, 0x03]).await });
+
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_finished(),
+            "send_packet should still be waiting for channel capacity"
+        );
+
+        {
+            let guard = tokio::time::timeout(Duration::from_millis(500), manager.state.lock())
+                .await
+                .expect("state lock must be free while send_packet waits on a full channel");
+            assert!(guard.sender.is_some());
+        }
+
+        assert_eq!(rx.recv().await, Some(vec![0xAA]));
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("send_packet should complete once the channel has capacity")
+            .expect("send_packet task should not panic");
+        assert!(result.is_ok(), "send_packet failed: {:?}", result.err());
+        assert_eq!(rx.recv().await, Some(vec![0x01, 0x02, 0x03]));
+    }
+
+    // A state mutex held elsewhere must make send_packet fail with TimedOut
+    // after ~2s instead of hanging forever.
+    #[tokio::test]
+    async fn send_packet_lock_timeout_returns_err() {
+        let manager = AACPManager::new();
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        let guard = {
+            let mut state = manager.state.lock().await;
+            state.sender = Some(tx);
+            state
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), manager.send_packet(&[0x01]))
+            .await
+            .expect("send_packet must not hang while the state mutex is held");
+        drop(guard);
+
+        let err = result.expect_err("send_packet should fail when the state lock is busy");
+        assert!(
+            matches!(
+                err.kind,
+                bluer::ErrorKind::Internal(bluer::InternalErrorKind::Io(
+                    std::io::ErrorKind::TimedOut
+                ))
+            ),
+            "unexpected error kind: {:?}",
+            err.kind
+        );
+    }
 }
