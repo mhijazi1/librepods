@@ -39,7 +39,7 @@ use futures::future::BoxFuture;
 use log::{error, info};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -62,8 +62,8 @@ type FlushRequest = oneshot::Sender<()>;
 /// at the instant.
 pub(crate) struct PlaybackSamples {
     rx: mpsc::Receiver<(Instant, bool)>,
-    /// Asks the stream monitor to re-baseline (#90).
-    rebaseline: Arc<AtomicBool>,
+    /// Asks the stream monitor to re-baseline at the core's reset (#90).
+    rebaseline: Arc<StdMutex<Option<Instant>>>,
 }
 
 impl PlaybackSamples {
@@ -71,10 +71,13 @@ impl PlaybackSamples {
         self.rx.recv().await
     }
 
-    /// `Command::DrainPlayback`: re-baseline the stream monitor before it
-    /// observes its next listing, and drop the samples already taken.
-    pub(crate) fn drain(&mut self) {
-        self.rebaseline.store(true, Ordering::SeqCst);
+    /// `Command::DrainPlayback` from the core's step at `reset`: re-baseline
+    /// the stream monitor at `reset` before it observes its next listing,
+    /// and drop the samples already taken. Anchored to `reset`, not to now,
+    /// so a stream first audible while earlier commands were awaited still
+    /// counts.
+    pub(crate) fn drain(&mut self, reset: Instant) {
+        *self.rebaseline.lock().unwrap_or_else(|e| e.into_inner()) = Some(reset);
         while self.rx.try_recv().is_ok() {}
     }
 }
@@ -183,7 +186,7 @@ where
     P: PeakSource + 'static,
 {
     let (play_tx, rx) = mpsc::channel(1);
-    let rebaseline = Arc::new(AtomicBool::new(false));
+    let rebaseline = Arc::new(StdMutex::new(None));
     let streams = stream_monitor::spawn_stream_playback(
         streams,
         peaks,
@@ -404,11 +407,12 @@ impl Shell {
         }
     }
 
-    /// Execute the core's commands in order. True when the task should end.
+    /// Execute the core's commands in order, from its step at `now`. True
+    /// when the task should end.
     /// No AACP or MediaController guard is held here; the sends take their
     /// own, and the media actions never take the outer MediaController mutex
     /// the device handlers hold (`ControllerMedia`).
-    async fn execute(&mut self, commands: Vec<Command>) -> bool {
+    async fn execute(&mut self, now: Instant, commands: Vec<Command>) -> bool {
         let mut end = false;
         for command in commands {
             match command {
@@ -451,7 +455,7 @@ impl Shell {
                 }
                 Command::AdoptSession => info!("Handoff: no reconnect session to adopt"),
                 Command::CancelReconnect => info!("Handoff: no reconnect to cancel"),
-                Command::DrainPlayback => self.play_rx.drain(),
+                Command::DrainPlayback => self.play_rx.drain(now),
                 Command::Exit => return true,
                 Command::Fail(reason) => {
                     error!("Handoff: {reason}");
@@ -466,14 +470,15 @@ impl Shell {
 /// Feed one input to the core, log its lines and execute its commands. True
 /// when the task should end.
 async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
-    let commands = core.handle(Instant::now(), input);
+    let now = Instant::now();
+    let commands = core.handle(now, input);
     for line in core.take_lines() {
         info!("Handoff {}: {line}", shell.mac);
         if let Some(sink) = &shell.lines {
             sink(&line);
         }
     }
-    shell.execute(commands).await
+    shell.execute(now, commands).await
 }
 
 async fn on_event(core: &mut Handoff, shell: &mut Shell, event: AACPEvent) -> bool {
@@ -2434,7 +2439,7 @@ mod tests {
         streams.settle().await;
         tokio::time::sleep(STREAM_TEST_MIN / 5).await;
         // The core resets its baseline while the stream debounces.
-        rx.drain();
+        rx.drain(Instant::now());
         let seen = samples_for(&mut rx, STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
         assert!(!seen.is_empty());
         assert!(seen.iter().all(|playing| !playing), "{seen:?}");
@@ -2444,12 +2449,51 @@ mod tests {
     async fn playback_poller_rebaseline_later_stream_plays_after_min() {
         let streams = LiveStreams::default();
         let mut rx = stream_poller(&streams, streams.clone()).await;
-        rx.drain();
+        rx.drain(Instant::now());
         streams.settle().await;
         let started = Instant::now();
         streams.set(vec![music(3)]);
         let playing_at = sample_until(&mut rx, true).await;
         assert!(playing_at.duration_since(started) >= STREAM_TEST_MIN);
+    }
+
+    /// A stream-only poller whose core resets while `music(6)` debounces,
+    /// that stream having started before the reset (`before_reset`) or just
+    /// after it. The shell requests the re-baseline, stamped with the reset,
+    /// only a fifth of the minimum after the stream was seen, as when it
+    /// awaited SendOwnership and Announce before DrainPlayback. Returns the
+    /// samples and when the stream started.
+    async fn late_rebaseline(before_reset: bool) -> (PlaybackSamples, Instant) {
+        let streams = LiveStreams::default();
+        let mut rx = stream_poller(&streams, streams.clone()).await;
+        let start = || {
+            let started = Instant::now();
+            streams.set(vec![music(6)]);
+            started
+        };
+        let started = before_reset.then(start);
+        streams.settle().await;
+        let reset = Instant::now();
+        let started = started.unwrap_or_else(start);
+        streams.settle().await;
+        tokio::time::sleep(STREAM_TEST_MIN / 5).await;
+        rx.drain(reset);
+        (rx, started)
+    }
+
+    #[tokio::test]
+    async fn playback_poller_rebaseline_late_request_keeps_start_after_reset() {
+        let (mut rx, started) = late_rebaseline(false).await;
+        let playing_at = sample_until(&mut rx, true).await;
+        assert!(playing_at.duration_since(started) >= STREAM_TEST_MIN);
+    }
+
+    #[tokio::test]
+    async fn playback_poller_rebaseline_late_request_drops_start_before_reset() {
+        let (mut rx, _) = late_rebaseline(true).await;
+        let seen = samples_for(&mut rx, STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|playing| !playing), "{seen:?}");
     }
 
     /// `LiveStreams` whose listings wait while the test holds `hold`;
@@ -2488,7 +2532,7 @@ mod tests {
         let held = hold.lock().unwrap();
         wait_until("a held listing", || started.load(Ordering::SeqCst) >= begun).await;
         tokio::time::sleep(STREAM_TEST_MIN + STREAM_TEST_MIN / 5).await;
-        rx.drain();
+        rx.drain(Instant::now());
         drop(held);
         let seen = samples_for(&mut rx, STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
         assert!(!seen.is_empty());
@@ -2502,7 +2546,7 @@ mod tests {
         streams.set(vec![music(5)]);
         sample_until(&mut rx, true).await;
         // The ReconnectedForPlayback case: the take is for this stream.
-        rx.drain();
+        rx.drain(Instant::now());
         let seen = samples_for(&mut rx, STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
         assert!(!seen.is_empty());
         assert!(seen.iter().all(|playing| *playing), "{seen:?}");
@@ -2716,10 +2760,11 @@ mod tests {
             }
 
             fn feed(&mut self, ms: u64, input: Input) -> Vec<Command> {
-                let commands = self.core.handle(self.t0 + Duration::from_millis(ms), input);
+                let now = self.t0 + Duration::from_millis(ms);
+                let commands = self.core.handle(now, input);
                 // As the shells' `PlaybackSamples::drain` (#90).
                 if commands.contains(&Command::DrainPlayback) {
-                    self.tracker.rebaseline();
+                    self.tracker.rebaseline(now);
                 }
                 self.log.push(commands.clone());
                 commands

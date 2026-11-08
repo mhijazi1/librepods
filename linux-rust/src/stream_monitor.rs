@@ -31,7 +31,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -293,23 +292,24 @@ impl PlaybackTracker {
         Some(playing)
     }
 
-    /// The handoff core reset its playback baseline (#90): streams still in
-    /// their audible debounce join the baseline, as MPRIS playback running
-    /// at the core's baseline is no new start, so they count only after
-    /// they stop and play again. Counted streams keep counting (no false
-    /// edge), and silent candidates stay candidates. Before the first
-    /// successful listing there is nothing to move: that listing is still
-    /// the baseline.
-    pub(crate) fn rebaseline(&mut self) {
+    /// The handoff core reset its playback baseline at `at` (#90): streams
+    /// whose audible debounce began before `at` join the baseline, as MPRIS
+    /// playback running at the core's baseline is no new start, so they
+    /// count only after they stop and play again. Streams first audible at
+    /// or after `at` keep debouncing, however late the request arrives.
+    /// Counted streams keep counting (no false edge), and silent candidates
+    /// stay candidates. Before the first successful listing there is
+    /// nothing to move: that listing is still the baseline.
+    pub(crate) fn rebaseline(&mut self, at: Instant) {
         let Some(preexisting) = &mut self.preexisting else {
             return;
         };
         self.gates.retain(|&index, gate| match gate {
-            Gate::Debounce(_) => {
+            Gate::Debounce(start) if *start < at => {
                 preexisting.insert(index);
                 false
             }
-            Gate::Counting(_) => true,
+            Gate::Debounce(_) | Gate::Counting(_) => true,
         });
     }
 
@@ -318,8 +318,9 @@ impl PlaybackTracker {
     /// `clock` is read only once the listing and the levels have returned,
     /// so a slow listing can't date a stream's start back to before the
     /// stream was seen. `rebaseline_requested` is asked right after
-    /// `clock`, and when true the tracker re-baselines before observing, so
-    /// a request made while the listing was in flight applies to it. A
+    /// `clock`, and when it gives a reset time the tracker re-baselines at
+    /// it before observing, so a request made while the listing was in
+    /// flight applies to it. A
     /// source error changes nothing and asks for no levels and no request:
     /// the last state and the streams' timers are kept, and the baseline is
     /// still the first successful listing.
@@ -328,14 +329,14 @@ impl PlaybackTracker {
         source: &mut dyn PlaybackSource,
         peaks: &mut dyn PeakSource,
         clock: impl FnOnce() -> Instant,
-        rebaseline_requested: impl FnOnce() -> bool,
+        rebaseline_requested: impl FnOnce() -> Option<Instant>,
     ) -> Option<bool> {
         match source.playback_streams() {
             Ok(streams) => {
                 let levels = peaks.levels(&self.candidates(&streams));
                 let now = clock();
-                if rebaseline_requested() {
-                    self.rebaseline();
+                if let Some(at) = rebaseline_requested() {
+                    self.rebaseline(at);
                 }
                 self.observe_levels(now, &streams, |index| {
                     levels.get(&index).copied().unwrap_or(0.0)
@@ -356,9 +357,10 @@ impl PlaybackTracker {
 /// the blocking pool in its own task, so a sound server that never answers
 /// stalls only this state, never the caller, and only until its connect or
 /// listing times out (`pulse::CONNECT_TIMEOUT`, `pulse::OPERATION_TIMEOUT`;
-/// the last state is kept). Setting `rebaseline` asks the tracker to
-/// re-baseline (`PlaybackTracker::rebaseline`) before it observes the next
-/// listing to return, even one already in flight (#90). The task stops once
+/// the last state is kept). Putting the core's reset time in `rebaseline`
+/// asks the tracker to re-baseline at it (`PlaybackTracker::rebaseline`)
+/// before it observes the next listing to return, even one already in
+/// flight (#90). The task stops once
 /// every receiver is dropped, dropping `peaks`; if sampling panics the state
 /// drops to false.
 pub(crate) fn spawn_stream_playback<S, P>(
@@ -366,7 +368,7 @@ pub(crate) fn spawn_stream_playback<S, P>(
     peaks: P,
     min: Duration,
     interval: Duration,
-    rebaseline: Arc<AtomicBool>,
+    rebaseline: Arc<Mutex<Option<Instant>>>,
 ) -> watch::Receiver<bool>
 where
     S: PlaybackSource + 'static,
@@ -383,7 +385,10 @@ where
             let sampled = tokio::task::spawn_blocking(move || {
                 let change =
                     tracker.poll_levels_rebaselining(&mut source, &mut peaks, Instant::now, || {
-                        rebaseline.swap(false, Ordering::SeqCst)
+                        rebaseline
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
                     });
                 (tracker, source, peaks, change)
             })
@@ -1367,7 +1372,7 @@ mod tests {
             peaks: &mut dyn PeakSource,
             clock: impl FnOnce() -> Instant,
         ) -> Option<bool> {
-            self.poll_levels_rebaselining(source, peaks, clock, || false)
+            self.poll_levels_rebaselining(source, peaks, clock, || None)
         }
     }
 
@@ -1476,12 +1481,12 @@ mod tests {
     }
 
     /// A tracker past its empty baseline whose new stream `music(1)` has
-    /// been audible since `start + STEP`, less than the minimum, when it is
-    /// re-baselined; its next sample is due at `start + STEP * 2`.
+    /// been audible since `start + STEP`, less than the minimum, when the
+    /// core resets at `start + STEP * 2`, its next sample.
     fn rebaselined_while_debouncing(start: Instant) -> PlaybackTracker {
         let mut tracker = started(start);
         assert_eq!(tracker.observe(start + STEP, &[music(1)]), None);
-        tracker.rebaseline();
+        tracker.rebaseline(start + STEP * 2);
         tracker
     }
 
@@ -1526,7 +1531,7 @@ mod tests {
     fn tracker_rebaseline_keeps_counted_stream() {
         let start = Instant::now();
         let mut tracker = counting(start);
-        tracker.rebaseline();
+        tracker.rebaseline(start + MIN);
         assert!(tracker.playing);
         let mut now = start + MIN + STEP;
         while now <= start + MIN * 4 {
@@ -1547,10 +1552,10 @@ mod tests {
             silent.observe_levels(start + STEP, &[music(1)], |_| SILENT),
             None
         );
-        silent.rebaseline();
+        silent.rebaseline(start + STEP);
         // A stream first seen after the re-baseline.
         let mut fresh = started(start);
-        fresh.rebaseline();
+        fresh.rebaseline(start + STEP);
         for (case, mut tracker) in [("silent", silent), ("fresh", fresh)] {
             let audible = start + STEP * 2;
             assert_eq!(tracker.observe(audible, &[music(1)]), None, "{case}");
@@ -1568,6 +1573,28 @@ mod tests {
     }
 
     #[test]
+    fn tracker_rebaseline_late_request_keeps_start_after_reset() {
+        let reset = Instant::now();
+        let mut tracker = started(reset - STEP);
+        // First audible after the core's reset, before its request arrives.
+        let audible = reset + Duration::from_millis(500);
+        assert_eq!(tracker.observe(audible, &[music(1)]), None);
+        let mut source = FakePlayback::new(vec![Ok(vec![music(1)])]);
+        let applied = tracker.poll_levels_rebaselining(
+            &mut source,
+            &mut AllAudible,
+            || reset + Duration::from_millis(1000),
+            || Some(reset),
+        );
+        assert_eq!(applied, None);
+        assert_eq!(
+            tracker.observe(audible + MIN - Duration::from_millis(1), &[music(1)]),
+            None
+        );
+        assert_eq!(tracker.observe(audible + MIN, &[music(1)]), Some(true));
+    }
+
+    #[test]
     fn tracker_rebaseline_before_first_listing_changes_nothing() {
         let start = Instant::now();
         let mut source = FakePlayback::new(vec![
@@ -1576,7 +1603,7 @@ mod tests {
             Ok(vec![music(1), music(2)]),
         ]);
         let mut tracker = PlaybackTracker::new(MIN);
-        tracker.rebaseline();
+        tracker.rebaseline(start);
         assert!(tracker.preexisting.is_none());
         // A request over a failed listing waits; over the first successful
         // one it moves nothing: that listing is the baseline.
@@ -1587,8 +1614,12 @@ mod tests {
             || panic!("asked over a failed listing"),
         );
         assert_eq!(failed, None);
-        let first =
-            tracker.poll_levels_rebaselining(&mut source, &mut AllAudible, || start, || true);
+        let first = tracker.poll_levels_rebaselining(
+            &mut source,
+            &mut AllAudible,
+            || start,
+            || Some(start),
+        );
         assert_eq!(first, None);
         assert_eq!(tracker.preexisting, Some(HashSet::from([1])));
         assert_eq!(tracker.observe(start + MIN * 3, &[music(1)]), None);

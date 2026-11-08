@@ -233,7 +233,7 @@ impl Io {
 
     /// Execute the core's commands in order. Ok(true) when it asked to exit.
     /// No AACP state guard is held here; the sends take their own.
-    async fn execute(&mut self, commands: Vec<Command>) -> Result<bool> {
+    async fn execute(&mut self, now: Instant, commands: Vec<Command>) -> Result<bool> {
         for command in commands {
             match command {
                 Command::SendOwnership(owns) => {
@@ -305,7 +305,7 @@ impl Io {
                     }
                     self.adapter.device(self.address)?.disconnect().await?;
                 }
-                Command::DrainPlayback => self.play_rx.drain(),
+                Command::DrainPlayback => self.play_rx.drain(now),
                 Command::Exit => return Ok(true),
                 Command::Fail(reason) => return Err(reason.into()),
             }
@@ -317,14 +317,15 @@ impl Io {
 /// Feed one input to the core, print its protocol lines and execute its
 /// commands. Ok(true) when the probe should stop.
 async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
-    let commands = core.handle(Instant::now(), input);
+    let now = Instant::now();
+    let commands = core.handle(now, input);
     for line in core.take_lines() {
         println!("{line}");
         if let Some(log) = &io.log {
             log.line(&io.address.to_string(), &line);
         }
     }
-    io.execute(commands).await
+    io.execute(now, commands).await
 }
 
 /// Feed one AACP event to the core and print STATUS after routing reports.
