@@ -2794,19 +2794,22 @@ mod tests {
         seen
     }
 
-    /// A stream-only poller over `streams` (no MPRIS) past its empty
-    /// baseline listing.
-    async fn stream_poller<S: PlaybackSource + 'static>(
+    /// A stream-only poller (no MPRIS) listing `source`, with `peaks` and
+    /// the stream worker's `observed` hook, past the empty baseline listing
+    /// of `streams`.
+    async fn stream_poller<S: PlaybackSource + 'static, P: PeakSource + 'static>(
         streams: &LiveStreams,
         source: S,
+        peaks: P,
+        observed: impl Fn(Instant) + Send + Sync + 'static,
     ) -> PlaybackSamples {
         let rx = spawn_playback_poller_with(
             || false,
             source,
-            AllAudible,
+            peaks,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
-            |_| (),
+            observed,
         );
         streams.settle().await;
         rx
@@ -2815,7 +2818,7 @@ mod tests {
     #[tokio::test]
     async fn playback_poller_rebaseline_debouncing_stream_never_plays() {
         let streams = LiveStreams::default();
-        let mut rx = stream_poller(&streams, streams.clone()).await;
+        let mut rx = stream_poller(&streams, streams.clone(), AllAudible, |_| ()).await;
         streams.set(vec![music(2)]);
         streams.settle().await;
         tokio::time::sleep(STREAM_TEST_MIN / 5).await;
@@ -2830,7 +2833,7 @@ mod tests {
     #[tokio::test]
     async fn playback_poller_rebaseline_later_stream_plays_after_min() {
         let streams = LiveStreams::default();
-        let mut rx = stream_poller(&streams, streams.clone()).await;
+        let mut rx = stream_poller(&streams, streams.clone(), AllAudible, |_| ()).await;
         rx.rebaseline(Instant::now());
         rx.drain();
         streams.settle().await;
@@ -2848,7 +2851,7 @@ mod tests {
     /// `rebaseline` directly; the `step_rebaseline` tests go through `step`.
     async fn late_rebaseline(before_reset: bool) -> (PlaybackSamples, Instant) {
         let streams = LiveStreams::default();
-        let mut rx = stream_poller(&streams, streams.clone()).await;
+        let mut rx = stream_poller(&streams, streams.clone(), AllAudible, |_| ()).await;
         let start = || {
             let started = Instant::now();
             streams.set(vec![music(6)]);
@@ -2886,7 +2889,7 @@ mod tests {
     #[tokio::test]
     async fn playback_poller_rebaseline_before_slow_drain_never_plays() {
         let streams = LiveStreams::default();
-        let mut rx = stream_poller(&streams, streams.clone()).await;
+        let mut rx = stream_poller(&streams, streams.clone(), AllAudible, |_| ()).await;
         streams.set(vec![music(7)]);
         streams.settle().await;
         let before = samples_for(&mut rx, STREAM_TEST_MIN * 2 / 5).await;
@@ -2926,7 +2929,7 @@ mod tests {
             hold: hold.clone(),
             started: started.clone(),
         };
-        let mut rx = stream_poller(&streams, source).await;
+        let mut rx = stream_poller(&streams, source, AllAudible, |_| ()).await;
         streams.set(vec![music(4)]);
         streams.settle().await;
         // Hold the next listing; once it returns the stream has lasted the
@@ -2947,7 +2950,7 @@ mod tests {
     #[tokio::test]
     async fn playback_poller_rebaseline_keeps_counted_stream() {
         let streams = LiveStreams::default();
-        let mut rx = stream_poller(&streams, streams.clone()).await;
+        let mut rx = stream_poller(&streams, streams.clone(), AllAudible, |_| ()).await;
         streams.set(vec![music(5)]);
         sample_until(&mut rx, true).await;
         // The ReconnectedForPlayback case: the take is for this stream.
@@ -3003,25 +3006,6 @@ mod tests {
             }
             AllAudible.levels(candidates)
         }
-    }
-
-    /// A stream-only poller over `streams` with `peaks` and the stream
-    /// worker's `observed` hook, past its empty baseline listing.
-    async fn held_poller<P: PeakSource + 'static>(
-        streams: &LiveStreams,
-        peaks: P,
-        observed: impl Fn(Instant) + Send + Sync + 'static,
-    ) -> PlaybackSamples {
-        let rx = spawn_playback_poller_with(
-            || false,
-            streams.clone(),
-            peaks,
-            STREAM_TEST_MIN,
-            STREAM_TEST_POLL,
-            observed,
-        );
-        streams.settle().await;
-        rx
     }
 
     /// A core step that resets the baseline, run through
@@ -3080,7 +3064,8 @@ mod tests {
     async fn playback_poller_rebaseline_sync_gap_never_plays() {
         let streams = LiveStreams::default();
         let hold = Hold::default();
-        let mut rx = held_poller(&streams, HeldPeaks(hold.clone()), |_| ()).await;
+        let mut rx =
+            stream_poller(&streams, streams.clone(), HeldPeaks(hold.clone()), |_| ()).await;
         // Held at the levels of the stream's first listing; its clock, read
         // after this, starts the debounce.
         let first = hold.arm(Instant::now());
@@ -3114,7 +3099,10 @@ mod tests {
         let streams = LiveStreams::default();
         let hold = Hold::default();
         let observed = hold.clone();
-        let mut rx = held_poller(&streams, AllAudible, move |at| observed.reached(at)).await;
+        let mut rx = stream_poller(&streams, streams.clone(), AllAudible, move |at| {
+            observed.reached(at)
+        })
+        .await;
         // Held after an observe: the next listing has the stream, so the
         // next observe starts its debounce.
         let (_, release) = held(hold.arm(Instant::now())).await;
@@ -3155,7 +3143,7 @@ mod tests {
     #[tokio::test]
     async fn playback_poller_rebaseline_publish_latency_later_stream_plays_once() {
         let streams = LiveStreams::default();
-        let mut rx = held_poller(&streams, AllAudible, |_| ()).await;
+        let mut rx = stream_poller(&streams, streams.clone(), AllAudible, |_| ()).await;
         let (reset, finish) = reset_step(&rx);
         drop(finish);
         let reset = reset.await.expect("the core stepped");
