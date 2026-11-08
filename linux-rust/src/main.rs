@@ -108,6 +108,8 @@ fn main() -> iced::Result {
     //     unsafe { env::set_var("WGPU_BACKEND", "gl") };
     // }
     if env::var("RUST_LOG").is_err() {
+        // SAFETY: still single-threaded here: no thread (the UI path's std::thread::spawn) or tokio
+        // runtime has started yet, and the --handoff-probe runtime returned or exited above.
         unsafe {
             env::set_var(
                 "RUST_LOG",
