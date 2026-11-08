@@ -1448,6 +1448,12 @@ mod tests {
         play_tx.send((Instant::now(), true)).await.unwrap();
         wait_until("the take", || logged().contains("requested Linux ownership")).await;
         events.send(owns(1)).unwrap();
+        events
+            .send(AACPEvent::ConnectedDevices(
+                vec![host(LOCAL), host(REMOTE)],
+                vec![host(LOCAL), host(REMOTE), host(SECOND_REMOTE)],
+            ))
+            .unwrap();
         events.send(AACPEvent::OwnershipToFalseRequest).unwrap();
         wait_until("the yield", || {
             logged().contains("REMOTE requested ownership; yielding")

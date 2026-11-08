@@ -107,6 +107,9 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Past this size a log is emptied when it is next opened (about 5000 lines).
+const MAX_LOG_BYTES: u64 = 1 << 20;
+
 fn write_record(file: &mut File, record: &Record) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(record)?;
     bytes.push(b'\n');
@@ -122,7 +125,8 @@ pub(crate) struct Log {
 
 impl Log {
     /// Open `path` for appending (created 0600, its directory 0700) and
-    /// write the session_start record.
+    /// write the session_start record. A log past `MAX_LOG_BYTES` is emptied
+    /// first: the report only reads the last session.
     pub(crate) fn open(path: &Path, source: Source) -> io::Result<Log> {
         if let Some(dir) = path.parent() {
             DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
@@ -132,6 +136,9 @@ impl Log {
             .append(true)
             .mode(0o600)
             .open(path)?;
+        if file.metadata()?.len() > MAX_LOG_BYTES {
+            file.set_len(0)?;
+        }
         write_record(
             &mut file,
             &Record::SessionStart {
@@ -445,6 +452,18 @@ mod tests {
                 ..
             }
         ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_empties_an_oversized_log() {
+        let dir = temp_dir("oversized");
+        let path = dir.join("handoff.jsonl");
+        std::fs::write(&path, vec![b'x'; MAX_LOG_BYTES as usize + 1]).unwrap();
+        Log::open(&path, Source::App).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(report(&text).is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
