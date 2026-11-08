@@ -464,11 +464,11 @@ impl Handoff {
                     {
                         out.push(Command::PauseMedia);
                     }
-                    // The first remote request to join a release Linux sent
-                    // while holding a take loses it (#40).
-                    let route_away = self.requested_take && p.cause != Cause::Remote;
+                    // A remote request joining a release Linux sent while
+                    // holding a take loses it (#40); `route_away` runs once
+                    // per take.
                     p.cause = Cause::Remote;
-                    if route_away {
+                    if self.requested_take {
                         self.route_away(out);
                     }
                     self.play_during_release = false;

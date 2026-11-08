@@ -42,7 +42,7 @@ pub(crate) fn plan_default_sink(
     match (event, airpods_sink) {
         (SinkEvent::Take, Some(airpods)) if current_default != Some(airpods) => (
             vec![SinkAction::SetDefault(airpods.to_string())],
-            current_default.or(remembered).map(str::to_string),
+            current_default.map(str::to_string),
         ),
         (SinkEvent::Take, _) => (Vec::new(), remembered.map(str::to_string)),
         (SinkEvent::Yield, Some(airpods)) if current_default == Some(airpods) => (
@@ -191,6 +191,16 @@ mod tests {
         assert_eq!(
             plan_default_sink(Some(DAC), Some(AIRPODS), Some(AIRPODS), Take),
             (vec![], Some(DAC.to_string()))
+        );
+    }
+
+    #[test]
+    fn take_with_unknown_default_forgets_earlier_memory() {
+        // The default couldn't be read, so the old DAC is stale: a later
+        // yield must not restore it over the user's choice.
+        assert_eq!(
+            plan_default_sink(Some(DAC), Some(AIRPODS), None, Take),
+            (set(AIRPODS), None)
         );
     }
 
