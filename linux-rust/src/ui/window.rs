@@ -1,5 +1,5 @@
 use crate::bluetooth::aacp::{
-    AACPEvent, BatteryComponent, BatteryStatus, ControlCommandIdentifiers,
+    AACPEvent, BatteryComponent, BatteryInfo, BatteryStatus, ControlCommandIdentifiers,
 };
 use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::{
@@ -26,6 +26,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex, RwLock};
+
+/// Merges a partial battery update into the previous levels, one component at a time.
+/// A component absent from `update` keeps its previous entry. A component present in
+/// `update` replaces it (level and status), even when its status is Disconnected.
+/// A component with no previous entry is appended.
+fn merge_battery(prev: &[BatteryInfo], update: &[BatteryInfo]) -> Vec<BatteryInfo> {
+    let mut merged = prev.to_vec();
+    for entry in update {
+        match merged.iter_mut().find(|m| m.component == entry.component) {
+            Some(existing) => *existing = entry.clone(),
+            None => merged.push(entry.clone()),
+        }
+    }
+    merged
+}
+
+/// Text for one battery level in the window. `None` means the level is not known.
+fn battery_level_label(level: Option<u8>) -> String {
+    match level {
+        Some(n) => format!("{n}%"),
+        None => "--".to_string(),
+    }
+}
 
 pub fn start_ui(
     ui_rx: UnboundedReceiver<BluetoothUIMessage>,
@@ -518,7 +541,7 @@ impl App {
                                 if let Some(DeviceState::AirPods(state)) =
                                     self.device_states.get_mut(&mac)
                                 {
-                                    state.battery = battery_info;
+                                    state.battery = merge_battery(&state.battery, &battery_info);
                                     debug!("Updated battery info for {}: {:?}", mac, state.battery);
                                 }
                             }
@@ -722,12 +745,12 @@ impl App {
                                                     level, if charging {"\u{1002E6}"} else {""}
                                                 )
                                             } else {
-                                                let left  = b.iter().find(|x| x.component == BatteryComponent::Left)
-                                                    .map(|x| x.level).unwrap_or_default();
-                                                let right = b.iter().find(|x| x.component == BatteryComponent::Right)
-                                                    .map(|x| x.level).unwrap_or_default();
-                                                let case  = b.iter().find(|x| x.component == BatteryComponent::Case)
-                                                    .map(|x| x.level).unwrap_or_default();
+                                                let left  = battery_level_label(b.iter().find(|x| x.component == BatteryComponent::Left)
+                                                    .map(|x| x.level));
+                                                let right = battery_level_label(b.iter().find(|x| x.component == BatteryComponent::Right)
+                                                    .map(|x| x.level));
+                                                let case  = battery_level_label(b.iter().find(|x| x.component == BatteryComponent::Case)
+                                                    .map(|x| x.level));
                                                 let left_charging = b.iter().find(|x| x.component == BatteryComponent::Left)
                                                     .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
                                                 let right_charging = b.iter().find(|x| x.component == BatteryComponent::Right)
@@ -735,7 +758,7 @@ impl App {
                                                 let case_charging = b.iter().find(|x| x.component == BatteryComponent::Case)
                                                     .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
                                                 format!(
-                                                    "\u{1018E5} {}%{} \u{1018E8} {}%{} \u{100E6C} {}%{}",
+                                                    "\u{1018E5} {}{} \u{1018E8} {}{} \u{100E6C} {}{}",
                                                     left, if left_charging {"\u{1002E6}"} else {""}, right, if right_charging {"\u{1002E6}"} else {""}, case, if case_charging {"\u{1002E6}"} else {""}
                                                 )
                                             }
@@ -1423,3 +1446,107 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
 //
 //     devices
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(component: BatteryComponent, level: u8, status: BatteryStatus) -> BatteryInfo {
+        BatteryInfo {
+            component,
+            level,
+            status,
+        }
+    }
+
+    fn prev_all() -> Vec<BatteryInfo> {
+        vec![
+            info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+            info(BatteryComponent::Right, 75, BatteryStatus::NotCharging),
+            info(BatteryComponent::Case, 60, BatteryStatus::NotCharging),
+        ]
+    }
+
+    #[test]
+    fn merge_battery_case_only_keeps_buds() {
+        let update = vec![info(BatteryComponent::Case, 55, BatteryStatus::Charging)];
+        let merged = merge_battery(&prev_all(), &update);
+        assert_eq!(
+            merged,
+            vec![
+                info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+                info(BatteryComponent::Right, 75, BatteryStatus::NotCharging),
+                info(BatteryComponent::Case, 55, BatteryStatus::Charging),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_battery_buds_only_keeps_case() {
+        let update = vec![
+            info(BatteryComponent::Left, 70, BatteryStatus::NotCharging),
+            info(BatteryComponent::Right, 65, BatteryStatus::Charging),
+        ];
+        let merged = merge_battery(&prev_all(), &update);
+        assert_eq!(
+            merged,
+            vec![
+                info(BatteryComponent::Left, 70, BatteryStatus::NotCharging),
+                info(BatteryComponent::Right, 65, BatteryStatus::Charging),
+                info(BatteryComponent::Case, 60, BatteryStatus::NotCharging),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_battery_full_update_replaces_all() {
+        let update = vec![
+            info(BatteryComponent::Left, 10, BatteryStatus::Charging),
+            info(BatteryComponent::Right, 20, BatteryStatus::Charging),
+            info(BatteryComponent::Case, 30, BatteryStatus::Disconnected),
+        ];
+        let merged = merge_battery(&prev_all(), &update);
+        assert_eq!(merged, update);
+    }
+
+    #[test]
+    fn merge_battery_empty_prev_takes_update() {
+        let update = vec![
+            info(BatteryComponent::Left, 40, BatteryStatus::NotCharging),
+            info(BatteryComponent::Case, 50, BatteryStatus::NotCharging),
+        ];
+        let merged = merge_battery(&[], &update);
+        assert_eq!(merged, update);
+    }
+
+    #[test]
+    fn merge_battery_appends_new_component() {
+        let prev = vec![info(BatteryComponent::Left, 80, BatteryStatus::NotCharging)];
+        let update = vec![info(BatteryComponent::Headphone, 90, BatteryStatus::NotCharging)];
+        let merged = merge_battery(&prev, &update);
+        assert_eq!(
+            merged,
+            vec![
+                info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+                info(BatteryComponent::Headphone, 90, BatteryStatus::NotCharging),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_battery_present_entry_wins_even_when_disconnected() {
+        let update = vec![info(BatteryComponent::Case, 0, BatteryStatus::Disconnected)];
+        let merged = merge_battery(&prev_all(), &update);
+        assert_eq!(
+            merged[2],
+            info(BatteryComponent::Case, 0, BatteryStatus::Disconnected)
+        );
+    }
+
+    #[test]
+    fn battery_level_label_shows_dash_for_unknown_level() {
+        assert_eq!(battery_level_label(None), "--");
+        assert_eq!(battery_level_label(Some(85)), "85%");
+    }
+}
+
