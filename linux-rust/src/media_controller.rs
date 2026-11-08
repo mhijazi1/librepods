@@ -1,4 +1,4 @@
-use crate::a2dp_resume::{A2dpResumeIo, Action};
+use crate::a2dp_resume::{A2dpResumeIo, AUDIBLE_SAMPLE, Action};
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use crate::bluetooth::aacp::{AACPManagerState, AudioSource, AudioSourceType, ConnectedDevice};
@@ -1774,9 +1774,6 @@ fn resume_profiles(
         ProfileChoice::Unavailable => Vec::new(),
     }
 }
-
-/// How long `audible` samples the peaks of the AirPods sink's streams.
-const AUDIBLE_SAMPLE: Duration = Duration::from_millis(500);
 
 /// The A2DP resume chain's production I/O (#200), on the controller clone
 /// `ControllerMedia` holds, so it never takes the outer MediaController

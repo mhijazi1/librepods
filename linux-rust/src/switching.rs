@@ -94,8 +94,9 @@ pub(crate) trait MediaActions: Send + Sync {
     /// Activate the AirPods' A2DP profile.
     fn activate_a2dp(&self) -> BoxFuture<'static, ()>;
     /// Run the A2DP resume chain (#200) until it ends, or until `cancel`
-    /// fires or its sender is dropped (checked between steps).
-    fn resume_a2dp(&self, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()>;
+    /// fires or its sender is dropped (checked between steps). It starts no
+    /// kick or profile cycle whose Play can't be due before `until`.
+    fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()>;
 }
 
 /// Blocking: pauses the local players and reports what it did.
@@ -130,8 +131,8 @@ impl MediaActions for ControllerMedia {
         })
     }
 
-    fn resume_a2dp(&self, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()> {
-        Box::pin(a2dp_resume::run(self.controller.clone(), cancel))
+    fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()> {
+        Box::pin(a2dp_resume::run(self.controller.clone(), until, cancel))
     }
 }
 
@@ -444,7 +445,7 @@ impl Shell {
     /// No AACP or MediaController guard is held here; the sends take their
     /// own, and the media actions never take the outer MediaController mutex
     /// the device handlers hold (`ControllerMedia`).
-    async fn execute(&mut self, commands: Vec<Command>) -> bool {
+    async fn execute(&mut self, now: Instant, commands: Vec<Command>) -> bool {
         let mut end = false;
         for command in commands {
             match command {
@@ -484,7 +485,9 @@ impl Shell {
                 Command::ResumeA2dp => {
                     let (cancel, cancelled) = oneshot::channel();
                     self.resume = Some(cancel);
-                    tokio::spawn(self.media.resume_a2dp(cancelled));
+                    // The core opened its hold window at `now`.
+                    let until = now + a2dp_resume::A2DP_RESUME_WINDOW;
+                    tokio::spawn(self.media.resume_a2dp(until, cancelled));
                 }
                 Command::DropSession => {
                     self.resume = None;
@@ -532,7 +535,7 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
             sink(&line);
         }
     }
-    shell.execute(commands).await
+    shell.execute(now, commands).await
 }
 
 async fn on_event(core: &mut Handoff, shell: &mut Shell, event: AACPEvent) -> bool {
@@ -1088,11 +1091,15 @@ mod tests {
             Box::pin(async {})
         }
 
-        fn resume_a2dp(&self, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()> {
+        fn resume_a2dp(
+            &self,
+            until: Instant,
+            cancel: oneshot::Receiver<()>,
+        ) -> BoxFuture<'static, ()> {
             let io = FakeResume {
                 mac: self.mac.clone(),
             };
-            Box::pin(a2dp_resume::run(io, cancel))
+            Box::pin(a2dp_resume::run(io, until, cancel))
         }
     }
 
