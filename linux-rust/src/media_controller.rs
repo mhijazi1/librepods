@@ -1345,8 +1345,8 @@ impl MediaController {
             }
             resumed_count
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         if resumed_count > 0 {
             info!("Resumed {} media player(s) via DBus", resumed_count);
@@ -1388,8 +1388,8 @@ impl MediaController {
             debug!("A2DP profile available: {}", available);
             available
         })
-            .await
-            .unwrap_or(false)
+        .await
+        .unwrap_or(false)
     }
 
     /// Gathers the inputs of `select_a2dp_profile` (one card snapshot, the
@@ -1497,8 +1497,8 @@ impl MediaController {
                     false
                 })
         })
-            .await
-            .unwrap_or(false);
+        .await
+        .unwrap_or(false);
 
         if success {
             info!("Successfully deactivated A2DP profile");
@@ -1508,7 +1508,10 @@ impl MediaController {
     }
 
     pub async fn handle_conversational_awareness(&self, status: u8) {
-        debug!("Entering handle_conversational_awareness with status: {}", status);
+        debug!(
+            "Entering handle_conversational_awareness with status: {}",
+            status
+        );
 
         let mac = self.state.lock().await.connected_device_mac.clone();
         if mac.is_empty() {
@@ -1531,8 +1534,8 @@ impl MediaController {
             let sink = sink.clone();
             move || get_sink_volume_percent_by_name_sync(&sink)
         })
-            .await
-            .unwrap_or(None);
+        .await
+        .unwrap_or(None);
 
         match status {
             1 => {
@@ -1571,8 +1574,8 @@ impl MediaController {
                         tokio::task::spawn_blocking(move || {
                             transition_sink_volume(&sink_clone, 15)
                         })
-                            .await
-                            .unwrap_or(false);
+                        .await
+                        .unwrap_or(false);
                         info!(
                             "Conversation reduce: lowered volume to 15% (original {})",
                             orig
@@ -1596,9 +1599,11 @@ impl MediaController {
                 if let Some(orig) = conv_original {
                     let target = orig.min(25);
                     let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, target))
-                        .await
-                        .unwrap_or(false);
+                    tokio::task::spawn_blocking(move || {
+                        transition_sink_volume(&sink_clone, target)
+                    })
+                    .await
+                    .unwrap_or(false);
                     info!(
                         "Conversation partial increase (3): set volume to {} (original {})",
                         target, orig
@@ -1606,9 +1611,11 @@ impl MediaController {
                 } else if let Some(orig_from_current) = current_volume_opt {
                     let target = orig_from_current.min(25);
                     let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, target))
-                        .await
-                        .unwrap_or(false);
+                    tokio::task::spawn_blocking(move || {
+                        transition_sink_volume(&sink_clone, target)
+                    })
+                    .await
+                    .unwrap_or(false);
                     info!(
                         "Conversation partial increase (3) with fallback current: set volume to {} (measured {})",
                         target, orig_from_current
@@ -1657,11 +1664,7 @@ impl MediaController {
                 let proxy =
                     conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
                 if proxy
-                    .method_call::<(), _, &str, &str>(
-                        "org.mpris.MediaPlayer2.Player",
-                        command,
-                        (),
-                    )
+                    .method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", command, ())
                     .is_ok()
                 {
                     info!("Sent {} to: {}", command, service);
@@ -1670,8 +1673,8 @@ impl MediaController {
                 }
             }
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
     }
 
     async fn restore_volume_if_needed(&self, sink: &str) {
@@ -1710,9 +1713,7 @@ impl MediaController {
 
         names
             .into_iter()
-            .filter(|s| {
-                s.starts_with("org.mpris.MediaPlayer2.") && !Self::is_kdeconnect_service(s)
-            })
+            .filter(|s| s.starts_with("org.mpris.MediaPlayer2.") && !Self::is_kdeconnect_service(s))
             .collect()
     }
 
@@ -2972,7 +2973,10 @@ mod tests {
             run_missing_card_lookup(CARD_LOOKUP_ATTEMPTS_PER_CHECK).await,
             (1, 0, Duration::ZERO)
         );
-        assert_eq!(card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS_PER_CHECK), Duration::ZERO);
+        assert_eq!(
+            card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS_PER_CHECK),
+            Duration::ZERO
+        );
         // The full poll used by the initial lookup and by deactivation keeps
         // its budget: 12 lookups, 11 sleeps of 250 ms.
         assert_eq!(
@@ -3004,7 +3008,8 @@ mod tests {
         assert!(expected <= A2DP_RECOVERY_BOUND, "{expected:?} > 15 s");
         // Still within the bound when the initial lookup is charged its
         // nominal CARD_LOOKUP_ATTEMPTS × CARD_LOOKUP_INTERVAL (~3 s).
-        let nominal = CARD_LOOKUP_INTERVAL * CARD_LOOKUP_ATTEMPTS + wait + WIREPLUMBER_SETTLE + wait;
+        let nominal =
+            CARD_LOOKUP_INTERVAL * CARD_LOOKUP_ATTEMPTS + wait + WIREPLUMBER_SETTLE + wait;
         assert!(nominal <= A2DP_RECOVERY_BOUND, "{nominal:?} > 15 s");
 
         // Replay the production sequence on a virtual clock: the initial full
@@ -3063,7 +3068,10 @@ mod tests {
         assert!(!ok);
         assert_eq!(checks.get(), 1 + 2 * attempts);
         assert_eq!(restarts.get(), 1);
-        assert_eq!(recheck_lookups.get(), 2 * attempts * CARD_LOOKUP_ATTEMPTS_PER_CHECK);
+        assert_eq!(
+            recheck_lookups.get(),
+            2 * attempts * CARD_LOOKUP_ATTEMPTS_PER_CHECK
+        );
         assert_eq!(clock.get(), expected);
         assert!(clock.get() <= A2DP_RECOVERY_BOUND);
     }

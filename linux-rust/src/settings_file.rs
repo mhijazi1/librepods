@@ -249,11 +249,16 @@ mod tests {
         let target = dir.join("settings.json");
         std::fs::write(&target, "original").unwrap();
 
-        let err = write_settings_file_with(&target, "new", |p| std::fs::metadata(p), |tmp| {
-            // The hook runs after the temp file is fully written.
-            assert_eq!(std::fs::read_to_string(tmp).unwrap(), "new");
-            Err(std::io::Error::other("injected"))
-        })
+        let err = write_settings_file_with(
+            &target,
+            "new",
+            |p| std::fs::metadata(p),
+            |tmp| {
+                // The hook runs after the temp file is fully written.
+                assert_eq!(std::fs::read_to_string(tmp).unwrap(), "new");
+                Err(std::io::Error::other("injected"))
+            },
+        )
         .unwrap_err();
 
         assert_eq!(err.to_string(), "injected");
@@ -311,7 +316,12 @@ mod tests {
 
         write_settings_file(&link, "new").unwrap();
 
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
         assert_eq!(dir_names(&dir), ["real.json", "settings.json"]);
         std::fs::remove_dir_all(dir).unwrap();
@@ -360,11 +370,16 @@ mod tests {
         let target = dir.join("devices.json");
 
         // The temp file is already private while it holds the contents.
-        write_settings_file_with(&target, "{}", |p| std::fs::metadata(p), |tmp| {
-            let mode = std::fs::metadata(tmp)?.permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-            Ok(())
-        })
+        write_settings_file_with(
+            &target,
+            "{}",
+            |p| std::fs::metadata(p),
+            |tmp| {
+                let mode = std::fs::metadata(tmp)?.permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+                Ok(())
+            },
+        )
         .unwrap();
 
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();

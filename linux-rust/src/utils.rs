@@ -24,18 +24,17 @@ pub fn get_preferences_path() -> PathBuf {
 pub fn get_app_settings_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
 
-    let config_dir = std::env::var("XDG_CONFIG_HOME")
-        .unwrap_or_else(|_| format!("{}/.config", home));
+    let config_dir =
+        std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", home));
 
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .unwrap_or_else(|_| format!("{}/.local/share", home));
+    let data_dir =
+        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home));
 
     let new_path = PathBuf::from(&config_dir)
         .join("librepods")
         .join("app_settings.json");
 
-    let old_path = PathBuf::from(&data_dir)
-        .join("app_settings.json");
+    let old_path = PathBuf::from(&data_dir).join("app_settings.json");
 
     // migrate if needed
     if old_path.exists() && !new_path.exists() {
@@ -490,7 +489,10 @@ mod tests {
     #[test]
     fn switching_pref_non_json_gives_handoff() {
         assert_eq!(parse_switching_mode("not json"), SwitchingMode::Handoff);
-        assert_eq!(parse_switching_mode("switching=off"), SwitchingMode::Handoff);
+        assert_eq!(
+            parse_switching_mode("switching=off"),
+            SwitchingMode::Handoff
+        );
         assert_eq!(parse_switching_mode(r#""off""#), SwitchingMode::Handoff);
         assert_eq!(parse_switching_mode("[]"), SwitchingMode::Handoff);
     }
@@ -498,7 +500,9 @@ mod tests {
     #[test]
     fn switching_pref_next_to_auto_connect() {
         assert_eq!(
-            parse_switching_mode(r#"{"switching":"off","AA:BB:CC:DD:EE:FF":{"autoConnect":false}}"#),
+            parse_switching_mode(
+                r#"{"switching":"off","AA:BB:CC:DD:EE:FF":{"autoConnect":false}}"#
+            ),
             SwitchingMode::Off
         );
         assert_eq!(
@@ -522,9 +526,15 @@ mod tests {
         assert!(parse_auto_connect("", mac));
         assert!(auto_connect_from_value(None, mac));
         assert!(parse_auto_connect(r#"{"AA:BB:CC:DD:EE:FF":{}}"#, mac));
-        assert!(parse_auto_connect(r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":null}}"#, mac));
+        assert!(parse_auto_connect(
+            r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":null}}"#,
+            mac
+        ));
         assert!(parse_auto_connect(r#"{"AA:BB:CC:DD:EE:FF":"off"}"#, mac));
-        assert!(parse_auto_connect(r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":true}}"#, mac));
+        assert!(parse_auto_connect(
+            r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":true}}"#,
+            mac
+        ));
     }
 
     #[test]
@@ -538,7 +548,9 @@ mod tests {
     fn export_battery_missing_gives_true() {
         assert!(export_battery_from_value(None));
         assert!(export_battery_from_value(Some(&serde_json::json!({}))));
-        assert!(export_battery_from_value(Some(&serde_json::json!({"exportBattery": null}))));
+        assert!(export_battery_from_value(Some(
+            &serde_json::json!({"exportBattery": null})
+        )));
         assert!(parse_export_battery("{}"));
         assert!(parse_export_battery(""));
         assert!(parse_export_battery("not json"));
@@ -547,15 +559,26 @@ mod tests {
 
     #[test]
     fn export_battery_bool_used_as_is() {
-        assert!(!export_battery_from_value(Some(&serde_json::json!({"exportBattery": false}))));
-        assert!(export_battery_from_value(Some(&serde_json::json!({"exportBattery": true}))));
+        assert!(!export_battery_from_value(Some(
+            &serde_json::json!({"exportBattery": false})
+        )));
+        assert!(export_battery_from_value(Some(
+            &serde_json::json!({"exportBattery": true})
+        )));
         assert!(!parse_export_battery(r#"{"exportBattery":false}"#));
         assert!(parse_export_battery(r#"{"exportBattery":true}"#));
     }
 
     #[test]
     fn export_battery_wrong_type_gives_true() {
-        for value in [r#""no""#, r#""false""#, "0", "1", "[]", r#"{"enabled":false}"#] {
+        for value in [
+            r#""no""#,
+            r#""false""#,
+            "0",
+            "1",
+            "[]",
+            r#"{"enabled":false}"#,
+        ] {
             assert!(
                 parse_export_battery(&format!(r#"{{"exportBattery":{value}}}"#)),
                 "{value}"

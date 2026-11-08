@@ -338,9 +338,24 @@ pub async fn start_le_monitor(
                                         // disconnected whenever the buds are outside it.
                                         if let Some(mac) = matched_airpods_mac.as_ref() {
                                             let battery_info = [
-                                                (BatteryComponent::Left, left_byte, left_battery, left_charging),
-                                                (BatteryComponent::Right, right_byte, right_battery, right_charging),
-                                                (BatteryComponent::Case, case_byte, case_battery, case_charging),
+                                                (
+                                                    BatteryComponent::Left,
+                                                    left_byte,
+                                                    left_battery,
+                                                    left_charging,
+                                                ),
+                                                (
+                                                    BatteryComponent::Right,
+                                                    right_byte,
+                                                    right_battery,
+                                                    right_charging,
+                                                ),
+                                                (
+                                                    BatteryComponent::Case,
+                                                    case_byte,
+                                                    case_battery,
+                                                    case_charging,
+                                                ),
                                             ]
                                             .into_iter()
                                             .filter(|(_, raw, _, _)| *raw != 0xff)
@@ -356,10 +371,12 @@ pub async fn start_le_monitor(
                                             .collect::<Vec<_>>();
 
                                             if !battery_info.is_empty() {
-                                                let _ = ui_tx_clone.send(BluetoothUIMessage::AACPUIEvent(
-                                                    mac.clone(),
-                                                    AACPEvent::BatteryInfo(battery_info),
-                                                ));
+                                                let _ = ui_tx_clone.send(
+                                                    BluetoothUIMessage::AACPUIEvent(
+                                                        mac.clone(),
+                                                        AACPEvent::BatteryInfo(battery_info),
+                                                    ),
+                                                );
                                             }
                                         }
 
