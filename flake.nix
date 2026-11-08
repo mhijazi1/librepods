@@ -6,7 +6,7 @@
     crane.url = "github:ipetkov/crane";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
-    systems.url = "github:nix-systems/default";
+    systems.url = "github:nix-systems/default-linux";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     # Only used to evaluate the Home Manager module in `checks`.
     home-manager = {
