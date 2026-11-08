@@ -1551,9 +1551,10 @@ impl MediaController {
     /// from one card read (#264). A release then waits for the AirPods sink,
     /// at most `HOLD_RELEASE_WAIT`. Never suspends a sink or moves streams.
     pub(crate) async fn apply_a2dp_hold(&self, hold: bool) {
-        if hold && !self.a2dp_held.load(Ordering::SeqCst) {
-            // A release emitted since: `off` now would only cut Linux's audio.
-            debug!("A2DP hold: already released, card left as is");
+        if self.a2dp_held.load(Ordering::SeqCst) != hold {
+            // The opposite hold was emitted since and is queued behind this
+            // one: writing now would only flap the transport.
+            debug!("A2DP hold({hold}): superseded, card left as is");
             return;
         }
         let (mac, cached) = {

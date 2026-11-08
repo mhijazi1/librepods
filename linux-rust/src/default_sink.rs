@@ -55,6 +55,7 @@ pub(crate) fn plan_default_sink(
             None,
         ),
         (SinkEvent::Yield, _) => (Vec::new(), None),
+        // `apply` runs a hold without planning.
         (SinkEvent::Hold(_), _) => (Vec::new(), remembered.map(str::to_string)),
     }
 }
@@ -515,21 +516,6 @@ mod tests {
         let settled = router.settled();
         drop((rx, applied));
         settles(settled).await;
-    }
-
-    #[test]
-    fn hold_plan_sets_nothing_and_keeps_memory() {
-        for hold in [true, false] {
-            assert_eq!(
-                plan_default_sink(
-                    Some(DAC),
-                    Some(AIRPODS),
-                    Some(AIRPODS),
-                    SinkEvent::Hold(hold)
-                ),
-                (vec![], Some(DAC.to_string()))
-            );
-        }
     }
 
     #[tokio::test]
