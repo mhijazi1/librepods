@@ -12,16 +12,17 @@
 //! - the AirPods card on a head-unit (HFP/HSP) profile: PipeWire's
 //!   `headset-head-unit*` or PulseAudio's `headset_head_unit` /
 //!   `handsfree_head_unit`.
+//!
+//! It also decides which playback streams (sink inputs) are worth taking the
+//! AirPods for (#10): `is_takeover_worthy`. `stream_monitor::PlaybackTracker`
+//! debounces those streams before the handoff core sees them as playback.
 
 use std::collections::BTreeMap;
 
 /// Which way a stream carries audio.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StreamDirection {
-    /// A sink input: an application playing audio. Not constructed by the
-    /// call monitor, which lists capture streams only; #10 classifies
-    /// playback streams with the same type.
-    #[allow(dead_code)]
+    /// A sink input: an application playing audio.
     Playback,
     /// A source output: an application recording audio.
     Capture,
@@ -35,6 +36,11 @@ pub(crate) struct StreamProps {
     pub(crate) props: BTreeMap<String, String>,
     /// The stream records a sink's monitor source, not a microphone.
     pub(crate) monitor: bool,
+    /// The sound server's index of the stream (sink input or source
+    /// output); it identifies the stream across snapshots.
+    pub(crate) index: u32,
+    /// The application has corked (paused) the stream.
+    pub(crate) corked: bool,
 }
 
 /// Property values that mark a capture stream as a sink monitor.
@@ -97,6 +103,66 @@ pub(crate) fn call_active(streams: &[StreamProps], airpods_profile: Option<&str>
     is_call_profile(airpods_profile) || streams.iter().any(is_call_stream)
 }
 
+/// `media.role` values of media worth taking the AirPods for.
+const MEDIA_ROLES: [&str; 4] = ["music", "movie", "video", "game"];
+
+/// Properties naming the node a stream is routed to.
+const TARGET_PROPS: [&str; 2] = ["target.object", "node.target"];
+
+/// LibrePods' own `application.name`.
+const OWN_APPLICATION: &str = "LibrePods";
+
+/// A property's trimmed value, None when it is absent or blank.
+fn prop<'a>(props: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+    props.get(key).map(|v| v.trim()).filter(|v| !v.is_empty())
+}
+
+/// Whether a playback stream (a sink input) is media worth taking the
+/// AirPods for, judged from its properties alone; `stream_monitor` adds the
+/// corked state and the minimum duration. Yes: `media.role` Music, Movie,
+/// Video or Game (any case), or no `media.role` but an `application.name`
+/// (games and browser tabs often set no role). No: capture streams, event
+/// and notification sounds (`media.role` event/notification, or an
+/// `event.id`), monitor streams (`stream.monitor`, or a target ending in
+/// `.monitor`), LibrePods' own streams, call audio (`media.role` phone or
+/// Communication; taking the AirPods for calls is #12), any other role, and
+/// anonymous streams with neither a role nor an application name.
+pub(crate) fn is_takeover_worthy(stream: &StreamProps) -> bool {
+    is_takeover_worthy_for(stream, std::process::id())
+}
+
+/// `is_takeover_worthy`, with LibrePods' process id given.
+fn is_takeover_worthy_for(stream: &StreamProps, own_pid: u32) -> bool {
+    if stream.direction != StreamDirection::Playback {
+        return false;
+    }
+    let props = &stream.props;
+    if stream.monitor || prop_is_true(props, "stream.monitor") {
+        return false;
+    }
+    if TARGET_PROPS
+        .iter()
+        .filter_map(|key| prop(props, key))
+        .any(|target| target.ends_with(".monitor"))
+    {
+        return false;
+    }
+    if prop(props, "event.id").is_some() {
+        return false;
+    }
+    let application = prop(props, "application.name");
+    let own_pid = own_pid.to_string();
+    if prop(props, "application.process.id") == Some(own_pid.as_str())
+        || application.is_some_and(|name| name.eq_ignore_ascii_case(OWN_APPLICATION))
+    {
+        return false;
+    }
+    match prop(props, "media.role") {
+        Some(role) => MEDIA_ROLES.iter().any(|r| role.eq_ignore_ascii_case(r)),
+        None => application.is_some(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,11 +177,17 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             monitor,
+            index: 0,
+            corked: false,
         }
     }
 
     fn capture(props: &[(&str, &str)]) -> StreamProps {
         stream(StreamDirection::Capture, props, false)
+    }
+
+    fn playback(props: &[(&str, &str)]) -> StreamProps {
+        stream(StreamDirection::Playback, props, false)
     }
 
     fn cards(entries: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
@@ -270,5 +342,168 @@ mod tests {
         ];
         assert!(call_active(&streams, Some("a2dp-sink")));
         assert!(!call_active(&streams[..2], Some("a2dp-sink")));
+    }
+
+    #[test]
+    fn takeover_worthy_media_roles() {
+        for role in [
+            "Music", "music", "MUSIC", "Movie", "movie", "Video", "VIDEO", "Game", "game",
+        ] {
+            assert!(
+                is_takeover_worthy(&playback(&[("media.role", role)])),
+                "{role}"
+            );
+            assert!(
+                is_takeover_worthy(&playback(&[
+                    ("media.role", role),
+                    ("application.name", "Firefox"),
+                ])),
+                "{role} with an application"
+            );
+        }
+        // No role, but an application name: a game or a browser tab.
+        assert!(is_takeover_worthy(&playback(&[(
+            "application.name",
+            "Steam"
+        )])));
+        assert!(is_takeover_worthy(&playback(&[
+            ("media.role", ""),
+            ("application.name", "Chromium"),
+        ])));
+        // A corked stream is still media; stream_monitor handles corking.
+        let mut corked = playback(&[("media.role", "Music")]);
+        corked.corked = true;
+        assert!(is_takeover_worthy(&corked));
+    }
+
+    #[test]
+    fn takeover_worthy_rejects_event_sounds() {
+        for role in ["event", "Event", "EVENT", "notification", "Notification"] {
+            assert!(
+                !is_takeover_worthy(&playback(&[
+                    ("media.role", role),
+                    ("application.name", "GNOME Shell"),
+                ])),
+                "{role}"
+            );
+        }
+        // An event id marks an event sound whatever its role.
+        assert!(!is_takeover_worthy(&playback(&[
+            ("event.id", "message-new-instant"),
+            ("application.name", "Discord"),
+        ])));
+        assert!(!is_takeover_worthy(&playback(&[
+            ("event.id", "bell"),
+            ("media.role", "Music"),
+        ])));
+        // Other roles are not media either.
+        for role in ["a11y", "test", "production", "animation"] {
+            assert!(
+                !is_takeover_worthy(&playback(&[
+                    ("media.role", role),
+                    ("application.name", "app"),
+                ])),
+                "{role}"
+            );
+        }
+        // Neither a role nor an application name.
+        assert!(!is_takeover_worthy(&playback(&[])));
+        assert!(!is_takeover_worthy(&playback(&[("application.name", " ")])));
+        assert!(!is_takeover_worthy(&playback(&[(
+            "media.name",
+            "Playback"
+        )])));
+    }
+
+    #[test]
+    fn takeover_worthy_rejects_monitors() {
+        // The monitor flag and PipeWire's stream.monitor property.
+        assert!(!is_takeover_worthy(&stream(
+            StreamDirection::Playback,
+            &[("media.role", "Music")],
+            true
+        )));
+        for value in ["true", "TRUE", "True"] {
+            assert!(
+                !is_takeover_worthy(&playback(&[
+                    ("media.role", "Music"),
+                    ("stream.monitor", value),
+                ])),
+                "stream.monitor={value}"
+            );
+        }
+        assert!(is_takeover_worthy(&playback(&[
+            ("media.role", "Music"),
+            ("stream.monitor", "false"),
+        ])));
+        // A stream routed to a monitor.
+        for key in ["target.object", "node.target"] {
+            assert!(
+                !is_takeover_worthy(&playback(&[
+                    ("application.name", "pw-loopback"),
+                    (key, "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"),
+                ])),
+                "{key}"
+            );
+            // Any other target is fine.
+            assert!(
+                is_takeover_worthy(&playback(&[
+                    ("application.name", "mpv"),
+                    (key, "alsa_output.pci-0000_00_1f.3.analog-stereo"),
+                ])),
+                "{key} to a sink"
+            );
+        }
+    }
+
+    #[test]
+    fn takeover_worthy_rejects_own_and_call_streams() {
+        const OWN_PID: u32 = 4242;
+        // LibrePods' own process, and its application name in any case.
+        let own = playback(&[
+            ("media.role", "Music"),
+            ("application.name", "mpv"),
+            ("application.process.id", "4242"),
+        ]);
+        assert!(!is_takeover_worthy_for(&own, OWN_PID));
+        assert!(is_takeover_worthy_for(&own, OWN_PID + 1));
+        let me = std::process::id().to_string();
+        assert!(!is_takeover_worthy(&playback(&[
+            ("application.name", "mpv"),
+            ("application.process.id", me.as_str()),
+        ])));
+        for name in ["LibrePods", "librepods", "LIBREPODS"] {
+            assert!(
+                !is_takeover_worthy_for(
+                    &playback(&[("media.role", "Music"), ("application.name", name)]),
+                    OWN_PID
+                ),
+                "{name}"
+            );
+        }
+        // Call audio is #12's.
+        for role in ["phone", "Phone", "Communication", "communication"] {
+            assert!(
+                !is_takeover_worthy(&playback(&[
+                    ("media.role", role),
+                    ("application.name", "Firefox"),
+                ])),
+                "{role}"
+            );
+        }
+        // Capture streams never are, whatever their role.
+        for role in ["Music", "Game", "Communication"] {
+            assert!(
+                !is_takeover_worthy(&capture(&[
+                    ("media.role", role),
+                    ("application.name", "OBS"),
+                ])),
+                "{role}"
+            );
+        }
+        assert!(!is_takeover_worthy(&capture(&[(
+            "application.name",
+            "OBS"
+        )])));
     }
 }

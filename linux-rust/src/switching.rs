@@ -29,7 +29,7 @@ use crate::bluetooth::aacp::{
 };
 use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::media_controller::{self, MediaController};
-use crate::stream_monitor::{self, CallSamples};
+use crate::stream_monitor::{self, CallSamples, MIN_STREAM_PLAYBACK, PlaybackSource, PulseStreams};
 use crate::utils::SwitchingMode;
 use futures::future::BoxFuture;
 use log::{error, info};
@@ -53,7 +53,9 @@ type EventTx = mpsc::UnboundedSender<AACPEvent>;
 /// A request to the event router to forward everything still in the primary
 /// queue; answered once it has.
 type FlushRequest = oneshot::Sender<()>;
-/// Playback samples: whether any local player was playing at the instant.
+/// Playback samples: whether any local MPRIS player was playing, or a
+/// takeover-worthy audio stream had been playing for the minimum duration,
+/// at the instant.
 pub(crate) type PlaybackSamples = mpsc::Receiver<(Instant, bool)>;
 
 /// The media side effects the handoff core can ask for, injected so tests
@@ -123,20 +125,53 @@ fn share_media(
     (Arc::new(Mutex::new(controller)), Arc::new(media))
 }
 
-/// Poll local playback every `PLAYBACK_POLL`. The poller stops once the
-/// receiver is dropped.
+/// Poll local playback every `PLAYBACK_POLL`: playing when an MPRIS player
+/// plays or a takeover-worthy audio stream has been playing for
+/// `MIN_STREAM_PLAYBACK` (#10). The poller stops once the receiver is
+/// dropped.
 pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
+    spawn_playback_poller_with(
+        MediaController::check_if_playing,
+        // shortcut: a new libpulse connection every PLAYBACK_POLL; fold the connections or subscribe to sink-input events (#73)
+        PulseStreams,
+        MIN_STREAM_PLAYBACK,
+        PLAYBACK_POLL,
+    )
+}
+
+/// `spawn_playback_poller` with its sources, minimum stream duration and
+/// interval injected. Every `interval` it samples `mpris` on the blocking
+/// pool and sends `(sampled_at, mpris || streams)`, where `streams` is the
+/// latest state of the stream monitor. The stream monitor samples `streams`
+/// in its own task (`stream_monitor::spawn_stream_playback`), so a sound
+/// server that never answers leaves the stream state as it was but never
+/// holds up the MPRIS samples. Only edges reach the handoff core
+/// (`Input::Playback`), which keeps every takeover decision.
+fn spawn_playback_poller_with<M, S>(
+    mpris: M,
+    streams: S,
+    min_stream: Duration,
+    interval: Duration,
+) -> PlaybackSamples
+where
+    M: Fn() -> bool + Send + Sync + 'static,
+    S: PlaybackSource + 'static,
+{
     let (play_tx, play_rx) = mpsc::channel(1);
+    let streams = stream_monitor::spawn_stream_playback(streams, min_stream, interval);
+    let mpris = Arc::new(mpris);
     tokio::spawn(async move {
         loop {
             let sampled_at = Instant::now();
-            let playing = tokio::task::spawn_blocking(MediaController::check_if_playing)
+            let mpris = mpris.clone();
+            let mpris_playing = tokio::task::spawn_blocking(move || mpris())
                 .await
                 .unwrap_or(false);
+            let playing = mpris_playing || *streams.borrow();
             if play_tx.send((sampled_at, playing)).await.is_err() {
                 break;
             }
-            tokio::time::sleep(PLAYBACK_POLL).await;
+            tokio::time::sleep(interval).await;
         }
     });
     play_rx
@@ -811,6 +846,8 @@ mod tests {
         AudioSource, AudioSourceType, ConnectedDevice, ControlCommandStatus, EarDetectionStatus,
         encode_media_information_call,
     };
+    use crate::call_detect::{StreamDirection, StreamProps};
+    use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
 
@@ -1090,11 +1127,74 @@ mod tests {
             mode: SwitchingMode,
             mac: &str,
             manager: &AACPManager,
-            (media_controller, media): (Arc<Mutex<MediaController>>, Arc<dyn MediaActions>),
+            media: (Arc<Mutex<MediaController>>, Arc<dyn MediaActions>),
             records: Arc<Records>,
             handler: Arc<DeviceHandler>,
         ) -> Self {
             let (play_tx, play_rx) = mpsc::channel(8);
+            Self::start_playback(
+                mode,
+                mac,
+                manager,
+                media,
+                records,
+                handler,
+                (play_tx, move || play_rx),
+            )
+            .await
+        }
+
+        /// Start in handoff mode with the playback samples of the real
+        /// playback poller over `mpris` and `streams` (#10). `play` then
+        /// reaches no task.
+        async fn start_streams<M, S>(
+            mac: &str,
+            manager: &AACPManager,
+            mpris: M,
+            streams: S,
+            min_stream: Duration,
+        ) -> Self
+        where
+            M: Fn() -> bool + Send + Sync + 'static,
+            S: PlaybackSource + 'static,
+        {
+            let records = Arc::new(Records::default());
+            let media = Arc::new(FakeMedia {
+                records: records.clone(),
+                mac: mac.to_string(),
+            });
+            let media_controller = Arc::new(Mutex::new(MediaController::new(
+                mac.to_string(),
+                LOCAL.to_string(),
+            )));
+            let (play_tx, _) = mpsc::channel(1);
+            Self::start_playback(
+                SwitchingMode::Handoff,
+                mac,
+                manager,
+                (media_controller, media),
+                records,
+                Arc::new(DeviceHandler::default()),
+                (play_tx, move || {
+                    spawn_playback_poller_with(mpris, streams, min_stream, STREAM_TEST_POLL)
+                }),
+            )
+            .await
+        }
+
+        /// Start with the given playback samples and the sender `play` uses.
+        async fn start_playback(
+            mode: SwitchingMode,
+            mac: &str,
+            manager: &AACPManager,
+            (media_controller, media): (Arc<Mutex<MediaController>>, Arc<dyn MediaActions>),
+            records: Arc<Records>,
+            handler: Arc<DeviceHandler>,
+            (play_tx, playback): (
+                mpsc::Sender<(Instant, bool)>,
+                impl FnOnce() -> PlaybackSamples,
+            ),
+        ) -> Self {
             let playback_started = Arc::new(AtomicBool::new(false));
             let started = playback_started.clone();
             let (command_tx, mut command_rx) =
@@ -1123,7 +1223,7 @@ mod tests {
                 media,
                 move || {
                     started.store(true, Ordering::SeqCst);
-                    play_rx
+                    playback()
                 },
                 move |airpods_mac: &str| {
                     assert_eq!(airpods_mac, calls_for);
@@ -1811,5 +1911,302 @@ mod tests {
                 Input::Ownership(vec![0]),
             ]
         );
+    }
+
+    /// The playback poll interval of the stream tests.
+    const STREAM_TEST_POLL: Duration = Duration::from_millis(20);
+    /// The minimum stream duration of the stream tests: long enough that a
+    /// stream set for a fifth of it can't count however the test is
+    /// scheduled, short enough for `next_packet`'s timeout.
+    const STREAM_TEST_MIN: Duration = Duration::from_millis(1000);
+
+    /// The sink inputs the test sets, listed as they are at each call.
+    #[derive(Clone, Default)]
+    struct LiveStreams {
+        streams: Arc<StdMutex<Vec<StreamProps>>>,
+        /// Listings returned so far.
+        listings: Arc<AtomicUsize>,
+    }
+
+    impl LiveStreams {
+        fn set(&self, streams: Vec<StreamProps>) {
+            *self.streams.lock().unwrap() = streams;
+        }
+
+        /// Wait until a listing that started after this call has returned,
+        /// so the stream monitor has seen what was set before it.
+        async fn settle(&self) {
+            let after = self.listings.load(Ordering::SeqCst) + 2;
+            wait_until("a stream listing", || {
+                self.listings.load(Ordering::SeqCst) >= after
+            })
+            .await;
+        }
+    }
+
+    impl PlaybackSource for LiveStreams {
+        fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
+            let streams = self.streams.lock().unwrap().clone();
+            self.listings.fetch_add(1, Ordering::SeqCst);
+            Ok(streams)
+        }
+    }
+
+    /// `LiveStreams` whose first listing waits until `gate` is released.
+    struct GatedFirst {
+        streams: LiveStreams,
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl PlaybackSource for GatedFirst {
+        fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.recv();
+            }
+            self.streams.playback_streams()
+        }
+    }
+
+    /// A sound server that never answers: every listing blocks until the
+    /// sender is dropped.
+    struct StalledStreams(std::sync::mpsc::Receiver<()>);
+
+    impl PlaybackSource for StalledStreams {
+        fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
+            let _ = self.0.recv();
+            Err(io::Error::other("stalled source released"))
+        }
+    }
+
+    fn sink_input(index: u32, role: &str) -> StreamProps {
+        StreamProps {
+            direction: StreamDirection::Playback,
+            props: [
+                ("media.role".to_string(), role.to_string()),
+                ("application.name".to_string(), "test player".to_string()),
+            ]
+            .into(),
+            monitor: false,
+            index,
+            corked: false,
+        }
+    }
+
+    fn music(index: u32) -> StreamProps {
+        sink_input(index, "Music")
+    }
+
+    fn event_sound(index: u32) -> StreamProps {
+        sink_input(index, "event")
+    }
+
+    /// The next playback sample.
+    async fn next_sample(rx: &mut PlaybackSamples) -> (Instant, bool) {
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("expected a playback sample")
+            .expect("poller running")
+    }
+
+    /// Read samples until one says `playing`, for at most 3 s; returns its
+    /// sample time.
+    async fn sample_until(rx: &mut PlaybackSamples, playing: bool) -> Instant {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (sampled_at, sample) = next_sample(rx).await;
+                if sample == playing {
+                    return sampled_at;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no playing={playing} sample"))
+    }
+
+    #[tokio::test]
+    async fn playback_poller_mpris_only_still_plays() {
+        let mpris = Arc::new(AtomicBool::new(false));
+        let reads = mpris.clone();
+        let mut rx = spawn_playback_poller_with(
+            move || reads.load(Ordering::SeqCst),
+            LiveStreams::default(),
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+        );
+        assert!(!next_sample(&mut rx).await.1);
+        mpris.store(true, Ordering::SeqCst);
+        sample_until(&mut rx, true).await;
+        // Every sample says so while MPRIS plays, with no stream at all.
+        for _ in 0..5 {
+            assert!(next_sample(&mut rx).await.1);
+        }
+        mpris.store(false, Ordering::SeqCst);
+        sample_until(&mut rx, false).await;
+    }
+
+    #[tokio::test]
+    async fn playback_poller_stream_plays_without_mpris() {
+        let streams = LiveStreams::default();
+        streams.set(vec![event_sound(1)]);
+        let mut rx = spawn_playback_poller_with(
+            || false,
+            streams.clone(),
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+        );
+        assert!(!next_sample(&mut rx).await.1);
+        // The stream monitor's baseline has the event sound only.
+        streams.settle().await;
+        let started = Instant::now();
+        streams.set(vec![event_sound(1), music(2)]);
+        let playing_at = sample_until(&mut rx, true).await;
+        // Only once the stream lasted the minimum.
+        assert!(playing_at.duration_since(started) >= STREAM_TEST_MIN);
+        for _ in 0..5 {
+            assert!(next_sample(&mut rx).await.1);
+        }
+        // The stream ends: not playing, with only the event sound left.
+        streams.set(vec![event_sound(1)]);
+        sample_until(&mut rx, false).await;
+    }
+
+    #[tokio::test]
+    async fn playback_poller_stalled_stream_source_keeps_mpris() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let mpris = Arc::new(AtomicBool::new(false));
+        let reads = mpris.clone();
+        let mut rx = spawn_playback_poller_with(
+            move || reads.load(Ordering::SeqCst),
+            StalledStreams(stalled),
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+        );
+        assert!(!next_sample(&mut rx).await.1);
+        mpris.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), sample_until(&mut rx, true))
+            .await
+            .expect("an MPRIS sample despite the stalled stream source");
+        for _ in 0..5 {
+            assert!(next_sample(&mut rx).await.1);
+        }
+        drop(rx);
+        // Let the blocked listing return so the runtime can shut down.
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn handoff_stream_playback_takes() {
+        let mac = "5A:00:00:00:00:0D";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let streams = LiveStreams::default();
+        let h =
+            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+        assert!(h.playback_started.load(Ordering::SeqCst));
+        expect_startup(&h, &mut rx).await;
+        // The stream monitor's baseline has no stream.
+        streams.settle().await;
+
+        // A music stream with no MPRIS player: one take once it lasted the
+        // minimum, OwnsConnection [1] only.
+        let started = Instant::now();
+        streams.set(vec![music(11)]);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert!(started.elapsed() >= STREAM_TEST_MIN);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+
+        // ACK, then the stream ends: the core's usual release.
+        h.emit(owns(1));
+        streams.set(Vec::new());
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_event_sound_stream_never_takes() {
+        let mac = "5A:00:00:00:00:0E";
+        let (manager, mut rx, _tx) = ready_session().await;
+        // An event sound open from the start, for longer than the minimum.
+        let streams = LiveStreams::default();
+        streams.set(vec![event_sound(21)]);
+        let h =
+            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+        expect_startup(&h, &mut rx).await;
+        streams.settle().await;
+        tokio::time::sleep(STREAM_TEST_MIN).await;
+        // A new music stream that ends well before the minimum.
+        streams.set(vec![event_sound(21), music(22)]);
+        tokio::time::sleep(STREAM_TEST_MIN / 5).await;
+        streams.set(vec![event_sound(21)]);
+        tokio::time::sleep(STREAM_TEST_MIN).await;
+
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        assert_eq!(h.activations(), 1);
+        stop_handoff_task(mac);
+    }
+
+    /// A music stream already playing in the stream monitor's first listing,
+    /// optionally held until playback samples have reached the core: no
+    /// take while it keeps playing, one take once it is paused and resumed.
+    async fn preexisting_stream_case(mac: &str, delay_first_listing: bool) {
+        let (manager, mut rx, _tx) = ready_session().await;
+        let streams = LiveStreams::default();
+        streams.set(vec![music(31)]);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let source = GatedFirst {
+            streams: streams.clone(),
+            gate: delay_first_listing.then_some(gate),
+        };
+        let mpris_calls = Arc::new(AtomicUsize::new(0));
+        let calls = mpris_calls.clone();
+        let mpris = move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let h = Harness::start_streams(mac, &manager, mpris, source, STREAM_TEST_MIN).await;
+        expect_startup(&h, &mut rx).await;
+        if delay_first_listing {
+            // The third MPRIS sample is taken only once the core received
+            // the first (the channel holds one): the baseline sample came
+            // before any stream listing.
+            wait_until("MPRIS samples", || mpris_calls.load(Ordering::SeqCst) >= 3).await;
+            assert_eq!(streams.listings.load(Ordering::SeqCst), 0);
+            release.send(()).expect("first listing waiting");
+        }
+        streams.settle().await;
+
+        // Playing for more than twice the minimum: no new start, no take.
+        tokio::time::sleep(STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+
+        // Paused, then resumed: a new start, one take once it lasted the
+        // minimum from the resume, OwnsConnection [1] only.
+        streams.set(vec![StreamProps {
+            corked: true,
+            ..music(31)
+        }]);
+        streams.settle().await;
+        let resumed = Instant::now();
+        streams.set(vec![music(31)]);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert!(resumed.elapsed() >= STREAM_TEST_MIN);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_preexisting_stream_playback_never_takes() {
+        preexisting_stream_case("5A:00:00:00:00:0F", false).await;
+    }
+
+    #[tokio::test]
+    async fn handoff_preexisting_stream_late_first_listing_never_takes() {
+        preexisting_stream_case("5A:00:00:00:00:10", true).await;
     }
 }
