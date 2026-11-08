@@ -99,7 +99,9 @@ pub(crate) enum Input {
     /// Switch to automatic handoff (REPL `auto`). Its "not owning" is a
     /// pending release, so the reply is that release's acknowledgement and
     /// never a loss; a play edge before the reply is retaken once it
-    /// settles (#54).
+    /// settles (#54). While any request is pending (a repeated Auto, a
+    /// release or a take) it sends no "not owning", so every one in flight
+    /// has a tracked acknowledgement.
     Auto,
     /// Switch to manual mode (REPL `manual`).
     Manual,
@@ -406,8 +408,10 @@ impl Handoff {
                     return;
                 }
                 out.push(Command::ConnectA2dp);
-                if !self.requested_take {
-                    // Tracked like a playback-stop release (#54).
+                if !self.requested_take && self.pending.is_none() {
+                    // Tracked like a playback-stop release (#54). A release
+                    // already pending covers it: a second "not owning" would
+                    // get a reply that acknowledges nothing.
                     self.request(now, false, Cause::Playback, out);
                 }
                 self.automatic = true;
@@ -1871,6 +1875,27 @@ mod tests {
         assert_eq!(all, [SendOwnership(true)]);
         assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
         assert_eq!(p.feed(500, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(600, false), [SendOwnership(false)]);
+    }
+
+    #[test]
+    fn repeated_auto_reply_never_yields() {
+        // A second Auto while the first one's release is pending sends no
+        // second "not owning", so no reply is left acknowledging nothing.
+        let mut p = Probe::new(false, true);
+        p.routing(ready_facts());
+        let mut all = p.feed(100, Input::Auto);
+        all.extend(p.feed(150, Input::Auto));
+        all.extend(p.play(200, false));
+        all.extend(p.play(300, true));
+        let releases = all.iter().filter(|c| **c == SendOwnership(false)).count();
+        for i in 0..releases {
+            all.extend(p.feed(400 + i as u64, Input::Ownership(vec![0])));
+        }
+        all.extend(p.feed(500, Input::Ownership(vec![1])));
+        assert!(!all.contains(&PauseMedia));
+        assert_eq!(all.iter().filter(|c| **c == SendOwnership(true)).count(), 1);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
         assert_eq!(p.play(600, false), [SendOwnership(false)]);
     }
 

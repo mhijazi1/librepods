@@ -32,9 +32,10 @@ struct InitBacklog {
     drained: bool,
 }
 
-/// Take every event queued so far, run `send` (the last "not owning"), then
-/// take events up to and including the first OwnsConnection report, its
-/// echo. Without an echo within `INIT_ECHO_WAIT` the backlog is not drained.
+/// Run `send` (the last "not owning"), take every event queued by the time it
+/// returns, then take events up to and including the first OwnsConnection
+/// report, its echo. Without an echo within `INIT_ECHO_WAIT` the backlog is
+/// not drained.
 async fn collect_init_backlog<E>(
     events: &mut tokio::sync::mpsc::UnboundedReceiver<AACPEvent>,
     send: impl Future<Output = std::result::Result<(), E>>,
@@ -42,11 +43,13 @@ async fn collect_init_backlog<E>(
 where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    // Cut after `send` returns: it can wait on the state lock or the writer
+    // queue, and a report arriving meanwhile is not its echo.
+    send.await.map_err(Into::into)?;
     let mut backlog = InitBacklog::default();
     while let Ok(event) = events.try_recv() {
         backlog.events.push(event);
     }
-    send.await.map_err(Into::into)?;
     backlog.drained = tokio::time::timeout(INIT_ECHO_WAIT, async {
         while let Some(event) = events.recv().await {
             let echo = matches!(
@@ -958,27 +961,53 @@ mod tests {
         events.iter().map(|e| format!("{e:?}")).collect()
     }
 
-    #[tokio::test]
-    async fn init_backlog_ends_at_echo_of_final_not_owning() {
+    /// Collect a backlog after hosts and connect_control's [0] answer. The
+    /// send queues `during` while suspended, and a spawned task queues the
+    /// echo [0] and a later [0] only once the send has returned.
+    async fn backlog_around_send(during: Option<AACPEvent>) -> InitBacklog {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        // Queued before the send: hosts and connect_control's [0] answer,
-        // which must not be taken for the echo.
         tx.send(hosts_event()).unwrap();
         tx.send(owns_event(0)).unwrap();
+        let (returned, after) = tokio::sync::oneshot::channel::<()>();
+        let echo_tx = tx.clone();
+        tokio::spawn(async move {
+            after.await.unwrap();
+            echo_tx.send(owns_event(0)).unwrap();
+            echo_tx.send(owns_event(0)).unwrap();
+        });
         let send = async {
-            tx.send(owns_event(0)).unwrap();
-            tx.send(owns_event(0)).unwrap();
+            if let Some(event) = during {
+                tx.send(event).unwrap();
+                tokio::task::yield_now().await;
+            }
+            returned.send(()).unwrap();
             Ok::<(), std::io::Error>(())
         };
         let backlog = collect_init_backlog(&mut rx, send).await.unwrap();
+        // The later [0] is fresh: it stays queued for the core.
+        assert_eq!(named(&[rx.try_recv().unwrap()]), named(&[owns_event(0)]));
+        assert!(rx.try_recv().is_err());
+        backlog
+    }
+
+    #[tokio::test]
+    async fn init_backlog_ends_at_echo_of_final_not_owning() {
+        let backlog = backlog_around_send(None).await;
         assert!(backlog.drained);
         assert_eq!(
             named(&backlog.events),
             named(&[hosts_event(), owns_event(0), owns_event(0)])
         );
-        // The later [0] is fresh: it stays queued for the core.
-        assert_eq!(named(&[rx.try_recv().unwrap()]), named(&[owns_event(0)]));
-        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn init_backlog_report_during_suspended_send_is_pre_send() {
+        let backlog = backlog_around_send(Some(owns_event(0))).await;
+        assert!(backlog.drained);
+        assert_eq!(
+            named(&backlog.events),
+            named(&[hosts_event(), owns_event(0), owns_event(0), owns_event(0)])
+        );
     }
 
     #[tokio::test]
