@@ -168,12 +168,7 @@ impl App {
             .and_then(|v| v.get("stem_control").cloned())
             .and_then(|s| serde_json::from_value(s).ok())
             .unwrap_or(false);
-        // debt: #31 duplicates utils::parse_preferred_codec (kept as upstream wrote it)
-        let preferred_codec = settings
-            .clone()
-            .and_then(|v| v.get("preferred_codec").cloned())
-            .and_then(|c| serde_json::from_value(c).ok())
-            .unwrap_or_default();
+        let preferred_codec = crate::utils::preferred_codec_from_value(settings.as_ref());
 
         let bluetooth_state = BluetoothState::new();
 
