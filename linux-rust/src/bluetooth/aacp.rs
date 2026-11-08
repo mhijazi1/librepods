@@ -589,55 +589,55 @@ impl AACPManager {
                 info!("Received Battery Info: {:?}", state.battery_info);
             }
             opcodes::CONTROL_COMMAND => {
-                if payload.len() < 7 {
+                let Some(parsed) = parse_control_command(payload) else {
                     error!("Control Command packet too short: {}", hex::encode(payload));
                     return;
-                }
-                let identifier_byte = payload[2];
-                let value_bytes = &payload[3..7];
-
-                let last_non_zero = value_bytes.iter().rposition(|&b| b != 0);
-                let value = match last_non_zero {
-                    Some(i) => value_bytes[..=i].to_vec(),
-                    None => vec![0],
                 };
 
-                if let Some(identifier) = ControlCommandIdentifiers::from_u8(identifier_byte) {
-                    let status = ControlCommandStatus {
-                        identifier,
-                        value: value.clone(),
-                    };
-                    let mut state = self.state.lock().await;
-                    if let Some(existing) = state
-                        .control_command_status_list
-                        .iter_mut()
-                        .find(|s| s.identifier == identifier)
-                    {
-                        existing.value = value.clone();
-                    } else {
-                        state.control_command_status_list.push(status.clone());
-                    }
-                    if identifier == ControlCommandIdentifiers::OwnsConnection {
-                        state.owns = value_bytes[0] != 0;
-                    }
-                    if let Some(subscribers) = state.control_command_subscribers.get(&identifier) {
-                        for sub in subscribers {
-                            let _ = sub.send(value.clone());
+                match parsed {
+                    ParsedControlCommand::Known {
+                        status,
+                        owns_connection,
+                    } => {
+                        let identifier = status.identifier;
+                        let value = status.value.clone();
+                        let mut state = self.state.lock().await;
+                        if let Some(existing) = state
+                            .control_command_status_list
+                            .iter_mut()
+                            .find(|s| s.identifier == identifier)
+                        {
+                            existing.value = value.clone();
+                        } else {
+                            state.control_command_status_list.push(status.clone());
                         }
+                        if let Some(owns) = owns_connection {
+                            state.owns = owns;
+                        }
+                        if let Some(subscribers) =
+                            state.control_command_subscribers.get(&identifier)
+                        {
+                            for sub in subscribers {
+                                let _ = sub.send(value.clone());
+                            }
+                        }
+                        if let Some(ref tx) = state.event_tx {
+                            let _ = tx.send(AACPEvent::ControlCommand(status));
+                        }
+                        info!(
+                            "Received Control Command: {:?}, value: {}",
+                            identifier,
+                            hex::encode(&value)
+                        );
                     }
-                    if let Some(ref tx) = state.event_tx {
-                        let _ = tx.send(AACPEvent::ControlCommand(status));
+                    ParsedControlCommand::Unknown {
+                        identifier: identifier_byte,
+                    } => {
+                        error!(
+                            "Unknown Control Command identifier: {:#04x}",
+                            identifier_byte
+                        );
                     }
-                    info!(
-                        "Received Control Command: {:?}, value: {}",
-                        identifier,
-                        hex::encode(&value)
-                    );
-                } else {
-                    error!(
-                        "Unknown Control Command identifier: {:#04x}",
-                        identifier_byte
-                    );
                 }
             }
             opcodes::EAR_DETECTION => {
@@ -876,16 +876,10 @@ impl AACPManager {
                 }
             }
             opcodes::AUDIO_SOURCE => {
-                if payload.len() < 9 {
+                let Some(audio_source) = parse_audio_source(payload) else {
                     error!("Audio Source packet too short: {}", hex::encode(payload));
                     return;
-                }
-                let mac = format!(
-                    "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                    payload[7], payload[6], payload[5], payload[4], payload[3], payload[2]
-                );
-                let typ = AudioSourceType::from_u8(payload[8]).unwrap_or(AudioSourceType::Unknown);
-                let audio_source = AudioSource { mac, r#type: typ };
+                };
                 let mut state = self.state.lock().await;
                 state.audio_source = Some(audio_source.clone());
                 if let Some(ref tx) = state.event_tx {
@@ -894,42 +888,20 @@ impl AACPManager {
                 info!("Received Audio Source: {:?}", state.audio_source);
             }
             opcodes::CONNECTED_DEVICES => {
-                if payload.len() < 5 {
-                    error!(
-                        "Connected Devices packet too short: {}",
-                        hex::encode(payload)
-                    );
+                let Some(devices) = parse_connected_devices(payload) else {
+                    if payload.len() < 5 {
+                        error!(
+                            "Connected Devices packet too short: {}",
+                            hex::encode(payload)
+                        );
+                    } else {
+                        error!(
+                            "Connected Devices packet length mismatch: {}",
+                            hex::encode(payload)
+                        );
+                    }
                     return;
-                }
-                let count = payload[4] as usize;
-                if payload.len() < 5 + count * 8 {
-                    error!(
-                        "Connected Devices packet length mismatch: {}",
-                        hex::encode(payload)
-                    );
-                    return;
-                }
-                let mut devices = Vec::with_capacity(count);
-                for i in 0..count {
-                    let base = 5 + i * 8;
-                    let mac = format!(
-                        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                        payload[base],
-                        payload[base + 1],
-                        payload[base + 2],
-                        payload[base + 3],
-                        payload[base + 4],
-                        payload[base + 5]
-                    );
-                    let info1 = payload[base + 6];
-                    let info2 = payload[base + 7];
-                    devices.push(ConnectedDevice {
-                        mac,
-                        info1,
-                        info2,
-                        r#type: None,
-                    });
-                }
+                };
                 let mut state = self.state.lock().await;
                 state.old_connected_devices = state.connected_devices.clone();
                 state.connected_devices = devices.clone();
@@ -942,12 +914,11 @@ impl AACPManager {
                 info!("Received Connected Devices: {:?}", state.connected_devices);
             }
             opcodes::SMART_ROUTING_RESP => {
-                if payload.len() < 2 {
+                let Some(response) = parse_smart_routing_response(payload) else {
                     return;
-                }
-                let packet_string = String::from_utf8_lossy(&payload[2..]);
-                info!("Received Smart Routing Response: {}", packet_string);
-                if packet_string.contains("SetOwnershipToFalse") {
+                };
+                info!("Received Smart Routing Response: {}", response.text);
+                if response.set_ownership_to_false {
                     info!("Received OwnershipToFalse request");
                     if let Some(ref tx) = self.state.lock().await.event_tx {
                         let _ = tx.send(AACPEvent::OwnershipToFalseRequest);
@@ -1014,13 +985,8 @@ impl AACPManager {
         identifier: ControlCommandIdentifiers,
         value: &[u8],
     ) -> Result<()> {
-        let opcode = [opcodes::CONTROL_COMMAND, 0x00];
-        let mut data = vec![identifier as u8];
-        for i in 0..4 {
-            data.push(value.get(i).copied().unwrap_or(0));
-        }
-        let packet = [opcode.as_slice(), data.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        self.send_data_packet(&encode_control_command(identifier, value))
+            .await
     }
 
     pub async fn send_media_information_new_device(
@@ -1028,72 +994,16 @@ impl AACPManager {
         self_mac_address: &str,
         target_mac_address: &str,
     ) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(112);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-
-        buffer.extend_from_slice(&[0x68, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-        buffer.extend_from_slice(b"playingApp");
-        buffer.push(0x42);
-        buffer.extend_from_slice(b"NA");
-        buffer.push(0x52);
-        buffer.extend_from_slice(b"hostStreamingState");
-        buffer.push(0x42);
-        buffer.extend_from_slice(b"NO");
-        buffer.push(0x49);
-        buffer.extend_from_slice(b"btAddress");
-        buffer.push(0x51);
-        buffer.extend_from_slice(self_mac_address.as_bytes());
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"btName");
-        buffer.push(0x43);
-        buffer.extend_from_slice(b"Mac");
-        buffer.push(0x58);
-        buffer.extend_from_slice(b"otherDevice");
-        buffer.extend_from_slice(b"AudioCategory");
-        buffer.extend_from_slice(&[0x30, 0x64]);
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        self.send_data_packet(&encode_media_information_new_device(
+            self_mac_address,
+            target_mac_address,
+        ))
+        .await
     }
 
     pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(106);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x62, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5]);
-        buffer.push(0x4A);
-        buffer.extend_from_slice(b"localscore");
-        buffer.extend_from_slice(&[0x30, 0x64]);
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"reason");
-        buffer.push(0x48);
-        buffer.extend_from_slice(b"Hijackv2");
-        buffer.push(0x51);
-        buffer.extend_from_slice(b"audioRoutingScore");
-        buffer.extend_from_slice(&[0x31, 0x2D, 0x01, 0x5F]);
-        buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-        buffer.push(0x01);
-        buffer.push(0x4B);
-        buffer.extend_from_slice(b"remotescore");
-        buffer.push(0xA5);
-
-        while buffer.len() < 106 {
-            buffer.push(0x00);
-        }
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        self.send_data_packet(&encode_hijack_request(target_mac_address))
+            .await
     }
 
     pub async fn send_media_information(
@@ -1102,104 +1012,23 @@ impl AACPManager {
         target_mac_address: &str,
         streaming_state: bool,
     ) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(138);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x82, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-        buffer.extend_from_slice(b"PlayingApp");
-        buffer.push(0x56);
-        buffer.extend_from_slice(b"com.google.ios.youtube");
-        buffer.push(0x52);
-        buffer.extend_from_slice(b"HostStreamingState");
-        buffer.push(0x42);
-        buffer.extend_from_slice(if streaming_state { b"YES" } else { b"NO" });
-        buffer.push(0x49);
-        buffer.extend_from_slice(b"btAddress");
-        buffer.push(0x51);
-        buffer.extend_from_slice(self_mac_address.as_bytes());
-        buffer.extend_from_slice(b"btName");
-        buffer.push(0x43);
-        buffer.extend_from_slice(b"Mac");
-        buffer.push(0x58);
-        buffer.extend_from_slice(b"otherDevice");
-        buffer.extend_from_slice(b"AudioCategory");
-        buffer.extend_from_slice(&[0x31, 0x2D, 0x01]);
-
-        while buffer.len() < 138 {
-            buffer.push(0x00);
-        }
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        self.send_data_packet(&encode_media_information(
+            self_mac_address,
+            target_mac_address,
+            streaming_state,
+        ))
+        .await
     }
 
     pub async fn send_smart_routing_show_ui(&self, target_mac_address: &str) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(134);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x7E, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE6, 0x5B]);
-        buffer.extend_from_slice(b"SmartRoutingKeyShowNearbyUI");
-        buffer.push(0x01);
-        buffer.push(0x4A);
-        buffer.extend_from_slice(b"localscore");
-        buffer.extend_from_slice(&[0x31, 0x2D]);
-        buffer.push(0x01);
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"reasonHhijackv2");
-        buffer.push(0x51);
-        buffer.extend_from_slice(b"audioRoutingScore");
-        buffer.push(0xA2);
-        buffer.push(0x5F);
-        buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-        buffer.push(0x01);
-        buffer.push(0x4B);
-        buffer.extend_from_slice(b"remotescore");
-        buffer.push(0xA2);
-
-        while buffer.len() < 134 {
-            buffer.push(0x00);
-        }
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        self.send_data_packet(&encode_smart_routing_show_ui(target_mac_address))
+            .await
     }
 
+    // Caller arrives with #17 (Undo notification).
     pub async fn send_hijack_reversed(&self, target_mac_address: &str) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(97);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x59, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE3]);
-        buffer.push(0x5F);
-        buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-        buffer.push(0x01);
-        buffer.push(0x59);
-        buffer.extend_from_slice(b"audioRoutingShowReverseUI");
-        buffer.push(0x01);
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"reason");
-        buffer.push(0x53);
-        buffer.extend_from_slice(b"ReverseBannerTapped");
-
-        while buffer.len() < 97 {
-            buffer.push(0x00);
-        }
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        self.send_data_packet(&encode_hijack_reversed(target_mac_address))
+            .await
     }
 
     pub async fn send_add_tipi_device(
@@ -1207,39 +1036,333 @@ impl AACPManager {
         self_mac_address: &str,
         target_mac_address: &str,
     ) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(86);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x4E, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5]);
-        buffer.extend_from_slice(&[0x48, 0x69]);
-        buffer.extend_from_slice(b"idleTime");
-        buffer.extend_from_slice(&[0x08, 0x47]);
-        buffer.extend_from_slice(b"newTipi");
-        buffer.extend_from_slice(&[0x01, 0x49]);
-        buffer.extend_from_slice(b"btAddress");
-        buffer.push(0x51);
-        buffer.extend_from_slice(self_mac_address.as_bytes());
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"btName");
-        buffer.push(0x43);
-        buffer.extend_from_slice(b"Mac");
-        buffer.push(0x50);
-        buffer.extend_from_slice(b"nearbyAudioScore");
-        buffer.push(0x0E);
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        self.send_data_packet(&encode_add_tipi_device(
+            self_mac_address,
+            target_mac_address,
+        ))
+        .await
     }
 
     pub async fn send_some_packet(&self) -> Result<()> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
     }
+}
+
+// Pure AACP packet encoders and parsers. They take no locks and do no I/O so
+// the protocol can be tested offline. Encoders return the data packet without
+// the 4-byte AACP header (send_data_packet adds it). Parsers take the payload
+// the way receive_packet slices it: `&packet[4..]`, opcode at payload[0].
+
+// Target MAC components in reverse order, as every smart-routing packet sends
+// them. A component that is not valid hex panics, as it did before these
+// encoders were extracted; changing that is out of scope for this refactor.
+fn reversed_mac_bytes(mac_address: &str) -> Vec<u8> {
+    let mac_bytes: Vec<u8> = mac_address
+        .split(':')
+        .map(|s| u8::from_str_radix(s, 16).unwrap())
+        .collect();
+    mac_bytes.iter().rev().cloned().collect()
+}
+
+pub(crate) fn encode_control_command(
+    identifier: ControlCommandIdentifiers,
+    value: &[u8],
+) -> Vec<u8> {
+    let opcode = [opcodes::CONTROL_COMMAND, 0x00];
+    let mut data = vec![identifier as u8];
+    for i in 0..4 {
+        data.push(value.get(i).copied().unwrap_or(0));
+    }
+    [opcode.as_slice(), data.as_slice()].concat()
+}
+
+pub(crate) fn encode_media_information_new_device(
+    self_mac_address: &str,
+    target_mac_address: &str,
+) -> Vec<u8> {
+    let opcode = [opcodes::SMART_ROUTING, 0x00];
+    let mut buffer = Vec::with_capacity(112);
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+
+    buffer.extend_from_slice(&[0x68, 0x00]);
+    buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
+    buffer.extend_from_slice(b"playingApp");
+    buffer.push(0x42);
+    buffer.extend_from_slice(b"NA");
+    buffer.push(0x52);
+    buffer.extend_from_slice(b"hostStreamingState");
+    buffer.push(0x42);
+    buffer.extend_from_slice(b"NO");
+    buffer.push(0x49);
+    buffer.extend_from_slice(b"btAddress");
+    buffer.push(0x51);
+    buffer.extend_from_slice(self_mac_address.as_bytes());
+    buffer.push(0x46);
+    buffer.extend_from_slice(b"btName");
+    buffer.push(0x43);
+    buffer.extend_from_slice(b"Mac");
+    buffer.push(0x58);
+    buffer.extend_from_slice(b"otherDevice");
+    buffer.extend_from_slice(b"AudioCategory");
+    buffer.extend_from_slice(&[0x30, 0x64]);
+
+    [opcode.as_slice(), buffer.as_slice()].concat()
+}
+
+pub(crate) fn encode_hijack_request(target_mac_address: &str) -> Vec<u8> {
+    let opcode = [opcodes::SMART_ROUTING, 0x00];
+    let mut buffer = Vec::with_capacity(106);
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    buffer.extend_from_slice(&[0x62, 0x00]);
+    buffer.extend_from_slice(&[0x01, 0xE5]);
+    buffer.push(0x4A);
+    buffer.extend_from_slice(b"localscore");
+    buffer.extend_from_slice(&[0x30, 0x64]);
+    buffer.push(0x46);
+    buffer.extend_from_slice(b"reason");
+    buffer.push(0x48);
+    buffer.extend_from_slice(b"Hijackv2");
+    buffer.push(0x51);
+    buffer.extend_from_slice(b"audioRoutingScore");
+    buffer.extend_from_slice(&[0x31, 0x2D, 0x01, 0x5F]);
+    buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
+    buffer.push(0x01);
+    buffer.push(0x4B);
+    buffer.extend_from_slice(b"remotescore");
+    buffer.push(0xA5);
+
+    while buffer.len() < 106 {
+        buffer.push(0x00);
+    }
+
+    [opcode.as_slice(), buffer.as_slice()].concat()
+}
+
+pub(crate) fn encode_media_information(
+    self_mac_address: &str,
+    target_mac_address: &str,
+    streaming_state: bool,
+) -> Vec<u8> {
+    let opcode = [opcodes::SMART_ROUTING, 0x00];
+    let mut buffer = Vec::with_capacity(138);
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    buffer.extend_from_slice(&[0x82, 0x00]);
+    buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
+    buffer.extend_from_slice(b"PlayingApp");
+    buffer.push(0x56);
+    buffer.extend_from_slice(b"com.google.ios.youtube");
+    buffer.push(0x52);
+    buffer.extend_from_slice(b"HostStreamingState");
+    buffer.push(0x42);
+    buffer.extend_from_slice(if streaming_state { b"YES" } else { b"NO" });
+    buffer.push(0x49);
+    buffer.extend_from_slice(b"btAddress");
+    buffer.push(0x51);
+    buffer.extend_from_slice(self_mac_address.as_bytes());
+    buffer.extend_from_slice(b"btName");
+    buffer.push(0x43);
+    buffer.extend_from_slice(b"Mac");
+    buffer.push(0x58);
+    buffer.extend_from_slice(b"otherDevice");
+    buffer.extend_from_slice(b"AudioCategory");
+    buffer.extend_from_slice(&[0x31, 0x2D, 0x01]);
+
+    while buffer.len() < 138 {
+        buffer.push(0x00);
+    }
+    [opcode.as_slice(), buffer.as_slice()].concat()
+}
+
+pub(crate) fn encode_smart_routing_show_ui(target_mac_address: &str) -> Vec<u8> {
+    let opcode = [opcodes::SMART_ROUTING, 0x00];
+    let mut buffer = Vec::with_capacity(134);
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    buffer.extend_from_slice(&[0x7E, 0x00]);
+    buffer.extend_from_slice(&[0x01, 0xE6, 0x5B]);
+    buffer.extend_from_slice(b"SmartRoutingKeyShowNearbyUI");
+    buffer.push(0x01);
+    buffer.push(0x4A);
+    buffer.extend_from_slice(b"localscore");
+    buffer.extend_from_slice(&[0x31, 0x2D]);
+    buffer.push(0x01);
+    buffer.push(0x46);
+    buffer.extend_from_slice(b"reasonHhijackv2");
+    buffer.push(0x51);
+    buffer.extend_from_slice(b"audioRoutingScore");
+    buffer.push(0xA2);
+    buffer.push(0x5F);
+    buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
+    buffer.push(0x01);
+    buffer.push(0x4B);
+    buffer.extend_from_slice(b"remotescore");
+    buffer.push(0xA2);
+
+    while buffer.len() < 134 {
+        buffer.push(0x00);
+    }
+
+    [opcode.as_slice(), buffer.as_slice()].concat()
+}
+
+// Caller arrives with #17 (Undo notification).
+pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> Vec<u8> {
+    let opcode = [opcodes::SMART_ROUTING, 0x00];
+    let mut buffer = Vec::with_capacity(97);
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    buffer.extend_from_slice(&[0x59, 0x00]);
+    buffer.extend_from_slice(&[0x01, 0xE3]);
+    buffer.push(0x5F);
+    buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
+    buffer.push(0x01);
+    buffer.push(0x59);
+    buffer.extend_from_slice(b"audioRoutingShowReverseUI");
+    buffer.push(0x01);
+    buffer.push(0x46);
+    buffer.extend_from_slice(b"reason");
+    buffer.push(0x53);
+    buffer.extend_from_slice(b"ReverseBannerTapped");
+
+    while buffer.len() < 97 {
+        buffer.push(0x00);
+    }
+
+    [opcode.as_slice(), buffer.as_slice()].concat()
+}
+
+pub(crate) fn encode_add_tipi_device(self_mac_address: &str, target_mac_address: &str) -> Vec<u8> {
+    let opcode = [opcodes::SMART_ROUTING, 0x00];
+    let mut buffer = Vec::with_capacity(86);
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    buffer.extend_from_slice(&[0x4E, 0x00]);
+    buffer.extend_from_slice(&[0x01, 0xE5]);
+    buffer.extend_from_slice(&[0x48, 0x69]);
+    buffer.extend_from_slice(b"idleTime");
+    buffer.extend_from_slice(&[0x08, 0x47]);
+    buffer.extend_from_slice(b"newTipi");
+    buffer.extend_from_slice(&[0x01, 0x49]);
+    buffer.extend_from_slice(b"btAddress");
+    buffer.push(0x51);
+    buffer.extend_from_slice(self_mac_address.as_bytes());
+    buffer.push(0x46);
+    buffer.extend_from_slice(b"btName");
+    buffer.push(0x43);
+    buffer.extend_from_slice(b"Mac");
+    buffer.push(0x50);
+    buffer.extend_from_slice(b"nearbyAudioScore");
+    buffer.push(0x0E);
+
+    [opcode.as_slice(), buffer.as_slice()].concat()
+}
+
+// AUDIO_SOURCE (0x0E): source MAC in payload[2..8], least significant byte
+// first; source type in payload[8]. None if payload.len() < 9.
+pub(crate) fn parse_audio_source(payload: &[u8]) -> Option<AudioSource> {
+    if payload.len() < 9 {
+        return None;
+    }
+    let mac = format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        payload[7], payload[6], payload[5], payload[4], payload[3], payload[2]
+    );
+    let typ = AudioSourceType::from_u8(payload[8]).unwrap_or(AudioSourceType::Unknown);
+    Some(AudioSource { mac, r#type: typ })
+}
+
+// CONNECTED_DEVICES (0x2E): device count in payload[4], then 8 bytes per
+// device from payload[5] (6-byte MAC in order, info1, info2). None if the
+// payload is shorter than the count requires.
+pub(crate) fn parse_connected_devices(payload: &[u8]) -> Option<Vec<ConnectedDevice>> {
+    if payload.len() < 5 {
+        return None;
+    }
+    let count = payload[4] as usize;
+    if payload.len() < 5 + count * 8 {
+        return None;
+    }
+    let mut devices = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = 5 + i * 8;
+        let mac = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            payload[base],
+            payload[base + 1],
+            payload[base + 2],
+            payload[base + 3],
+            payload[base + 4],
+            payload[base + 5]
+        );
+        let info1 = payload[base + 6];
+        let info2 = payload[base + 7];
+        devices.push(ConnectedDevice {
+            mac,
+            info1,
+            info2,
+            r#type: None,
+        });
+    }
+    Some(devices)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedControlCommand {
+    Known {
+        status: ControlCommandStatus,
+        // Some(payload[3] != 0) for OwnsConnection, None for other identifiers.
+        owns_connection: Option<bool>,
+    },
+    Unknown {
+        identifier: u8,
+    },
+}
+
+// CONTROL_COMMAND (0x09): identifier in payload[2], value in payload[3..7]
+// with trailing zero bytes trimmed (all zero becomes [0]). None if
+// payload.len() < 7.
+pub(crate) fn parse_control_command(payload: &[u8]) -> Option<ParsedControlCommand> {
+    if payload.len() < 7 {
+        return None;
+    }
+    let identifier_byte = payload[2];
+    let value_bytes = &payload[3..7];
+
+    let last_non_zero = value_bytes.iter().rposition(|&b| b != 0);
+    let value = match last_non_zero {
+        Some(i) => value_bytes[..=i].to_vec(),
+        None => vec![0],
+    };
+
+    match ControlCommandIdentifiers::from_u8(identifier_byte) {
+        Some(identifier) => Some(ParsedControlCommand::Known {
+            status: ControlCommandStatus { identifier, value },
+            owns_connection: (identifier == ControlCommandIdentifiers::OwnsConnection)
+                .then(|| value_bytes[0] != 0),
+        }),
+        None => Some(ParsedControlCommand::Unknown {
+            identifier: identifier_byte,
+        }),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SmartRoutingResponse {
+    // Lossy UTF-8 of payload[2..].
+    pub text: String,
+    pub set_ownership_to_false: bool,
+}
+
+// SMART_ROUTING_RESP (0x11): the text is the lossy UTF-8 of payload[2..].
+// None if payload.len() < 2.
+pub(crate) fn parse_smart_routing_response(payload: &[u8]) -> Option<SmartRoutingResponse> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&payload[2..]).into_owned();
+    let set_ownership_to_false = text.contains("SetOwnershipToFalse");
+    Some(SmartRoutingResponse {
+        text,
+        set_ownership_to_false,
+    })
 }
 
 async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
@@ -1359,5 +1482,673 @@ mod tests {
             "unexpected error kind: {:?}",
             err.kind
         );
+    }
+
+    // Golden packets: the exact bytes the send_* methods put on the send
+    // channel (header included), captured from the implementation before the
+    // encoders were extracted. They pin current behaviour, quirks included
+    // (no 0x46 before "btName" in media information, "reasonHhijackv2" in the
+    // show-UI packet, the 0x4E length in add-tipi, the padding lengths). Do not
+    // "fix" these bytes in a refactor; protocol changes need their own ticket.
+    const GOLDEN_TARGET_MAC: &str = "AA:BB:CC:DD:EE:FF";
+    const GOLDEN_SELF_MAC: &str = "11:22:33:44:55:66";
+
+    const GOLDEN_OWNS_CONNECTION_0: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00,
+    ];
+    const GOLDEN_OWNS_CONNECTION_1: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00,
+    ];
+    const GOLDEN_HIJACK_REQUEST: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x62, 0x00, 0x01,
+        0xE5, 0x4A, 0x6C, 0x6F, 0x63, 0x61, 0x6C, 0x73, 0x63, 0x6F, 0x72, 0x65, 0x30, 0x64, 0x46,
+        0x72, 0x65, 0x61, 0x73, 0x6F, 0x6E, 0x48, 0x48, 0x69, 0x6A, 0x61, 0x63, 0x6B, 0x76, 0x32,
+        0x51, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x52, 0x6F, 0x75, 0x74, 0x69, 0x6E, 0x67, 0x53, 0x63,
+        0x6F, 0x72, 0x65, 0x31, 0x2D, 0x01, 0x5F, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x52, 0x6F, 0x75,
+        0x74, 0x69, 0x6E, 0x67, 0x53, 0x65, 0x74, 0x4F, 0x77, 0x6E, 0x65, 0x72, 0x73, 0x68, 0x69,
+        0x70, 0x54, 0x6F, 0x46, 0x61, 0x6C, 0x73, 0x65, 0x01, 0x4B, 0x72, 0x65, 0x6D, 0x6F, 0x74,
+        0x65, 0x73, 0x63, 0x6F, 0x72, 0x65, 0xA5,
+    ];
+    const GOLDEN_SMART_ROUTING_SHOW_UI: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x7E, 0x00, 0x01,
+        0xE6, 0x5B, 0x53, 0x6D, 0x61, 0x72, 0x74, 0x52, 0x6F, 0x75, 0x74, 0x69, 0x6E, 0x67, 0x4B,
+        0x65, 0x79, 0x53, 0x68, 0x6F, 0x77, 0x4E, 0x65, 0x61, 0x72, 0x62, 0x79, 0x55, 0x49, 0x01,
+        0x4A, 0x6C, 0x6F, 0x63, 0x61, 0x6C, 0x73, 0x63, 0x6F, 0x72, 0x65, 0x31, 0x2D, 0x01, 0x46,
+        0x72, 0x65, 0x61, 0x73, 0x6F, 0x6E, 0x48, 0x68, 0x69, 0x6A, 0x61, 0x63, 0x6B, 0x76, 0x32,
+        0x51, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x52, 0x6F, 0x75, 0x74, 0x69, 0x6E, 0x67, 0x53, 0x63,
+        0x6F, 0x72, 0x65, 0xA2, 0x5F, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x52, 0x6F, 0x75, 0x74, 0x69,
+        0x6E, 0x67, 0x53, 0x65, 0x74, 0x4F, 0x77, 0x6E, 0x65, 0x72, 0x73, 0x68, 0x69, 0x70, 0x54,
+        0x6F, 0x46, 0x61, 0x6C, 0x73, 0x65, 0x01, 0x4B, 0x72, 0x65, 0x6D, 0x6F, 0x74, 0x65, 0x73,
+        0x63, 0x6F, 0x72, 0x65, 0xA2,
+    ];
+    const GOLDEN_MEDIA_INFORMATION_STREAMING: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x82, 0x00, 0x01,
+        0xE5, 0x4A, 0x50, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x56, 0x63, 0x6F,
+        0x6D, 0x2E, 0x67, 0x6F, 0x6F, 0x67, 0x6C, 0x65, 0x2E, 0x69, 0x6F, 0x73, 0x2E, 0x79, 0x6F,
+        0x75, 0x74, 0x75, 0x62, 0x65, 0x52, 0x48, 0x6F, 0x73, 0x74, 0x53, 0x74, 0x72, 0x65, 0x61,
+        0x6D, 0x69, 0x6E, 0x67, 0x53, 0x74, 0x61, 0x74, 0x65, 0x42, 0x59, 0x45, 0x53, 0x49, 0x62,
+        0x74, 0x41, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A,
+        0x33, 0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35, 0x35, 0x3A, 0x36, 0x36, 0x62, 0x74, 0x4E, 0x61,
+        0x6D, 0x65, 0x43, 0x4D, 0x61, 0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76,
+        0x69, 0x63, 0x65, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72,
+        0x79, 0x31, 0x2D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    const GOLDEN_MEDIA_INFORMATION_NOT_STREAMING: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x82, 0x00, 0x01,
+        0xE5, 0x4A, 0x50, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x56, 0x63, 0x6F,
+        0x6D, 0x2E, 0x67, 0x6F, 0x6F, 0x67, 0x6C, 0x65, 0x2E, 0x69, 0x6F, 0x73, 0x2E, 0x79, 0x6F,
+        0x75, 0x74, 0x75, 0x62, 0x65, 0x52, 0x48, 0x6F, 0x73, 0x74, 0x53, 0x74, 0x72, 0x65, 0x61,
+        0x6D, 0x69, 0x6E, 0x67, 0x53, 0x74, 0x61, 0x74, 0x65, 0x42, 0x4E, 0x4F, 0x49, 0x62, 0x74,
+        0x41, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A, 0x33,
+        0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35, 0x35, 0x3A, 0x36, 0x36, 0x62, 0x74, 0x4E, 0x61, 0x6D,
+        0x65, 0x43, 0x4D, 0x61, 0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76, 0x69,
+        0x63, 0x65, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72, 0x79,
+        0x31, 0x2D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    const GOLDEN_MEDIA_INFORMATION_NEW_DEVICE: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x68, 0x00, 0x01,
+        0xE5, 0x4A, 0x70, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x42, 0x4E, 0x41,
+        0x52, 0x68, 0x6F, 0x73, 0x74, 0x53, 0x74, 0x72, 0x65, 0x61, 0x6D, 0x69, 0x6E, 0x67, 0x53,
+        0x74, 0x61, 0x74, 0x65, 0x42, 0x4E, 0x4F, 0x49, 0x62, 0x74, 0x41, 0x64, 0x64, 0x72, 0x65,
+        0x73, 0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A, 0x33, 0x33, 0x3A, 0x34, 0x34, 0x3A,
+        0x35, 0x35, 0x3A, 0x36, 0x36, 0x46, 0x62, 0x74, 0x4E, 0x61, 0x6D, 0x65, 0x43, 0x4D, 0x61,
+        0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76, 0x69, 0x63, 0x65, 0x41, 0x75,
+        0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72, 0x79, 0x30, 0x64,
+    ];
+    const GOLDEN_ADD_TIPI_DEVICE: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x4E, 0x00, 0x01,
+        0xE5, 0x48, 0x69, 0x69, 0x64, 0x6C, 0x65, 0x54, 0x69, 0x6D, 0x65, 0x08, 0x47, 0x6E, 0x65,
+        0x77, 0x54, 0x69, 0x70, 0x69, 0x01, 0x49, 0x62, 0x74, 0x41, 0x64, 0x64, 0x72, 0x65, 0x73,
+        0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A, 0x33, 0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35,
+        0x35, 0x3A, 0x36, 0x36, 0x46, 0x62, 0x74, 0x4E, 0x61, 0x6D, 0x65, 0x43, 0x4D, 0x61, 0x63,
+        0x50, 0x6E, 0x65, 0x61, 0x72, 0x62, 0x79, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x53, 0x63, 0x6F,
+        0x72, 0x65, 0x0E,
+    ];
+    const GOLDEN_HIJACK_REVERSED: &[u8] = &[
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x59, 0x00, 0x01,
+        0xE3, 0x5F, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x52, 0x6F, 0x75, 0x74, 0x69, 0x6E, 0x67, 0x53,
+        0x65, 0x74, 0x4F, 0x77, 0x6E, 0x65, 0x72, 0x73, 0x68, 0x69, 0x70, 0x54, 0x6F, 0x46, 0x61,
+        0x6C, 0x73, 0x65, 0x01, 0x59, 0x61, 0x75, 0x64, 0x69, 0x6F, 0x52, 0x6F, 0x75, 0x74, 0x69,
+        0x6E, 0x67, 0x53, 0x68, 0x6F, 0x77, 0x52, 0x65, 0x76, 0x65, 0x72, 0x73, 0x65, 0x55, 0x49,
+        0x01, 0x46, 0x72, 0x65, 0x61, 0x73, 0x6F, 0x6E, 0x53, 0x52, 0x65, 0x76, 0x65, 0x72, 0x73,
+        0x65, 0x42, 0x61, 0x6E, 0x6E, 0x65, 0x72, 0x54, 0x61, 0x70, 0x70, 0x65, 0x64,
+    ];
+
+    // Offline manager with an injected bounded send channel (#2/#24 pattern).
+    async fn manager_with_send_channel() -> (AACPManager, mpsc::Receiver<Vec<u8>>) {
+        let manager = AACPManager::new();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        manager.state.lock().await.sender = Some(tx);
+        (manager, rx)
+    }
+
+    // Takes the single packet a send_* call put on the channel.
+    fn sent_packet(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        let packet = rx
+            .try_recv()
+            .expect("send_* should queue exactly one packet");
+        assert!(rx.try_recv().is_err(), "send_* queued more than one packet");
+        packet
+    }
+
+    #[tokio::test]
+    async fn golden_send_control_command_owns_connection_0() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_control_command(ControlCommandIdentifiers::OwnsConnection, &[0])
+            .await
+            .expect("send_control_command");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_OWNS_CONNECTION_0);
+    }
+
+    #[tokio::test]
+    async fn golden_send_control_command_owns_connection_1() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_control_command(ControlCommandIdentifiers::OwnsConnection, &[1])
+            .await
+            .expect("send_control_command");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_OWNS_CONNECTION_1);
+    }
+
+    #[tokio::test]
+    async fn golden_send_hijack_request() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_hijack_request(GOLDEN_TARGET_MAC)
+            .await
+            .expect("send_hijack_request");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_HIJACK_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn golden_send_smart_routing_show_ui() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_smart_routing_show_ui(GOLDEN_TARGET_MAC)
+            .await
+            .expect("send_smart_routing_show_ui");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_SMART_ROUTING_SHOW_UI);
+    }
+
+    #[tokio::test]
+    async fn golden_send_media_information_streaming() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true)
+            .await
+            .expect("send_media_information");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_MEDIA_INFORMATION_STREAMING);
+    }
+
+    #[tokio::test]
+    async fn golden_send_media_information_not_streaming() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, false)
+            .await
+            .expect("send_media_information");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_MEDIA_INFORMATION_NOT_STREAMING);
+    }
+
+    #[tokio::test]
+    async fn golden_send_media_information_new_device() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+            .await
+            .expect("send_media_information_new_device");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_MEDIA_INFORMATION_NEW_DEVICE);
+    }
+
+    #[tokio::test]
+    async fn golden_send_add_tipi_device() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+            .await
+            .expect("send_add_tipi_device");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_ADD_TIPI_DEVICE);
+    }
+
+    #[tokio::test]
+    async fn golden_send_hijack_reversed() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_hijack_reversed(GOLDEN_TARGET_MAC)
+            .await
+            .expect("send_hijack_reversed");
+        assert_eq!(sent_packet(&mut rx), GOLDEN_HIJACK_REVERSED);
+    }
+
+    // The data packet the encoders return, without the 4-byte AACP header that
+    // send_data_packet prepends.
+    fn without_header(packet: &[u8]) -> &[u8] {
+        assert!(packet.starts_with(&HEADER_BYTES));
+        &packet[HEADER_BYTES.len()..]
+    }
+
+    #[test]
+    fn golden_encode_control_command_owns_connection() {
+        assert_eq!(
+            encode_control_command(ControlCommandIdentifiers::OwnsConnection, &[0]),
+            without_header(GOLDEN_OWNS_CONNECTION_0)
+        );
+        assert_eq!(
+            encode_control_command(ControlCommandIdentifiers::OwnsConnection, &[1]),
+            without_header(GOLDEN_OWNS_CONNECTION_1)
+        );
+    }
+
+    #[test]
+    fn encode_control_command_pads_and_truncates_value_to_four_bytes() {
+        assert_eq!(
+            encode_control_command(ControlCommandIdentifiers::ListeningMode, &[]),
+            [0x09, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode_control_command(
+                ControlCommandIdentifiers::ListeningMode,
+                &[1, 2, 3, 4, 5, 6]
+            ),
+            [0x09, 0x00, 0x0D, 0x01, 0x02, 0x03, 0x04]
+        );
+    }
+
+    #[test]
+    fn golden_encode_hijack_request() {
+        assert_eq!(
+            encode_hijack_request(GOLDEN_TARGET_MAC),
+            without_header(GOLDEN_HIJACK_REQUEST)
+        );
+    }
+
+    #[test]
+    fn golden_encode_smart_routing_show_ui() {
+        assert_eq!(
+            encode_smart_routing_show_ui(GOLDEN_TARGET_MAC),
+            without_header(GOLDEN_SMART_ROUTING_SHOW_UI)
+        );
+    }
+
+    #[test]
+    fn golden_encode_media_information_streaming() {
+        assert_eq!(
+            encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true),
+            without_header(GOLDEN_MEDIA_INFORMATION_STREAMING)
+        );
+    }
+
+    #[test]
+    fn golden_encode_media_information_not_streaming() {
+        assert_eq!(
+            encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, false),
+            without_header(GOLDEN_MEDIA_INFORMATION_NOT_STREAMING)
+        );
+    }
+
+    #[test]
+    fn golden_encode_media_information_new_device() {
+        assert_eq!(
+            encode_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC),
+            without_header(GOLDEN_MEDIA_INFORMATION_NEW_DEVICE)
+        );
+    }
+
+    #[test]
+    fn golden_encode_add_tipi_device() {
+        assert_eq!(
+            encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC),
+            without_header(GOLDEN_ADD_TIPI_DEVICE)
+        );
+    }
+
+    #[test]
+    fn golden_encode_hijack_reversed() {
+        assert_eq!(
+            encode_hijack_reversed(GOLDEN_TARGET_MAC),
+            without_header(GOLDEN_HIJACK_REVERSED)
+        );
+    }
+
+    // Current behaviour, kept on purpose by #7: a MAC component that is not
+    // valid hex panics instead of returning an error.
+    #[test]
+    #[should_panic]
+    fn encode_hijack_request_invalid_mac_panics() {
+        let _ = encode_hijack_request("ZZ:BB:CC:DD:EE:FF");
+    }
+
+    // Parser vectors are payloads as receive_packet slices them (`&packet[4..]`,
+    // opcode at payload[0]).
+
+    // AUDIO_SOURCE: MAC 11:22:33:44:55:66 stored LSB first, type Media.
+    const AUDIO_SOURCE_PAYLOAD: &[u8] = &[0x0E, 0x00, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x02];
+
+    #[test]
+    fn golden_parse_audio_source() {
+        assert_eq!(
+            parse_audio_source(AUDIO_SOURCE_PAYLOAD),
+            Some(AudioSource {
+                mac: "11:22:33:44:55:66".to_string(),
+                r#type: AudioSourceType::Media,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_audio_source_types() {
+        let mut payload = AUDIO_SOURCE_PAYLOAD.to_vec();
+        for (byte, typ) in [
+            (0x00, AudioSourceType::None),
+            (0x01, AudioSourceType::Call),
+            (0x02, AudioSourceType::Media),
+            (0x03, AudioSourceType::Unknown),
+            (0xFF, AudioSourceType::Unknown),
+        ] {
+            payload[8] = byte;
+            assert_eq!(parse_audio_source(&payload).map(|s| s.r#type), Some(typ));
+        }
+    }
+
+    #[test]
+    fn parse_audio_source_truncated_returns_none() {
+        for n in 0..AUDIO_SOURCE_PAYLOAD.len() {
+            assert_eq!(
+                parse_audio_source(&AUDIO_SOURCE_PAYLOAD[..n]),
+                None,
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_audio_source_oversized_ignores_trailing_bytes() {
+        let mut payload = AUDIO_SOURCE_PAYLOAD.to_vec();
+        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            parse_audio_source(&payload),
+            parse_audio_source(AUDIO_SOURCE_PAYLOAD)
+        );
+    }
+
+    // CONNECTED_DEVICES: count 2 at payload[4], then 8 bytes per device.
+    const CONNECTED_DEVICES_PAYLOAD: &[u8] = &[
+        0x2E, 0x00, 0x00, 0x00, 0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02, 0x11, 0x22,
+        0x33, 0x44, 0x55, 0x66, 0x03, 0x04,
+    ];
+
+    fn connected_devices_vector() -> Vec<ConnectedDevice> {
+        vec![
+            ConnectedDevice {
+                mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                info1: 0x01,
+                info2: 0x02,
+                r#type: None,
+            },
+            ConnectedDevice {
+                mac: "11:22:33:44:55:66".to_string(),
+                info1: 0x03,
+                info2: 0x04,
+                r#type: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn golden_parse_connected_devices() {
+        assert_eq!(
+            parse_connected_devices(CONNECTED_DEVICES_PAYLOAD),
+            Some(connected_devices_vector())
+        );
+    }
+
+    #[test]
+    fn parse_connected_devices_zero_count_is_empty() {
+        assert_eq!(
+            parse_connected_devices(&[0x2E, 0x00, 0x00, 0x00, 0x00]),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn parse_connected_devices_truncated_returns_none() {
+        for n in 0..CONNECTED_DEVICES_PAYLOAD.len() {
+            assert_eq!(
+                parse_connected_devices(&CONNECTED_DEVICES_PAYLOAD[..n]),
+                None,
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_connected_devices_count_255_short_payload_returns_none() {
+        let mut payload = CONNECTED_DEVICES_PAYLOAD.to_vec();
+        payload[4] = 0xFF;
+        assert_eq!(parse_connected_devices(&payload), None);
+        assert_eq!(parse_connected_devices(&payload[..5]), None);
+    }
+
+    #[test]
+    fn parse_connected_devices_oversized_ignores_trailing_bytes() {
+        let mut payload = CONNECTED_DEVICES_PAYLOAD.to_vec();
+        payload.extend_from_slice(&[0x99; 7]);
+        assert_eq!(
+            parse_connected_devices(&payload),
+            Some(connected_devices_vector())
+        );
+    }
+
+    // CONTROL_COMMAND: OwnsConnection (0x06) = 1.
+    const CONTROL_COMMAND_PAYLOAD: &[u8] = &[0x09, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00];
+
+    fn owns_connection_command(value: Vec<u8>, owns: bool) -> ParsedControlCommand {
+        ParsedControlCommand::Known {
+            status: ControlCommandStatus {
+                identifier: ControlCommandIdentifiers::OwnsConnection,
+                value,
+            },
+            owns_connection: Some(owns),
+        }
+    }
+
+    #[test]
+    fn golden_parse_control_command_owns_connection() {
+        assert_eq!(
+            parse_control_command(CONTROL_COMMAND_PAYLOAD),
+            Some(owns_connection_command(vec![0x01], true))
+        );
+        assert_eq!(
+            parse_control_command(&[0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00]),
+            Some(owns_connection_command(vec![0x00], false))
+        );
+        // The owns flag is payload[3] alone, even when later bytes are set.
+        assert_eq!(
+            parse_control_command(&[0x09, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00]),
+            Some(owns_connection_command(vec![0x00, 0x01], false))
+        );
+    }
+
+    #[test]
+    fn parse_control_command_trims_trailing_zero_bytes() {
+        assert_eq!(
+            parse_control_command(&[0x09, 0x00, 0x0D, 0x02, 0x00, 0x00, 0x00]),
+            Some(ParsedControlCommand::Known {
+                status: ControlCommandStatus {
+                    identifier: ControlCommandIdentifiers::ListeningMode,
+                    value: vec![0x02],
+                },
+                owns_connection: None,
+            })
+        );
+        assert_eq!(
+            parse_control_command(&[0x09, 0x00, 0x1A, 0x00, 0x03, 0x00, 0x04]),
+            Some(ParsedControlCommand::Known {
+                status: ControlCommandStatus {
+                    identifier: ControlCommandIdentifiers::ListeningModeConfigs,
+                    value: vec![0x00, 0x03, 0x00, 0x04],
+                },
+                owns_connection: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_control_command_unknown_identifier() {
+        assert_eq!(
+            parse_control_command(&[0x09, 0x00, 0x99, 0x01, 0x00, 0x00, 0x00]),
+            Some(ParsedControlCommand::Unknown { identifier: 0x99 })
+        );
+    }
+
+    #[test]
+    fn parse_control_command_truncated_returns_none() {
+        for n in 0..CONTROL_COMMAND_PAYLOAD.len() {
+            assert_eq!(
+                parse_control_command(&CONTROL_COMMAND_PAYLOAD[..n]),
+                None,
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_control_command_oversized_ignores_trailing_bytes() {
+        let mut payload = CONTROL_COMMAND_PAYLOAD.to_vec();
+        payload.extend_from_slice(&[0x05, 0x06, 0x07]);
+        assert_eq!(
+            parse_control_command(&payload),
+            Some(owns_connection_command(vec![0x01], true))
+        );
+    }
+
+    // SMART_ROUTING_RESP: opcode, one byte, then text.
+    const SMART_ROUTING_PAYLOAD: &[u8] = b"\x11\x00reason:SetOwnershipToFalse";
+
+    #[test]
+    fn golden_parse_smart_routing_set_ownership_to_false() {
+        assert_eq!(
+            parse_smart_routing_response(SMART_ROUTING_PAYLOAD),
+            Some(SmartRoutingResponse {
+                text: "reason:SetOwnershipToFalse".to_string(),
+                set_ownership_to_false: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_smart_routing_without_ownership_request() {
+        assert_eq!(
+            parse_smart_routing_response(b"\x11\x00SetOwnership\xFFToFalse"),
+            Some(SmartRoutingResponse {
+                text: "SetOwnership\u{FFFD}ToFalse".to_string(),
+                set_ownership_to_false: false,
+            })
+        );
+        assert_eq!(
+            parse_smart_routing_response(&[0x11, 0x00]),
+            Some(SmartRoutingResponse {
+                text: String::new(),
+                set_ownership_to_false: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_smart_routing_truncated() {
+        for n in 0..SMART_ROUTING_PAYLOAD.len() {
+            let parsed = parse_smart_routing_response(&SMART_ROUTING_PAYLOAD[..n]);
+            if n < 2 {
+                assert_eq!(parsed, None, "n = {n}");
+            } else {
+                let text = String::from_utf8_lossy(&SMART_ROUTING_PAYLOAD[2..n]).into_owned();
+                let set_ownership_to_false = text.contains("SetOwnershipToFalse");
+                assert_eq!(
+                    parsed,
+                    Some(SmartRoutingResponse {
+                        text,
+                        set_ownership_to_false
+                    }),
+                    "n = {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_smart_routing_oversized_keeps_trailing_bytes_in_text() {
+        let mut payload = SMART_ROUTING_PAYLOAD.to_vec();
+        payload.extend_from_slice(b"\x00tail");
+        assert_eq!(
+            parse_smart_routing_response(&payload),
+            Some(SmartRoutingResponse {
+                text: "reason:SetOwnershipToFalse\u{0}tail".to_string(),
+                set_ownership_to_false: true,
+            })
+        );
+    }
+
+    fn with_header(payload: &[u8]) -> Vec<u8> {
+        [HEADER_BYTES.as_slice(), payload].concat()
+    }
+
+    #[tokio::test]
+    async fn receive_control_command_owns_connection_sets_owns_and_emits_event() {
+        let manager = AACPManager::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        manager.set_event_channel(event_tx).await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        manager
+            .subscribe_to_control_command(ControlCommandIdentifiers::OwnsConnection, sub_tx)
+            .await;
+
+        manager
+            .receive_packet(&with_header(CONTROL_COMMAND_PAYLOAD))
+            .await;
+
+        {
+            let state = manager.state.lock().await;
+            assert!(state.owns);
+            assert_eq!(
+                state.control_command_status_list,
+                vec![ControlCommandStatus {
+                    identifier: ControlCommandIdentifiers::OwnsConnection,
+                    value: vec![0x01],
+                }]
+            );
+        }
+        match event_rx.try_recv() {
+            Ok(AACPEvent::ControlCommand(status)) => {
+                assert_eq!(status.identifier, ControlCommandIdentifiers::OwnsConnection);
+                assert_eq!(status.value, vec![0x01]);
+            }
+            other => panic!("expected ControlCommand event, got {other:?}"),
+        }
+        assert_eq!(sub_rx.try_recv().ok(), Some(vec![0x01]));
+
+        manager
+            .receive_packet(&with_header(&[0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00]))
+            .await;
+        {
+            let state = manager.state.lock().await;
+            assert!(!state.owns);
+            assert_eq!(state.control_command_status_list.len(), 1);
+            assert_eq!(state.control_command_status_list[0].value, vec![0x00]);
+        }
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AACPEvent::ControlCommand(_))
+        ));
+        assert_eq!(sub_rx.try_recv().ok(), Some(vec![0x00]));
+    }
+
+    #[tokio::test]
+    async fn receive_smart_routing_set_ownership_to_false_emits_event() {
+        let manager = AACPManager::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        manager.set_event_channel(event_tx).await;
+
+        manager
+            .receive_packet(&with_header(b"\x11\x00SomethingElse"))
+            .await;
+        assert!(event_rx.try_recv().is_err());
+
+        manager
+            .receive_packet(&with_header(SMART_ROUTING_PAYLOAD))
+            .await;
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AACPEvent::OwnershipToFalseRequest)
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn receive_short_parsed_packets_change_nothing() {
+        let manager = AACPManager::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        manager.set_event_channel(event_tx).await;
+
+        let mut connected_devices_255 = CONNECTED_DEVICES_PAYLOAD.to_vec();
+        connected_devices_255[4] = 0xFF;
+        let packets = [
+            with_header(&AUDIO_SOURCE_PAYLOAD[..8]),
+            with_header(&CONNECTED_DEVICES_PAYLOAD[..4]),
+            with_header(&connected_devices_255),
+            with_header(&CONTROL_COMMAND_PAYLOAD[..6]),
+            with_header(&[0x09, 0x00, 0x99, 0x01, 0x00, 0x00, 0x00]),
+            with_header(&SMART_ROUTING_PAYLOAD[..1]),
+        ];
+        for packet in &packets {
+            manager.receive_packet(packet).await;
+        }
+
+        let state = manager.state.lock().await;
+        assert!(state.audio_source.is_none());
+        assert!(state.connected_devices.is_empty());
+        assert!(state.control_command_status_list.is_empty());
+        assert!(!state.owns);
+        assert!(event_rx.try_recv().is_err());
     }
 }
