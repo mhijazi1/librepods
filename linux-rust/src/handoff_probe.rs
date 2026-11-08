@@ -714,4 +714,126 @@ mod tests {
         );
         assert!(args.handoff_auto);
     }
+
+    // What the REPL `take` prints, straight from the core (#42): with no live
+    // control session it is the NO_SESSION WAIT line, whatever the policy
+    // skip reason (case recovery is checked first).
+    use crate::bluetooth::aacp::{AudioSource, ConnectedDevice};
+
+    const CORE_LOCAL: &str = "01:02:03:04:05:06";
+    const CORE_REMOTE: &str = "07:08:09:0A:0B:0C";
+    const NO_SESSION_WAIT: &str = "WAIT no live control session";
+
+    fn core_device(mac: &str) -> ConnectedDevice {
+        ConnectedDevice {
+            mac: mac.to_string(),
+            info1: 0,
+            info2: 0,
+            r#type: None,
+        }
+    }
+
+    /// Two hosts, both buds in ear, idle audio and Linux owning: a take on
+    /// this session would be allowed.
+    fn feed_worn_idle_session(core: &mut Handoff, now: Instant) {
+        core.handle(
+            now,
+            Input::ConnectedDevices {
+                old: Vec::new(),
+                new: vec![core_device(CORE_LOCAL), core_device(CORE_REMOTE)],
+            },
+        );
+        core.handle(
+            now,
+            Input::EarState(vec![EarDetectionStatus::InEar, EarDetectionStatus::InEar]),
+        );
+        core.handle(
+            now,
+            Input::AudioSource(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            }),
+        );
+        core.handle(now, Input::Ownership(vec![0]));
+    }
+
+    #[test]
+    fn core_take_during_case_recovery_waits() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut core = Handoff::new(CORE_LOCAL.to_string(), t0, true, true);
+        feed_worn_idle_session(&mut core, t0);
+        assert_eq!(
+            core.handle(
+                at(20),
+                Input::EarState(vec![EarDetectionStatus::InCase, EarDetectionStatus::InCase]),
+            ),
+            []
+        );
+        assert_eq!(
+            core.handle(at(100), Input::Disconnected),
+            [Command::DropSession]
+        );
+        core.take_lines();
+
+        assert_eq!(core.handle(at(200), Input::Take), []);
+        let lines = core.take_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with(NO_SESSION_WAIT), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("BLOCKED")), "{lines:?}");
+    }
+
+    #[test]
+    fn core_take_without_session_at_startup_waits() {
+        let t0 = Instant::now();
+        let mut core = Handoff::new(CORE_LOCAL.to_string(), t0, true, false);
+        feed_worn_idle_session(&mut core, t0);
+        core.take_lines();
+
+        assert_eq!(core.handle(t0, Input::Take), []);
+        let lines = core.take_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with(NO_SESSION_WAIT), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("BLOCKED")), "{lines:?}");
+    }
+
+    #[test]
+    fn core_take_on_lost_session_waits() {
+        let t0 = Instant::now();
+        let mut core = Handoff::new(CORE_LOCAL.to_string(), t0, true, true);
+        feed_worn_idle_session(&mut core, t0);
+        assert_eq!(core.handle(t0, Input::SessionLost), []);
+        core.take_lines();
+
+        assert_eq!(core.handle(t0, Input::Take), []);
+        let lines = core.take_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with(NO_SESSION_WAIT), "{lines:?}");
+    }
+
+    #[test]
+    fn core_take_live_blocked_by_wear_still_blocked() {
+        let t0 = Instant::now();
+        let mut core = Handoff::new(CORE_LOCAL.to_string(), t0, true, true);
+        feed_worn_idle_session(&mut core, t0);
+        assert_eq!(
+            core.handle(
+                t0,
+                Input::EarState(vec![
+                    EarDetectionStatus::OutOfEar,
+                    EarDetectionStatus::InCase,
+                ]),
+            ),
+            []
+        );
+        core.take_lines();
+
+        assert_eq!(core.handle(t0, Input::Take), []);
+        let lines = core.take_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("BLOCKED take needs two hosts"),
+            "{lines:?}"
+        );
+    }
 }
