@@ -1118,40 +1118,35 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    /// Report A is queued, then the cut and report B queue on the state lock
+    /// in that order (tokio's Mutex is FIFO). If the cut released the lock
+    /// between the backlog take and the facts read, B would land in between.
+    #[tokio::test]
     async fn reconnect_facts_cut_splits_reports_exactly() {
-        let mut splits = 0;
-        for _ in 0..50 {
-            let manager = AACPManager::new();
-            let (tx, events) = tokio::sync::mpsc::unbounded_channel();
-            manager.set_event_channel(tx).await;
-            let reporter = manager.clone();
-            let reporting = tokio::spawn(async move {
-                for n in 1..=8u8 {
-                    let macs: Vec<[u8; 6]> = (1..=n).map(|i| [i; 6]).collect();
-                    reporter.receive_packet(&hosts_packet(&macs)).await;
-                    // An uncontended lock never yields: park so the cut can land mid-stream.
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            });
-            // Cut mid-stream: once the first report is queued.
-            while events.is_empty() {
-                tokio::task::yield_now().await;
-            }
-            let (((_, mut events), backlog), facts) =
-                cut_facts((manager, events), InitBacklog::default()).await;
-            reporting.await.unwrap();
-            let cut = host_reports(&backlog.events);
-            assert_eq!(cut.last().unwrap().1, facts.hosts);
-            let rest = drain(&mut events);
-            let rest = host_reports(&rest);
-            if let Some((old, _)) = rest.first() {
-                assert_eq!(*old, facts.hosts);
-                splits += 1;
-            }
-            assert_eq!(cut.len() + rest.len(), 8);
-        }
-        assert!(splits > 0, "no cut landed mid-stream");
+        let manager = AACPManager::new();
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_channel(tx).await;
+        manager.receive_packet(&hosts_packet(&[L_MAC])).await;
+        let held = manager.state.lock().await;
+        let cut = tokio::spawn(cut_facts((manager.clone(), events), InitBacklog::default()));
+        // current_thread: each yield runs the spawned task up to its lock wait.
+        tokio::task::yield_now().await;
+        let reporter = manager.clone();
+        let report = tokio::spawn(async move {
+            reporter
+                .receive_packet(&hosts_packet(&[L_MAC, R_MAC]))
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        let (((_, mut events), backlog), facts) = cut.await.unwrap();
+        report.await.unwrap();
+        assert_eq!(facts.hosts, [core_device(CORE_LOCAL)]);
+        assert_eq!(host_reports(&backlog.events).last().unwrap().1, facts.hosts);
+        let rest = drain(&mut events);
+        let rest = host_reports(&rest);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].0, facts.hosts);
     }
 
     const L_MAC: [u8; 6] = [1, 2, 3, 4, 5, 6];
