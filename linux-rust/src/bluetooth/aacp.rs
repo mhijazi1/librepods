@@ -997,12 +997,12 @@ impl AACPManager {
         self.send_data_packet(&encode_media_information_new_device(
             self_mac_address,
             target_mac_address,
-        ))
+        )?)
         .await
     }
 
     pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<()> {
-        self.send_data_packet(&encode_hijack_request(target_mac_address))
+        self.send_data_packet(&encode_hijack_request(target_mac_address)?)
             .await
     }
 
@@ -1016,18 +1016,18 @@ impl AACPManager {
             self_mac_address,
             target_mac_address,
             streaming_state,
-        ))
+        )?)
         .await
     }
 
     pub async fn send_smart_routing_show_ui(&self, target_mac_address: &str) -> Result<()> {
-        self.send_data_packet(&encode_smart_routing_show_ui(target_mac_address))
+        self.send_data_packet(&encode_smart_routing_show_ui(target_mac_address)?)
             .await
     }
 
     // Caller arrives with #17 (Undo notification).
     pub async fn send_hijack_reversed(&self, target_mac_address: &str) -> Result<()> {
-        self.send_data_packet(&encode_hijack_reversed(target_mac_address))
+        self.send_data_packet(&encode_hijack_reversed(target_mac_address)?)
             .await
     }
 
@@ -1039,7 +1039,7 @@ impl AACPManager {
         self.send_data_packet(&encode_add_tipi_device(
             self_mac_address,
             target_mac_address,
-        ))
+        )?)
         .await
     }
 
@@ -1054,15 +1054,40 @@ impl AACPManager {
 // the 4-byte AACP header (send_data_packet adds it). Parsers take the payload
 // the way receive_packet slices it: `&packet[4..]`, opcode at payload[0].
 
+// Parses "AA:BB:CC:DD:EE:FF" into bytes in address order. Exactly six
+// components, each exactly two hex digits in either case. Anything else,
+// including a leading '+' (which from_str_radix would accept), gives None.
+pub(crate) fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for slot in out.iter_mut() {
+        let part = parts.next()?;
+        if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        *slot = u8::from_str_radix(part, 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+fn invalid_mac_error(mac_address: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "invalid target MAC address {mac_address:?}: expected six colon-separated hex octets"
+        ),
+    )
+}
+
 // Target MAC components in reverse order, as every smart-routing packet sends
-// them. A component that is not valid hex panics, as it did before these
-// encoders were extracted; changing that is out of scope for this refactor.
-fn reversed_mac_bytes(mac_address: &str) -> Vec<u8> {
-    let mac_bytes: Vec<u8> = mac_address
-        .split(':')
-        .map(|s| u8::from_str_radix(s, 16).unwrap())
-        .collect();
-    mac_bytes.iter().rev().cloned().collect()
+// them. An invalid address is an InvalidInput error, not a panic.
+fn reversed_mac_bytes(mac_address: &str) -> std::io::Result<[u8; 6]> {
+    let mut mac = parse_mac(mac_address).ok_or_else(|| invalid_mac_error(mac_address))?;
+    mac.reverse();
+    Ok(mac)
 }
 
 // OPACK value writers: the subset of Apple's OPACK encoding that the
@@ -1174,15 +1199,16 @@ pub(crate) fn tipi_body(
 // Smart-routing data packet: opcode, reversed target MAC, u16 LE length of
 // what follows (the 0x01 byte plus the dict), 0x01, then the dict with no
 // padding.
-fn smart_routing_packet(target_mac_address: &str, dict: &[u8]) -> Vec<u8> {
+fn smart_routing_packet(target_mac_address: &str, dict: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mac = reversed_mac_bytes(target_mac_address)?;
     let length = u16::try_from(1 + dict.len()).expect("smart-routing dict exceeds u16 length");
     let mut packet = Vec::with_capacity(11 + dict.len());
     packet.extend_from_slice(&[opcodes::SMART_ROUTING, 0x00]);
-    packet.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    packet.extend_from_slice(&mac);
     packet.extend_from_slice(&length.to_le_bytes());
     packet.push(0x01);
     packet.extend_from_slice(dict);
-    packet
+    Ok(packet)
 }
 
 pub(crate) fn encode_control_command(
@@ -1200,15 +1226,15 @@ pub(crate) fn encode_control_command(
 pub(crate) fn encode_media_information_new_device(
     self_mac_address: &str,
     target_mac_address: &str,
-) -> Vec<u8> {
+) -> std::io::Result<Vec<u8>> {
     let dict = media_information_body("NA", false, self_mac_address, "Mac", 100);
     smart_routing_packet(target_mac_address, &dict)
 }
 
-pub(crate) fn encode_hijack_request(target_mac_address: &str) -> Vec<u8> {
+pub(crate) fn encode_hijack_request(target_mac_address: &str) -> std::io::Result<Vec<u8>> {
     let opcode = [opcodes::SMART_ROUTING, 0x00];
     let mut buffer = Vec::with_capacity(106);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address)?);
     buffer.extend_from_slice(&[0x62, 0x00]);
     buffer.extend_from_slice(&[0x01, 0xE5]);
     buffer.push(0x4A);
@@ -1231,14 +1257,14 @@ pub(crate) fn encode_hijack_request(target_mac_address: &str) -> Vec<u8> {
         buffer.push(0x00);
     }
 
-    [opcode.as_slice(), buffer.as_slice()].concat()
+    Ok([opcode.as_slice(), buffer.as_slice()].concat())
 }
 
 pub(crate) fn encode_media_information(
     self_mac_address: &str,
     target_mac_address: &str,
     streaming_state: bool,
-) -> Vec<u8> {
+) -> std::io::Result<Vec<u8>> {
     let dict = media_information_body(
         "com.google.ios.youtube",
         streaming_state,
@@ -1249,10 +1275,10 @@ pub(crate) fn encode_media_information(
     smart_routing_packet(target_mac_address, &dict)
 }
 
-pub(crate) fn encode_smart_routing_show_ui(target_mac_address: &str) -> Vec<u8> {
+pub(crate) fn encode_smart_routing_show_ui(target_mac_address: &str) -> std::io::Result<Vec<u8>> {
     let opcode = [opcodes::SMART_ROUTING, 0x00];
     let mut buffer = Vec::with_capacity(134);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address)?);
     buffer.extend_from_slice(&[0x7E, 0x00]);
     buffer.extend_from_slice(&[0x01, 0xE6, 0x5B]);
     buffer.extend_from_slice(b"SmartRoutingKeyShowNearbyUI");
@@ -1277,14 +1303,14 @@ pub(crate) fn encode_smart_routing_show_ui(target_mac_address: &str) -> Vec<u8> 
         buffer.push(0x00);
     }
 
-    [opcode.as_slice(), buffer.as_slice()].concat()
+    Ok([opcode.as_slice(), buffer.as_slice()].concat())
 }
 
 // Caller arrives with #17 (Undo notification).
-pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> Vec<u8> {
+pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> std::io::Result<Vec<u8>> {
     let opcode = [opcodes::SMART_ROUTING, 0x00];
     let mut buffer = Vec::with_capacity(97);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address)?);
     buffer.extend_from_slice(&[0x59, 0x00]);
     buffer.extend_from_slice(&[0x01, 0xE3]);
     buffer.push(0x5F);
@@ -1302,10 +1328,13 @@ pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> Vec<u8> {
         buffer.push(0x00);
     }
 
-    [opcode.as_slice(), buffer.as_slice()].concat()
+    Ok([opcode.as_slice(), buffer.as_slice()].concat())
 }
 
-pub(crate) fn encode_add_tipi_device(self_mac_address: &str, target_mac_address: &str) -> Vec<u8> {
+pub(crate) fn encode_add_tipi_device(
+    self_mac_address: &str,
+    target_mac_address: &str,
+) -> std::io::Result<Vec<u8>> {
     let dict = tipi_body(0, true, self_mac_address, "Mac", 6);
     smart_routing_packet(target_mac_address, &dict)
 }
@@ -1796,7 +1825,7 @@ mod tests {
     #[test]
     fn golden_encode_hijack_request() {
         assert_eq!(
-            encode_hijack_request(GOLDEN_TARGET_MAC),
+            encode_hijack_request(GOLDEN_TARGET_MAC).expect("encode_hijack_request"),
             without_header(GOLDEN_HIJACK_REQUEST)
         );
     }
@@ -1804,7 +1833,7 @@ mod tests {
     #[test]
     fn golden_encode_smart_routing_show_ui() {
         assert_eq!(
-            encode_smart_routing_show_ui(GOLDEN_TARGET_MAC),
+            encode_smart_routing_show_ui(GOLDEN_TARGET_MAC).expect("encode_smart_routing_show_ui"),
             without_header(GOLDEN_SMART_ROUTING_SHOW_UI)
         );
     }
@@ -1812,7 +1841,8 @@ mod tests {
     #[test]
     fn golden_encode_media_information_streaming() {
         assert_eq!(
-            encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true),
+            encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true)
+                .expect("encode_media_information"),
             without_header(GOLDEN_MEDIA_INFORMATION_STREAMING)
         );
     }
@@ -1820,7 +1850,8 @@ mod tests {
     #[test]
     fn golden_encode_media_information_not_streaming() {
         assert_eq!(
-            encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, false),
+            encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, false)
+                .expect("encode_media_information"),
             without_header(GOLDEN_MEDIA_INFORMATION_NOT_STREAMING)
         );
     }
@@ -1828,7 +1859,8 @@ mod tests {
     #[test]
     fn golden_encode_media_information_new_device() {
         assert_eq!(
-            encode_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC),
+            encode_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+                .expect("encode_media_information_new_device"),
             without_header(GOLDEN_MEDIA_INFORMATION_NEW_DEVICE)
         );
     }
@@ -1836,7 +1868,8 @@ mod tests {
     #[test]
     fn golden_encode_add_tipi_device() {
         assert_eq!(
-            encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC),
+            encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+                .expect("encode_add_tipi_device"),
             without_header(GOLDEN_ADD_TIPI_DEVICE)
         );
     }
@@ -1844,17 +1877,104 @@ mod tests {
     #[test]
     fn golden_encode_hijack_reversed() {
         assert_eq!(
-            encode_hijack_reversed(GOLDEN_TARGET_MAC),
+            encode_hijack_reversed(GOLDEN_TARGET_MAC).expect("encode_hijack_reversed"),
             without_header(GOLDEN_HIJACK_REVERSED)
         );
     }
 
-    // Current behaviour, kept on purpose by #7: a MAC component that is not
-    // valid hex panics instead of returning an error.
     #[test]
-    #[should_panic]
-    fn encode_hijack_request_invalid_mac_panics() {
-        let _ = encode_hijack_request("ZZ:BB:CC:DD:EE:FF");
+    fn parse_mac_accepts_six_hex_octets_in_either_case() {
+        let want = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert_eq!(parse_mac("AA:BB:CC:DD:EE:FF"), Some(want));
+        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff"), Some(want));
+        assert_eq!(
+            parse_mac("00:01:0a:1F:a0:9e"),
+            Some([0, 1, 0x0A, 0x1F, 0xA0, 0x9E])
+        );
+    }
+
+    #[test]
+    fn parse_mac_rejects_malformed_addresses() {
+        for bad in [
+            "",
+            "AA:BB",
+            "ZZ:BB:CC:DD:EE:FF",
+            "AA:BB:CC:DD:EE:FF:00",
+            "AAA:BB:CC:DD:EE:FF",
+            "AA::CC:DD:EE:FF",
+            "+A:BB:CC:DD:EE:FF",
+            "A:BB:CC:DD:EE:FF",
+            "AA:BB:CC:DD:EE:",
+            "AA-BB-CC-DD-EE-FF",
+            " AA:BB:CC:DD:EE:FF",
+            "0x:BB:CC:DD:EE:FF",
+        ] {
+            assert_eq!(parse_mac(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    // Every target-MAC encoder returns InvalidInput with the address in the
+    // message, never a panic.
+    fn assert_invalid_mac_error(result: std::io::Result<Vec<u8>>, bad: &str) {
+        let err = result.expect_err("an invalid target MAC must be an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(bad),
+            "error should name the bad address: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_mac_encoders_return_invalid_input() {
+        for bad in ["ZZ:BB:CC:DD:EE:FF", "AA:BB"] {
+            assert_invalid_mac_error(encode_hijack_request(bad), bad);
+            assert_invalid_mac_error(encode_smart_routing_show_ui(bad), bad);
+            assert_invalid_mac_error(encode_hijack_reversed(bad), bad);
+            assert_invalid_mac_error(encode_media_information(GOLDEN_SELF_MAC, bad, true), bad);
+            assert_invalid_mac_error(
+                encode_media_information_new_device(GOLDEN_SELF_MAC, bad),
+                bad,
+            );
+            assert_invalid_mac_error(encode_add_tipi_device(GOLDEN_SELF_MAC, bad), bad);
+        }
+    }
+
+    // The send_* methods fail before they take the state lock or touch the
+    // channel, so nothing is queued.
+    #[tokio::test]
+    async fn invalid_mac_send_methods_return_invalid_input_and_send_nothing() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        let bad = "ZZ:BB:CC:DD:EE:FF";
+        let errors = vec![
+            manager.send_hijack_request(bad).await,
+            manager.send_smart_routing_show_ui(bad).await,
+            manager.send_hijack_reversed(bad).await,
+            manager
+                .send_media_information(GOLDEN_SELF_MAC, bad, true)
+                .await,
+            manager
+                .send_media_information_new_device(GOLDEN_SELF_MAC, bad)
+                .await,
+            manager.send_add_tipi_device(GOLDEN_SELF_MAC, bad).await,
+        ];
+        for result in errors {
+            let err = result.expect_err("an invalid target MAC must be an error");
+            assert!(
+                matches!(
+                    err.kind,
+                    bluer::ErrorKind::Internal(bluer::InternalErrorKind::Io(
+                        std::io::ErrorKind::InvalidInput
+                    ))
+                ),
+                "unexpected error kind: {:?}",
+                err.kind
+            );
+            assert!(err.message.contains(bad), "message: {}", err.message);
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     fn opack_uint(n: u32) -> Vec<u8> {
@@ -1933,8 +2053,9 @@ mod tests {
     // Parses a space-separated hex dump as printed in #35.
     fn capture_bytes(dump: &str) -> Vec<u8> {
         dump.split_whitespace()
-            .map(|b| u8::from_str_radix(b, 16).expect("hex byte"))
-            .collect()
+            .map(|b| u8::from_str_radix(b, 16))
+            .collect::<std::result::Result<Vec<u8>, _>>()
+            .expect("hex dump")
     }
 
     fn assert_media_information_matches_apple(
@@ -2050,7 +2171,7 @@ mod tests {
     #[test]
     fn golden_apple_hijack_request() {
         // Skip opcode (2), reversed MAC (6), length (2) and the 0x01 byte.
-        let packet = encode_hijack_request(GOLDEN_TARGET_MAC);
+        let packet = encode_hijack_request(GOLDEN_TARGET_MAC).expect("encode_hijack_request");
         let apple = capture_bytes(APPLE_HIJACK_REQUEST);
         assert_eq!(apple.len(), 97);
         assert_eq!(packet[11..], apple[..]);
@@ -2161,28 +2282,38 @@ mod tests {
     #[test]
     fn opack_framing_all_smart_routing_encoders() {
         let packets = [
-            ("hijack_request", encode_hijack_request(GOLDEN_TARGET_MAC)),
+            (
+                "hijack_request",
+                encode_hijack_request(GOLDEN_TARGET_MAC).expect("hijack_request"),
+            ),
             (
                 "smart_routing_show_ui",
-                encode_smart_routing_show_ui(GOLDEN_TARGET_MAC),
+                encode_smart_routing_show_ui(GOLDEN_TARGET_MAC).expect("smart_routing_show_ui"),
             ),
             (
                 "media_information streaming",
-                encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true),
+                encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true)
+                    .expect("media_information streaming"),
             ),
             (
                 "media_information not streaming",
-                encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, false),
+                encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, false)
+                    .expect("media_information not streaming"),
             ),
             (
                 "media_information_new_device",
-                encode_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC),
+                encode_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+                    .expect("media_information_new_device"),
             ),
             (
                 "add_tipi_device",
-                encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC),
+                encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+                    .expect("add_tipi_device"),
             ),
-            ("hijack_reversed", encode_hijack_reversed(GOLDEN_TARGET_MAC)),
+            (
+                "hijack_reversed",
+                encode_hijack_reversed(GOLDEN_TARGET_MAC).expect("hijack_reversed"),
+            ),
         ];
         for (name, packet) in &packets {
             if let Err(e) = check_smart_routing_frame(packet) {
@@ -2229,7 +2360,8 @@ mod tests {
         assert!(opack_walk(&old, 11).is_err());
         assert!(check_smart_routing_frame(&old).is_err());
 
-        let good = encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true);
+        let good = encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true)
+            .expect("encode_media_information");
         assert_eq!(check_smart_routing_frame(&good), Ok(()));
 
         // Only the bare btName: drop the 0x46 tag before "btName" (and fix the
