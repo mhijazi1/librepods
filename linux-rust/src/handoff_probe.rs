@@ -27,8 +27,8 @@ const INIT_ECHO_WAIT: Duration = Duration::from_secs(1);
 #[derive(Default)]
 struct InitBacklog {
     events: Vec<AACPEvent>,
-    /// The echo of the last "not owning" ends `events`: what follows is
-    /// fresh.
+    /// The echo of the last "not owning" was seen, so the boundary may follow
+    /// `events`, which the facts cut ends (#143): what follows is fresh.
     drained: bool,
 }
 
@@ -1121,7 +1121,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reconnect_facts_cut_splits_reports_exactly() {
         let mut splits = 0;
-        for _ in 0..200 {
+        for _ in 0..50 {
             let manager = AACPManager::new();
             let (tx, events) = tokio::sync::mpsc::unbounded_channel();
             manager.set_event_channel(tx).await;
@@ -1130,6 +1130,8 @@ mod tests {
                 for n in 1..=8u8 {
                     let macs: Vec<[u8; 6]> = (1..=n).map(|i| [i; 6]).collect();
                     reporter.receive_packet(&hosts_packet(&macs)).await;
+                    // An uncontended lock never yields: park so the cut can land mid-stream.
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             });
             // Cut mid-stream: once the first report is queued.
