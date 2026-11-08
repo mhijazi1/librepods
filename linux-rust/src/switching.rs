@@ -70,8 +70,8 @@ pub(crate) trait MediaActions: Send + Sync {
     fn activate_a2dp(&self) -> BoxFuture<'static, ()>;
 }
 
-/// Blocking: pauses the local players and returns how many paused.
-type PausePlayers = Arc<dyn Fn() -> usize + Send + Sync>;
+/// Blocking: pauses the local players and reports what it did.
+type PausePlayers = Arc<dyn Fn() -> media_controller::PauseOutcome + Send + Sync>;
 
 /// Production media actions on a clone of the device's `MediaController`
 /// (its state is shared, DECISIONS #5). The device handlers lock the outer
@@ -1786,7 +1786,7 @@ mod tests {
             Arc::new(move || {
                 counted.pauses.fetch_add(1, Ordering::SeqCst);
                 trace(&paused_for, "PauseMedia".to_string());
-                0
+                media_controller::PauseOutcome::default()
             }),
         );
         let handler = DeviceHandler {
