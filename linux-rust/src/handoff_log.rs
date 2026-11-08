@@ -170,6 +170,10 @@ impl Log {
             // The directory lock (dropped, so released, after the reopen)
             // makes check, rename and reopen one step for other openers.
             let fresh = File::open(path.parent().unwrap_or(Path::new("."))).and_then(|dir| {
+                #[cfg(test)]
+                if let Some(hook) = tests::BEFORE_LOCK.take() {
+                    hook();
+                }
                 dir.lock()?;
                 // Move only the file measured above: a process that lost a race
                 // with another rotator must not move that one's fresh log over .1.
@@ -199,6 +203,8 @@ impl Log {
             });
             match fresh {
                 Ok(fresh) => file = fresh,
+                // debt: a failed reopen after a successful rename also lands
+                // here, so "cannot rotate" is misleading then (#111).
                 Err(e) => warn!(
                     "Handoff log: cannot rotate {} to {}: {e}; appending to it",
                     path.display(),
@@ -660,6 +666,9 @@ mod tests {
     }
 
     thread_local! {
+        /// Runs in Log::open's rotation branch after the size measurement,
+        /// just before the directory lock is taken.
+        pub(super) static BEFORE_LOCK: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
         /// Runs in Log::open between the inode check and the rename.
         pub(super) static BEFORE_RENAME: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
     }
@@ -676,25 +685,38 @@ mod tests {
         // The review's GDB interleaving: a rival opener measures the same
         // oversized log while the probe sits between its check and rename.
         let (go, rival_go) = mpsc::channel();
+        let (measured, rival_measured) = mpsc::channel();
         let (done, rival_done) = mpsc::channel();
         let rival = std::thread::spawn({
             let path = path.clone();
             move || {
                 rival_go.recv().unwrap();
+                BEFORE_LOCK.set(Some(Box::new(move || measured.send(()).unwrap())));
                 let log = Log::open(&path, Source::Probe).unwrap();
                 let _ = done.send(());
-                log
+                // Taken by Log::open only in the rotation branch.
+                (log, BEFORE_LOCK.take().is_none())
             }
         });
         BEFORE_RENAME.set(Some(Box::new(move || {
             go.send(()).unwrap();
+            // The proof of ordering: the rival measured the old oversized
+            // inode and is about to lock. A timeout fails (a regression
+            // would otherwise deadlock on the held lock), never passes.
+            rival_measured
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the rival never reached the lock in the rotation branch");
+            // Sanity only: with the lock held, the rival cannot finish.
             assert!(
-                rival_done.recv_timeout(Duration::from_millis(200)).is_err(),
+                rival_done.recv_timeout(Duration::from_millis(50)).is_err(),
                 "the rival rotated while the probe held the directory lock"
             );
         })));
         let _probe = Log::open(&path, Source::Probe).unwrap();
-        let _rival = rival.join().unwrap();
+        // Drop the hook if unused, so a waiting rival errors instead of hanging.
+        assert!(BEFORE_RENAME.take().is_none(), "the probe did not rotate");
+        let (_rival, rival_measured_old) = rival.join().unwrap();
+        assert!(rival_measured_old, "the rival did not reach the lock");
         app.line("AA:BB:CC:DD:EE:FF", "REQUEST owner=linux");
         let old = records(&rotated);
         assert!(
