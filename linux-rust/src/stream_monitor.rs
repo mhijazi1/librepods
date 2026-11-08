@@ -403,16 +403,18 @@ impl PlaybackSource for PulseStreams {
         let introspector = context.introspect();
         let inputs: Rc<RefCell<ListAccumulator<StreamProps>>> = Rc::default();
         let mut op = introspector.get_sink_input_info_list({
-            let inputs = inputs.clone();
+            let inputs = Rc::downgrade(&inputs);
             move |result| {
-                inputs.borrow_mut().record(result, |input| {
-                    Some(playback_stream(
-                        input.index,
-                        &input.proplist,
-                        input.corked,
-                        input.mute,
-                        &input.volume,
-                    ))
+                pulse::update(&inputs, |inputs| {
+                    inputs.record(result, |input| {
+                        Some(playback_stream(
+                            input.index,
+                            &input.proplist,
+                            input.corked,
+                            input.mute,
+                            &input.volume,
+                        ))
+                    })
                 })
             }
         });
@@ -428,10 +430,12 @@ impl StreamSource for PulseStreams {
 
         let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
         let mut op = introspector.get_source_info_list({
-            let monitors = monitors.clone();
+            let monitors = Rc::downgrade(&monitors);
             move |result| {
-                monitors.borrow_mut().record(result, |source| {
-                    source.monitor_of_sink.is_some().then_some(source.index)
+                pulse::update(&monitors, |monitors| {
+                    monitors.record(result, |source| {
+                        source.monitor_of_sink.is_some().then_some(source.index)
+                    })
                 })
             }
         });
@@ -440,18 +444,20 @@ impl StreamSource for PulseStreams {
 
         let outputs: Rc<RefCell<ListAccumulator<(u32, StreamProps)>>> = Rc::default();
         let mut op = introspector.get_source_output_info_list({
-            let outputs = outputs.clone();
+            let outputs = Rc::downgrade(&outputs);
             move |result| {
-                outputs.borrow_mut().record(result, |output| {
-                    let stream = StreamProps {
-                        direction: StreamDirection::Capture,
-                        props: props(&output.proplist),
-                        monitor: false,
-                        index: output.index,
-                        corked: output.corked,
-                        muted: false,
-                    };
-                    Some((output.source, stream))
+                pulse::update(&outputs, |outputs| {
+                    outputs.record(result, |output| {
+                        let stream = StreamProps {
+                            direction: StreamDirection::Capture,
+                            props: props(&output.proplist),
+                            monitor: false,
+                            index: output.index,
+                            corked: output.corked,
+                            muted: false,
+                        };
+                        Some((output.source, stream))
+                    })
                 })
             }
         });
@@ -460,15 +466,17 @@ impl StreamSource for PulseStreams {
 
         let cards: Rc<RefCell<ListAccumulator<(String, Option<String>)>>> = Rc::default();
         let mut op = introspector.get_card_info_list({
-            let cards = cards.clone();
+            let cards = Rc::downgrade(&cards);
             move |result| {
-                cards.borrow_mut().record(result, |card| {
-                    let name = card.name.as_ref()?.to_string();
-                    let profile = card
-                        .active_profile
-                        .as_ref()
-                        .and_then(|p| p.name.as_ref().map(|n| n.to_string()));
-                    Some((name, profile))
+                pulse::update(&cards, |cards| {
+                    cards.record(result, |card| {
+                        let name = card.name.as_ref()?.to_string();
+                        let profile = card
+                            .active_profile
+                            .as_ref()
+                            .and_then(|p| p.name.as_ref().map(|n| n.to_string()));
+                        Some((name, profile))
+                    })
                 })
             }
         });
@@ -765,8 +773,12 @@ fn peak_stream(mainloop: &mut Mainloop, index: u32) -> io::Result<PeakStream> {
     let introspector = context.introspect();
     let sinks: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
     let mut op = introspector.get_sink_input_info(index, {
-        let sinks = sinks.clone();
-        move |result| sinks.borrow_mut().record(result, |input| Some(input.sink))
+        let sinks = Rc::downgrade(&sinks);
+        move |result| {
+            pulse::update(&sinks, |sinks| {
+                sinks.record(result, |input| Some(input.sink))
+            })
+        }
     });
     pulse::wait(mainloop, &mut op, "sink input info")?;
     let sink = sinks.take().finish("sink input info")?.pop();
@@ -774,11 +786,11 @@ fn peak_stream(mainloop: &mut Mainloop, index: u32) -> io::Result<PeakStream> {
 
     let monitors: Rc<RefCell<ListAccumulator<u32>>> = Rc::default();
     let mut op = introspector.get_sink_info_by_index(sink, {
-        let monitors = monitors.clone();
+        let monitors = Rc::downgrade(&monitors);
         move |result| {
-            monitors
-                .borrow_mut()
-                .record(result, |sink| Some(sink.monitor_source))
+            pulse::update(&monitors, |monitors| {
+                monitors.record(result, |sink| Some(sink.monitor_source))
+            })
         }
     });
     pulse::wait(mainloop, &mut op, "sink info")?;

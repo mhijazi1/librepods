@@ -1,4 +1,4 @@
-//! The one libpulse connect and operation wait (#73). Both are bounded, so a
+//! The one libpulse connect and operation wait. Both are bounded, so a
 //! sound server that accepts the socket but never answers fails a query with
 //! `io::ErrorKind::TimedOut` instead of wedging the thread that asked.
 
@@ -6,7 +6,9 @@ use libpulse_binding::context::{Context, FlagSet as ContextFlagSet, State as Con
 use libpulse_binding::mainloop::standard::Mainloop;
 use libpulse_binding::operation::{Operation, State as OperationState};
 use libpulse_binding::time::MicroSeconds;
+use std::cell::RefCell;
 use std::io;
+use std::rc::Weak;
 use std::time::{Duration, Instant};
 
 /// Longest a connection may take to become ready: a local sound server
@@ -51,7 +53,8 @@ pub(crate) fn connect_on(mainloop: &mut Mainloop, name: &str) -> io::Result<Cont
 }
 
 /// Run `mainloop` until `op` is done, within `OPERATION_TIMEOUT`. An
-/// operation that fails or times out is cancelled, which frees its callback.
+/// operation that fails or times out is cancelled, so its callback never
+/// runs again, but that does not free the callback: see `update`.
 pub(crate) fn wait<F: ?Sized>(
     mainloop: &mut Mainloop,
     op: &mut Operation<F>,
@@ -68,6 +71,20 @@ pub(crate) fn wait<F: ?Sized>(
         op.cancel();
     }
     result
+}
+
+/// Run `f` on what a query callback collects, if the caller still holds it.
+/// Query callbacks hold `state` only as a `Weak`, because libpulse-binding
+/// 2.30.1 frees a callback only when it gets End or Error, and a cancelled
+/// or failed operation gets neither: `Operation::cancel` frees nothing,
+/// since `Operation::from_raw` keeps no pointer for a non-null callback.
+/// So the collected items go when the caller drops `state`.
+// shortcut: each operation `wait` gives up on leaks its boxed callback and
+// the emptied Rc allocation of `state`, a few dozen bytes (#TBD).
+pub(crate) fn update<T>(state: &Weak<RefCell<T>>, f: impl FnOnce(&mut T)) {
+    if let Some(state) = state.upgrade() {
+        f(&mut state.borrow_mut());
+    }
 }
 
 fn context_ready(state: ContextState) -> io::Result<bool> {
@@ -124,7 +141,8 @@ fn run_until(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     /// Runs `run_until` on a virtual clock that each step advances by the
     /// time it may block (or by `cap`, if less); returns the result and the
@@ -221,5 +239,24 @@ mod tests {
         });
         result.unwrap();
         assert_eq!(steps.len(), 1);
+    }
+
+    #[test]
+    fn abandoned_callback_frees_collected_items() {
+        // What libpulse-binding does with the callback of a cancelled
+        // operation: it never frees it.
+        let item = Rc::new(());
+        let state = Rc::new(RefCell::new(Vec::new()));
+        let callback: &mut dyn FnMut(Rc<()>) = Box::leak(Box::new({
+            let state = Rc::downgrade(&state);
+            move |item| update(&state, |items| items.push(item))
+        }));
+        callback(item.clone());
+        assert_eq!(Rc::strong_count(&item), 2);
+        drop(state);
+        assert_eq!(Rc::strong_count(&item), 1);
+        // A late call after the caller gave up is a no-op.
+        callback(item.clone());
+        assert_eq!(Rc::strong_count(&item), 1);
     }
 }

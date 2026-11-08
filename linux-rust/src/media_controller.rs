@@ -1539,7 +1539,7 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
     let introspector = context.introspect();
     let cards: Rc<RefCell<Vec<OwnedCardInfo>>> = Rc::new(RefCell::new(Vec::new()));
     let mut op = introspector.get_card_info_list({
-        let cards = cards.clone();
+        let cards = Rc::downgrade(&cards);
         move |result| {
             if let ListResult::Item(item) = result {
                 let profiles = item
@@ -1553,11 +1553,13 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
                     .active_profile
                     .as_ref()
                     .and_then(|p| p.name.as_ref().map(|n| n.to_string()));
-                cards.borrow_mut().push(OwnedCardInfo {
-                    index: item.index,
-                    proplist: item.proplist.clone(),
-                    profiles,
-                    active_profile,
+                pulse::update(&cards, |cards| {
+                    cards.push(OwnedCardInfo {
+                        index: item.index,
+                        proplist: item.proplist.clone(),
+                        profiles,
+                        active_profile,
+                    })
                 });
             }
         }
@@ -1574,13 +1576,15 @@ fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
     let introspector = context.introspect();
     let sink_info: Rc<RefCell<Option<OwnedSinkInfo>>> = Rc::new(RefCell::new(None));
     let mut op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info = sink_info.clone();
+        let sink_info = Rc::downgrade(&sink_info);
         move |result: ListResult<&SinkInfo>| {
             if let ListResult::Item(item) = result {
-                *sink_info.borrow_mut() = Some(OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
+                pulse::update(&sink_info, |sink_info| {
+                    *sink_info = Some(OwnedSinkInfo {
+                        name: item.name.as_ref().map(|s| s.to_string()),
+                        proplist: item.proplist.clone(),
+                        volume: item.volume,
+                    })
                 });
             }
         }
@@ -1614,13 +1618,15 @@ pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
     let mut introspector = context.introspect();
     let sink_info: Rc<RefCell<Option<OwnedSinkInfo>>> = Rc::new(RefCell::new(None));
     let mut op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info = sink_info.clone();
+        let sink_info = Rc::downgrade(&sink_info);
         move |result: ListResult<&SinkInfo>| {
             if let ListResult::Item(item) = result {
-                *sink_info.borrow_mut() = Some(OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
+                pulse::update(&sink_info, |sink_info| {
+                    *sink_info = Some(OwnedSinkInfo {
+                        name: item.name.as_ref().map(|s| s.to_string()),
+                        proplist: item.proplist.clone(),
+                        volume: item.volume,
+                    })
                 });
             }
         }
@@ -1655,13 +1661,15 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
         let introspector = context.introspect();
         let sink_list: Rc<RefCell<Vec<OwnedSinkInfo>>> = Rc::new(RefCell::new(Vec::new()));
         let mut op = introspector.get_sink_info_list({
-            let sink_list = sink_list.clone();
+            let sink_list = Rc::downgrade(&sink_list);
             move |result: ListResult<&SinkInfo>| {
                 if let ListResult::Item(item) = result {
-                    sink_list.borrow_mut().push(OwnedSinkInfo {
-                        name: item.name.as_ref().map(|s| s.to_string()),
-                        proplist: item.proplist.clone(),
-                        volume: item.volume,
+                    pulse::update(&sink_list, |sink_list| {
+                        sink_list.push(OwnedSinkInfo {
+                            name: item.name.as_ref().map(|s| s.to_string()),
+                            proplist: item.proplist.clone(),
+                            volume: item.volume,
+                        })
                     });
                 }
             }
