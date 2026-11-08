@@ -2462,7 +2462,9 @@ mod tests {
     /// after it. The shell requests the re-baseline, stamped with the reset,
     /// only a fifth of the minimum after the stream was seen, as when it
     /// awaited SendOwnership and Announce before DrainPlayback. Returns the
-    /// samples and when the stream started.
+    /// samples and when the stream started. It calls `drain` directly, not
+    /// through step -> Shell::execute(now) -> drain(now); that path test and
+    /// the race of a debounce finishing before the late request are #146.
     async fn late_rebaseline(before_reset: bool) -> (PlaybackSamples, Instant) {
         let streams = LiveStreams::default();
         let mut rx = stream_poller(&streams, streams.clone()).await;

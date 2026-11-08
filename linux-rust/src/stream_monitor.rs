@@ -2616,6 +2616,7 @@ mod tests {
             AllAudible,
             Duration::from_millis(50),
             Duration::from_millis(5),
+            Default::default(),
         );
         tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
             .await
