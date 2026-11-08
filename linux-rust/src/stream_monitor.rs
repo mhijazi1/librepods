@@ -198,7 +198,7 @@ fn pulse_error(what: &str) -> io::Error {
 }
 
 /// Connect to the sound server, blocking until the context is ready.
-// shortcut: duplicates media_controller.rs's pulse_connect, which #32 is changing in parallel; fold the two together after it lands (#TBD)
+// shortcut: duplicates media_controller.rs's pulse_connect; fold the two together (#73)
 fn connect() -> io::Result<(Mainloop, Context)> {
     let mut mainloop = Mainloop::new().ok_or_else(|| pulse_error("mainloop"))?;
     let mut context =
@@ -221,7 +221,7 @@ fn connect() -> io::Result<(Mainloop, Context)> {
 }
 
 /// Run the mainloop until the operation is done.
-// shortcut: no timeout; a sound server that never answers stalls the call monitor (not the handoff task) until restart (#TBD)
+// shortcut: no timeout; a sound server that never answers stalls the call monitor (not the handoff task) until restart (#73)
 fn wait<F: ?Sized>(mainloop: &mut Mainloop, op: &Operation<F>, what: &str) -> io::Result<()> {
     loop {
         match op.get_state() {
