@@ -118,7 +118,9 @@ pub(crate) trait MediaActions: Send + Sync {
     fn activate_a2dp(&self) -> BoxFuture<'static, ()>;
     /// Run the A2DP resume chain (#200) until it ends, or until `cancel`
     /// fires or its sender is dropped (checked between steps). It starts no
-    /// kick or profile cycle whose Play can't be due before `until`.
+    /// kick or profile cycle whose Play can't be due before `until`. It
+    /// first waits for the default sink routes enqueued before it; a cancel
+    /// or `until` during that wait ends it with no action.
     fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()>;
     /// Enqueue a default sink route (#40); never waits for the sound server.
     fn route_default_sink(&self, event: SinkEvent);
@@ -159,7 +161,14 @@ impl MediaActions for ControllerMedia {
     }
 
     fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()> {
-        Box::pin(a2dp_resume::run(self.controller.clone(), until, cancel))
+        // Taken now, so it covers the RouteToAirPods enqueued just before.
+        let routed = self.sinks.settled();
+        Box::pin(a2dp_resume::run(
+            self.controller.clone(),
+            until,
+            cancel,
+            routed,
+        ))
     }
 
     fn route_default_sink(&self, event: SinkEvent) {
@@ -1135,7 +1144,7 @@ mod tests {
             let io = FakeResume {
                 mac: self.mac.clone(),
             };
-            Box::pin(a2dp_resume::run(io, until, cancel))
+            Box::pin(a2dp_resume::run(io, until, cancel, std::future::ready(())))
         }
 
         fn route_default_sink(&self, event: SinkEvent) {

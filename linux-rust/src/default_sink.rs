@@ -10,7 +10,8 @@ use crate::media_controller::MediaController;
 use crate::pulse;
 use futures::future::BoxFuture;
 use log::{info, warn};
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{mpsc, watch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SinkEvent {
@@ -63,26 +64,61 @@ pub(crate) trait DefaultSinkIo: Send + Sync + 'static {
 }
 
 /// Enqueues route events for one worker task, which ends when this drops.
-pub(crate) struct DefaultSinkRouter(mpsc::UnboundedSender<SinkEvent>);
+pub(crate) struct DefaultSinkRouter {
+    events: mpsc::UnboundedSender<SinkEvent>,
+    /// Events enqueued so far.
+    sent: AtomicU64,
+    /// Events the worker has applied so far.
+    applied: watch::Receiver<u64>,
+}
 
 impl DefaultSinkRouter {
     pub(crate) fn spawn(io: impl DefaultSinkIo) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(run(io, rx));
-        DefaultSinkRouter(tx)
+        let (router, events, applied) = Self::new();
+        tokio::spawn(run(io, events, applied));
+        router
+    }
+
+    /// The router, and the channel ends its worker takes.
+    fn new() -> (Self, mpsc::UnboundedReceiver<SinkEvent>, watch::Sender<u64>) {
+        let (events, rx) = mpsc::unbounded_channel();
+        let (applied_tx, applied) = watch::channel(0);
+        let router = DefaultSinkRouter {
+            events,
+            sent: AtomicU64::new(0),
+            applied,
+        };
+        (router, rx, applied_tx)
     }
 
     /// Never blocks.
     pub(crate) fn route(&self, event: SinkEvent) {
-        let _ = self.0.send(event);
+        self.sent.fetch_add(1, Ordering::SeqCst);
+        let _ = self.events.send(event);
+    }
+
+    /// Resolves once the worker has applied every event enqueued before this
+    /// call, whatever their outcome, or once the worker is gone.
+    pub(crate) fn settled(&self) -> impl Future<Output = ()> + Send + 'static {
+        let sent = self.sent.load(Ordering::SeqCst);
+        let mut applied = self.applied.clone();
+        async move {
+            // An Err means the worker is gone: nothing more will apply.
+            let _ = applied.wait_for(|&n| n >= sent).await;
+        }
     }
 }
 
-/// Plan and apply each event in order.
-async fn run(io: impl DefaultSinkIo, mut events: mpsc::UnboundedReceiver<SinkEvent>) {
+/// Plan and apply each event in order, counting each in `applied`.
+async fn run(
+    io: impl DefaultSinkIo,
+    mut events: mpsc::UnboundedReceiver<SinkEvent>,
+    applied: watch::Sender<u64>,
+) {
     let mut remembered: Option<String> = None;
     while let Some(event) = events.recv().await {
         remembered = apply(&io, remembered, event).await;
+        applied.send_modify(|n| *n += 1);
     }
 }
 
@@ -153,9 +189,11 @@ mod tests {
     use super::SinkAction::SetDefault;
     use super::SinkEvent::{Take, Yield};
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use futures::FutureExt;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     const DAC: &str = "alsa_output.dac";
     const AIRPODS: &str = "bluez_output.AA";
@@ -250,6 +288,8 @@ mod tests {
         default: Arc<Mutex<String>>,
         sets: Arc<Mutex<Vec<String>>>,
         fail: Arc<AtomicBool>,
+        /// When set, each `set_default` finishes only on one of its permits.
+        gate: Option<Arc<Notify>>,
     }
 
     impl FakeSinks {
@@ -258,6 +298,7 @@ mod tests {
                 default: Arc::new(Mutex::new(DAC.to_string())),
                 sets: Arc::default(),
                 fail: Arc::new(AtomicBool::new(fail)),
+                gate: None,
             }
         }
 
@@ -282,16 +323,21 @@ mod tests {
             if ok {
                 *self.default.lock().unwrap() = name;
             }
-            Box::pin(async move { ok })
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                ok
+            })
         }
     }
 
     /// Send `Take`, let the worker finish it, run `between`, then send
     /// `Yield` and wait for the worker to end.
     async fn take_then_yield(sinks: &FakeSinks, between: impl FnOnce()) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let worker = tokio::spawn(run(sinks.clone(), rx));
-        let router = DefaultSinkRouter(tx);
+        let (router, rx, applied) = DefaultSinkRouter::new();
+        let worker = tokio::spawn(run(sinks.clone(), rx, applied));
         router.route(Take);
         tokio::time::timeout(Duration::from_secs(3), async {
             while sinks.sets().is_empty() {
@@ -366,13 +412,81 @@ mod tests {
     #[tokio::test]
     async fn router_runs_events_in_send_order() {
         let sinks = FakeSinks::new(false);
-        let (tx, rx) = mpsc::unbounded_channel();
-        let router = DefaultSinkRouter(tx);
+        let (router, rx, applied) = DefaultSinkRouter::new();
         for event in [Take, Yield, Take, Yield] {
             router.route(event);
         }
         drop(router);
-        run(sinks.clone(), rx).await;
+        run(sinks.clone(), rx, applied).await;
         assert_eq!(sinks.sets(), [AIRPODS, DAC, AIRPODS, DAC]);
+    }
+
+    /// Wait up to 3 s for `settled`; panics if it doesn't resolve.
+    async fn settles(settled: impl Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(3), settled)
+            .await
+            .expect("settled");
+    }
+
+    #[tokio::test]
+    async fn settled_is_ready_with_nothing_queued() {
+        let router = DefaultSinkRouter::spawn(FakeSinks::new(false));
+        assert_eq!(router.settled().now_or_never(), Some(()));
+    }
+
+    #[tokio::test]
+    async fn settled_waits_for_a_slow_take() {
+        let gate = Arc::new(Notify::new());
+        let sinks = FakeSinks {
+            gate: Some(gate.clone()),
+            ..FakeSinks::new(false)
+        };
+        let router = DefaultSinkRouter::spawn(sinks.clone());
+        router.route(Take);
+        let take = router.settled();
+        router.route(Yield);
+        let take_and_yield = router.settled();
+        tokio::pin!(take, take_and_yield);
+        // Each set_default is in flight once recorded, held by the gate.
+        let sinks = &sinks;
+        let in_flight = move |n| {
+            tokio::time::timeout(Duration::from_secs(3), async move {
+                while sinks.sets().len() < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        in_flight(1).await.expect("the take's set_default");
+        let held = tokio::time::timeout(Duration::from_millis(100), &mut take).await;
+        assert!(held.is_err(), "settled before the take finished");
+        gate.notify_one();
+        settles(&mut take).await;
+        in_flight(2).await.expect("the yield's set_default");
+        let held = tokio::time::timeout(Duration::from_millis(100), &mut take_and_yield).await;
+        assert!(held.is_err(), "settled before the yield finished");
+        gate.notify_one();
+        settles(take_and_yield).await;
+        assert_eq!(sinks.sets(), [AIRPODS, DAC]);
+    }
+
+    #[tokio::test]
+    async fn settled_after_failed_take_and_yield() {
+        let sinks = FakeSinks::new(true);
+        let router = DefaultSinkRouter::spawn(sinks.clone());
+        router.route(Take);
+        settles(router.settled()).await;
+        router.route(Yield);
+        settles(router.settled()).await;
+        // The take failed, so the yield had nothing to restore.
+        assert_eq!(sinks.sets(), [AIRPODS]);
+    }
+
+    #[tokio::test]
+    async fn settled_resolves_when_worker_is_gone() {
+        let (router, rx, applied) = DefaultSinkRouter::new();
+        router.route(Take);
+        let settled = router.settled();
+        drop((rx, applied));
+        settles(settled).await;
     }
 }
