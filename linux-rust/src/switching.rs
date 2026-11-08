@@ -364,6 +364,7 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     let commands = core.handle(Instant::now(), input);
     for line in core.take_lines() {
         info!("Handoff {}: {line}", shell.mac);
+        // debt: #64 production step() calls the test module's trace hook; replace with an injectable log sink
         #[cfg(test)]
         tests::trace(&shell.mac, line);
     }
