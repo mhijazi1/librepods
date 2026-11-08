@@ -2256,4 +2256,255 @@ mod tests {
     async fn handoff_preexisting_stream_late_first_listing_never_takes() {
         preexisting_stream_case("5A:00:00:00:00:10", true).await;
     }
+
+    /// #20: the non-events of upstream #724's reports never take the AirPods
+    /// or pause anything. Each runs through the real stream tracker and core
+    /// at injected times, with a counterfactual twin that does take.
+    mod non_event {
+        use super::*;
+        use crate::stream_monitor::PlaybackTracker;
+        use Command::{PauseMedia, SendOwnership};
+        use EarDetectionStatus::{InCase, InEar, OutOfEar};
+        use libpulse_binding::proplist::Proplist;
+        use libpulse_binding::volume::{ChannelVolumes, Volume};
+
+        const POLL_MS: u64 = PLAYBACK_POLL.as_millis() as u64;
+        const MIN_MS: u64 = MIN_STREAM_PLAYBACK.as_millis() as u64;
+        /// When each scenario's event starts, after the baselines at 10 ms.
+        const EVENT_MS: u64 = 500;
+        /// Neither takes nor pauses.
+        const NO_TAKE: Vec<Vec<Command>> = Vec::new();
+
+        fn facts() -> SessionFacts {
+            SessionFacts {
+                hosts: vec![host(LOCAL), host(REMOTE)],
+                ears: vec![InEar, InEar],
+                audio: Some(AudioSource {
+                    mac: "00:00:00:00:00:00".to_string(),
+                    r#type: AudioSourceType::None,
+                }),
+                owner: Some(vec![0]),
+            }
+        }
+
+        /// The core fed as the default path feeds it: each playback sample
+        /// is MPRIS `||` the real `PlaybackTracker`'s state, as
+        /// `spawn_playback_poller_with` combines them.
+        struct Pipeline {
+            core: Handoff,
+            tracker: PlaybackTracker,
+            streams_playing: bool,
+            t0: Instant,
+            /// Every command list the core returned, in order.
+            log: Vec<Vec<Command>>,
+        }
+
+        impl Pipeline {
+            /// `handoff::tests::Probe::ready`: automatic, connected, Linux
+            /// plus a remote host, worn, idle audio, owner [0], then a
+            /// stopped sample and an empty stream listing as the baselines.
+            fn ready() -> Self {
+                let t0 = Instant::now();
+                let mut p = Pipeline {
+                    core: Handoff::new(LOCAL.to_string(), t0, true, true),
+                    tracker: PlaybackTracker::new(MIN_STREAM_PLAYBACK),
+                    streams_playing: false,
+                    t0,
+                    log: Vec::new(),
+                };
+                for input in seed_inputs(facts()) {
+                    p.feed(0, input);
+                }
+                assert_eq!(p.step(10, false, &[]), []);
+                p
+            }
+
+            fn feed(&mut self, ms: u64, input: Input) -> Vec<Command> {
+                let commands = self.core.handle(self.t0 + Duration::from_millis(ms), input);
+                self.log.push(commands.clone());
+                commands
+            }
+
+            /// One playback sample at `ms`: the stream listing, then the core.
+            fn step(&mut self, ms: u64, mpris: bool, streams: &[StreamProps]) -> Vec<Command> {
+                let now = self.t0 + Duration::from_millis(ms);
+                if let Some(playing) = self.tracker.observe(now, streams) {
+                    self.streams_playing = playing;
+                }
+                let playing = mpris || self.streams_playing;
+                self.feed(
+                    ms,
+                    Input::Playback {
+                        sampled_at: now,
+                        playing,
+                    },
+                )
+            }
+
+            /// A sample every `PLAYBACK_POLL` from `EVENT_MS` until over
+            /// twice the minimum stream playback later.
+            fn event(&mut self, mpris: bool, streams: &[StreamProps]) {
+                for ms in (EVENT_MS..=EVENT_MS + 2 * MIN_MS + POLL_MS).step_by(POLL_MS as usize) {
+                    self.step(ms, mpris, streams);
+                }
+            }
+
+            /// The command lists that take the AirPods or pause anything.
+            fn takes(&self) -> Vec<Vec<Command>> {
+                self.log
+                    .iter()
+                    .filter(|c| c.contains(&SendOwnership(true)) || c.contains(&PauseMedia))
+                    .cloned()
+                    .collect()
+            }
+        }
+
+        /// `ready`, then `mpris` and `streams` from the event on.
+        fn run(mpris: bool, streams: &[StreamProps]) -> Pipeline {
+            let mut p = Pipeline::ready();
+            p.event(mpris, streams);
+            p
+        }
+
+        /// Sink input 1, uncorked and unmuted, with these properties only.
+        fn sink(props: &[(&str, &str)]) -> StreamProps {
+            StreamProps {
+                props: props
+                    .iter()
+                    .map(|&(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..music(1)
+            }
+        }
+
+        #[test]
+        fn non_event_system_sound() {
+            assert_eq!(run(false, &[event_sound(1)]).takes(), NO_TAKE);
+            assert_eq!(run(false, &[music(1)]).takes(), [vec![SendOwnership(true)]]);
+        }
+
+        #[test]
+        fn non_event_notification_sound() {
+            let canberra = sink(&[
+                ("application.name", "test player"),
+                ("event.id", "message-new-instant"),
+            ]);
+            for stream in [sink_input(1, "notification"), canberra] {
+                assert_eq!(run(false, &[stream.clone()]).takes(), NO_TAKE, "{stream:?}");
+            }
+            let app_only = sink(&[("application.name", "test player")]);
+            assert_eq!(run(false, &[app_only]).takes(), [vec![SendOwnership(true)]]);
+        }
+
+        const DISCONNECT_MS: u64 = EVENT_MS;
+        /// The music stream of the reconnect case has played over the
+        /// minimum by now, and started over the minimum earlier (#90).
+        const RECONNECT_MS: u64 = DISCONNECT_MS + POLL_MS + MIN_MS + POLL_MS;
+
+        /// The session drops while worn (recovery Immediate) and a new one
+        /// comes at `RECONNECT_MS`; the player (MPRIS and a music stream)
+        /// plays from `start` ms on.
+        fn reconnect_case(start: u64) -> Pipeline {
+            let mut p = Pipeline::ready();
+            assert_eq!(
+                p.feed(DISCONNECT_MS, Input::Disconnected),
+                [Command::DropSession]
+            );
+            let player = [music(1)];
+            let end = RECONNECT_MS + 2 * MIN_MS + POLL_MS;
+            for ms in (DISCONNECT_MS + POLL_MS..=end).step_by(POLL_MS as usize) {
+                if ms == DISCONNECT_MS + 2 * POLL_MS {
+                    assert_eq!(
+                        p.feed(ms, Input::Tick),
+                        [Command::Reconnect { audio: true }]
+                    );
+                }
+                if ms == RECONNECT_MS {
+                    p.feed(ms, Input::Reconnected(facts()));
+                }
+                let playing = ms >= start;
+                let streams: &[StreamProps] = if playing { &player } else { &[] };
+                p.step(ms, playing, streams);
+            }
+            p
+        }
+
+        #[test]
+        fn non_event_playback_already_running_on_reconnect() {
+            assert_eq!(reconnect_case(DISCONNECT_MS + POLL_MS).takes(), NO_TAKE);
+            assert_eq!(
+                reconnect_case(RECONNECT_MS + POLL_MS).takes(),
+                [vec![SendOwnership(true)]]
+            );
+        }
+
+        #[test]
+        fn non_event_paused_player() {
+            let corked = StreamProps {
+                corked: true,
+                ..music(1)
+            };
+            assert_eq!(run(false, &[corked]).takes(), NO_TAKE);
+            assert_eq!(run(false, &[music(1)]).takes(), [vec![SendOwnership(true)]]);
+        }
+
+        /// A browser tab's sink input (no role) as `PulseStreams` lists it.
+        fn tab(mute: bool, level: Volume) -> StreamProps {
+            let mut proplist = Proplist::new().expect("proplist");
+            proplist.set_str("application.name", "Firefox").unwrap();
+            let mut volume = ChannelVolumes::default();
+            volume.set(2, level);
+            stream_monitor::playback_stream(1, &proplist, false, mute, &volume)
+        }
+
+        #[test]
+        fn non_event_muted_autoplay_tab() {
+            for stream in [tab(true, Volume::NORMAL), tab(false, Volume::MUTED)] {
+                assert_eq!(run(false, &[stream.clone()]).takes(), NO_TAKE, "{stream:?}");
+            }
+            assert_eq!(
+                run(false, &[tab(false, Volume::NORMAL)]).takes(),
+                [vec![SendOwnership(true)]]
+            );
+        }
+
+        /// `ready`, then a wear report, then a fresh music stream with MPRIS.
+        fn wearing(ears: [EarDetectionStatus; 2]) -> Pipeline {
+            let mut p = Pipeline::ready();
+            p.feed(20, Input::EarState(ears.to_vec()));
+            p.event(true, &[music(1)]);
+            p
+        }
+
+        #[test]
+        fn non_event_playback_not_worn() {
+            for (off, one_in) in [
+                ([OutOfEar, OutOfEar], [InEar, OutOfEar]),
+                ([InCase, InCase], [InEar, InCase]),
+            ] {
+                assert_eq!(wearing(off).takes(), NO_TAKE, "{off:?}");
+                assert_eq!(
+                    wearing(one_in).takes(),
+                    [vec![SendOwnership(true)]],
+                    "{one_in:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn non_event_control_genuine_play_takes() {
+            let mut p = Pipeline::ready();
+            let stream = [music(1)];
+            let mut ms = EVENT_MS;
+            while ms < EVENT_MS + MIN_MS {
+                assert_eq!(p.step(ms, false, &stream), [], "{ms} ms");
+                ms += POLL_MS;
+            }
+            assert_eq!(p.step(ms, false, &stream), [SendOwnership(true)]);
+            for later in (ms + POLL_MS..=ms + MIN_MS).step_by(POLL_MS as usize) {
+                assert_eq!(p.step(later, false, &stream), [], "{later} ms");
+            }
+            assert_eq!(p.takes(), [vec![SendOwnership(true)]]);
+        }
+    }
 }
