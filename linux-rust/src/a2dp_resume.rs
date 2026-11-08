@@ -80,7 +80,7 @@ enum Stage {
 }
 
 /// The resume chain's pure step machine.
-pub(crate) struct Chain {
+struct Chain {
     stage: Stage,
     /// The players playing at the chain's start (the take's ACK).
     start: Vec<String>,
@@ -88,7 +88,7 @@ pub(crate) struct Chain {
 }
 
 impl Chain {
-    pub(crate) fn new(now: Instant, playing: Vec<String>) -> Self {
+    fn new(now: Instant, playing: Vec<String>) -> Self {
         Chain {
             stage: Stage::Start,
             start: playing,
@@ -97,12 +97,12 @@ impl Chain {
     }
 
     /// When the next step is due.
-    pub(crate) fn due(&self) -> Instant {
+    fn due(&self) -> Instant {
         self.due
     }
 
     /// Whether the next step reads audibility and the playing players.
-    pub(crate) fn senses(&self) -> bool {
+    fn senses(&self) -> bool {
         matches!(self.stage, Stage::Nudged | Stage::Kicked | Stage::Cycled(_))
     }
 
@@ -110,7 +110,7 @@ impl Chain {
     /// over. `audible` and `playing` matter only when `senses()`; audible
     /// ends the chain there. Once the sink is suspended or the players
     /// paused, the next step always undoes it.
-    pub(crate) fn step(
+    fn step(
         &mut self,
         now: Instant,
         audible: bool,
@@ -158,7 +158,7 @@ impl Chain {
     }
 
     /// Stop the chain between steps: only a suspended sink is resumed.
-    pub(crate) fn cancel(&mut self) -> Vec<Action> {
+    fn cancel(&mut self) -> Vec<Action> {
         match std::mem::replace(&mut self.stage, Stage::Done) {
             Stage::Suspended => vec![Action::SuspendSink(false)],
             _ => Vec::new(),
