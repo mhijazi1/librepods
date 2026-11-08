@@ -132,6 +132,7 @@ fn share_media(
 pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
     spawn_playback_poller_with(
         MediaController::check_if_playing,
+        // shortcut: a new libpulse connection every PLAYBACK_POLL; fold the connections or subscribe to sink-input events (#73)
         PulseStreams,
         MIN_STREAM_PLAYBACK,
         PLAYBACK_POLL,

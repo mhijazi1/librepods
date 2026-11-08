@@ -146,7 +146,8 @@ pub(crate) trait PlaybackSource: Send {
 /// worthy (`call_detect::is_takeover_worthy`) and uncorked in every sample
 /// for at least `min`. Corking, vanishing or reclassification forgets it, so
 /// it starts over if it comes back. Stream playback is on while any stream
-/// counts.
+/// counts. An app that keeps a silent stream open uncorked still counts;
+/// libpulse reports no level for sink inputs (#84).
 #[derive(Debug)]
 pub(crate) struct PlaybackTracker {
     min: Duration,
