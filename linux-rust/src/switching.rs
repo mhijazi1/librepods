@@ -2420,6 +2420,8 @@ mod tests {
                     );
                 }
                 if ms == RECONNECT_MS {
+                    // The tracker counts a stream started before the drop.
+                    assert_eq!(p.streams_playing, start < ms);
                     p.feed(ms, Input::Reconnected(facts()));
                 }
                 let playing = ms >= start;
