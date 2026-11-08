@@ -354,14 +354,30 @@ impl Handoff {
                     self.say("REMOTE requested ownership; control session lost");
                     return;
                 }
-                // A repeat of a request Linux already yielded to: that yield
-                // paused once, so this one must not pause again (#39, #61).
-                if self
+                // A release Linux already sent answers this request too: a
+                // second "not owning" would get a reply that acknowledges
+                // nothing and yields a later take (#61, #137). Join it,
+                // keeping its `since` so the ACK timeout is not pushed back,
+                // and make now the one pause its ACK would have made: a
+                // user/quit release, or a playback restart it would retake
+                // for. A remote release already paused when it was sent. A
+                // local call refuses (below) any release but a remote one, so
+                // the release still settles for the call (#11).
+                let call_holds = self.local_call && self.requested_take;
+                if let Some(p) = self
                     .pending
-                    .is_some_and(|p| !p.desired && p.cause == Cause::Remote)
+                    .as_mut()
+                    .filter(|p| !p.desired && (p.cause == Cause::Remote || !call_holds))
                 {
-                    // Keep the pending release and its `since`, so its ACK
-                    // timeout is not pushed back.
+                    if self.automatic
+                        && self.requested_take
+                        && (matches!(p.cause, Cause::User | Cause::Quit)
+                            || self.play_during_release)
+                    {
+                        out.push(Command::PauseMedia);
+                    }
+                    p.cause = Cause::Remote;
+                    self.play_during_release = false;
                     self.say("REMOTE requested ownership; release already pending");
                     return;
                 }
@@ -2252,6 +2268,134 @@ mod tests {
             all.iter().filter(|c| **c == SendOwnership(false)).count(),
             2
         );
+    }
+
+    fn count(all: &[Vec<Command>], command: Command) -> usize {
+        all.iter().flatten().filter(|c| **c == command).count()
+    }
+
+    #[test]
+    fn remote_request_joins_pending_playback_release() {
+        // #137: a remote request during a playback-stop release joins it. No
+        // second "not owning" is sent, so no stray [0] yields the retake.
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        let all = [
+            p.play(1500, false),
+            p.feed(1800, Input::RemoteOwnershipRequest),
+            p.feed(1900, Input::Ownership(vec![0])),
+            p.play(2000, true),
+            p.feed(2100, Input::Ownership(vec![1])),
+        ];
+        assert_eq!(
+            all,
+            [
+                vec![SendOwnership(false)],
+                vec![],
+                vec![],
+                vec![SendOwnership(true)],
+                vec![],
+            ]
+        );
+        assert_eq!(count(&all, SendOwnership(false)), 1);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+
+        // The joined release's timeout still counts from its send at 1500.
+        let mut p = acked_auto_take();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1800, Input::RemoteOwnershipRequest), []);
+        p.core.take_lines();
+        let tick = 1500 + ACK_TIMEOUT.as_millis() as u64 + 1;
+        assert_eq!(p.feed(tick, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 1);
+
+        // Playback restarted during the release: the request pauses it once
+        // and the ACK neither retakes nor pauses again.
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        assert_eq!(p.play(1600, true), []);
+        assert_eq!(p.feed(1700, Input::RemoteOwnershipRequest), [PauseMedia]);
+        assert_eq!(p.feed(1800, Input::Ownership(vec![0])), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+
+        // A call started during the release: refused as before (#11), so
+        // the ACK still retakes for the restarted playback.
+        let mut p = acked_auto_take();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1550, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play(1600, true), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(1700, Input::RemoteOwnershipRequest), []);
+        assert_eq!(
+            p.core.take_lines(),
+            ["REMOTE requested ownership; refused during a local call"]
+        );
+        assert_eq!(
+            p.feed(1800, Input::Ownership(vec![0])),
+            [SendOwnership(true)]
+        );
+    }
+
+    #[test]
+    fn remote_request_joins_pending_auto_release() {
+        // #49's Auto release joined by a remote request (#137).
+        let mut p = Probe::new(false, true);
+        p.routing(SessionFacts {
+            owner: Some(vec![1]),
+            ..ready_facts()
+        });
+        let all = [
+            p.feed(100, Input::Auto),
+            p.feed(200, Input::RemoteOwnershipRequest),
+            p.feed(300, Input::Ownership(vec![0])),
+            p.play(400, false),
+            p.play(500, true),
+            p.feed(600, Input::Ownership(vec![1])),
+        ];
+        assert_eq!(
+            all,
+            [
+                vec![ConnectA2dp, SendOwnership(false), Announce],
+                vec![],
+                vec![],
+                vec![],
+                vec![SendOwnership(true)],
+                vec![],
+            ]
+        );
+        assert_eq!(count(&all, SendOwnership(false)), 1);
+        assert_eq!(count(&all, PauseMedia), 0);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+    }
+
+    #[test]
+    fn remote_request_joins_pending_user_or_quit_release() {
+        // A user or quit release of a live take: the request makes the one
+        // pause the release's ACK would have made (#137).
+        for (release, ack) in [(Input::Release, vec![]), (Input::Quit, vec![Exit])] {
+            let mut p = Probe::ready();
+            p.core.take_lines();
+            let all = [
+                p.feed(100, Input::Take),
+                p.feed(200, Input::Ownership(vec![1])),
+                p.feed(300, release),
+                p.feed(400, Input::RemoteOwnershipRequest),
+                p.feed(500, Input::Ownership(vec![0])),
+            ];
+            assert_eq!(
+                all,
+                [
+                    vec![SendOwnership(true)],
+                    vec![],
+                    vec![SendOwnership(false)],
+                    vec![PauseMedia],
+                    ack,
+                ]
+            );
+            assert_eq!(count(&all, PauseMedia), 1);
+            assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+        }
     }
 
     /// `acked_auto_take` (playing at 1000 ms), then a local call starts.
