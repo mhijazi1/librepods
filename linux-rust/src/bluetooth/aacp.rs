@@ -1,5 +1,6 @@
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
+use crate::settings_file::{parse_devices, write_settings_file};
 use crate::utils::get_devices_path;
 use bluer::{
     Address, AddressType, Error, Result,
@@ -778,21 +779,13 @@ impl AACPManager {
                     },
                 };
                 let mut state = self.state.lock().await;
-                if let Some(mac) = state.airpods_mac
-                    && let Some(device_data) = state.devices.get_mut(&mac.to_string())
-                {
-                    device_data.name = info.name.clone();
-                    device_data.information = Some(DeviceInformation::AirPods(info.clone()));
-                }
-                let json = serde_json::to_string(&state.devices).unwrap();
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
+                if let Some(mac) = state.airpods_mac {
+                    let mac = mac.to_string();
+                    if let Some(devices) =
+                        update_devices_file(|d| devices_with_information(d, &mac, &info))
+                    {
+                        state.devices = devices;
+                    }
                 }
                 info!("Received Information: {:?}", info);
             }
@@ -838,48 +831,13 @@ impl AACPManager {
                         .collect::<Vec<_>>()
                 );
                 let mut state = self.state.lock().await;
-                for (key_type, key_data) in &keys {
-                    if let Some(kt) = ProximityKeyType::from_u8(*key_type)
-                        && let Some(mac) = state.airpods_mac
+                if let Some(mac) = state.airpods_mac {
+                    let mac = mac.to_string();
+                    if let Some(devices) =
+                        update_devices_file(|d| devices_with_proximity_keys(d, &mac, &keys))
                     {
-                        let mac_str = mac.to_string();
-                        let device_data =
-                            state.devices.entry(mac_str.clone()).or_insert(DeviceData {
-                                name: mac_str.clone(),
-                                type_: DeviceType::AirPods,
-                                information: None,
-                            });
-                        match kt {
-                            ProximityKeyType::Irk => match device_data.information.as_mut() {
-                                Some(DeviceInformation::AirPods(info)) => {
-                                    info.le_keys.irk = hex::encode(key_data);
-                                }
-                                _ => {
-                                    error!("Device information is not AirPods for adding LE IRK.");
-                                }
-                            },
-                            ProximityKeyType::EncKey => match device_data.information.as_mut() {
-                                Some(DeviceInformation::AirPods(info)) => {
-                                    info.le_keys.enc_key = hex::encode(key_data);
-                                }
-                                _ => {
-                                    error!(
-                                        "Device information is not AirPods for adding LE encryption key."
-                                    );
-                                }
-                            },
-                        }
+                        state.devices = devices;
                     }
-                }
-                let json = serde_json::to_string(&state.devices).unwrap();
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
                 }
             }
             opcodes::STEM_PRESS => {
@@ -1429,6 +1387,81 @@ pub(crate) fn parse_connected_devices(payload: &[u8]) -> Option<Vec<ConnectedDev
             info2,
             r#type: None,
         });
+    }
+    Some(devices)
+}
+
+/// `devices` with `info` set on `mac`'s entry; a missing entry is not created.
+fn devices_with_information(
+    mut devices: HashMap<String, DeviceData>,
+    mac: &str,
+    info: &AirPodsInformation,
+) -> HashMap<String, DeviceData> {
+    if let Some(device_data) = devices.get_mut(mac) {
+        device_data.name = info.name.clone();
+        device_data.information = Some(DeviceInformation::AirPods(info.clone()));
+    }
+    devices
+}
+
+/// `devices` with each known key in `keys` stored on `mac`'s entry, which is
+/// created (named after the MAC) if missing.
+fn devices_with_proximity_keys(
+    mut devices: HashMap<String, DeviceData>,
+    mac: &str,
+    keys: &[(u8, Vec<u8>)],
+) -> HashMap<String, DeviceData> {
+    for (key_type, key_data) in keys {
+        let Some(kt) = ProximityKeyType::from_u8(*key_type) else {
+            continue;
+        };
+        let device_data = devices.entry(mac.to_string()).or_insert(DeviceData {
+            name: mac.to_string(),
+            type_: DeviceType::AirPods,
+            information: None,
+        });
+        match (kt, device_data.information.as_mut()) {
+            (ProximityKeyType::Irk, Some(DeviceInformation::AirPods(info))) => {
+                info.le_keys.irk = hex::encode(key_data);
+            }
+            (ProximityKeyType::EncKey, Some(DeviceInformation::AirPods(info))) => {
+                info.le_keys.enc_key = hex::encode(key_data);
+            }
+            (ProximityKeyType::Irk, _) => {
+                error!("Device information is not AirPods for adding LE IRK.");
+            }
+            (ProximityKeyType::EncKey, _) => {
+                error!("Device information is not AirPods for adding LE encryption key.");
+            }
+        }
+    }
+    devices
+}
+
+/// Applies `update` to a fresh read of devices.json and writes the result back
+/// atomically, so devices saved since connect are kept. Returns the written
+/// map; on any error logs it and writes nothing.
+fn update_devices_file(
+    update: impl FnOnce(HashMap<String, DeviceData>) -> HashMap<String, DeviceData>,
+) -> Option<HashMap<String, DeviceData>> {
+    let path = get_devices_path();
+    let devices = match parse_devices(std::fs::read_to_string(&path)) {
+        Ok(devices) => update(devices),
+        Err(e) => {
+            error!("Not saving devices, failed to read {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    let json = match serde_json::to_string(&devices) {
+        Ok(json) => json,
+        Err(e) => {
+            error!("Failed to serialize devices: {}", e);
+            return None;
+        }
+    };
+    if let Err(e) = write_settings_file(&path, &json) {
+        error!("Failed to save devices: {}", e);
+        return None;
     }
     Some(devices)
 }
@@ -2961,5 +2994,137 @@ mod tests {
         assert!(state.control_command_status_list.is_empty());
         assert!(!state.owns);
         assert!(event_rx.try_recv().is_err());
+    }
+
+    const AIRPODS_MAC: &str = "AA:AA:AA:AA:AA:AA";
+    const OTHER_MAC: &str = "BB:BB:BB:BB:BB:BB";
+
+    fn airpods_info(name: &str) -> AirPodsInformation {
+        let s = |v: &str| v.to_string();
+        AirPodsInformation {
+            name: s(name),
+            model_number: s("A2084"),
+            manufacturer: s("Apple Inc."),
+            serial_number: s("SN"),
+            version1: s("1"),
+            version2: s("2"),
+            hardware_revision: s("1.0.0"),
+            updater_identifier: s("com.apple.accessory.updater"),
+            left_serial_number: s("L"),
+            right_serial_number: s("R"),
+            version3: s("3"),
+            le_keys: AirPodsLEKeys {
+                irk: String::new(),
+                enc_key: String::new(),
+            },
+        }
+    }
+
+    /// A device saved after connect (absent from the snapshot), with information.
+    fn other_device() -> DeviceData {
+        DeviceData {
+            name: "Ear (2)".to_string(),
+            type_: DeviceType::Nothing,
+            information: Some(DeviceInformation::Nothing(
+                crate::devices::nothing::NothingInformation {
+                    serial_number: "SN1".to_string(),
+                    firmware_version: "1.0.0".to_string(),
+                },
+            )),
+        }
+    }
+
+    fn devices(entries: Vec<(&str, DeviceData)>) -> HashMap<String, DeviceData> {
+        entries
+            .into_iter()
+            .map(|(mac, data)| (mac.to_string(), data))
+            .collect()
+    }
+
+    fn assert_other_unchanged(devices: &HashMap<String, DeviceData>) {
+        assert_eq!(
+            serde_json::to_value(&devices[OTHER_MAC]).unwrap(),
+            serde_json::to_value(other_device()).unwrap()
+        );
+    }
+
+    #[test]
+    fn information_keeps_other_devices() {
+        let airpods = DeviceData {
+            name: AIRPODS_MAC.to_string(),
+            type_: DeviceType::AirPods,
+            information: None,
+        };
+        let info = airpods_info("My AirPods");
+        let updated = devices_with_information(
+            devices(vec![(AIRPODS_MAC, airpods), (OTHER_MAC, other_device())]),
+            AIRPODS_MAC,
+            &info,
+        );
+
+        assert_eq!(updated.len(), 2);
+        assert_other_unchanged(&updated);
+        let airpods = &updated[AIRPODS_MAC];
+        assert_eq!(airpods.name, "My AirPods");
+        assert_eq!(
+            serde_json::to_value(&airpods.information).unwrap(),
+            serde_json::to_value(Some(DeviceInformation::AirPods(info))).unwrap()
+        );
+    }
+
+    #[test]
+    fn information_missing_entry_unchanged() {
+        let updated = devices_with_information(
+            devices(vec![(OTHER_MAC, other_device())]),
+            AIRPODS_MAC,
+            &airpods_info("My AirPods"),
+        );
+
+        assert_eq!(updated.len(), 1);
+        assert_other_unchanged(&updated);
+    }
+
+    #[test]
+    fn proximity_keys_keeps_other_devices() {
+        let airpods = DeviceData {
+            name: "My AirPods".to_string(),
+            type_: DeviceType::AirPods,
+            information: Some(DeviceInformation::AirPods(airpods_info("My AirPods"))),
+        };
+        let keys = [(0x01, vec![0x11, 0x22]), (0x04, vec![0x33]), (0x02, vec![0x44])];
+        let updated = devices_with_proximity_keys(
+            devices(vec![(AIRPODS_MAC, airpods), (OTHER_MAC, other_device())]),
+            AIRPODS_MAC,
+            &keys,
+        );
+
+        assert_eq!(updated.len(), 2);
+        assert_other_unchanged(&updated);
+        let Some(DeviceInformation::AirPods(info)) = &updated[AIRPODS_MAC].information else {
+            panic!("AirPods information lost");
+        };
+        assert_eq!(info.le_keys.irk, "1122");
+        assert_eq!(info.le_keys.enc_key, "33");
+        assert_eq!(updated[AIRPODS_MAC].name, "My AirPods");
+    }
+
+    #[test]
+    fn proximity_keys_inserts_entry() {
+        // Only unknown key types: no entry is created.
+        let updated = devices_with_proximity_keys(
+            devices(vec![(OTHER_MAC, other_device())]),
+            AIRPODS_MAC,
+            &[(0x02, vec![0x44])],
+        );
+        assert_eq!(updated.len(), 1);
+
+        let updated = devices_with_proximity_keys(updated, AIRPODS_MAC, &[(0x01, vec![0x11])]);
+
+        assert_eq!(updated.len(), 2);
+        assert_other_unchanged(&updated);
+        let airpods = &updated[AIRPODS_MAC];
+        assert_eq!(airpods.name, AIRPODS_MAC);
+        assert!(matches!(airpods.type_, DeviceType::AirPods));
+        assert!(airpods.information.is_none());
     }
 }
