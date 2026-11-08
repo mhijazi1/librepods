@@ -6,13 +6,13 @@
 //! warning.
 
 use crate::switching::LineSink;
-use log::warn;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -107,8 +107,23 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Past this size a log is emptied when it is next opened (about 5000 lines).
+/// Past this size (about 5000 lines) a log is rotated to `handoff.jsonl.1`,
+/// replacing an older `.1`, when it is next opened.
 const MAX_LOG_BYTES: u64 = 1 << 20;
+
+/// Set `mode` on an open file or directory that has group/other bits, through
+/// its handle (fchmod), so a swapped path is never chmodded. Warn-only.
+fn make_private(handle: &File, mode: u32, path: &Path) {
+    let tightened = handle.metadata().and_then(|m| {
+        if m.permissions().mode() & 0o077 == 0 {
+            return Ok(());
+        }
+        handle.set_permissions(Permissions::from_mode(mode))
+    });
+    if let Err(e) = tightened {
+        warn!("Handoff log: cannot make {} private: {e}", path.display());
+    }
+}
 
 fn write_record(file: &mut File, record: &Record) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(record)?;
@@ -124,24 +139,82 @@ pub(crate) struct Log {
 }
 
 impl Log {
-    /// Open `path` for appending (created 0600, its directory 0700) and
-    /// write the session_start record. A log past `MAX_LOG_BYTES` is emptied
-    /// first: the report only reads the last session.
+    /// Open `path` for appending (made 0600, its directory 0700) and write
+    /// the session_start record. A log past `MAX_LOG_BYTES` is first renamed
+    /// to `<path>.1` (`handoff.jsonl.1`), replacing an older one, and a fresh
+    /// log started: the report only reads the last session, and a writer
+    /// still running keeps appending to the renamed file.
     pub(crate) fn open(path: &Path, source: Source) -> io::Result<Log> {
         if let Some(dir) = path.parent() {
             DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+            match File::open(dir) {
+                Ok(handle) => make_private(&handle, 0o700, dir),
+                Err(e) => warn!("Handoff log: cannot make {} private: {e}", dir.display()),
+            }
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)?;
+        let open = || {
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)
+        };
+        let mut file = open()?;
+        make_private(&file, 0o600, path);
+        let measured = file.metadata()?;
+        if measured.len() > MAX_LOG_BYTES {
+            let mut rotated = path.as_os_str().to_owned();
+            rotated.push(".1");
+            let rotated = PathBuf::from(rotated);
+            // The directory lock (dropped, so released, after the reopen)
+            // makes check, rename and reopen one step for other openers.
+            let fresh = File::open(path.parent().unwrap_or(Path::new("."))).and_then(|dir| {
+                #[cfg(test)]
+                if let Some(hook) = tests::BEFORE_LOCK.take() {
+                    hook();
+                }
+                dir.lock()?;
+                // Move only the file measured above: a process that lost a race
+                // with another rotator must not move that one's fresh log over .1.
+                let moved = std::fs::metadata(path).and_then(|now| {
+                    if (now.dev(), now.ino()) != (measured.dev(), measured.ino()) {
+                        return Ok(false);
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = tests::BEFORE_RENAME.take() {
+                        hook();
+                    }
+                    std::fs::rename(path, &rotated).map(|()| true)
+                });
+                match moved {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                    moved => {
+                        if let Ok(true) = moved {
+                            info!(
+                                "Handoff log: rotated {} to {}",
+                                path.display(),
+                                rotated.display()
+                            );
+                        }
+                        open()
+                    }
+                }
+            });
+            match fresh {
+                Ok(fresh) => file = fresh,
+                // debt: a failed reopen after a successful rename also lands
+                // here, so "cannot rotate" is misleading then (#111).
+                Err(e) => warn!(
+                    "Handoff log: cannot rotate {} to {}: {e}; appending to it",
+                    path.display(),
+                    rotated.display()
+                ),
+            }
+        }
         let len = file.metadata()?.len();
         let mut last = [b'\n'];
-        if len > MAX_LOG_BYTES {
-            file.set_len(0)?;
-        } else if len > 0 {
+        if len > 0 {
             file.read_exact_at(&mut last, len - 1)?;
         }
         // End a torn last record, so the session_start is a line of its own.
@@ -311,7 +384,9 @@ mod tests {
         AudioSource, AudioSourceType, ConnectedDevice, EarDetectionStatus,
     };
     use crate::handoff::{ACK_TIMEOUT, Handoff, Input};
+    use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     /// A fresh directory under the system temp dir.
@@ -468,15 +543,215 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn records(path: &Path) -> Vec<Record> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
     #[test]
-    fn open_empties_an_oversized_log() {
+    fn handoff_log_open_tightens_loose_file() {
+        let dir = temp_dir("loose-file");
+        let path = dir.join("librepods/handoff.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = r#"{"record":"session_start","ts_ms":1000,"version":"0.1.0","source":"app"}"#;
+        std::fs::write(&path, format!("{old}\n")).unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        Log::open(&path, Source::App).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().next(), Some(old), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_open_tightens_loose_dir() {
+        let dir = temp_dir("loose-dir");
+        let leaf = dir.join("librepods");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::set_permissions(&leaf, Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        Log::open(&leaf.join("handoff.jsonl"), Source::App).unwrap();
+        assert_eq!(mode(&leaf), 0o700);
+        assert_eq!(mode(&dir), 0o755);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_open_rotates_oversized() {
         let dir = temp_dir("oversized");
         let path = dir.join("handoff.jsonl");
-        std::fs::write(&path, vec![b'x'; MAX_LOG_BYTES as usize + 1]).unwrap();
+        let rotated = dir.join("handoff.jsonl.1");
+        let old = vec![b'x'; MAX_LOG_BYTES as usize + 1];
+        std::fs::write(&path, &old).unwrap();
+        std::fs::write(&rotated, b"older marker\n").unwrap();
         Log::open(&path, Source::App).unwrap();
+        assert!(std::fs::read(&rotated).unwrap() == old);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1, "{text}");
-        assert!(report(text.as_bytes()).is_some());
+        assert!(matches!(
+            serde_json::from_str(&text),
+            Ok(Record::SessionStart { .. })
+        ));
+        assert_eq!(mode(&path), 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_open_keeps_oversized_log_when_rotation_fails() {
+        let dir = temp_dir("rotate-fails");
+        let path = dir.join("handoff.jsonl");
+        let mut old = vec![b'x'; MAX_LOG_BYTES as usize + 1];
+        *old.last_mut().unwrap() = b'\n';
+        std::fs::write(&path, &old).unwrap();
+        // rename() cannot replace a non-empty directory.
+        std::fs::create_dir_all(dir.join("handoff.jsonl.1/full")).unwrap();
+        Log::open(&path, Source::App).unwrap();
+        let text = std::fs::read(&path).unwrap();
+        assert!(text.starts_with(&old), "the oversized log was truncated");
+        assert!(matches!(
+            records(&path).as_slice(),
+            [Record::SessionStart { .. }]
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_rotation_keeps_running_writer() {
+        let dir = temp_dir("rotate-running");
+        let path = dir.join("handoff.jsonl");
+        let mut filler = vec![b'x'; MAX_LOG_BYTES as usize - 1];
+        *filler.last_mut().unwrap() = b'\n';
+        std::fs::write(&path, filler).unwrap();
+        let app = Log::open(&path, Source::App).unwrap();
+        let _probe = Log::open(&path, Source::Probe).unwrap();
+        app.line("AA:BB:CC:DD:EE:FF", "REQUEST owner=linux");
+        let old = records(&dir.join("handoff.jsonl.1"));
+        assert!(
+            matches!(
+                old.as_slice(),
+                [
+                    Record::SessionStart {
+                        source: Source::App,
+                        ..
+                    },
+                    Record::Line {
+                        kind: Kind::TakeRequest,
+                        ..
+                    },
+                ]
+            ),
+            "{old:?}"
+        );
+        let new = records(&path);
+        assert!(
+            matches!(
+                new.as_slice(),
+                [Record::SessionStart {
+                    source: Source::Probe,
+                    ..
+                }]
+            ),
+            "{new:?}"
+        );
+        let report = report(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(report.take_requests, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    thread_local! {
+        /// Runs in Log::open's rotation branch after the size measurement,
+        /// just before the directory lock is taken.
+        pub(super) static BEFORE_LOCK: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+        /// Runs in Log::open between the inode check and the rename.
+        pub(super) static BEFORE_RENAME: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+    }
+
+    #[test]
+    fn handoff_log_concurrent_rotation_keeps_rotated_log() {
+        let dir = temp_dir("rotate-race");
+        let path = dir.join("handoff.jsonl");
+        let rotated = dir.join("handoff.jsonl.1");
+        let mut filler = vec![b'x'; MAX_LOG_BYTES as usize - 1];
+        *filler.last_mut().unwrap() = b'\n';
+        std::fs::write(&path, filler).unwrap();
+        let app = Log::open(&path, Source::App).unwrap();
+        // The review's GDB interleaving: a rival opener measures the same
+        // oversized log while the probe sits between its check and rename.
+        let (go, rival_go) = mpsc::channel();
+        let (measured, rival_measured) = mpsc::channel();
+        let (done, rival_done) = mpsc::channel();
+        let rival = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                rival_go.recv().unwrap();
+                BEFORE_LOCK.set(Some(Box::new(move || measured.send(()).unwrap())));
+                let log = Log::open(&path, Source::Probe).unwrap();
+                let _ = done.send(());
+                // Taken by Log::open only in the rotation branch.
+                (log, BEFORE_LOCK.take().is_none())
+            }
+        });
+        BEFORE_RENAME.set(Some(Box::new(move || {
+            go.send(()).unwrap();
+            // The proof of ordering: the rival measured the old oversized
+            // inode and is about to lock. A timeout fails (a regression
+            // would otherwise deadlock on the held lock), never passes.
+            rival_measured
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the rival never reached the lock in the rotation branch");
+            // Sanity only: with the lock held, the rival cannot finish.
+            assert!(
+                rival_done.recv_timeout(Duration::from_millis(50)).is_err(),
+                "the rival rotated while the probe held the directory lock"
+            );
+        })));
+        let _probe = Log::open(&path, Source::Probe).unwrap();
+        // Drop the hook if unused, so a waiting rival errors instead of hanging.
+        assert!(BEFORE_RENAME.take().is_none(), "the probe did not rotate");
+        let (_rival, rival_measured_old) = rival.join().unwrap();
+        assert!(rival_measured_old, "the rival did not reach the lock");
+        app.line("AA:BB:CC:DD:EE:FF", "REQUEST owner=linux");
+        let old = records(&rotated);
+        assert!(
+            matches!(
+                old.as_slice(),
+                [
+                    Record::SessionStart {
+                        source: Source::App,
+                        ..
+                    },
+                    Record::Line {
+                        kind: Kind::TakeRequest,
+                        ..
+                    },
+                ]
+            ),
+            "{old:?}"
+        );
+        let new = records(&path);
+        assert!(
+            matches!(
+                new.as_slice(),
+                [
+                    Record::SessionStart {
+                        source: Source::Probe,
+                        ..
+                    },
+                    Record::SessionStart {
+                        source: Source::Probe,
+                        ..
+                    },
+                ]
+            ),
+            "{new:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
