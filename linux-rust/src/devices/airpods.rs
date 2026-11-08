@@ -148,7 +148,13 @@ impl AirPodsDevice {
         // the microphone has no transport either. Claim a profile right away.
         let mc_profile = media_controller.clone();
         tokio::spawn(async move {
-            mc_profile.lock().await.activate_a2dp_profile().await;
+            // Activation can take tens of seconds on a slow card (enumeration
+            // waits, card lookups, a WirePlumber restart). Clone the controller
+            // (its state is shared) and release the outer lock before awaiting,
+            // so the playback listener, ear detection and ownership handling
+            // are not stalled behind it.
+            let mc = mc_profile.lock().await.clone();
+            mc.activate_a2dp_profile().await;
         });
 
         let mc_listener = media_controller.lock().await;
