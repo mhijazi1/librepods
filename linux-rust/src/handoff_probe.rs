@@ -984,7 +984,8 @@ mod tests {
     #[tokio::test]
     async fn init_backlog_without_echo_has_no_boundary() {
         // Real time: the crate's tokio has no `test-util`, so no
-        // `tokio::time::pause`; this waits `INIT_ECHO_WAIT` once.
+        // `tokio::time::pause`; this waits `INIT_ECHO_WAIT` once. `tx` stays
+        // open, so only that bound ends the wait.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(hosts_event()).unwrap();
         tx.send(owns_event(0)).unwrap();
@@ -996,7 +997,6 @@ mod tests {
             named(&backlog.events),
             named(&[hosts_event(), owns_event(0)])
         );
-        drop(tx);
     }
 
     #[test]

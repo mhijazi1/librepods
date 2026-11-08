@@ -1451,16 +1451,16 @@ mod tests {
         })
         .await;
         h.emit(AACPEvent::OwnershipToFalseRequest);
-        let remote = || -> Vec<usize> {
+        let remotes = || -> Vec<usize> {
             let trace = traced(mac);
             (0..trace.len())
                 .filter(|&i| trace[i].starts_with("REMOTE requested ownership"))
                 .collect()
         };
-        wait_until("the post-snapshot request", || remote().len() == 2).await;
+        wait_until("the post-snapshot request", || remotes().len() == 2).await;
         let trace = traced(mac);
         let boundary = position(&trace, "BACKLOG drained");
-        let remote = remote();
+        let remote = remotes();
         assert!(remote[0] < boundary && boundary < remote[1], "{trace:#?}");
         assert_eq!(
             trace
