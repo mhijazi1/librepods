@@ -2011,6 +2011,7 @@ mod tests {
             monitor: false,
             index,
             corked: false,
+            muted: false,
         }
     }
 
@@ -2164,6 +2165,30 @@ mod tests {
         tokio::time::sleep(STREAM_TEST_MIN / 5).await;
         streams.set(vec![event_sound(21)]);
         tokio::time::sleep(STREAM_TEST_MIN).await;
+
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        assert_eq!(h.activations(), 1);
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_muted_stream_never_takes() {
+        let mac = "5A:00:00:00:00:11";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let streams = LiveStreams::default();
+        let h =
+            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+        expect_startup(&h, &mut rx).await;
+        // The baseline has no stream.
+        streams.settle().await;
+        // A new, uncorked but muted music stream (a muted autoplaying tab),
+        // for well over the minimum.
+        streams.set(vec![StreamProps {
+            muted: true,
+            ..music(41)
+        }]);
+        tokio::time::sleep(STREAM_TEST_MIN * 2 + STREAM_TEST_MIN / 2).await;
 
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
