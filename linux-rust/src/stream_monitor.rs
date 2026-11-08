@@ -31,8 +31,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
@@ -609,13 +609,91 @@ const PEAK_RETRY: Duration = Duration::from_secs(2);
 /// peak thread leaves every stream silent (stream playback never counts;
 /// MPRIS still does).
 pub(crate) struct PulsePeaks {
-    candidates: Sender<HashSet<u32>>,
+    candidates: CandidateTx,
     peaks: Arc<Mutex<HashMap<u32, f32>>>,
+}
+
+/// The candidate hand-over to the peak thread: at most one pending set, the
+/// newest, so a stalled peak thread neither grows memory nor replays stale
+/// sets. `closed` is set once the `CandidateTx` is dropped.
+#[derive(Default)]
+struct Slot {
+    set: Option<HashSet<u32>>,
+    closed: bool,
+}
+
+impl Slot {
+    fn empty(&mut self) -> bool {
+        self.set.is_none() && !self.closed
+    }
+}
+
+type SharedSlot = Arc<(Mutex<Slot>, Condvar)>;
+
+/// The producer side of the hand-over; dropping it closes the slot.
+struct CandidateTx(SharedSlot);
+
+/// The consumer side of the hand-over. A set offered before the producer
+/// was dropped is still taken before `Disconnected`.
+struct CandidateRx(SharedSlot);
+
+fn candidate_slot() -> (CandidateTx, CandidateRx) {
+    let shared = SharedSlot::default();
+    (CandidateTx(shared.clone()), CandidateRx(shared))
+}
+
+impl CandidateTx {
+    /// Replace the pending set with `set`; never waits on the consumer.
+    fn offer(&self, set: HashSet<u32>) {
+        let (slot, ready) = &*self.0;
+        slot.lock().unwrap_or_else(PoisonError::into_inner).set = Some(set);
+        ready.notify_one();
+    }
+}
+
+impl Drop for CandidateTx {
+    fn drop(&mut self) {
+        let (slot, ready) = &*self.0;
+        slot.lock().unwrap_or_else(PoisonError::into_inner).closed = true;
+        ready.notify_one();
+    }
+}
+
+impl CandidateRx {
+    /// The pending set, waiting for one; `Disconnected` once the slot is
+    /// closed and empty.
+    fn take(&self) -> Result<HashSet<u32>, RecvTimeoutError> {
+        let (slot, ready) = &*self.0;
+        let slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut slot = ready
+            .wait_while(slot, Slot::empty)
+            .unwrap_or_else(PoisonError::into_inner);
+        slot.set.take().ok_or(RecvTimeoutError::Disconnected)
+    }
+
+    /// As `take`, but `Timeout` once `timeout` passes with nothing offered.
+    fn take_timeout(&self, timeout: Duration) -> Result<HashSet<u32>, RecvTimeoutError> {
+        let (slot, ready) = &*self.0;
+        let slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut slot, _) = ready
+            .wait_timeout_while(slot, timeout, Slot::empty)
+            .unwrap_or_else(PoisonError::into_inner);
+        match slot.set.take() {
+            Some(set) => Ok(set),
+            None if slot.closed => Err(RecvTimeoutError::Disconnected),
+            None => Err(RecvTimeoutError::Timeout),
+        }
+    }
+
+    #[cfg(test)]
+    fn try_take(&self) -> Option<HashSet<u32>> {
+        self.take_timeout(Duration::ZERO).ok()
+    }
 }
 
 impl PulsePeaks {
     pub(crate) fn new() -> Self {
-        let (candidates, rx) = std::sync::mpsc::channel();
+        let (candidates, rx) = candidate_slot();
         let peaks: Arc<Mutex<HashMap<u32, f32>>> = Arc::default();
         let thread_peaks = peaks.clone();
         if let Err(e) = std::thread::Builder::new()
@@ -631,7 +709,7 @@ impl PulsePeaks {
 impl PeakSource for PulsePeaks {
     fn levels(&mut self, candidates: &HashSet<u32>) -> HashMap<u32, f32> {
         // A dead peak thread only leaves the streams silent.
-        let _ = self.candidates.send(candidates.clone());
+        self.candidates.offer(candidates.clone());
         let mut peaks =
             std::mem::take(&mut *self.peaks.lock().unwrap_or_else(PoisonError::into_inner));
         peaks.retain(|index, _| candidates.contains(index));
@@ -654,7 +732,7 @@ struct PeakStream {
 /// stream that failed (its connection dropped, or its sink input moved or
 /// ended) is reopened with the next candidate set; one that could not be
 /// opened is retried after `PEAK_RETRY`.
-fn peak_thread(candidates: &Receiver<HashSet<u32>>, peaks: &Mutex<HashMap<u32, f32>>) {
+fn peak_thread(candidates: &CandidateRx, peaks: &Mutex<HashMap<u32, f32>>) {
     let Some(mut mainloop) = Mainloop::new() else {
         log::warn!("Stream monitor: no peak mainloop, so streams read silent");
         return;
@@ -665,11 +743,9 @@ fn peak_thread(candidates: &Receiver<HashSet<u32>>, peaks: &Mutex<HashMap<u32, f
     loop {
         // Idle (no stream to read) until the next candidate set.
         let next = if streams.is_empty() {
-            candidates
-                .recv()
-                .map_err(|_| RecvTimeoutError::Disconnected)
+            candidates.take()
         } else {
-            candidates.recv_timeout(PEAK_TICK)
+            candidates.take_timeout(PEAK_TICK)
         };
         match next {
             Ok(wanted) => {
@@ -1925,5 +2001,71 @@ mod tests {
             assert!(Instant::now() < deadline, "peak thread still running");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn candidate_slot_keeps_only_newest() {
+        let (tx, rx) = candidate_slot();
+        for i in 0..1000 {
+            tx.offer(HashSet::from([i]));
+        }
+        assert_eq!(rx.take(), Ok(HashSet::from([999])));
+        assert_eq!(rx.try_take(), None);
+    }
+
+    #[test]
+    fn candidate_offer_never_waits_on_a_stuck_consumer() {
+        let (tx, _rx) = candidate_slot();
+        let start = Instant::now();
+        for i in 0..1000 {
+            tx.offer(HashSet::from([i]));
+        }
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn candidate_take_timeout_times_out_with_nothing_offered() {
+        let (_tx, rx) = candidate_slot();
+        let start = Instant::now();
+        assert_eq!(
+            rx.take_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
+    }
+
+    #[test]
+    fn candidate_slot_closes_when_producer_dropped() {
+        let (tx, rx) = candidate_slot();
+        let (done, result) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done.send(rx.take()).unwrap();
+            rx
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        drop(tx);
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(RecvTimeoutError::Disconnected))
+        );
+        let rx = waiter.join().unwrap();
+        assert_eq!(rx.take(), Err(RecvTimeoutError::Disconnected));
+        let start = Instant::now();
+        assert_eq!(
+            rx.take_timeout(Duration::from_secs(5)),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn candidate_set_offered_before_drop_is_delivered_first() {
+        let (tx, rx) = candidate_slot();
+        tx.offer(HashSet::from([7]));
+        drop(tx);
+        assert_eq!(rx.take_timeout(PEAK_TICK), Ok(HashSet::from([7])));
+        assert_eq!(rx.take(), Err(RecvTimeoutError::Disconnected));
     }
 }
