@@ -1,0 +1,25 @@
+{"record":"session_start","ts_ms":1762580000000,"version":"0.1.0","source":"probe"}
+{"record":"line","ts_ms":1762580001000,"mac":"AA:BB:CC:DD:EE:FF","kind":"take_request","line":"REQUEST owner=linux"}
+{"record":"line","ts_ms":1762580001100,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_linux","line":"ACK owner=linux elapsed_ms=100"}
+{"record":"line","ts_ms":1762580002000,"mac":"AA:BB:CC:DD:EE:FF","kind":"blocked","line":"BLOCKED take needs Linux plus a remote host, an in-ear bud, and confirmed idle audio"}
+{"record":"line","ts_ms":1762580003000,"mac":"AA:BB:CC:DD:EE:FF","kind":"yield","line":"YIELD owner=not-linux; another host has the AirPods; Linux gave up its take"}
+{"record":"line","ts_ms":1762580009000,"mac":"AA:BB:CC:DD:EE:FF","kind":"timeout","line":"TIMEOUT ownership acknowledgement not received; audible handoff unconfirmed"}
+{"record":"session_start","ts_ms":1762590000000,"version":"0.1.0","source":"app"}
+{"record":"line","ts_ms":1762590001000,"mac":"AA:BB:CC:DD:EE:FF","kind":"other","line":"AUTO enabled; waiting for a new playback start after the baseline"}
+{"record":"line","ts_ms":1762590002000,"mac":"AA:BB:CC:DD:EE:FF","kind":"take_request","line":"AUTO playback started; requested Linux ownership"}
+{"record":"line","ts_ms":1762590002100,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_linux","line":"ACK owner=linux elapsed_ms=100"}
+{"record":"line","ts_ms":1762590010000,"mac":"AA:BB:CC:DD:EE:FF","kind":"other","line":"AUTO playback stopped; releasing ownership"}
+{"record":"line","ts_ms":1762590010080,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_not_linux","line":"ACK owner=not-linux elapsed_ms=80"}
+{"record":"line","ts_ms":1762590020000,"mac":"AA:BB:CC:DD:EE:FF","kind":"take_request","line":"REQUEST owner=linux"}
+{"record":"line","ts_ms":1762590025001,"mac":"AA:BB:CC:DD:EE:FF","kind":"timeout","line":"TIMEOUT ownership acknowledgement not received; audible handoff unconfirmed"}
+{"record":"line","ts_ms":1762590030000,"mac":"AA:BB:CC:DD:EE:FF","kind":"blocked","line":"BLOCKED take needs Linux plus a remote host, an in-ear bud, and confirmed idle audio"}
+{"record":"line","ts_ms":1762590040000,"mac":"AA:BB:CC:DD:EE:FF","kind":"take_request","line":"AUTO playback started; requested Linux ownership"}
+{"record":"line","ts_ms":1762590040150,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_linux","line":"ACK owner=linux elapsed_ms=150"}
+{"record":"line","ts_ms":1762590050000,"mac":"AA:BB:CC:DD:EE:FF","kind":"yield","line":"YIELD owner=not-linux; another host has the AirPods; Linux gave up its take and paused local playback"}
+{"record":"line","ts_ms":1762590055000,"mac":"AA:BB:CC:DD:EE:FF","kind":"take_request","line":"AUTO playback restarted during the release; requested Linux ownership"}
+{"record":"line","ts_ms":1762590060000,"mac":"AA:BB:CC:DD:EE:FF","kind":"yield","line":"REMOTE requested ownership; yielding"}
+{"record":"line","ts_ms":1762590060100,"mac":"AA:BB:CC:DD:EE:FF","kind":"ack_not_linux","line":"ACK owner=not-linux elapsed_ms=100"}
+{"record":"line","ts_ms":1762590070000,"mac":"AA:BB:CC:DD:EE:FF","kind":"other","line":"DISCONNECTED clearing ownership and playback baseline"}
+{"record":"line","ts_ms":1762590093000,"mac":"AA:BB:CC:DD:EE:FF","kind":"reconnect_failed","line":"RECONNECT failed: Connection refused; retrying in 2s"}
+{"record":"line","ts_ms":1762590095500,"mac":"AA:BB:CC:DD:EE:FF","kind":"other","line":"RECONNECTED with fresh routing and wear state"}
+{"record":"line","ts_ms":17625901
