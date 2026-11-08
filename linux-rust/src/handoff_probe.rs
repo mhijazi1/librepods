@@ -329,6 +329,8 @@ impl Io {
                 Command::RouteToAirPods | Command::RouteAway => {
                     println!("Default sink routing is not run by the probe")
                 }
+                // The probe never enables the A2DP hold.
+                Command::HoldA2dp(_) => println!("A2DP hold is not run by the probe"),
                 Command::Exit => return Ok(true),
                 Command::Fail(reason) => return Err(reason.into()),
             }

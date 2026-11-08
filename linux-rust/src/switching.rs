@@ -124,6 +124,9 @@ pub(crate) trait MediaActions: Send + Sync {
     fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()>;
     /// Enqueue a default sink route (#40); never waits for the sound server.
     fn route_default_sink(&self, event: SinkEvent);
+    /// Mark the A2DP hold (#264) at once, then enqueue its card write with
+    /// the routes; never waits for the sound server.
+    fn hold_a2dp(&self, hold: bool);
 }
 
 /// Blocking: pauses the local players and reports what it did.
@@ -173,6 +176,11 @@ impl MediaActions for ControllerMedia {
 
     fn route_default_sink(&self, event: SinkEvent) {
         self.sinks.route(event);
+    }
+
+    fn hold_a2dp(&self, hold: bool) {
+        self.controller.set_a2dp_held(hold);
+        self.sinks.route(SinkEvent::Hold(hold));
     }
 }
 
@@ -539,6 +547,7 @@ impl Shell {
                 }
                 Command::RouteToAirPods => self.media.route_default_sink(SinkEvent::Take),
                 Command::RouteAway => self.media.route_default_sink(SinkEvent::Yield),
+                Command::HoldA2dp(hold) => self.media.hold_a2dp(hold),
                 Command::DropSession => {
                     self.resume = None;
                     info!(
@@ -653,7 +662,8 @@ async fn run_handoff(mut shell: Shell) {
     let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true)
         .with_connect_mode(shell.connect_mode)
         .with_last_owner_linux(last_owner_linux(&shell.mac))
-        .with_default_sink_routing(true);
+        .with_default_sink_routing(true)
+        .with_a2dp_hold(true);
     for input in seed_inputs(facts) {
         if step(&mut core, &mut shell, input).await {
             return;
@@ -1115,6 +1125,8 @@ mod tests {
         activations: AtomicUsize,
         /// Not traced, so the trace assertions don't see them.
         routes: StdMutex<Vec<SinkEvent>>,
+        /// `routes.len()` at each resume chain spawn (#264).
+        resume_spawns: StdMutex<Vec<usize>>,
     }
 
     /// Records the media actions instead of touching D-Bus or PipeWire. The
@@ -1141,6 +1153,8 @@ mod tests {
             until: Instant,
             cancel: oneshot::Receiver<()>,
         ) -> BoxFuture<'static, ()> {
+            let routed = self.records.routes.lock().unwrap().len();
+            self.records.resume_spawns.lock().unwrap().push(routed);
             let io = FakeResume {
                 mac: self.mac.clone(),
             };
@@ -1149,6 +1163,14 @@ mod tests {
 
         fn route_default_sink(&self, event: SinkEvent) {
             self.records.routes.lock().unwrap().push(event);
+        }
+
+        fn hold_a2dp(&self, hold: bool) {
+            self.records
+                .routes
+                .lock()
+                .unwrap()
+                .push(SinkEvent::Hold(hold));
         }
     }
 
@@ -1613,6 +1635,14 @@ mod tests {
         }
 
         fn routes(&self) -> Vec<SinkEvent> {
+            self.sink_events()
+                .into_iter()
+                .filter(|e| !matches!(e, SinkEvent::Hold(_)))
+                .collect()
+        }
+
+        /// The routes and A2DP holds (#264), in the order the shell asked.
+        fn sink_events(&self) -> Vec<SinkEvent> {
             self.records.routes.lock().unwrap().clone()
         }
     }
@@ -3952,5 +3982,42 @@ mod tests {
         assert!(!last_owner_linux(B));
         remember_last_owner_linux(A, false);
         assert!(!last_owner_linux(A));
+    }
+
+    /// #264: a take, a remote yield, then a retake: the hold, then its
+    /// release before the retake's route and resume chain.
+    #[tokio::test]
+    async fn hold_on_remote_yield_released_before_retake_route() {
+        let mac = "5A:00:00:00:01:08";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        expect_startup(&h, &mut rx).await;
+        expect_take(&h, &mut rx).await;
+        h.emit(owns(1));
+        wait_until("the take's route", || !h.routes().is_empty()).await;
+
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        h.emit(owns(0));
+        wait_until("the hold", || {
+            h.sink_events().contains(&SinkEvent::Hold(true))
+        })
+        .await;
+
+        h.a2dp(false).await;
+        h.play(false).await;
+        h.play(true).await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        h.emit(owns(1));
+        wait_until("the resume chain's start", || {
+            !resume_actions(mac).is_empty()
+        })
+        .await;
+        use SinkEvent::{Hold, Take, Yield};
+        let events = [Hold(false), Take, Yield, Hold(true), Hold(false), Take];
+        assert_eq!(h.sink_events(), events);
+        // The chain was spawned after the release and the retake's route.
+        assert_eq!(*h.records.resume_spawns.lock().unwrap(), [events.len()]);
+        stop_handoff_task(mac);
     }
 }

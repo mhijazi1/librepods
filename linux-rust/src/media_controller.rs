@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -509,6 +509,44 @@ fn select_a2dp_profile(
         })
 }
 
+/// Longest the A2DP hold's release waits for the AirPods sink (#264).
+pub(crate) const HOLD_RELEASE_WAIT: Duration = Duration::from_secs(3);
+
+/// The A2DP hold's write (#264): `off`, only from an active A2DP profile, so
+/// a call, a card already off or an unknown profile is left alone.
+fn hold_profile(active: Option<&str>) -> Option<&'static str> {
+    active.filter(|p| p.starts_with("a2dp")).map(|_| "off")
+}
+
+/// The hold's release (#264): the A2DP choice, only from `off`, so it never
+/// breaks a call or undoes a profile the user chose.
+fn release_profile(
+    available: &[String],
+    active: Option<&str>,
+    cached: Option<&str>,
+    preferred: crate::utils::PreferredCodec,
+) -> Option<String> {
+    match select_a2dp_profile(available, active, cached, preferred) {
+        ProfileChoice::Activate(profile) if active == Some("off") => Some(profile),
+        _ => None,
+    }
+}
+
+/// Poll `sink` until it finds the AirPods sink, at most `HOLD_RELEASE_WAIT`.
+async fn wait_for_sink<F, Fut>(mut sink: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
+    tokio::time::timeout(HOLD_RELEASE_WAIT, async {
+        while sink().await.is_none() {
+            tokio::time::sleep(CARD_LOOKUP_INTERVAL).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 /// Make sure the card offers an A2DP profile: check once, then wait up to
 /// `attempts` checks `interval` apart, then `restart` WirePlumber exactly once
 /// and wait the same way again. No sleep follows the final check of a wait.
@@ -619,6 +657,9 @@ pub struct MediaController {
     /// `pause_all_media` calls in flight. Released under `state` together
     /// with the self-pause flag they set; read under `state` by the listener.
     ownership_pauses: Arc<AtomicUsize>,
+    /// The handoff's A2DP hold is on (#264): `activate_a2dp_profile` writes
+    /// nothing. Set synchronously by the shell, in emit order.
+    a2dp_held: Arc<AtomicBool>,
 }
 
 impl MediaController {
@@ -629,6 +670,7 @@ impl MediaController {
         MediaController {
             state: Arc::new(Mutex::new(state)),
             ownership_pauses: Arc::new(AtomicUsize::new(0)),
+            a2dp_held: Arc::default(),
         }
     }
 
@@ -1155,6 +1197,9 @@ impl MediaController {
         P: FnOnce(u32, String) -> PFut,
         PFut: Future<Output = bool>,
     {
+        if self.a2dp_hold_skips() {
+            return Ok(());
+        }
         // Always resolve the card by MAC first: a reconnect can change its index.
         let index = before_deadline(deadline, lookup).await?;
         self.state.lock().await.device_index = index;
@@ -1195,6 +1240,10 @@ impl MediaController {
             ProfileChoice::Activate(profile) => profile,
         };
 
+        // A hold that started during the activation wins (#264).
+        if self.a2dp_hold_skips() {
+            return Ok(());
+        }
         info!("Activating A2DP profile for AirPods: {}", preferred_profile);
         if before_deadline(deadline, || set(idx, preferred_profile.clone())).await? {
             info!("Successfully activated A2DP profile: {}", preferred_profile);
@@ -1480,6 +1529,78 @@ impl MediaController {
             info!("Successfully deactivated A2DP profile");
         } else {
             warn!("Failed to deactivate A2DP profile");
+        }
+    }
+
+    /// Mark the A2DP hold on or off (#264). The handoff shell calls it in
+    /// emit order, before `apply_a2dp_hold` runs on the router's worker.
+    pub(crate) fn set_a2dp_held(&self, held: bool) {
+        self.a2dp_held.store(held, Ordering::SeqCst);
+    }
+
+    /// The A2DP hold is on, so an activation must not write (#264).
+    fn a2dp_hold_skips(&self) -> bool {
+        let held = self.a2dp_held.load(Ordering::SeqCst);
+        if held {
+            info!("A2DP activation skipped: another host owns the AirPods (A2DP hold)");
+        }
+        held
+    }
+
+    /// Turn the card `off` (`hold`), or back to the A2DP choice from `off`,
+    /// from one card read (#264). A release then waits for the AirPods sink,
+    /// at most `HOLD_RELEASE_WAIT`. Never suspends a sink or moves streams.
+    pub(crate) async fn apply_a2dp_hold(&self, hold: bool) {
+        if hold && !self.a2dp_held.load(Ordering::SeqCst) {
+            // A release emitted since: `off` now would only cut Linux's audio.
+            debug!("A2DP hold: already released, card left as is");
+            return;
+        }
+        let (mac, cached) = {
+            let state = self.state.lock().await;
+            (
+                state.connected_device_mac.clone(),
+                state.cached_a2dp_profile.clone(),
+            )
+        };
+        let card_mac = mac.clone();
+        let card = tokio::task::spawn_blocking(move || {
+            get_card_info_list_sync().into_iter().find(|card| {
+                card.device_string
+                    .as_deref()
+                    .is_some_and(|d| d.contains(&card_mac))
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(card) = card else {
+            debug!("A2DP hold({hold}): no card for {mac}");
+            return;
+        };
+        let active = card.active_profile.as_deref();
+        let profile = if hold {
+            hold_profile(active).map(str::to_string)
+        } else {
+            release_profile(
+                &card.profiles,
+                active,
+                Some(&cached),
+                crate::utils::load_preferred_codec(),
+            )
+        };
+        let Some(profile) = profile else {
+            debug!("A2DP hold({hold}): card profile {active:?} left as is");
+            return;
+        };
+        let (index, write) = (card.index, profile.clone());
+        if !blocking(move || set_card_profile_sync(index, &write)).await {
+            warn!("A2DP hold({hold}): failed to set the card to {profile}");
+            return;
+        }
+        info!("A2DP hold({hold}): card set to {profile}");
+        if !hold && !wait_for_sink(|| get_sink_name_by_mac(&mac)).await {
+            info!("A2DP hold released; no AirPods sink within {HOLD_RELEASE_WAIT:?}");
         }
     }
 
@@ -3618,5 +3739,111 @@ mod tests {
         let (ok, checks, restarts, sleeps) = run_recovery(None, false).await;
         assert!(!ok);
         assert_eq!((checks, restarts, sleeps), (1 + attempts, 1, attempts - 1));
+    }
+
+    // #264: the A2DP hold.
+
+    #[test]
+    fn hold_profile_turns_a2dp_off() {
+        for active in ALL_A2DP {
+            assert_eq!(hold_profile(Some(active)), Some("off"));
+        }
+    }
+
+    #[test]
+    fn hold_profile_leaves_off_call_and_unknown() {
+        for active in [Some("off"), Some("headset-head-unit"), None] {
+            assert_eq!(hold_profile(active), None, "{active:?}");
+        }
+    }
+
+    #[test]
+    fn release_profile_from_off_takes_the_a2dp_choice() {
+        let available = profiles(&["off", "a2dp-sink-sbc", "a2dp-sink"]);
+        let release =
+            |cached| release_profile(&available, Some("off"), cached, PreferredCodec::Aac);
+        // The cached choice if available, else the preferred order.
+        assert_eq!(release(Some("a2dp-sink-sbc")), Some("a2dp-sink-sbc".into()));
+        assert_eq!(release(Some("a2dp-sink-sbc_xq")), Some("a2dp-sink".into()));
+        assert_eq!(release(None), Some("a2dp-sink".into()));
+    }
+
+    #[test]
+    fn release_profile_leaves_any_other_profile() {
+        let available = profiles(&["off", "a2dp-sink", "headset-head-unit"]);
+        for active in [Some("a2dp-sink"), Some("headset-head-unit"), None] {
+            assert_eq!(
+                release_profile(&available, active, Some("a2dp-sink"), PreferredCodec::Aac),
+                None,
+                "{active:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_release_wait_ends_after_the_bound_without_a_sink() {
+        let start = Instant::now();
+        assert!(!wait_for_sink(|| async { None }).await);
+        assert_eq!(start.elapsed(), HOLD_RELEASE_WAIT);
+        assert!(HOLD_RELEASE_WAIT <= Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_release_wait_ends_once_the_sink_appears() {
+        let start = Instant::now();
+        assert!(wait_for_sink(|| async { Some("bluez_output.AA".to_string()) }).await);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        // Found on the third look.
+        let looks = std::cell::Cell::new(0);
+        let found = wait_for_sink(|| {
+            looks.set(looks.get() + 1);
+            let found = looks.get() == 3;
+            async move { found.then(|| "bluez_output.AA".to_string()) }
+        })
+        .await;
+        assert!(found);
+        assert_eq!(start.elapsed(), 2 * CARD_LOOKUP_INTERVAL);
+    }
+
+    /// An activation with every step immediate; `choose` runs `during` and
+    /// asks for `a2dp-sink`. Returns the profiles `set` was called with.
+    async fn activate_held(held: bool, during: impl FnOnce(&MediaController)) -> Vec<String> {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(held);
+        let sets = std::cell::RefCell::new(Vec::new());
+        let deadline = Instant::now() + A2DP_ACTIVATION_DEADLINE;
+        let outcome = controller
+            .activate_a2dp_profile_with(
+                deadline,
+                || async { Some(3) },
+                || async { true },
+                |_| {
+                    during(&controller);
+                    async { ProfileChoice::Activate("a2dp-sink".to_string()) }
+                },
+                |_, profile| {
+                    sets.borrow_mut().push(profile);
+                    async { true }
+                },
+            )
+            .await;
+        assert_eq!(outcome, Ok(()));
+        sets.into_inner()
+    }
+
+    #[tokio::test]
+    async fn activate_skips_while_held() {
+        assert_eq!(activate_held(true, |_| {}).await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn activate_runs_when_not_held() {
+        assert_eq!(activate_held(false, |_| {}).await, ["a2dp-sink"]);
+    }
+
+    #[tokio::test]
+    async fn activate_skips_hold_set_mid_activation() {
+        let sets = activate_held(false, |c| c.set_a2dp_held(true)).await;
+        assert_eq!(sets, Vec::<String>::new());
     }
 }

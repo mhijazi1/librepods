@@ -19,6 +19,9 @@ pub(crate) enum SinkEvent {
     Take,
     /// Linux lost them.
     Yield,
+    /// The handoff's A2DP hold on or off (#264); queued with the routes so
+    /// `settled()` covers it and a later `Take` finds the AirPods sink.
+    Hold(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +55,7 @@ pub(crate) fn plan_default_sink(
             None,
         ),
         (SinkEvent::Yield, _) => (Vec::new(), None),
+        (SinkEvent::Hold(_), _) => (Vec::new(), remembered.map(str::to_string)),
     }
 }
 
@@ -61,6 +65,9 @@ pub(crate) trait DefaultSinkIo: Send + Sync + 'static {
     fn airpods_sink(&self) -> BoxFuture<'static, Option<String>>;
     /// True when the server accepted `name` as the default sink.
     fn set_default(&self, name: String) -> BoxFuture<'static, bool>;
+    /// Apply the A2DP hold (#264); a release returns once the AirPods sink
+    /// is back or its wait ran out.
+    fn hold_a2dp(&self, hold: bool) -> BoxFuture<'static, ()>;
 }
 
 /// Enqueues route events for one worker task, which ends when this drops.
@@ -129,6 +136,10 @@ async fn apply(
     remembered: Option<String>,
     event: SinkEvent,
 ) -> Option<String> {
+    if let SinkEvent::Hold(hold) = event {
+        io.hold_a2dp(hold).await;
+        return remembered;
+    }
     let airpods = io.airpods_sink().await;
     let current = io.current_default().await;
     let (actions, next) = plan_default_sink(
@@ -177,6 +188,11 @@ impl DefaultSinkIo for MediaController {
                 .await
                 .unwrap_or(false)
         })
+    }
+
+    fn hold_a2dp(&self, hold: bool) -> BoxFuture<'static, ()> {
+        let controller = self.clone();
+        Box::pin(async move { controller.apply_a2dp_hold(hold).await })
     }
 }
 
@@ -329,6 +345,17 @@ mod tests {
                     gate.notified().await;
                 }
                 ok
+            })
+        }
+
+        /// Recorded in `sets`, so the order shows; gated like a set.
+        fn hold_a2dp(&self, hold: bool) -> BoxFuture<'static, ()> {
+            self.sets.lock().unwrap().push(format!("Hold({hold})"));
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
             })
         }
     }
@@ -488,5 +515,54 @@ mod tests {
         let settled = router.settled();
         drop((rx, applied));
         settles(settled).await;
+    }
+
+    #[test]
+    fn hold_plan_sets_nothing_and_keeps_memory() {
+        for hold in [true, false] {
+            assert_eq!(
+                plan_default_sink(
+                    Some(DAC),
+                    Some(AIRPODS),
+                    Some(AIRPODS),
+                    SinkEvent::Hold(hold)
+                ),
+                (vec![], Some(DAC.to_string()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_release_then_take_settle_in_send_order() {
+        let gate = Arc::new(Notify::new());
+        let sinks = FakeSinks {
+            gate: Some(gate.clone()),
+            ..FakeSinks::new(false)
+        };
+        let router = DefaultSinkRouter::spawn(sinks.clone());
+        router.route(SinkEvent::Hold(false));
+        router.route(Take);
+        let both = router.settled();
+        tokio::pin!(both);
+        let sinks = &sinks;
+        let in_flight = move |n| {
+            tokio::time::timeout(Duration::from_secs(3), async move {
+                while sinks.sets().len() < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        in_flight(1).await.expect("the release");
+        let held = tokio::time::timeout(Duration::from_millis(100), &mut both).await;
+        assert!(held.is_err(), "settled before the release finished");
+        // The take waits for the slow release.
+        assert_eq!(sinks.sets(), ["Hold(false)"]);
+        gate.notify_one();
+        in_flight(2).await.expect("the take's set_default");
+        let held = tokio::time::timeout(Duration::from_millis(100), &mut both).await;
+        assert!(held.is_err(), "settled before the take finished");
+        gate.notify_one();
+        settles(both).await;
+        assert_eq!(sinks.sets(), ["Hold(false)", AIRPODS]);
     }
 }

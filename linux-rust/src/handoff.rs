@@ -184,6 +184,10 @@ pub(crate) enum Command {
     /// Give the default sink back to the one `RouteToAirPods` replaced, if
     /// the AirPods are still default (#40).
     RouteAway,
+    /// Turn the AirPods card `off` while another host owns them and Linux
+    /// holds no take, so PipeWire can't re-acquire A2DP; false turns it back
+    /// to A2DP from `off` (#264). Only when `with_a2dp_hold` enables it.
+    HoldA2dp(bool),
     /// Stop the probe.
     Exit,
     /// Stop the probe with this error.
@@ -297,6 +301,14 @@ pub(crate) struct Handoff {
     /// This take already sent `RouteAway`; the next take clears it, so a
     /// timed-out remote release's later loss sends no second one.
     routed_away: bool,
+    /// Emit `HoldA2dp` (#264).
+    a2dp_hold: bool,
+    /// Another host got the AirPods while Linux held no take (#264). Set by
+    /// the hold edges, cleared by an OwnsConnection=1 and a disconnect; a
+    /// pending, refused or lost take keeps it.
+    remote_owns: bool,
+    /// The last `HoldA2dp` emitted; None until a session start emits one.
+    held: Option<bool>,
 }
 
 impl Handoff {
@@ -342,7 +354,17 @@ impl Handoff {
             lines: Vec::new(),
             default_sink_routing: false,
             routed_away: false,
+            a2dp_hold: false,
+            remote_owns: false,
+            held: None,
         }
+    }
+
+    /// Hold the AirPods card `off` while another host owns them (#264); off
+    /// by default.
+    pub(crate) fn with_a2dp_hold(mut self, enabled: bool) -> Self {
+        self.a2dp_hold = enabled;
+        self
     }
 
     /// Route the default sink to the AirPods on a take's ACK and away on
@@ -420,6 +442,10 @@ impl Handoff {
             Input::AudioSource(source) => {
                 if self.remote_took(&source) {
                     self.last_owner_linux = false;
+                    // While Linux holds a take, the [0] that follows yields.
+                    if !self.requested_take {
+                        self.hold_for_remote(out);
+                    }
                 }
                 self.audio = Some(source);
             }
@@ -486,6 +512,7 @@ impl Handoff {
                     self.play_during_release = false;
                     self.last_owner_linux = false;
                     self.say("REMOTE requested ownership; release already pending");
+                    self.hold_for_remote(out);
                     return;
                 }
                 if self.pending.is_none()
@@ -513,10 +540,12 @@ impl Handoff {
                 }
                 if self.owner.as_deref() == Some(&[0]) && !self.requested_take {
                     self.say("REMOTE requested ownership; Linux already yielded");
+                    self.hold_for_remote(out);
                     return;
                 }
                 self.say("REMOTE requested ownership; yielding");
                 self.request(now, false, Cause::Remote, out);
+                self.hold_for_remote(out);
             }
             Input::SessionLost => {
                 if self.live() {
@@ -550,6 +579,9 @@ impl Handoff {
                 }
                 // Queued replays are fed before REPL input, so the #79 exemption can end here.
                 self.snapshot_hosts.clear();
+                // A session start: restores a card an earlier run left `off`
+                // (#264); before ConnectA2dp, which the hold blocks.
+                self.sync_hold(true, out);
                 out.push(Command::ConnectA2dp);
                 if !self.requested_take && self.pending.is_none() {
                     // Tracked like a playback-stop release (#54). A release
@@ -595,7 +627,10 @@ impl Handoff {
                     self.say("REQUEST owner=not-linux");
                 }
             }
-            Input::Quit => self.quitting = true,
+            Input::Quit => {
+                self.quitting = true;
+                self.sync_hold(false, out);
+            }
             Input::LocalCall(in_call) => self.local_call(now, in_call, out),
             Input::Tick => self.tick(now, out),
             Input::A2dpTransport { active } => self.a2dp_active = Some(active),
@@ -733,6 +768,9 @@ impl Handoff {
         self.owner = Some(value.clone());
         if value == [1] {
             self.last_owner_linux = true;
+            // Before a take's RouteToAirPods and ResumeA2dp (#264).
+            self.remote_owns = false;
+            self.sync_hold(false, out);
         }
         if value == [0] && self.reconnect_take_pending {
             // A stale report queued while the reconnected session
@@ -787,7 +825,10 @@ impl Handoff {
                     return;
                 }
                 // Another host took the AirPods without asking.
-                None if was_linux => self.last_owner_linux = false,
+                None if was_linux => {
+                    self.last_owner_linux = false;
+                    self.hold_for_remote(out);
+                }
                 None => {}
             }
             self.requested_take = false;
@@ -872,6 +913,7 @@ impl Handoff {
             out.push(Command::PauseMedia);
         }
         self.route_away(out);
+        self.hold_for_remote(out);
         self.say(format!(
             "YIELD owner=not-linux; another host has the AirPods; Linux gave up its {}take{}",
             if dropped { "pending " } else { "" },
@@ -887,6 +929,24 @@ impl Handoff {
     fn route_away(&mut self, out: &mut Vec<Command>) {
         if self.default_sink_routing && !std::mem::replace(&mut self.routed_away, true) {
             out.push(Command::RouteAway);
+        }
+    }
+
+    /// Another host got the AirPods and Linux holds no take: hold A2DP
+    /// (#264).
+    fn hold_for_remote(&mut self, out: &mut Vec<Command>) {
+        self.remote_owns = true;
+        self.sync_hold(false, out);
+    }
+
+    /// Emit the hold the facts ask for when it differs from the last one
+    /// emitted. Before a session start has emitted one, only `start` does,
+    /// so the start also restores a card an earlier run left `off`.
+    fn sync_hold(&mut self, start: bool, out: &mut Vec<Command>) {
+        let want = self.remote_owns && !self.quitting;
+        if self.a2dp_hold && (start || self.held.is_some()) && self.held != Some(want) {
+            self.held = Some(want);
+            out.push(Command::HoldA2dp(want));
         }
     }
 
@@ -937,6 +997,10 @@ impl Handoff {
         if self.requested_take && self.automatic {
             out.push(Command::PauseMedia);
         }
+        // The next session start emits the hold again.
+        self.remote_owns = false;
+        self.sync_hold(false, out);
+        self.held = None;
         out.push(Command::DropSession);
         self.connected = false;
         self.session_lost = false;
@@ -981,10 +1045,13 @@ impl Handoff {
         self.owner = facts.owner;
         if self.audio.as_ref().is_some_and(|a| self.remote_took(a)) {
             self.last_owner_linux = false;
+            self.remote_owns = true;
         }
         if self.owner.as_deref() == Some(&[1]) {
             self.last_owner_linux = true;
+            self.remote_owns = false;
         }
+        self.sync_hold(true, out);
         if self.automatic {
             self.announce(out);
         }
@@ -4038,5 +4105,320 @@ mod tests {
         assert_eq!(p.play(1000, false), []);
         assert_eq!(p.feed(window_end() - 1, Input::Tick), []);
         assert_eq!(p.feed(window_end(), Input::Tick), [SendOwnership(false)]);
+    }
+
+    // #264: the A2DP hold.
+
+    fn remote_media() -> Input {
+        Input::AudioSource(source(REMOTE, AudioSourceType::Media))
+    }
+
+    fn holds(out: &[Command]) -> Vec<Command> {
+        out.iter()
+            .filter(|c| matches!(c, HoldA2dp(_)))
+            .cloned()
+            .collect()
+    }
+
+    /// The daemon's start with `hold` and routing on: seed facts, then the
+    /// session start's `Auto`, its release acknowledged, then a "stopped"
+    /// baseline sample.
+    fn hold_ready(hold: bool) -> Probe {
+        let mut p = Probe::new(false, true);
+        p.core.a2dp_hold = hold;
+        p.core.default_sink_routing = true;
+        p.routing(ready_facts());
+        let start = p.feed(5, Input::Auto);
+        assert_eq!(
+            holds(&start),
+            if hold { vec![HoldA2dp(false)] } else { vec![] }
+        );
+        assert_eq!(p.feed(8, Input::Ownership(vec![0])), []);
+        assert_eq!(p.play(10, false), []);
+        p
+    }
+
+    /// `hold_ready(true)`, then a take for playback acknowledged at 600 ms.
+    fn hold_take() -> Probe {
+        let mut p = hold_ready(true);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), [RouteToAirPods]);
+        p
+    }
+
+    /// `hold_ready(true)` with another host's request answered: held.
+    fn held() -> Probe {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+        p
+    }
+
+    #[test]
+    fn hold_session_start_idle_releases_before_connect_a2dp() {
+        let mut p = Probe::new(false, true);
+        p.core.a2dp_hold = true;
+        p.routing(ready_facts());
+        assert_eq!(
+            p.feed(5, Input::Auto),
+            [
+                HoldA2dp(false),
+                ConnectA2dp,
+                SendOwnership(false),
+                Announce,
+                DrainPlayback
+            ]
+        );
+        // A later Auto emits only a change.
+        assert_eq!(p.feed(8, Input::Ownership(vec![0])), []);
+        assert_eq!(
+            p.feed(10, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+        );
+    }
+
+    #[test]
+    fn hold_session_start_with_remote_media_holds() {
+        let mut p = Probe::new(false, true);
+        p.core.a2dp_hold = true;
+        // The seed's edge only records the fact: no session start yet.
+        p.routing(ready_facts());
+        assert_eq!(p.feed(1, remote_media()), []);
+        assert_eq!(
+            p.feed(5, Input::Auto),
+            [
+                HoldA2dp(true),
+                ConnectA2dp,
+                SendOwnership(false),
+                Announce,
+                DrainPlayback
+            ]
+        );
+    }
+
+    #[test]
+    fn hold_reconnected_facts_start_a_session() {
+        let mut p = held();
+        assert_eq!(
+            p.feed(200, Input::Disconnected),
+            [HoldA2dp(false), DropSession]
+        );
+        assert_eq!(p.feed(1200, Input::Tick), [Reconnect { audio: true }]);
+        let remote = SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Media)),
+            ..ready_facts()
+        };
+        assert_eq!(
+            p.feed(1300, Input::Reconnected(remote)),
+            [AdoptSession, HoldA2dp(true), Announce, DrainPlayback]
+        );
+        // Idle facts restore the card.
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(200, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(1200, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(1300, Input::Reconnected(ready_facts())),
+            [AdoptSession, HoldA2dp(false), Announce, DrainPlayback]
+        );
+    }
+
+    #[test]
+    fn hold_issue_sequence_remote_request_after_release_ack() {
+        let mut p = hold_take();
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(p.hold_ends(1000), [SendOwnership(false)]);
+        assert_eq!(p.feed(1100, Input::Ownership(vec![0])), []);
+        assert_eq!(
+            p.feed(1200, Input::RemoteOwnershipRequest),
+            [HoldA2dp(true)]
+        );
+    }
+
+    #[test]
+    fn hold_not_on_own_release_ack_alone() {
+        let mut p = hold_take();
+        let mut all = p.play(1000, false);
+        all.extend(p.hold_ends(1000));
+        all.extend(p.feed(1100, Input::Ownership(vec![0])));
+        for ms in (1200..20_000).step_by(1000) {
+            all.extend(p.feed(ms, Input::Tick));
+        }
+        assert_eq!(all, [SendOwnership(false)]);
+    }
+
+    #[test]
+    fn hold_remote_request_on_acked_take() {
+        let mut p = hold_take();
+        assert_eq!(
+            p.feed(1100, Input::RemoteOwnershipRequest),
+            [PauseMedia, RouteAway, SendOwnership(false), HoldA2dp(true)]
+        );
+        // Later edges while held emit nothing more.
+        assert_eq!(p.feed(1150, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(1300, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.feed(1400, remote_media()), []);
+    }
+
+    #[test]
+    fn hold_remote_request_joins_pending_release() {
+        let mut p = hold_take();
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(p.hold_ends(1000), [SendOwnership(false)]);
+        assert_eq!(
+            p.feed(1100, Input::RemoteOwnershipRequest),
+            [RouteAway, HoldA2dp(true)]
+        );
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+    }
+
+    #[test]
+    fn hold_remote_request_resends_timed_out_release() {
+        let mut p = hold_take();
+        assert_eq!(p.feed(700, Input::Release), [SendOwnership(false)]);
+        assert_eq!(p.feed(700 + 5001, Input::Tick), []);
+        // Not held yet: the timed-out release was the user's.
+        assert_eq!(
+            p.feed(5800, Input::RemoteOwnershipRequest),
+            [PauseMedia, RouteAway, SendOwnership(false), HoldA2dp(true)]
+        );
+        assert_eq!(p.feed(5900, Input::Tick), []);
+        assert_eq!(p.feed(10_900, Input::Tick), []);
+        // The remote release timed out too: a repeat re-sends it.
+        assert_eq!(
+            p.feed(11_000, Input::RemoteOwnershipRequest),
+            [SendOwnership(false)]
+        );
+    }
+
+    #[test]
+    fn hold_yield_take() {
+        let mut p = hold_take();
+        assert_eq!(
+            p.feed(1100, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway, HoldA2dp(true)]
+        );
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+    }
+
+    #[test]
+    fn hold_unsolicited_loss_after_linux_owned() {
+        let mut p = hold_ready(true);
+        // Linux owns without a take of its own.
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(200, Input::Ownership(vec![0])), [HoldA2dp(true)]);
+        assert_eq!(p.feed(300, Input::Ownership(vec![0])), []);
+    }
+
+    #[test]
+    fn hold_remote_audio_source() {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(100, remote_media()), [HoldA2dp(true)]);
+        assert_eq!(p.feed(200, remote_media()), []);
+        // While Linux holds a take, the loss that follows holds instead.
+        let mut p = hold_take();
+        assert_eq!(p.feed(1100, remote_media()), []);
+        assert_eq!(
+            p.feed(1200, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway, HoldA2dp(true)]
+        );
+    }
+
+    #[test]
+    fn hold_not_on_refusal_or_session_lost() {
+        let mut p = hold_take();
+        assert_eq!(p.feed(700, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.feed(1100, Input::RemoteOwnershipRequest), []);
+
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(100, Input::SessionLost), []);
+        assert_eq!(p.feed(200, Input::RemoteOwnershipRequest), []);
+    }
+
+    #[test]
+    fn hold_take_ack_releases_before_route_and_resume() {
+        let mut p = held();
+        assert_eq!(p.feed(200, idle_transport()), []);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(
+            p.feed(600, Input::Ownership(vec![1])),
+            [HoldA2dp(false), RouteToAirPods, ResumeA2dp]
+        );
+        assert_eq!(p.feed(700, Input::Ownership(vec![1])), []);
+    }
+
+    #[test]
+    fn hold_kept_by_timed_out_or_lost_take() {
+        let mut p = held();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        let mut all = Vec::new();
+        for ms in (600..12_000).step_by(500) {
+            all.extend(p.feed(ms, Input::Tick));
+        }
+        assert_eq!(holds(&all), []);
+
+        let mut p = held();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(
+            p.feed(600, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
+    }
+
+    #[test]
+    fn hold_disconnected_releases_before_drop_session() {
+        let mut p = held();
+        assert_eq!(
+            p.feed(200, Input::Disconnected),
+            [HoldA2dp(false), DropSession]
+        );
+    }
+
+    #[test]
+    fn hold_quit_releases_before_exit() {
+        let mut p = held();
+        assert_eq!(p.feed(200, Input::Quit), [HoldA2dp(false), Exit]);
+    }
+
+    /// The c1/c2 sequences of the tests above; every command, in order.
+    fn hold_sequences(hold: bool) -> Vec<Command> {
+        let mut all = Vec::new();
+        let mut start = Probe::new(false, true);
+        start.core.a2dp_hold = hold;
+        start.routing(ready_facts());
+        all.extend(start.feed(1, remote_media()));
+        all.extend(start.feed(5, Input::Auto));
+
+        let mut p = hold_ready(hold);
+        all.extend(p.play(500, true));
+        all.extend(p.feed(600, Input::Ownership(vec![1])));
+        all.extend(p.play(1000, false));
+        all.extend(p.hold_ends(1000));
+        all.extend(p.feed(1100, Input::Ownership(vec![0])));
+        all.extend(p.feed(1200, Input::RemoteOwnershipRequest));
+        all.extend(p.feed(1300, idle_transport()));
+        all.extend(p.play(1500, true));
+        all.extend(p.feed(1600, Input::Ownership(vec![1])));
+        all.extend(p.feed(1700, Input::Ownership(vec![0])));
+        all.extend(p.feed(1800, Input::Disconnected));
+
+        let mut p = hold_ready(hold);
+        all.extend(p.feed(100, Input::Ownership(vec![1])));
+        all.extend(p.feed(200, Input::Ownership(vec![0])));
+        all.extend(p.feed(300, Input::Quit));
+
+        let mut p = hold_ready(hold);
+        all.extend(p.feed(100, remote_media()));
+        all.extend(p.feed(200, Input::Disconnected));
+        all.extend(p.feed(1200, Input::Tick));
+        all.extend(p.feed(1300, Input::Reconnected(ready_facts())));
+        all
+    }
+
+    #[test]
+    fn hold_off_never_emits_hold() {
+        assert_eq!(holds(&hold_sequences(false)), []);
+        // The twin: the same sequences hold and release with the flag on.
+        let on = holds(&hold_sequences(true));
+        assert!(on.contains(&HoldA2dp(true)) && on.contains(&HoldA2dp(false)));
     }
 }
