@@ -51,7 +51,10 @@ pub(crate) enum Input {
     EarState(Vec<EarDetectionStatus>),
     /// Audio source report.
     AudioSource(AudioSource),
-    /// Connected hosts report: previous and new list.
+    /// Connected hosts report: previous and new list. Linux announces itself
+    /// for a remote host in `new` that the core does not already know; the
+    /// report's `old` may be stale (a replay of a report already in the
+    /// session snapshot) and is not used for that decision (#58).
     ConnectedDevices {
         old: Vec<ConnectedDevice>,
         new: Vec<ConnectedDevice>,
@@ -297,12 +300,16 @@ impl Handoff {
                 self.ears = ears;
             }
             Input::AudioSource(source) => self.audio = Some(source),
-            Input::ConnectedDevices { old, new } => {
+            Input::ConnectedDevices { old: _, new } => {
+                // Compare against the hosts the core already knows, not the
+                // event's `old`: a report queued before the session snapshot
+                // (seed, Reconnected facts) is replayed with a stale `old`
+                // and must not announce a second time (#58).
                 if self.automatic
                     && self.live()
                     && new
                         .iter()
-                        .any(|d| d.mac != self.local && !old.iter().any(|o| o.mac == d.mac))
+                        .any(|d| d.mac != self.local && !self.hosts.iter().any(|h| h.mac == d.mac))
                 {
                     self.announce(out);
                 }
@@ -1108,6 +1115,95 @@ mod tests {
         assert_eq!(p.play(3500, false), []);
         assert_eq!(p.play(4000, true), []);
         assert_eq!(p.feed(4100, Input::Take), []);
+    }
+
+    fn announces(out: &[Command]) -> usize {
+        out.iter().filter(|c| matches!(c, Announce)).count()
+    }
+
+    fn stale_replay() -> Input {
+        Input::ConnectedDevices {
+            old: vec![host(LOCAL)],
+            new: two_hosts(),
+        }
+    }
+
+    #[test]
+    fn connected_devices_replay_after_auto_no_second_announce() {
+        // #58: the startup seed, then Auto, then the queued report that the
+        // seed already contained, replayed with its pre-update `old`.
+        for automatic in [false, true] {
+            let mut p = Probe::new(automatic, true);
+            p.feed(
+                0,
+                Input::ConnectedDevices {
+                    old: Vec::new(),
+                    new: two_hosts(),
+                },
+            );
+            let auto = p.feed(10, Input::Auto);
+            assert_eq!(announces(&auto), 1, "automatic={automatic}: {auto:?}");
+            assert_eq!(p.feed(20, stale_replay()), [], "automatic={automatic}");
+        }
+    }
+
+    #[test]
+    fn connected_devices_replay_after_reconnect_no_second_announce() {
+        // #58: the reconnect's facts already hold the remote host; the
+        // report queued before them is replayed without a second announce.
+        let mut p = Probe::new(true, true);
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(5000, Input::Tick), [Reconnect { audio: true }]);
+        let facts = SessionFacts {
+            hosts: two_hosts(),
+            ..SessionFacts::default()
+        };
+        let out = p.feed(5100, Input::Reconnected(facts));
+        assert_eq!(announces(&out), 1, "{out:?}");
+        assert_eq!(p.feed(5200, stale_replay()), []);
+    }
+
+    #[test]
+    fn connected_devices_new_host_still_announced() {
+        let second = "0D:0E:0F:10:11:12";
+        let three = || vec![host(LOCAL), host(REMOTE), host(second)];
+
+        // A fresh `old`.
+        let mut p = Probe::ready();
+        assert_eq!(
+            p.feed(
+                100,
+                Input::ConnectedDevices {
+                    old: two_hosts(),
+                    new: three(),
+                },
+            ),
+            [Announce]
+        );
+        // The same report again announces nothing.
+        assert_eq!(
+            p.feed(
+                200,
+                Input::ConnectedDevices {
+                    old: two_hosts(),
+                    new: three(),
+                },
+            ),
+            []
+        );
+
+        // A stale `old` still announces the new host exactly once.
+        let mut p = Probe::ready();
+        assert_eq!(
+            p.feed(
+                100,
+                Input::ConnectedDevices {
+                    old: vec![host(LOCAL)],
+                    new: three(),
+                },
+            ),
+            [Announce]
+        );
     }
 
     #[test]
