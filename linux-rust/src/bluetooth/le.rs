@@ -2,6 +2,7 @@ use crate::bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryInfo, BatterySt
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
+use crate::ui::window::merge_battery_entry;
 use crate::utils::{ah, get_devices_path, load_auto_connect};
 use aes::Aes128;
 use aes::cipher::Array;
@@ -38,6 +39,30 @@ fn verify_rpa(addr: &str, irk: &[u8; 16]) -> bool {
         addr, hash, computed_hash
     );
     hash == computed_hash
+}
+
+/// The tray's new (level, status) for one battery component (L, R or Case) after a
+/// BLE proximity advertisement whose raw byte for it is `raw`. Bit 7 is the charging
+/// flag and bits 0-6 are the level; `0xff` means no reading (e.g. the case after its
+/// lid closes). The byte is mapped to an update and the keep/replace decision is left
+/// to `merge_battery_entry`, so a `0xff` never clears a known non-Disconnected level.
+/// When the result is Disconnected the level is `None`, as the tray had before.
+fn ble_tray_entry(
+    prev_level: Option<u8>,
+    prev_status: Option<BatteryStatus>,
+    raw: u8,
+) -> (Option<u8>, Option<BatteryStatus>) {
+    let update = if raw == 0xff {
+        (0, BatteryStatus::Disconnected)
+    } else if raw & 0x80 != 0 {
+        (raw & 0x7f, BatteryStatus::Charging)
+    } else {
+        (raw & 0x7f, BatteryStatus::NotCharging)
+    };
+    match merge_battery_entry(prev_level.zip(prev_status), update) {
+        (_, BatteryStatus::Disconnected) => (None, Some(BatteryStatus::Disconnected)),
+        (level, status) => (Some(level), Some(status)),
+    }
 }
 
 pub async fn start_le_monitor(
@@ -286,42 +311,24 @@ pub async fn start_le_monitor(
                                         if let Some(handle) = &tray_handle_clone {
                                             handle
                                                 .update(|tray: &mut MyTray| {
-                                                    tray.battery_l = if left_byte == 0xff {
-                                                        None
-                                                    } else {
-                                                        Some(left_battery as u8)
-                                                    };
-                                                    tray.battery_l_status = if left_byte == 0xff {
-                                                        Some(BatteryStatus::Disconnected)
-                                                    } else if left_charging {
-                                                        Some(BatteryStatus::Charging)
-                                                    } else {
-                                                        Some(BatteryStatus::NotCharging)
-                                                    };
-                                                    tray.battery_r = if right_byte == 0xff {
-                                                        None
-                                                    } else {
-                                                        Some(right_battery as u8)
-                                                    };
-                                                    tray.battery_r_status = if right_byte == 0xff {
-                                                        Some(BatteryStatus::Disconnected)
-                                                    } else if right_charging {
-                                                        Some(BatteryStatus::Charging)
-                                                    } else {
-                                                        Some(BatteryStatus::NotCharging)
-                                                    };
-                                                    tray.battery_c = if case_byte == 0xff {
-                                                        None
-                                                    } else {
-                                                        Some(case_battery as u8)
-                                                    };
-                                                    tray.battery_c_status = if case_byte == 0xff {
-                                                        Some(BatteryStatus::Disconnected)
-                                                    } else if case_charging {
-                                                        Some(BatteryStatus::Charging)
-                                                    } else {
-                                                        Some(BatteryStatus::NotCharging)
-                                                    };
+                                                    (tray.battery_l, tray.battery_l_status) =
+                                                        ble_tray_entry(
+                                                            tray.battery_l,
+                                                            tray.battery_l_status,
+                                                            left_byte as u8,
+                                                        );
+                                                    (tray.battery_r, tray.battery_r_status) =
+                                                        ble_tray_entry(
+                                                            tray.battery_r,
+                                                            tray.battery_r_status,
+                                                            right_byte as u8,
+                                                        );
+                                                    (tray.battery_c, tray.battery_c_status) =
+                                                        ble_tray_entry(
+                                                            tray.battery_c,
+                                                            tray.battery_c_status,
+                                                            case_byte as u8,
+                                                        );
                                                 })
                                                 .await;
                                         }
@@ -447,5 +454,82 @@ mod tests {
             !verify_rpa(&forged, &IRK),
             "flipped hash {forged} must not verify"
         );
+    }
+
+    use BatteryStatus::{Charging, Disconnected, NotCharging};
+
+    #[test]
+    fn ble_tray_entry_0xff_keeps_known_level() {
+        assert_eq!(
+            ble_tray_entry(Some(40), Some(NotCharging), 0xff),
+            (Some(40), Some(NotCharging))
+        );
+        assert_eq!(
+            ble_tray_entry(Some(55), Some(Charging), 0xff),
+            (Some(55), Some(Charging))
+        );
+    }
+
+    #[test]
+    fn ble_tray_entry_0xff_without_known_level_is_disconnected() {
+        for (level, status) in [
+            (None, None),
+            (None, Some(Disconnected)),
+            (Some(30), Some(Disconnected)),
+            (Some(30), None),
+            (None, Some(NotCharging)),
+        ] {
+            assert_eq!(
+                ble_tray_entry(level, status, 0xff),
+                (None, Some(Disconnected)),
+                "prev {level:?}/{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ble_tray_entry_reading_always_wins() {
+        let prevs = [
+            (None, None),
+            (None, Some(Disconnected)),
+            (Some(40), Some(NotCharging)),
+            (Some(55), Some(Charging)),
+            (Some(30), Some(Disconnected)),
+        ];
+        for (level, status) in prevs {
+            assert_eq!(
+                ble_tray_entry(level, status, 0x85),
+                (Some(5), Some(Charging)),
+                "prev {level:?}/{status:?}"
+            );
+            assert_eq!(
+                ble_tray_entry(level, status, 0x64),
+                (Some(100), Some(NotCharging)),
+                "prev {level:?}/{status:?}"
+            );
+            assert_eq!(
+                ble_tray_entry(level, status, 0x00),
+                (Some(0), Some(NotCharging)),
+                "prev {level:?}/{status:?}"
+            );
+            assert_eq!(
+                ble_tray_entry(level, status, 0xfe),
+                (Some(0x7e), Some(Charging)),
+                "prev {level:?}/{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ble_tray_entry_case_lid_close_sequence() {
+        // Case reads 62% while open, then the lid closes (0xff): the tray keeps 62%.
+        let (l, s) = ble_tray_entry(None, None, 62);
+        assert_eq!((l, s), (Some(62), Some(NotCharging)));
+        let (l, s) = ble_tray_entry(l, s, 0xff);
+        assert_eq!((l, s), (Some(62), Some(NotCharging)));
+        let (l, s) = ble_tray_entry(l, s, 0xff);
+        assert_eq!((l, s), (Some(62), Some(NotCharging)));
+        // A new reading replaces it.
+        assert_eq!(ble_tray_entry(l, s, 0x80 | 63), (Some(63), Some(Charging)));
     }
 }
