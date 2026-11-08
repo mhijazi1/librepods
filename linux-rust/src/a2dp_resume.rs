@@ -400,6 +400,7 @@ fn transport_state(bus: &Connection, path: &str) -> Result<Option<bool>, Gone> {
 mod tests {
     use super::*;
     use Action::*;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -706,9 +707,11 @@ mod tests {
 
     /// Counting fake BlueZ for `TransportReader`: `paths` is what a lookup
     /// finds, `states` each path's State (absent: gone); None fails the bus.
+    /// `lookup_seq` overrides `paths` for the next lookups, one per lookup.
     #[derive(Default)]
     struct FakeBlueZ {
         paths: Option<Vec<&'static str>>,
+        lookup_seq: VecDeque<Option<Vec<&'static str>>>,
         states: Vec<(&'static str, Option<&'static str>)>,
         lookups: usize,
         reads: usize,
@@ -717,12 +720,14 @@ mod tests {
     impl FakeBlueZ {
         fn read(&mut self, reader: &mut TransportReader) -> Option<bool> {
             let (paths, states) = (&self.paths, &self.states);
+            let lookup_seq = &mut self.lookup_seq;
             let (lookups, reads) = (&mut self.lookups, &mut self.reads);
             reader.read(
                 || {
                     *lookups += 1;
-                    paths
-                        .as_ref()
+                    lookup_seq
+                        .pop_front()
+                        .unwrap_or_else(|| paths.clone())
                         .map(|p| p.iter().map(|p| p.to_string()).collect())
                 },
                 |path| {
@@ -814,25 +819,14 @@ mod tests {
         assert_eq!((bluez.lookups, bluez.reads), (3, 3));
 
         // Replaced (fd0 -> fd1) between the lookup and its read: seen this read.
+        let mut bluez = FakeBlueZ {
+            lookup_seq: [Some(vec![FD0]), Some(vec![FD1])].into(),
+            states: vec![(FD1, Some("active"))],
+            ..Default::default()
+        };
         let mut reader = TransportReader::default();
-        let mut found = [vec![FD0], vec![FD1]].into_iter();
-        let mut lookups = 0;
-        let active = reader.read(
-            || {
-                lookups += 1;
-                found
-                    .next()
-                    .map(|p| p.iter().map(|p| p.to_string()).collect())
-            },
-            |path| {
-                if path == FD1 {
-                    Ok(Some(true))
-                } else {
-                    Err(Gone)
-                }
-            },
-        );
-        assert_eq!((active, lookups), (Some(true), 2));
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        assert_eq!(bluez.lookups, 2);
         assert_eq!(reader.paths, [FD1]);
     }
 
@@ -855,23 +849,14 @@ mod tests {
 
         // Fresh lookup lists an active fd0 beside a gone fd1; the next
         // lookup drops fd1: active in the same read.
+        let mut bluez = FakeBlueZ {
+            lookup_seq: [Some(vec![FD0, FD1]), Some(vec![FD0])].into(),
+            states: vec![(FD0, Some("active"))],
+            ..Default::default()
+        };
         let mut reader = TransportReader::default();
-        let mut found = [vec![FD0, FD1], vec![FD0]].into_iter();
-        let active = reader.read(
-            || {
-                found
-                    .next()
-                    .map(|p| p.iter().map(|p| p.to_string()).collect())
-            },
-            |path| {
-                if path == FD0 {
-                    Ok(Some(true))
-                } else {
-                    Err(Gone)
-                }
-            },
-        );
-        assert_eq!(active, Some(true));
+        assert_eq!(bluez.read(&mut reader), Some(true));
+        assert_eq!(bluez.lookups, 2);
         assert_eq!(reader.paths, [FD0]);
 
         // Every lookup still lists the gone fd1: inconclusive, never idle.
