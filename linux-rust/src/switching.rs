@@ -63,27 +63,62 @@ pub(crate) trait MediaActions: Send + Sync {
     fn activate_a2dp(&self) -> BoxFuture<'static, ()>;
 }
 
-/// Production media actions on the device's shared `MediaController`. The
-/// controller is cloned (its state is shared) and the outer guard dropped
-/// before awaiting (DECISIONS #5).
-pub(crate) struct ControllerMedia(pub(crate) Arc<Mutex<MediaController>>);
+/// Blocking: pauses the local players and returns how many paused.
+type PausePlayers = Arc<dyn Fn() -> usize + Send + Sync>;
+
+/// Production media actions on a clone of the device's `MediaController`
+/// (its state is shared, DECISIONS #5). The device handlers lock the outer
+/// `Arc<Mutex<MediaController>>` and ear detection holds it across an A2DP
+/// activation (up to ~43 s, #32), so this adapter never takes that mutex: it
+/// is built from the controller before the controller is put behind it
+/// (`device_media`), and has no field that could reach it.
+pub(crate) struct ControllerMedia {
+    controller: MediaController,
+    pause_players: PausePlayers,
+}
 
 impl MediaActions for ControllerMedia {
     fn pause(&self) -> BoxFuture<'static, ()> {
-        let outer = self.0.clone();
+        let controller = self.controller.clone();
+        let pause_players = self.pause_players.clone();
         Box::pin(async move {
-            let controller = outer.lock().await.clone();
-            controller.pause_all_media().await;
+            controller
+                .pause_all_media_with(move || pause_players())
+                .await;
         })
     }
 
     fn activate_a2dp(&self) -> BoxFuture<'static, ()> {
-        let outer = self.0.clone();
+        let controller = self.controller.clone();
         Box::pin(async move {
-            let controller = outer.lock().await.clone();
             controller.activate_a2dp_profile().await;
         })
     }
+}
+
+/// A device's `MediaController`, behind the outer mutex its handlers lock,
+/// and the handoff media adapter, used by `AirPodsDevice::new`.
+pub(crate) fn device_media(
+    airpods_mac: String,
+    local_mac: String,
+) -> (Arc<Mutex<MediaController>>, Arc<dyn MediaActions>) {
+    share_media(
+        MediaController::new(airpods_mac, local_mac),
+        Arc::new(MediaController::pause_playing_mpris_players),
+    )
+}
+
+/// The adapter takes its clone before the controller goes behind the outer
+/// mutex, so no handler can hold that mutex at that point.
+fn share_media(
+    controller: MediaController,
+    pause_players: PausePlayers,
+) -> (Arc<Mutex<MediaController>>, Arc<dyn MediaActions>) {
+    let media = ControllerMedia {
+        controller: controller.clone(),
+        pause_players,
+    };
+    (Arc::new(Mutex::new(controller)), Arc::new(media))
 }
 
 /// Poll local playback every `PLAYBACK_POLL`. The poller stops once the
@@ -270,8 +305,9 @@ impl Shell {
     }
 
     /// Execute the core's commands in order. True when the task should end.
-    /// No AACP or MediaController guard is held here; the sends and media
-    /// actions take their own.
+    /// No AACP or MediaController guard is held here; the sends take their
+    /// own, and the media actions never take the outer MediaController mutex
+    /// the device handlers hold (`ControllerMedia`).
     async fn execute(&mut self, commands: Vec<Command>) -> bool {
         let mut end = false;
         for command in commands {
@@ -792,6 +828,9 @@ mod tests {
         finished: StdMutex<Vec<String>>,
         block_ear: AtomicBool,
         release: Notify,
+        /// While blocked, hold this outer MediaController mutex, as the
+        /// device's ear detection holds it across `handle_ear_detection`.
+        hold: Option<Arc<Mutex<MediaController>>>,
     }
 
     impl DeviceHandler {
@@ -812,6 +851,10 @@ mod tests {
                     if matches!(event, AACPEvent::EarDetection(..))
                         && handler.block_ear.swap(false, Ordering::SeqCst)
                     {
+                        let _guard = match &handler.hold {
+                            Some(outer) => Some(outer.lock().await),
+                            None => None,
+                        };
                         handler.release.notified().await;
                     }
                     handler.finished.lock().unwrap().push(name);
@@ -960,6 +1003,37 @@ mod tests {
             block_ear: bool,
         ) -> Self {
             let records = Arc::new(Records::default());
+            let media = Arc::new(FakeMedia {
+                records: records.clone(),
+                mac: mac.to_string(),
+            });
+            let media_controller = Arc::new(Mutex::new(MediaController::new(
+                mac.to_string(),
+                LOCAL.to_string(),
+            )));
+            let handler = DeviceHandler::default();
+            handler.block_ear.store(block_ear, Ordering::SeqCst);
+            Self::start_wired(
+                mode,
+                mac,
+                manager,
+                (media_controller, media),
+                records,
+                Arc::new(handler),
+            )
+            .await
+        }
+
+        /// Start with the given controller and media adapter, and device
+        /// handler.
+        async fn start_wired(
+            mode: SwitchingMode,
+            mac: &str,
+            manager: &AACPManager,
+            (media_controller, media): (Arc<Mutex<MediaController>>, Arc<dyn MediaActions>),
+            records: Arc<Records>,
+            handler: Arc<DeviceHandler>,
+        ) -> Self {
             let (play_tx, play_rx) = mpsc::channel(8);
             let playback_started = Arc::new(AtomicBool::new(false));
             let started = playback_started.clone();
@@ -981,24 +1055,16 @@ mod tests {
                     airpods_mac: mac.to_string(),
                     local_mac: LOCAL.to_string(),
                     manager: manager.clone(),
-                    media_controller: Arc::new(Mutex::new(MediaController::new(
-                        mac.to_string(),
-                        LOCAL.to_string(),
-                    ))),
+                    media_controller,
                     command_tx,
                 },
-                Arc::new(FakeMedia {
-                    records: records.clone(),
-                    mac: mac.to_string(),
-                }),
+                media,
                 move || {
                     started.store(true, Ordering::SeqCst);
                     play_rx
                 },
             )
             .await;
-            let handler = Arc::new(DeviceHandler::default());
-            handler.block_ear.store(block_ear, Ordering::SeqCst);
             switching.dispatch_events(events_rx, handler.clone().handle());
             Harness {
                 records,
@@ -1235,6 +1301,100 @@ mod tests {
         assert_eq!(h.pauses(), 1);
 
         stop_handoff_task(mac);
+    }
+
+    /// The production media adapter (`device_media`) never waits for the
+    /// outer MediaController mutex that ear detection holds across an A2DP
+    /// activation: a remote request is still answered at once, and the task
+    /// keeps taking events and ticks (session loss) while it is held.
+    #[tokio::test]
+    async fn handoff_production_media_ignores_held_controller_lock() {
+        let mac = "5A:00:00:00:00:0B";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let records = Arc::new(Records::default());
+        let counted = records.clone();
+        let paused_for = mac.to_string();
+        // Built as `device_media` builds it. Only the blocking D-Bus pause is
+        // replaced (no session bus here, and a test must not pause the
+        // developer's players); an empty AirPods MAC makes the real A2DP
+        // activation return before touching PipeWire.
+        let (outer, media) = share_media(
+            MediaController::new(String::new(), LOCAL.to_string()),
+            Arc::new(move || {
+                counted.pauses.fetch_add(1, Ordering::SeqCst);
+                trace(&paused_for, "PauseMedia".to_string());
+                0
+            }),
+        );
+        let handler = DeviceHandler {
+            hold: Some(outer.clone()),
+            ..Default::default()
+        };
+        handler.block_ear.store(true, Ordering::SeqCst);
+        let h = Harness::start_wired(
+            SwitchingMode::Handoff,
+            mac,
+            &manager,
+            (outer.clone(), media),
+            records,
+            Arc::new(handler),
+        )
+        .await;
+        let task = handoff_task(mac).expect("handoff task");
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(next_packet(&mut rx).await, expected_new_device(REMOTE).await);
+        assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        expect_take(&h, &mut rx).await;
+        h.emit(owns(1));
+        wait_until("the take's ACK", || {
+            traced(mac).iter().any(|l| l.starts_with("ACK owner=linux"))
+        })
+        .await;
+
+        // Ear detection takes the outer mutex and holds it, as across a slow
+        // A2DP activation.
+        let worn = wear(EarDetectionStatus::InEar);
+        h.emit(worn.clone());
+        wait_until("ear detection to hold the MediaController", || {
+            outer.try_lock().is_err()
+        })
+        .await;
+
+        // Another host asks: [PauseMedia, SendOwnership(false)] runs through
+        // the real adapter without waiting for the mutex.
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+        let trace = traced(mac);
+        assert!(
+            position(&trace, "REMOTE requested ownership; yielding")
+                < position(&trace, "PauseMedia")
+        );
+
+        // Later events still reach the core.
+        h.emit(owns(0));
+        wait_until("the yield's ACK", || {
+            let trace = traced(mac);
+            trace
+                .iter()
+                .skip(position(&trace, "REMOTE requested ownership; yielding"))
+                .any(|l| l.starts_with("ACK owner=not-linux"))
+        })
+        .await;
+
+        // And ticks: the task notices the lost session and ends.
+        manager.disconnect().await;
+        wait_until("the task to end", || task.is_finished()).await;
+        assert!(outer.try_lock().is_err(), "the mutex was held throughout");
+        assert_eq!(h.handler.finished(), named(&[owns(1)]));
+
+        // Released, ear detection and the rest run once, in order.
+        h.handler.release.notify_one();
+        let all = named(&[owns(1), worn, AACPEvent::OwnershipToFalseRequest, owns(0)]);
+        wait_until("the handler to catch up", || h.handler.finished() == all).await;
+        assert_eq!(h.handler.started(), all);
     }
 
     #[tokio::test]

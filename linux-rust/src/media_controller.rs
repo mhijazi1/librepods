@@ -963,7 +963,7 @@ impl MediaController {
 
     /// `pause_all_media` with the D-Bus side injected, so the self-pause
     /// marking can be tested without a session bus.
-    async fn pause_all_media_with<F>(&self, pause_players: F)
+    pub(crate) async fn pause_all_media_with<F>(&self, pause_players: F)
     where
         F: FnOnce() -> usize + Send + 'static,
     {
@@ -986,7 +986,7 @@ impl MediaController {
 
     /// Pause every MPRIS player that reports `Playing`; returns how many
     /// paused. Blocking: run it on a blocking thread.
-    fn pause_playing_mpris_players() -> usize {
+    pub(crate) fn pause_playing_mpris_players() -> usize {
         let conn = match Connection::new_session() {
             Ok(c) => c,
             Err(_) => return 0,

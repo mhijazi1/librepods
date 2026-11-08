@@ -1,7 +1,7 @@
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
 use crate::media_controller::MediaController;
-use crate::switching::{ControllerMedia, Switching, SwitchingSetup, spawn_playback_poller};
+use crate::switching::{Switching, SwitchingSetup, device_media, spawn_playback_poller};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
 use bluer::Address;
@@ -119,10 +119,10 @@ impl AirPodsDevice {
             .expect("Failed to get adapter address")
             .to_string();
 
-        let media_controller = Arc::new(Mutex::new(MediaController::new(
-            mac_address.to_string(),
-            local_mac.clone(),
-        )));
+        // The handoff media adapter shares the controller's state without
+        // taking the outer mutex the handlers below lock (switching.rs).
+        let (media_controller, handoff_media) =
+            device_media(mac_address.to_string(), local_mac.clone());
         let mc_clone = media_controller.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -169,7 +169,7 @@ impl AirPodsDevice {
                 media_controller: media_controller.clone(),
                 command_tx: command_tx.clone(),
             },
-            Arc::new(ControllerMedia(media_controller.clone())),
+            handoff_media,
             spawn_playback_poller,
         )
         .await;
