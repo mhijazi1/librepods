@@ -1,9 +1,9 @@
 //! Handoff diagnostics (#21): a JSONL log of the handoff core's lines for
 //! hardware test sessions, and the `--handoff-report` summary of its last
 //! session. The records hold only timestamps, the AirPods MAC and the core's
-//! lines, never key material. Logging never fails or stops switching: a
-//! failed open installs no sink, a failed write stops the log, each with one
-//! warning.
+//! lines, never key material. Logging never fails, stops or stalls
+//! switching: the file I/O runs on a writer thread, and a failed open or
+//! write stops the log with one warning.
 
 use crate::switching::LineSink;
 use log::{info, warn};
@@ -14,8 +14,11 @@ use std::fs::{DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One JSON object per line of the log.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -125,7 +128,7 @@ fn make_private(handle: &File, mode: u32, path: &Path) {
     }
 }
 
-fn write_record(file: &mut File, record: &Record) -> io::Result<()> {
+fn write_record(file: &mut impl Write, record: &Record) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(record)?;
     bytes.push(b'\n');
     // One write per record, so an O_APPEND writer never interleaves lines.
@@ -145,122 +148,187 @@ fn rotation_warning(path: &Path, rotated: &Path, renamed: bool, e: &io::Error) -
     }
 }
 
-/// An open handoff log. A write error stops it after one warning.
+/// Records waiting for the writer thread; past this, `Log::line` drops them.
+const QUEUE_BOUND: usize = 256;
+/// How long dropping a `Log` waits for its writer to drain the queue.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Open `path` for appending (made 0600, its directory 0700) and write the
+/// session_start record stamped `started_ms`. A log past `MAX_LOG_BYTES` is
+/// first renamed to `<path>.1` (`handoff.jsonl.1`), replacing an older one,
+/// and a fresh log started: the report only reads the last session, and a
+/// writer still running keeps appending to the renamed file.
+fn open_file(path: &Path, source: Source, started_ms: u64) -> io::Result<File> {
+    if let Some(dir) = path.parent() {
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        match File::open(dir) {
+            Ok(handle) => make_private(&handle, 0o700, dir),
+            Err(e) => warn!("Handoff log: cannot make {} private: {e}", dir.display()),
+        }
+    }
+    let open = || {
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+    };
+    let mut file = open()?;
+    make_private(&file, 0o600, path);
+    let measured = file.metadata()?;
+    if measured.len() > MAX_LOG_BYTES {
+        let suffixed = |suffix: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        let (rotated, lock_path) = (suffixed(".1"), suffixed(".lock"));
+        // The lock on `<path>.lock` (dropped, so released, after the reopen)
+        // makes check, rename and reopen one step for other openers. A
+        // writable file, not the directory: NFS emulates flock with fcntl.
+        // Ok holds whether the rename happened and the reopen's result.
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&lock_path);
+        let fresh = lock_file.and_then(|lock| {
+            make_private(&lock, 0o600, &lock_path);
+            #[cfg(test)]
+            if let Some(hook) = tests::BEFORE_LOCK.take() {
+                hook();
+            }
+            lock.lock()?;
+            // Move only the file measured above: a process that lost a race
+            // with another rotator must not move that one's fresh log over .1.
+            let moved = std::fs::metadata(path).and_then(|now| {
+                if (now.dev(), now.ino()) != (measured.dev(), measured.ino()) {
+                    return Ok(false);
+                }
+                #[cfg(test)]
+                if let Some(hook) = tests::BEFORE_RENAME.take() {
+                    hook();
+                }
+                std::fs::rename(path, &rotated).map(|()| true)
+            });
+            match moved {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                moved => {
+                    let renamed = matches!(moved, Ok(true));
+                    if renamed {
+                        info!(
+                            "Handoff log: rotated {} to {}",
+                            path.display(),
+                            rotated.display()
+                        );
+                        #[cfg(test)]
+                        if let Some(hook) = tests::AFTER_RENAME.take() {
+                            hook();
+                        }
+                    }
+                    Ok((renamed, open()))
+                }
+            }
+        });
+        // An error before the rename (lock file, lock, metadata) moved nothing.
+        match fresh.unwrap_or_else(|e| (false, Err(e))) {
+            (_, Ok(fresh)) => file = fresh,
+            (renamed, Err(e)) => warn!("{}", rotation_warning(path, &rotated, renamed, &e)),
+        }
+    }
+    let len = file.metadata()?.len();
+    let mut last = [b'\n'];
+    if len > 0 {
+        file.read_exact_at(&mut last, len - 1)?;
+    }
+    // End a torn last record, so the session_start is a line of its own.
+    if last != [b'\n'] {
+        file.write_all(b"\n")?;
+    }
+    write_record(
+        &mut file,
+        &Record::SessionStart {
+            ts_ms: started_ms,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            source,
+        },
+    )?;
+    Ok(file)
+}
+
+/// A handoff log. Its file I/O runs on a `handoff-log` writer thread, so a
+/// hung state filesystem never stalls the caller. A failed open or write
+/// stops the writer after one warning; later lines are dropped silently.
 pub(crate) struct Log {
-    path: PathBuf,
-    file: Mutex<Option<File>>,
+    /// None only while dropping.
+    tx: Option<SyncSender<Record>>,
+    /// Disconnected when the writer thread ends; a Mutex only so Log is Sync.
+    done: Mutex<Receiver<()>>,
+    /// The queue is full and its warning was given.
+    overflowing: AtomicBool,
+    dropped: AtomicUsize,
+    overflow_warnings: AtomicUsize,
 }
 
 impl Log {
-    /// Open `path` for appending (made 0600, its directory 0700) and write
-    /// the session_start record. A log past `MAX_LOG_BYTES` is first renamed
-    /// to `<path>.1` (`handoff.jsonl.1`), replacing an older one, and a fresh
-    /// log started: the report only reads the last session, and a writer
-    /// still running keeps appending to the renamed file.
+    /// Open the log on the caller's thread (see `open_file`): an Err means
+    /// nothing is logged. The appends then run on the writer thread. Only
+    /// tests need the synchronous open.
+    #[cfg(test)]
     pub(crate) fn open(path: &Path, source: Source) -> io::Result<Log> {
-        if let Some(dir) = path.parent() {
-            DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-            match File::open(dir) {
-                Ok(handle) => make_private(&handle, 0o700, dir),
-                Err(e) => warn!("Handoff log: cannot make {} private: {e}", dir.display()),
-            }
-        }
-        let open = || {
-            OpenOptions::new()
-                .create(true)
-                .read(true)
-                .append(true)
-                .mode(0o600)
-                .open(path)
-        };
-        let mut file = open()?;
-        make_private(&file, 0o600, path);
-        let measured = file.metadata()?;
-        if measured.len() > MAX_LOG_BYTES {
-            let suffixed = |suffix: &str| {
-                let mut name = path.as_os_str().to_owned();
-                name.push(suffix);
-                PathBuf::from(name)
-            };
-            let (rotated, lock_path) = (suffixed(".1"), suffixed(".lock"));
-            // The lock on `<path>.lock` (dropped, so released, after the reopen)
-            // makes check, rename and reopen one step for other openers. A
-            // writable file, not the directory: NFS emulates flock with fcntl.
-            // Ok holds whether the rename happened and the reopen's result.
-            let lock_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .mode(0o600)
-                .open(&lock_path);
-            let fresh = lock_file.and_then(|lock| {
-                make_private(&lock, 0o600, &lock_path);
-                #[cfg(test)]
-                if let Some(hook) = tests::BEFORE_LOCK.take() {
-                    hook();
-                }
-                lock.lock()?;
-                // Move only the file measured above: a process that lost a race
-                // with another rotator must not move that one's fresh log over .1.
-                let moved = std::fs::metadata(path).and_then(|now| {
-                    if (now.dev(), now.ino()) != (measured.dev(), measured.ino()) {
-                        return Ok(false);
+        let file = open_file(path, source, now_ms())?;
+        Self::spawn(path, move || Ok(file))
+    }
+
+    /// Like `open`, but returns at once: the open runs on the writer thread,
+    /// which warns if it fails. Lines sent meanwhile are queued, and the
+    /// session_start is stamped now so that no line predates it.
+    fn start(path: &Path, source: Source) -> io::Result<Log> {
+        let (owned, started_ms) = (path.to_owned(), now_ms());
+        Self::spawn(path, move || open_file(&owned, source, started_ms))
+    }
+
+    /// Start the writer thread: it runs `opener`, then appends each queued
+    /// record to the writer that returned. Err only when the spawn fails.
+    fn spawn<W: Write + Send + 'static>(
+        path: &Path,
+        opener: impl FnOnce() -> io::Result<W> + Send + 'static,
+    ) -> io::Result<Log> {
+        let (tx, rx) = sync_channel::<Record>(QUEUE_BOUND);
+        let (done_tx, done) = mpsc::channel::<()>();
+        let path = path.to_owned();
+        thread::Builder::new()
+            .name("handoff-log".to_string())
+            .spawn(move || {
+                let _done = done_tx;
+                let path = path.display();
+                let mut writer = match opener() {
+                    Ok(writer) => writer,
+                    Err(e) => {
+                        warn!("Handoff log: cannot open {path}: {e}; not logging");
+                        return;
                     }
-                    #[cfg(test)]
-                    if let Some(hook) = tests::BEFORE_RENAME.take() {
-                        hook();
-                    }
-                    std::fs::rename(path, &rotated).map(|()| true)
-                });
-                match moved {
-                    Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                    moved => {
-                        let renamed = matches!(moved, Ok(true));
-                        if renamed {
-                            info!(
-                                "Handoff log: rotated {} to {}",
-                                path.display(),
-                                rotated.display()
-                            );
-                            #[cfg(test)]
-                            if let Some(hook) = tests::AFTER_RENAME.take() {
-                                hook();
-                            }
-                        }
-                        Ok((renamed, open()))
+                };
+                for record in rx {
+                    if let Err(e) = write_record(&mut writer, &record) {
+                        warn!("Handoff log: cannot write {path}: {e}; handoff logging stopped");
+                        return;
                     }
                 }
-            });
-            // An error before the rename (lock file, lock, metadata) moved nothing.
-            match fresh.unwrap_or_else(|e| (false, Err(e))) {
-                (_, Ok(fresh)) => file = fresh,
-                (renamed, Err(e)) => warn!("{}", rotation_warning(path, &rotated, renamed, &e)),
-            }
-        }
-        let len = file.metadata()?.len();
-        let mut last = [b'\n'];
-        if len > 0 {
-            file.read_exact_at(&mut last, len - 1)?;
-        }
-        // End a torn last record, so the session_start is a line of its own.
-        if last != [b'\n'] {
-            file.write_all(b"\n")?;
-        }
-        write_record(
-            &mut file,
-            &Record::SessionStart {
-                ts_ms: now_ms(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                source,
-            },
-        )?;
+            })?;
         Ok(Log {
-            path: path.to_owned(),
-            file: Mutex::new(Some(file)),
+            tx: Some(tx),
+            done: Mutex::new(done),
+            overflowing: AtomicBool::new(false),
+            dropped: AtomicUsize::new(0),
+            overflow_warnings: AtomicUsize::new(0),
         })
     }
 
-    /// Append a `line` record for the AirPods `mac`.
+    /// Queue a `line` record for the AirPods `mac`, or drop it when the
+    /// writer is `QUEUE_BOUND` records behind or has stopped.
     pub(crate) fn line(&self, mac: &str, line: &str) {
         let record = Record::Line {
             ts_ms: now_ms(),
@@ -268,16 +336,20 @@ impl Log {
             kind: classify(line),
             line: line.to_string(),
         };
-        // shortcut: the append runs synchronously on the handoff task, so a hung state filesystem (e.g. a stale NFS home) would stall switching; move it to a writer thread if that is ever seen (#105)
-        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(open) = file.as_mut()
-            && let Err(e) = write_record(open, &record)
-        {
-            warn!(
-                "Handoff log: cannot write {}: {e}; handoff logging stopped",
-                self.path.display()
-            );
-            *file = None;
+        let Some(tx) = &self.tx else { return };
+        match tx.try_send(record) {
+            Ok(()) => self.overflowing.store(false, Ordering::Relaxed),
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                if !self.overflowing.swap(true, Ordering::Relaxed) {
+                    self.overflow_warnings.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Handoff log: writer is not keeping up (a hung state filesystem?); dropping records"
+                    );
+                }
+            }
+            // The writer stopped after its own warning.
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -287,23 +359,33 @@ impl Log {
     }
 }
 
-/// Open the log at the default path, or warn once and return None.
+impl Drop for Log {
+    /// Let the writer drain the queue, but leave a hung one detached after
+    /// `DRAIN_TIMEOUT`, so exit never waits on the filesystem.
+    fn drop(&mut self) {
+        self.tx = None;
+        let _ = self
+            .done
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recv_timeout(DRAIN_TIMEOUT);
+    }
+}
+
+/// Start the log at the default path without waiting on the filesystem, or
+/// warn once and return None.
 pub(crate) fn open_default(source: Source) -> Option<Log> {
     let Some(path) = default_path() else {
         warn!("Handoff log: neither XDG_STATE_HOME nor HOME is set; not logging");
         return None;
     };
-    Log::open(&path, source)
-        .inspect_err(|e| {
-            warn!(
-                "Handoff log: cannot open {}: {e}; not logging",
-                path.display()
-            )
-        })
+    Log::start(&path, source)
+        .inspect_err(|e| warn!("Handoff log: cannot start its writer thread: {e}; not logging"))
         .ok()
 }
 
 /// The app's log, opened once per process, so one app run is one session.
+/// It is never dropped, so the last queued records may be lost at app exit.
 pub(crate) fn app_log() -> Option<Arc<Log>> {
     static LOG: OnceLock<Option<Arc<Log>>> = OnceLock::new();
     LOG.get_or_init(|| open_default(Source::App).map(Arc::new))
@@ -705,6 +787,7 @@ mod tests {
         let app = Log::open(&path, Source::App).unwrap();
         let _probe = Log::open(&path, Source::Probe).unwrap();
         app.line("AA:BB:CC:DD:EE:FF", "REQUEST owner=linux");
+        drop(app);
         let old = records(&dir.join("handoff.jsonl.1"));
         assert!(
             matches!(
@@ -849,6 +932,7 @@ mod tests {
         let (_rival, rival_measured_old) = rival.join().unwrap();
         assert!(rival_measured_old, "the rival did not reach the lock");
         app.line("AA:BB:CC:DD:EE:FF", "REQUEST owner=linux");
+        drop(app);
         let old = records(&rotated);
         assert!(
             matches!(
@@ -949,6 +1033,138 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         assert!(Log::open(&file.join("librepods/handoff.jsonl"), Source::App).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    const MAC: &str = "AA:BB:CC:DD:EE:FF";
+
+    /// An opener that blocks until the sender is used or dropped.
+    fn hung_opener() -> (
+        mpsc::Sender<()>,
+        impl FnOnce() -> io::Result<io::Sink> + Send,
+    ) {
+        let (release, released) = mpsc::channel();
+        (release, move || {
+            let _ = released.recv();
+            Ok(io::sink())
+        })
+    }
+
+    #[test]
+    fn handoff_log_line_never_blocks_on_a_hung_writer() {
+        let (release, opener) = hung_opener();
+        let log = Arc::new(Log::spawn(Path::new("/hung/handoff.jsonl"), opener).unwrap());
+        let sink = log.clone().sink(MAC.to_string());
+        let t0 = Instant::now();
+        for _ in 0..QUEUE_BOUND + 50 {
+            sink("REQUEST owner=linux");
+        }
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        assert_eq!(log.dropped.load(Ordering::Relaxed), 50);
+        assert_eq!(log.overflow_warnings.load(Ordering::Relaxed), 1);
+        release.send(()).unwrap();
+        drop((sink, log));
+    }
+
+    #[test]
+    fn handoff_log_start_does_not_wait_for_open() {
+        let dir = temp_dir("slow-open");
+        let path = dir.join("librepods/handoff.jsonl");
+        let (release, released) = mpsc::channel::<()>();
+        // What Log::start does, with an open that waits for the release.
+        let started_ms = now_ms();
+        let t0 = Instant::now();
+        let log = Log::spawn(&path, {
+            let path = path.clone();
+            move || {
+                let _ = released.recv();
+                open_file(&path, Source::App, started_ms)
+            }
+        })
+        .unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        let lines = [
+            "REQUEST owner=linux",
+            "ACK owner=linux elapsed_ms=1",
+            "REMOTE requested ownership; yielding",
+        ];
+        for line in lines {
+            log.line(MAC, line);
+        }
+        assert!(!path.exists(), "the open did not wait for the release");
+        release.send(()).unwrap();
+        drop(log);
+        let written = records(&path);
+        let [Record::SessionStart { ts_ms: start, .. }, logged @ ..] = written.as_slice() else {
+            panic!("{written:?}");
+        };
+        let mut last = *start;
+        for (record, expected) in logged.iter().zip(lines) {
+            let Record::Line { ts_ms, line, .. } = record else {
+                panic!("{written:?}");
+            };
+            assert_eq!(line, expected);
+            assert!(*ts_ms >= last, "{written:?}");
+            last = *ts_ms;
+        }
+        assert_eq!(logged.len(), lines.len(), "{written:?}");
+        // The real Log::start appends after the session_start it stamps.
+        let probe = Log::start(&path, Source::Probe).unwrap();
+        probe.line(MAC, "BLOCKED take");
+        drop(probe);
+        assert!(matches!(
+            &records(&path)[4..],
+            [
+                Record::SessionStart {
+                    source: Source::Probe,
+                    ..
+                },
+                Record::Line {
+                    kind: Kind::Blocked,
+                    ..
+                },
+            ]
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_drop_is_bounded_on_a_hung_writer() {
+        let (release, opener) = hung_opener();
+        let log = Log::spawn(Path::new("/hung/handoff.jsonl"), opener).unwrap();
+        log.line(MAC, "REQUEST owner=linux");
+        let t0 = Instant::now();
+        drop(log);
+        let waited = t0.elapsed();
+        assert!(
+            waited < DRAIN_TIMEOUT + Duration::from_secs(1),
+            "{waited:?}"
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn handoff_log_stops_silently_after_writer_failure() {
+        // An open failure, and a write failure (/dev/null opened read-only).
+        let failed_open = Log::spawn(Path::new("/x"), || {
+            Err::<File, _>(io::Error::other("no state dir"))
+        });
+        let failed_write = Log::spawn(Path::new("/x"), || File::open("/dev/null"));
+        for log in [failed_open.unwrap(), failed_write.unwrap()] {
+            log.line(MAC, "REQUEST owner=linux");
+            // Disconnected once the writer thread has ended.
+            assert_eq!(
+                log.done
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            );
+            for _ in 0..QUEUE_BOUND + 1 {
+                log.line(MAC, "REQUEST owner=linux");
+            }
+            assert_eq!(log.dropped.load(Ordering::Relaxed), 0);
+            assert_eq!(log.overflow_warnings.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]
