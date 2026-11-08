@@ -2,7 +2,7 @@ use crate::bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryInfo, BatterySt
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
-use crate::utils::{ah, get_devices_path, get_preferences_path};
+use crate::utils::{ah, get_devices_path, load_auto_connect};
 use aes::Aes128;
 use aes::cipher::Array;
 use aes::cipher::{BlockCipherDecrypt, KeyInit};
@@ -165,19 +165,10 @@ pub async fn start_le_monitor(
                                         let connection_state = apple_data[10] as usize;
                                         debug!("Connection state: {}", connection_state);
                                         if connection_state == 0x00 {
-                                            let pref_path = get_preferences_path();
-                                            let preferences: HashMap<
-                                                String,
-                                                HashMap<String, bool>,
-                                            > = std::fs::read_to_string(&pref_path)
-                                                .ok()
-                                                .and_then(|s| serde_json::from_str(&s).ok())
-                                                .unwrap_or_default();
-                                            let auto_connect = preferences
-                                                .get(matched_airpods_mac.as_ref().unwrap())
-                                                .and_then(|prefs| prefs.get("autoConnect"))
-                                                .copied()
-                                                .unwrap_or(true);
+                                            // Tolerates top-level keys such as `switching`.
+                                            let auto_connect = load_auto_connect(
+                                                matched_airpods_mac.as_ref().unwrap(),
+                                            );
                                             debug!(
                                                 "Auto-connect preference for {}: {}",
                                                 matched_airpods_mac.as_ref().unwrap(),

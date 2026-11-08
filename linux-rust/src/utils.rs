@@ -118,6 +118,78 @@ pub fn parse_preferred_codec(settings: &str) -> PreferredCodec {
     preferred_codec_from_value(value.as_ref())
 }
 
+/// How the app answers AirPods ownership (automatic device switching), from
+/// the top-level `switching` key of preferences.json.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SwitchingMode {
+    /// The #841 handoff core (handoff.rs) decides every take and yield.
+    #[default]
+    Handoff,
+    /// The eager playback takeover (hijack) the app used before.
+    Legacy,
+    /// Linux never claims or yields ownership.
+    Off,
+}
+
+/// Reads `switching` from already-parsed preferences. Missing preferences, a
+/// missing key or null give the default (handoff); a value of the wrong type
+/// or an unknown name logs a warning and gives the default too.
+pub fn switching_mode_from_value(preferences: Option<&serde_json::Value>) -> SwitchingMode {
+    let Some(value) = preferences.and_then(|p| p.get("switching")) else {
+        return SwitchingMode::default();
+    };
+    if value.is_null() {
+        return SwitchingMode::default();
+    }
+    serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+        log::warn!(
+            "Unknown switching preference {value}; expected \"handoff\", \"legacy\" or \"off\". Using handoff."
+        );
+        SwitchingMode::default()
+    })
+}
+
+/// Extracts `switching` from the preferences JSON; anything missing or
+/// unreadable gives the default (handoff). Split from the file read for tests.
+pub fn parse_switching_mode(preferences: &str) -> SwitchingMode {
+    let value = serde_json::from_str::<serde_json::Value>(preferences).ok();
+    switching_mode_from_value(value.as_ref())
+}
+
+/// Reads the switching mode from preferences.json, falling back to handoff.
+pub fn load_switching_mode() -> SwitchingMode {
+    std::fs::read_to_string(get_preferences_path())
+        .map(|s| parse_switching_mode(&s))
+        .unwrap_or_default()
+}
+
+/// Reads a device's `autoConnect` from already-parsed preferences. The file
+/// holds one object per AirPods MAC next to top-level settings such as
+/// `switching`, so other keys and value types are ignored. Anything missing
+/// or unreadable gives the default (true).
+pub fn auto_connect_from_value(preferences: Option<&serde_json::Value>, mac: &str) -> bool {
+    preferences
+        .and_then(|p| p.get(mac))
+        .and_then(|device| device.get("autoConnect"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Extracts a device's `autoConnect` from the preferences JSON (see
+/// `auto_connect_from_value`). Split from the file read for tests.
+pub fn parse_auto_connect(preferences: &str, mac: &str) -> bool {
+    let value = serde_json::from_str::<serde_json::Value>(preferences).ok();
+    auto_connect_from_value(value.as_ref(), mac)
+}
+
+/// Reads a device's `autoConnect` from preferences.json, defaulting to true.
+pub fn load_auto_connect(mac: &str) -> bool {
+    std::fs::read_to_string(get_preferences_path())
+        .map(|s| parse_auto_connect(&s, mac))
+        .unwrap_or(true)
+}
+
 fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let mut swapped_key = *key;
     swapped_key.reverse();
@@ -266,6 +338,107 @@ mod tests {
             parse_preferred_codec(r#"{"preferred_codec":"Sbc"}"#),
             PreferredCodec::Sbc
         );
+    }
+
+    #[test]
+    fn switching_pref_missing_gives_handoff() {
+        assert_eq!(SwitchingMode::default(), SwitchingMode::Handoff);
+        assert_eq!(switching_mode_from_value(None), SwitchingMode::Handoff);
+        assert_eq!(parse_switching_mode("{}"), SwitchingMode::Handoff);
+        assert_eq!(parse_switching_mode(""), SwitchingMode::Handoff);
+        assert_eq!(
+            parse_switching_mode(r#"{"switching":null}"#),
+            SwitchingMode::Handoff
+        );
+    }
+
+    #[test]
+    fn switching_pref_valid_values() {
+        assert_eq!(
+            parse_switching_mode(r#"{"switching":"handoff"}"#),
+            SwitchingMode::Handoff
+        );
+        assert_eq!(
+            parse_switching_mode(r#"{"switching":"legacy"}"#),
+            SwitchingMode::Legacy
+        );
+        assert_eq!(
+            parse_switching_mode(r#"{"switching":"off"}"#),
+            SwitchingMode::Off
+        );
+        assert_eq!(
+            switching_mode_from_value(Some(&serde_json::json!({"switching": "legacy"}))),
+            SwitchingMode::Legacy
+        );
+    }
+
+    #[test]
+    fn switching_pref_invalid_string_gives_handoff() {
+        for value in [r#""Off""#, r#""bogus""#, r#""""#, r#"" off""#] {
+            assert_eq!(
+                parse_switching_mode(&format!(r#"{{"switching":{value}}}"#)),
+                SwitchingMode::Handoff,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_pref_wrong_type_gives_handoff() {
+        for value in ["true", "0", "[\"off\"]", r#"{"mode":"off"}"#] {
+            assert_eq!(
+                parse_switching_mode(&format!(r#"{{"switching":{value}}}"#)),
+                SwitchingMode::Handoff,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_pref_non_json_gives_handoff() {
+        assert_eq!(parse_switching_mode("not json"), SwitchingMode::Handoff);
+        assert_eq!(parse_switching_mode("switching=off"), SwitchingMode::Handoff);
+        assert_eq!(parse_switching_mode(r#""off""#), SwitchingMode::Handoff);
+        assert_eq!(parse_switching_mode("[]"), SwitchingMode::Handoff);
+    }
+
+    #[test]
+    fn switching_pref_next_to_auto_connect() {
+        assert_eq!(
+            parse_switching_mode(r#"{"switching":"off","AA:BB:CC:DD:EE:FF":{"autoConnect":false}}"#),
+            SwitchingMode::Off
+        );
+        assert_eq!(
+            parse_switching_mode(r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":false}}"#),
+            SwitchingMode::Handoff
+        );
+    }
+
+    #[test]
+    fn auto_connect_pref_next_to_switching() {
+        let prefs = r#"{"switching":"legacy","AA:BB:CC:DD:EE:FF":{"autoConnect":false}}"#;
+        assert!(!parse_auto_connect(prefs, "AA:BB:CC:DD:EE:FF"));
+        assert!(parse_auto_connect(prefs, "11:22:33:44:55:66"));
+    }
+
+    #[test]
+    fn auto_connect_pref_defaults_to_true() {
+        let mac = "AA:BB:CC:DD:EE:FF";
+        assert!(parse_auto_connect("{}", mac));
+        assert!(parse_auto_connect("not json", mac));
+        assert!(parse_auto_connect("", mac));
+        assert!(auto_connect_from_value(None, mac));
+        assert!(parse_auto_connect(r#"{"AA:BB:CC:DD:EE:FF":{}}"#, mac));
+        assert!(parse_auto_connect(r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":null}}"#, mac));
+        assert!(parse_auto_connect(r#"{"AA:BB:CC:DD:EE:FF":"off"}"#, mac));
+        assert!(parse_auto_connect(r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":true}}"#, mac));
+    }
+
+    #[test]
+    fn auto_connect_pref_reads_each_device() {
+        let prefs = r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":false},"11:22:33:44:55:66":{"autoConnect":true}}"#;
+        assert!(!parse_auto_connect(prefs, "AA:BB:CC:DD:EE:FF"));
+        assert!(parse_auto_connect(prefs, "11:22:33:44:55:66"));
     }
 
     #[test]
