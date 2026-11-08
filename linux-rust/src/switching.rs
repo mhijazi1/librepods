@@ -642,6 +642,7 @@ impl Switching {
             .then(handoff_log::app_log)
             .flatten();
         let mac = setup.airpods_mac.clone();
+        // shortcut: connect mode is read once at start; a live update is tracked in (#153)
         let switching =
             Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller)
                 .await
