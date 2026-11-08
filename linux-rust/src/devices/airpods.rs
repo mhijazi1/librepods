@@ -1,10 +1,12 @@
 use crate::battery_provider::{BatteryExporter, BluezBatteryProvider};
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
+use crate::bluetooth::aacp::{BatteryInfo, BatteryStatus};
 use crate::media_controller::MediaController;
 use crate::switching::{Switching, SwitchingSetup, device_media, spawn_playback_poller};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
+use crate::ui::window::merge_battery_entry;
 use bluer::Address;
 use ksni::Handle;
 use log::{debug, error, info, warn};
@@ -274,24 +276,40 @@ impl AirPodsDevice {
                         if let Some(handle) = &tray_handle {
                             handle
                                 .update(|tray: &mut MyTray| {
+                                    // Same per-component rule as the window: a
+                                    // Disconnected entry keeps a known level/status.
+                                    fn apply(
+                                        level: &mut Option<u8>,
+                                        status: &mut Option<BatteryStatus>,
+                                        b: &BatteryInfo,
+                                    ) {
+                                        let prev = (*level).zip(*status);
+                                        let (l, s) = merge_battery_entry(prev, (b.level, b.status));
+                                        *level = Some(l);
+                                        *status = Some(s);
+                                    }
                                     for b in &battery_info {
                                         match b.component as u8 {
-                                            0x01 => {
-                                                tray.battery_headphone = Some(b.level);
-                                                tray.battery_headphone_status = Some(b.status);
-                                            }
-                                            0x02 => {
-                                                tray.battery_r = Some(b.level);
-                                                tray.battery_r_status = Some(b.status);
-                                            }
-                                            0x04 => {
-                                                tray.battery_l = Some(b.level);
-                                                tray.battery_l_status = Some(b.status);
-                                            }
-                                            0x08 => {
-                                                tray.battery_c = Some(b.level);
-                                                tray.battery_c_status = Some(b.status);
-                                            }
+                                            0x01 => apply(
+                                                &mut tray.battery_headphone,
+                                                &mut tray.battery_headphone_status,
+                                                b,
+                                            ),
+                                            0x02 => apply(
+                                                &mut tray.battery_r,
+                                                &mut tray.battery_r_status,
+                                                b,
+                                            ),
+                                            0x04 => apply(
+                                                &mut tray.battery_l,
+                                                &mut tray.battery_l_status,
+                                                b,
+                                            ),
+                                            0x08 => apply(
+                                                &mut tray.battery_c,
+                                                &mut tray.battery_c_status,
+                                                b,
+                                            ),
                                             _ => {}
                                         }
                                     }

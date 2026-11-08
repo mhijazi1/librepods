@@ -27,15 +27,43 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex, RwLock};
 
+/// The single per-component battery rule, shared by the window (`merge_battery`) and
+/// the tray (devices/airpods.rs). A Disconnected update (AACP status 0x04, e.g. the
+/// case while the buds are out of it) never replaces a known non-Disconnected
+/// level/status: the previous entry is kept. Otherwise the update wins: a Disconnected
+/// update is stored when nothing (or only Disconnected) is known, and a Charging or
+/// NotCharging update always replaces the previous entry.
+pub(crate) fn merge_battery_entry(
+    prev: Option<(u8, BatteryStatus)>,
+    update: (u8, BatteryStatus),
+) -> (u8, BatteryStatus) {
+    match prev {
+        Some(known)
+            if update.1 == BatteryStatus::Disconnected
+                && known.1 != BatteryStatus::Disconnected =>
+        {
+            known
+        }
+        _ => update,
+    }
+}
+
 /// Merges a partial battery update into the previous levels, one component at a time.
 /// A component absent from `update` keeps its previous entry. A component present in
-/// `update` replaces it (level and status), even when its status is Disconnected.
-/// A component with no previous entry is appended.
+/// both goes through `merge_battery_entry`. A component with no previous entry is
+/// appended.
 fn merge_battery(prev: &[BatteryInfo], update: &[BatteryInfo]) -> Vec<BatteryInfo> {
     let mut merged = prev.to_vec();
     for entry in update {
         match merged.iter_mut().find(|m| m.component == entry.component) {
-            Some(existing) => *existing = entry.clone(),
+            Some(existing) => {
+                let (level, status) = merge_battery_entry(
+                    Some((existing.level, existing.status)),
+                    (entry.level, entry.status),
+                );
+                existing.level = level;
+                existing.status = status;
+            }
             None => merged.push(entry.clone()),
         }
     }
@@ -48,6 +76,16 @@ fn battery_level_label(level: Option<u8>) -> String {
         Some(n) => format!("{n}%"),
         None => "--".to_string(),
     }
+}
+
+/// Text for one component's battery entry in the window. A missing entry or a
+/// Disconnected one (whose level byte is not a real level) is shown as `--`.
+fn battery_label(entry: Option<&BatteryInfo>) -> String {
+    battery_level_label(
+        entry
+            .filter(|x| x.status != BatteryStatus::Disconnected)
+            .map(|x| x.level),
+    )
 }
 
 pub fn start_ui(
@@ -745,12 +783,9 @@ impl App {
                                                     level, if charging {"\u{1002E6}"} else {""}
                                                 )
                                             } else {
-                                                let left  = battery_level_label(b.iter().find(|x| x.component == BatteryComponent::Left)
-                                                    .map(|x| x.level));
-                                                let right = battery_level_label(b.iter().find(|x| x.component == BatteryComponent::Right)
-                                                    .map(|x| x.level));
-                                                let case  = battery_level_label(b.iter().find(|x| x.component == BatteryComponent::Case)
-                                                    .map(|x| x.level));
+                                                let left  = battery_label(b.iter().find(|x| x.component == BatteryComponent::Left));
+                                                let right = battery_label(b.iter().find(|x| x.component == BatteryComponent::Right));
+                                                let case  = battery_label(b.iter().find(|x| x.component == BatteryComponent::Case));
                                                 let left_charging = b.iter().find(|x| x.component == BatteryComponent::Left)
                                                     .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
                                                 let right_charging = b.iter().find(|x| x.component == BatteryComponent::Right)
@@ -1459,6 +1494,11 @@ mod tests {
         }
     }
 
+    /// The AACP case entry sent while the buds are out of the case.
+    fn case_disconnected(level: u8) -> BatteryInfo {
+        info(BatteryComponent::Case, level, BatteryStatus::Disconnected)
+    }
+
     fn prev_all() -> Vec<BatteryInfo> {
         vec![
             info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
@@ -1506,7 +1546,14 @@ mod tests {
             info(BatteryComponent::Case, 30, BatteryStatus::Disconnected),
         ];
         let merged = merge_battery(&prev_all(), &update);
-        assert_eq!(merged, update);
+        assert_eq!(
+            merged,
+            vec![
+                info(BatteryComponent::Left, 10, BatteryStatus::Charging),
+                info(BatteryComponent::Right, 20, BatteryStatus::Charging),
+                info(BatteryComponent::Case, 60, BatteryStatus::NotCharging),
+            ]
+        );
     }
 
     #[test]
@@ -1534,12 +1581,110 @@ mod tests {
     }
 
     #[test]
-    fn merge_battery_present_entry_wins_even_when_disconnected() {
-        let update = vec![info(BatteryComponent::Case, 0, BatteryStatus::Disconnected)];
-        let merged = merge_battery(&prev_all(), &update);
+    fn merge_battery_disconnected_case_keeps_ble_level() {
+        let prev = vec![
+            info(BatteryComponent::Left, 70, BatteryStatus::NotCharging),
+            info(BatteryComponent::Right, 72, BatteryStatus::NotCharging),
+            info(BatteryComponent::Case, 80, BatteryStatus::NotCharging),
+        ];
+        let update = vec![case_disconnected(30)];
+        let merged = merge_battery(&prev, &update);
+        assert_eq!(merged, prev);
+    }
+
+    #[test]
+    fn merge_battery_disconnected_keeps_charging_entry() {
+        let prev = vec![info(BatteryComponent::Case, 45, BatteryStatus::Charging)];
+        let update = vec![case_disconnected(30)];
+        let merged = merge_battery(&prev, &update);
+        assert_eq!(merged, prev);
+    }
+
+    #[test]
+    fn merge_battery_disconnected_without_prev_is_appended() {
+        let prev = vec![
+            info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+            info(BatteryComponent::Right, 75, BatteryStatus::NotCharging),
+        ];
+        let update = vec![case_disconnected(30)];
+        let merged = merge_battery(&prev, &update);
         assert_eq!(
-            merged[2],
-            info(BatteryComponent::Case, 0, BatteryStatus::Disconnected)
+            merged,
+            vec![
+                info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+                info(BatteryComponent::Right, 75, BatteryStatus::NotCharging),
+                info(BatteryComponent::Case, 30, BatteryStatus::Disconnected),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_battery_disconnected_over_disconnected_replaces() {
+        let prev = vec![case_disconnected(30)];
+        let update = vec![case_disconnected(25)];
+        let merged = merge_battery(&prev, &update);
+        assert_eq!(merged, update);
+    }
+
+    #[test]
+    fn merge_battery_known_status_over_disconnected_replaces() {
+        let prev = vec![case_disconnected(30)];
+
+        let update = vec![info(BatteryComponent::Case, 55, BatteryStatus::NotCharging)];
+        assert_eq!(merge_battery(&prev, &update), update);
+
+        let update = vec![info(BatteryComponent::Case, 56, BatteryStatus::Charging)];
+        assert_eq!(merge_battery(&prev, &update), update);
+    }
+
+    #[test]
+    fn merge_battery_entry_tray_shaped() {
+        assert_eq!(
+            merge_battery_entry(
+                Some((80, BatteryStatus::NotCharging)),
+                (30, BatteryStatus::Disconnected)
+            ),
+            (80, BatteryStatus::NotCharging)
+        );
+        assert_eq!(
+            merge_battery_entry(None, (30, BatteryStatus::Disconnected)),
+            (30, BatteryStatus::Disconnected)
+        );
+        assert_eq!(
+            merge_battery_entry(
+                Some((30, BatteryStatus::Disconnected)),
+                (55, BatteryStatus::Charging)
+            ),
+            (55, BatteryStatus::Charging)
+        );
+    }
+
+    #[test]
+    fn merge_battery_entry_known_update_always_wins() {
+        assert_eq!(
+            merge_battery_entry(
+                Some((80, BatteryStatus::Charging)),
+                (79, BatteryStatus::NotCharging)
+            ),
+            (79, BatteryStatus::NotCharging)
+        );
+        assert_eq!(
+            merge_battery_entry(
+                Some((80, BatteryStatus::NotCharging)),
+                (81, BatteryStatus::Charging)
+            ),
+            (81, BatteryStatus::Charging)
+        );
+        assert_eq!(
+            merge_battery_entry(None, (50, BatteryStatus::NotCharging)),
+            (50, BatteryStatus::NotCharging)
+        );
+        assert_eq!(
+            merge_battery_entry(
+                Some((30, BatteryStatus::Disconnected)),
+                (25, BatteryStatus::Disconnected)
+            ),
+            (25, BatteryStatus::Disconnected)
         );
     }
 
@@ -1547,6 +1692,21 @@ mod tests {
     fn battery_level_label_shows_dash_for_unknown_level() {
         assert_eq!(battery_level_label(None), "--");
         assert_eq!(battery_level_label(Some(85)), "85%");
+    }
+
+    #[test]
+    fn battery_label_dash_for_missing_or_disconnected() {
+        assert_eq!(battery_label(None), "--");
+        let disconnected = info(BatteryComponent::Case, 30, BatteryStatus::Disconnected);
+        assert_eq!(battery_label(Some(&disconnected)), "--");
+    }
+
+    #[test]
+    fn battery_label_percent_for_known_status() {
+        let not_charging = info(BatteryComponent::Left, 85, BatteryStatus::NotCharging);
+        assert_eq!(battery_label(Some(&not_charging)), "85%");
+        let charging = info(BatteryComponent::Case, 85, BatteryStatus::Charging);
+        assert_eq!(battery_label(Some(&charging)), "85%");
     }
 }
 
