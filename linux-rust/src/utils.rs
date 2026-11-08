@@ -102,14 +102,20 @@ pub fn load_preferred_codec() -> PreferredCodec {
         .unwrap_or_default()
 }
 
-/// Extracts `preferred_codec` from the app settings JSON. Anything missing or
-/// unreadable gives the default (AAC). Split from the file read for testing.
-pub fn parse_preferred_codec(settings: &str) -> PreferredCodec {
-    serde_json::from_str::<serde_json::Value>(settings)
-        .ok()
+/// Reads `preferred_codec` from already-parsed app settings. Missing settings,
+/// a missing key, null or an unknown codec name all give the default (AAC).
+pub fn preferred_codec_from_value(settings: Option<&serde_json::Value>) -> PreferredCodec {
+    settings
         .and_then(|v| v.get("preferred_codec").cloned())
         .and_then(|c| serde_json::from_value(c).ok())
         .unwrap_or_default()
+}
+
+/// Extracts `preferred_codec` from the app settings JSON. Anything missing or
+/// unreadable gives the default (AAC). Split from the file read for testing.
+pub fn parse_preferred_codec(settings: &str) -> PreferredCodec {
+    let value = serde_json::from_str::<serde_json::Value>(settings).ok();
+    preferred_codec_from_value(value.as_ref())
 }
 
 fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
@@ -259,6 +265,31 @@ mod tests {
         assert_eq!(
             parse_preferred_codec(r#"{"preferred_codec":"Sbc"}"#),
             PreferredCodec::Sbc
+        );
+    }
+
+    #[test]
+    fn preferred_codec_from_value_defaults_to_aac() {
+        assert_eq!(preferred_codec_from_value(None), PreferredCodec::Aac);
+        assert_eq!(
+            preferred_codec_from_value(Some(&serde_json::json!({}))),
+            PreferredCodec::Aac
+        );
+        assert_eq!(
+            preferred_codec_from_value(Some(&serde_json::json!({"preferred_codec": null}))),
+            PreferredCodec::Aac
+        );
+        assert_eq!(
+            preferred_codec_from_value(Some(&serde_json::json!({"preferred_codec": "bogus"}))),
+            PreferredCodec::Aac
+        );
+        assert_eq!(
+            preferred_codec_from_value(Some(&serde_json::json!({"preferred_codec": "Sbc"}))),
+            PreferredCodec::Sbc
+        );
+        assert_eq!(
+            preferred_codec_from_value(Some(&serde_json::json!({"preferred_codec": "SbcXq"}))),
+            PreferredCodec::SbcXq
         );
     }
 }
