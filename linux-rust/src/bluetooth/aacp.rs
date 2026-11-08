@@ -1065,6 +1065,126 @@ fn reversed_mac_bytes(mac_address: &str) -> Vec<u8> {
     mac_bytes.iter().rev().cloned().collect()
 }
 
+// OPACK value writers: the subset of Apple's OPACK encoding that the
+// smart-routing dictionaries use, matching the audioaccessoryd relay payloads
+// captured in #35.
+
+// String: 0x40+n for n <= 32, then 0x61/0x62/0x63/0x64 with a 1/2/3/4-byte
+// little-endian length.
+fn opack_write_str(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    if n <= 0x20 {
+        out.push(0x40 + n as u8);
+    } else if n <= 0xFF {
+        out.push(0x61);
+        out.push(n as u8);
+    } else if n <= 0xFFFF {
+        out.push(0x62);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= 0xFF_FFFF {
+        out.push(0x63);
+        out.extend_from_slice(&(n as u32).to_le_bytes()[..3]);
+    } else {
+        out.push(0x64);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    }
+    out.extend_from_slice(bytes);
+}
+
+// Unsigned integer: 0x08+n for 0..=39, then 0x30 <u8>, 0x31 <u16 LE> and
+// 0x32 <u32 LE>.
+fn opack_write_uint(out: &mut Vec<u8>, n: u32) {
+    if n <= 39 {
+        out.push(0x08 + n as u8);
+    } else if n <= 0xFF {
+        out.push(0x30);
+        out.push(n as u8);
+    } else if n <= 0xFFFF {
+        out.push(0x31);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else {
+        out.push(0x32);
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+fn opack_write_true(out: &mut Vec<u8>) {
+    out.push(0x01);
+}
+
+// Dictionary header for `count` key/value pairs (count < 15).
+fn opack_write_dict_header(out: &mut Vec<u8>, count: u8) {
+    debug_assert!(count < 0x0F);
+    out.push(0xE0 + count);
+}
+
+// OPACK dict of a media-information relay message, in Apple's key order:
+// playingApp, hostStreamingState ("YES"/"NO"), btAddress, btName,
+// otherDeviceAudioCategory.
+pub(crate) fn media_information_body(
+    playing_app: &str,
+    host_streaming: bool,
+    bt_address: &str,
+    bt_name: &str,
+    audio_category: u32,
+) -> Vec<u8> {
+    let mut dict = Vec::with_capacity(128);
+    opack_write_dict_header(&mut dict, 5);
+    opack_write_str(&mut dict, "playingApp");
+    opack_write_str(&mut dict, playing_app);
+    opack_write_str(&mut dict, "hostStreamingState");
+    opack_write_str(&mut dict, if host_streaming { "YES" } else { "NO" });
+    opack_write_str(&mut dict, "btAddress");
+    opack_write_str(&mut dict, bt_address);
+    opack_write_str(&mut dict, "btName");
+    opack_write_str(&mut dict, bt_name);
+    opack_write_str(&mut dict, "otherDeviceAudioCategory");
+    opack_write_uint(&mut dict, audio_category);
+    dict
+}
+
+// OPACK dict of a tipi relay message, in Apple's key order: idleTime,
+// newTipi (only present when true, as Apple omits it otherwise), btAddress,
+// btName, nearbyAudioScore.
+pub(crate) fn tipi_body(
+    idle_time: u32,
+    new_tipi: bool,
+    bt_address: &str,
+    bt_name: &str,
+    nearby_audio_score: u32,
+) -> Vec<u8> {
+    let mut dict = Vec::with_capacity(80);
+    opack_write_dict_header(&mut dict, if new_tipi { 5 } else { 4 });
+    opack_write_str(&mut dict, "idleTime");
+    opack_write_uint(&mut dict, idle_time);
+    if new_tipi {
+        opack_write_str(&mut dict, "newTipi");
+        opack_write_true(&mut dict);
+    }
+    opack_write_str(&mut dict, "btAddress");
+    opack_write_str(&mut dict, bt_address);
+    opack_write_str(&mut dict, "btName");
+    opack_write_str(&mut dict, bt_name);
+    opack_write_str(&mut dict, "nearbyAudioScore");
+    opack_write_uint(&mut dict, nearby_audio_score);
+    dict
+}
+
+// Smart-routing data packet: opcode, reversed target MAC, u16 LE length of
+// what follows (the 0x01 byte plus the dict), 0x01, then the dict with no
+// padding.
+fn smart_routing_packet(target_mac_address: &str, dict: &[u8]) -> Vec<u8> {
+    let length = u16::try_from(1 + dict.len()).expect("smart-routing dict exceeds u16 length");
+    let mut packet = Vec::with_capacity(11 + dict.len());
+    packet.extend_from_slice(&[opcodes::SMART_ROUTING, 0x00]);
+    packet.extend_from_slice(&reversed_mac_bytes(target_mac_address));
+    packet.extend_from_slice(&length.to_le_bytes());
+    packet.push(0x01);
+    packet.extend_from_slice(dict);
+    packet
+}
+
 pub(crate) fn encode_control_command(
     identifier: ControlCommandIdentifiers,
     value: &[u8],
@@ -1081,33 +1201,8 @@ pub(crate) fn encode_media_information_new_device(
     self_mac_address: &str,
     target_mac_address: &str,
 ) -> Vec<u8> {
-    let opcode = [opcodes::SMART_ROUTING, 0x00];
-    let mut buffer = Vec::with_capacity(112);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
-
-    buffer.extend_from_slice(&[0x68, 0x00]);
-    buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-    buffer.extend_from_slice(b"playingApp");
-    buffer.push(0x42);
-    buffer.extend_from_slice(b"NA");
-    buffer.push(0x52);
-    buffer.extend_from_slice(b"hostStreamingState");
-    buffer.push(0x42);
-    buffer.extend_from_slice(b"NO");
-    buffer.push(0x49);
-    buffer.extend_from_slice(b"btAddress");
-    buffer.push(0x51);
-    buffer.extend_from_slice(self_mac_address.as_bytes());
-    buffer.push(0x46);
-    buffer.extend_from_slice(b"btName");
-    buffer.push(0x43);
-    buffer.extend_from_slice(b"Mac");
-    buffer.push(0x58);
-    buffer.extend_from_slice(b"otherDevice");
-    buffer.extend_from_slice(b"AudioCategory");
-    buffer.extend_from_slice(&[0x30, 0x64]);
-
-    [opcode.as_slice(), buffer.as_slice()].concat()
+    let dict = media_information_body("NA", false, self_mac_address, "Mac", 100);
+    smart_routing_packet(target_mac_address, &dict)
 }
 
 pub(crate) fn encode_hijack_request(target_mac_address: &str) -> Vec<u8> {
@@ -1144,34 +1239,14 @@ pub(crate) fn encode_media_information(
     target_mac_address: &str,
     streaming_state: bool,
 ) -> Vec<u8> {
-    let opcode = [opcodes::SMART_ROUTING, 0x00];
-    let mut buffer = Vec::with_capacity(138);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
-    buffer.extend_from_slice(&[0x82, 0x00]);
-    buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-    buffer.extend_from_slice(b"PlayingApp");
-    buffer.push(0x56);
-    buffer.extend_from_slice(b"com.google.ios.youtube");
-    buffer.push(0x52);
-    buffer.extend_from_slice(b"HostStreamingState");
-    buffer.push(0x42);
-    buffer.extend_from_slice(if streaming_state { b"YES" } else { b"NO" });
-    buffer.push(0x49);
-    buffer.extend_from_slice(b"btAddress");
-    buffer.push(0x51);
-    buffer.extend_from_slice(self_mac_address.as_bytes());
-    buffer.extend_from_slice(b"btName");
-    buffer.push(0x43);
-    buffer.extend_from_slice(b"Mac");
-    buffer.push(0x58);
-    buffer.extend_from_slice(b"otherDevice");
-    buffer.extend_from_slice(b"AudioCategory");
-    buffer.extend_from_slice(&[0x31, 0x2D, 0x01]);
-
-    while buffer.len() < 138 {
-        buffer.push(0x00);
-    }
-    [opcode.as_slice(), buffer.as_slice()].concat()
+    let dict = media_information_body(
+        "com.google.ios.youtube",
+        streaming_state,
+        self_mac_address,
+        "Mac",
+        301,
+    );
+    smart_routing_packet(target_mac_address, &dict)
 }
 
 pub(crate) fn encode_smart_routing_show_ui(target_mac_address: &str) -> Vec<u8> {
@@ -1231,28 +1306,8 @@ pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> Vec<u8> {
 }
 
 pub(crate) fn encode_add_tipi_device(self_mac_address: &str, target_mac_address: &str) -> Vec<u8> {
-    let opcode = [opcodes::SMART_ROUTING, 0x00];
-    let mut buffer = Vec::with_capacity(86);
-    buffer.extend_from_slice(&reversed_mac_bytes(target_mac_address));
-    buffer.extend_from_slice(&[0x4E, 0x00]);
-    buffer.extend_from_slice(&[0x01, 0xE5]);
-    buffer.extend_from_slice(&[0x48, 0x69]);
-    buffer.extend_from_slice(b"idleTime");
-    buffer.extend_from_slice(&[0x08, 0x47]);
-    buffer.extend_from_slice(b"newTipi");
-    buffer.extend_from_slice(&[0x01, 0x49]);
-    buffer.extend_from_slice(b"btAddress");
-    buffer.push(0x51);
-    buffer.extend_from_slice(self_mac_address.as_bytes());
-    buffer.push(0x46);
-    buffer.extend_from_slice(b"btName");
-    buffer.push(0x43);
-    buffer.extend_from_slice(b"Mac");
-    buffer.push(0x50);
-    buffer.extend_from_slice(b"nearbyAudioScore");
-    buffer.push(0x0E);
-
-    [opcode.as_slice(), buffer.as_slice()].concat()
+    let dict = tipi_body(0, true, self_mac_address, "Mac", 6);
+    smart_routing_packet(target_mac_address, &dict)
 }
 
 // AUDIO_SOURCE (0x0E): source MAC in payload[2..8], least significant byte
@@ -1485,11 +1540,34 @@ mod tests {
     }
 
     // Golden packets: the exact bytes the send_* methods put on the send
-    // channel (header included), captured from the implementation before the
-    // encoders were extracted. They pin current behaviour, quirks included
-    // (no 0x46 before "btName" in media information, "reasonHhijackv2" in the
-    // show-UI packet, the 0x4E length in add-tipi, the padding lengths). Do not
-    // "fix" these bytes in a refactor; protocol changes need their own ticket.
+    // channel (header included). They were captured from the implementation
+    // before the encoders were extracted (#7) and pin current behaviour.
+    // Protocol changes need their own ticket and must justify each changed
+    // byte here.
+    //
+    // #35 aligned three of them with the audioaccessoryd (BTSmartRoutingDaemon)
+    // relay payloads that mo captured from an iPhone in #35 (the
+    // golden_apple_* tests below hold that hex verbatim). The values Linux
+    // sends did not change, only the layout:
+    // - GOLDEN_MEDIA_INFORMATION_STREAMING / _NOT_STREAMING:
+    //   - length 0x82 -> 0x7E (streaming) / 0x7D (not streaming): the length
+    //     is 1 (the 0x01 byte) + the dict, 125 / 124 bytes. Every captured
+    //     payload is exactly one dict with nothing after it, so the trailing
+    //     0x00 padding the old length counted is gone (140 / 139 bytes total).
+    //   - "PlayingApp" 0x50 -> 0x70 and "HostStreamingState" 0x48 -> 0x68:
+    //     Apple's keys are lowercase, `4a 70 6c 61 79 69 6e 67 41 70 70` and
+    //     `52 68 6f 73 74 53 74 72 65 61 6d ...`.
+    //   - "YES" tag 0x42 -> 0x43: a 3-byte string, as in the capture's
+    //     `43 59 45 53` ("NO" stays `42 4e 4f`).
+    //   - 0x46 inserted before "btName": the key was a bare string with no
+    //     tag; the capture has `46 62 74 4e 61 6d 65`.
+    // - GOLDEN_ADD_TIPI_DEVICE: the stray 0x69 after the key tag 0x48 is
+    //   removed, giving `48 69 64 6c 65 54 69 6d 65` ("idleTime") as in the
+    //   capture. The length 0x4E (1 + the 77-byte dict) was already right; the
+    //   packet is now 92 bytes.
+    // The other constants are unchanged, quirks included ("reasonHhijackv2"
+    // in show-UI). GOLDEN_HIJACK_REQUEST already equals Apple's own Hijackv2
+    // payload (golden_apple_hijack_request).
     const GOLDEN_TARGET_MAC: &str = "AA:BB:CC:DD:EE:FF";
     const GOLDEN_SELF_MAC: &str = "11:22:33:44:55:66";
 
@@ -1522,28 +1600,28 @@ mod tests {
         0x63, 0x6F, 0x72, 0x65, 0xA2,
     ];
     const GOLDEN_MEDIA_INFORMATION_STREAMING: &[u8] = &[
-        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x82, 0x00, 0x01,
-        0xE5, 0x4A, 0x50, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x56, 0x63, 0x6F,
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x7E, 0x00, 0x01,
+        0xE5, 0x4A, 0x70, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x56, 0x63, 0x6F,
         0x6D, 0x2E, 0x67, 0x6F, 0x6F, 0x67, 0x6C, 0x65, 0x2E, 0x69, 0x6F, 0x73, 0x2E, 0x79, 0x6F,
-        0x75, 0x74, 0x75, 0x62, 0x65, 0x52, 0x48, 0x6F, 0x73, 0x74, 0x53, 0x74, 0x72, 0x65, 0x61,
-        0x6D, 0x69, 0x6E, 0x67, 0x53, 0x74, 0x61, 0x74, 0x65, 0x42, 0x59, 0x45, 0x53, 0x49, 0x62,
+        0x75, 0x74, 0x75, 0x62, 0x65, 0x52, 0x68, 0x6F, 0x73, 0x74, 0x53, 0x74, 0x72, 0x65, 0x61,
+        0x6D, 0x69, 0x6E, 0x67, 0x53, 0x74, 0x61, 0x74, 0x65, 0x43, 0x59, 0x45, 0x53, 0x49, 0x62,
         0x74, 0x41, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A,
-        0x33, 0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35, 0x35, 0x3A, 0x36, 0x36, 0x62, 0x74, 0x4E, 0x61,
-        0x6D, 0x65, 0x43, 0x4D, 0x61, 0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76,
-        0x69, 0x63, 0x65, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72,
-        0x79, 0x31, 0x2D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x33, 0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35, 0x35, 0x3A, 0x36, 0x36, 0x46, 0x62, 0x74, 0x4E,
+        0x61, 0x6D, 0x65, 0x43, 0x4D, 0x61, 0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65,
+        0x76, 0x69, 0x63, 0x65, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F,
+        0x72, 0x79, 0x31, 0x2D, 0x01,
     ];
     const GOLDEN_MEDIA_INFORMATION_NOT_STREAMING: &[u8] = &[
-        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x82, 0x00, 0x01,
-        0xE5, 0x4A, 0x50, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x56, 0x63, 0x6F,
+        0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x7D, 0x00, 0x01,
+        0xE5, 0x4A, 0x70, 0x6C, 0x61, 0x79, 0x69, 0x6E, 0x67, 0x41, 0x70, 0x70, 0x56, 0x63, 0x6F,
         0x6D, 0x2E, 0x67, 0x6F, 0x6F, 0x67, 0x6C, 0x65, 0x2E, 0x69, 0x6F, 0x73, 0x2E, 0x79, 0x6F,
-        0x75, 0x74, 0x75, 0x62, 0x65, 0x52, 0x48, 0x6F, 0x73, 0x74, 0x53, 0x74, 0x72, 0x65, 0x61,
+        0x75, 0x74, 0x75, 0x62, 0x65, 0x52, 0x68, 0x6F, 0x73, 0x74, 0x53, 0x74, 0x72, 0x65, 0x61,
         0x6D, 0x69, 0x6E, 0x67, 0x53, 0x74, 0x61, 0x74, 0x65, 0x42, 0x4E, 0x4F, 0x49, 0x62, 0x74,
         0x41, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A, 0x33,
-        0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35, 0x35, 0x3A, 0x36, 0x36, 0x62, 0x74, 0x4E, 0x61, 0x6D,
-        0x65, 0x43, 0x4D, 0x61, 0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76, 0x69,
-        0x63, 0x65, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72, 0x79,
-        0x31, 0x2D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35, 0x35, 0x3A, 0x36, 0x36, 0x46, 0x62, 0x74, 0x4E, 0x61,
+        0x6D, 0x65, 0x43, 0x4D, 0x61, 0x63, 0x58, 0x6F, 0x74, 0x68, 0x65, 0x72, 0x44, 0x65, 0x76,
+        0x69, 0x63, 0x65, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x43, 0x61, 0x74, 0x65, 0x67, 0x6F, 0x72,
+        0x79, 0x31, 0x2D, 0x01,
     ];
     const GOLDEN_MEDIA_INFORMATION_NEW_DEVICE: &[u8] = &[
         0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x68, 0x00, 0x01,
@@ -1557,12 +1635,12 @@ mod tests {
     ];
     const GOLDEN_ADD_TIPI_DEVICE: &[u8] = &[
         0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x4E, 0x00, 0x01,
-        0xE5, 0x48, 0x69, 0x69, 0x64, 0x6C, 0x65, 0x54, 0x69, 0x6D, 0x65, 0x08, 0x47, 0x6E, 0x65,
-        0x77, 0x54, 0x69, 0x70, 0x69, 0x01, 0x49, 0x62, 0x74, 0x41, 0x64, 0x64, 0x72, 0x65, 0x73,
-        0x73, 0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A, 0x33, 0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35,
-        0x35, 0x3A, 0x36, 0x36, 0x46, 0x62, 0x74, 0x4E, 0x61, 0x6D, 0x65, 0x43, 0x4D, 0x61, 0x63,
-        0x50, 0x6E, 0x65, 0x61, 0x72, 0x62, 0x79, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x53, 0x63, 0x6F,
-        0x72, 0x65, 0x0E,
+        0xE5, 0x48, 0x69, 0x64, 0x6C, 0x65, 0x54, 0x69, 0x6D, 0x65, 0x08, 0x47, 0x6E, 0x65, 0x77,
+        0x54, 0x69, 0x70, 0x69, 0x01, 0x49, 0x62, 0x74, 0x41, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73,
+        0x51, 0x31, 0x31, 0x3A, 0x32, 0x32, 0x3A, 0x33, 0x33, 0x3A, 0x34, 0x34, 0x3A, 0x35, 0x35,
+        0x3A, 0x36, 0x36, 0x46, 0x62, 0x74, 0x4E, 0x61, 0x6D, 0x65, 0x43, 0x4D, 0x61, 0x63, 0x50,
+        0x6E, 0x65, 0x61, 0x72, 0x62, 0x79, 0x41, 0x75, 0x64, 0x69, 0x6F, 0x53, 0x63, 0x6F, 0x72,
+        0x65, 0x0E,
     ];
     const GOLDEN_HIJACK_REVERSED: &[u8] = &[
         0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x59, 0x00, 0x01,
@@ -1777,6 +1855,412 @@ mod tests {
     #[should_panic]
     fn encode_hijack_request_invalid_mac_panics() {
         let _ = encode_hijack_request("ZZ:BB:CC:DD:EE:FF");
+    }
+
+    fn opack_uint(n: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        opack_write_uint(&mut out, n);
+        out
+    }
+
+    fn opack_str(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        opack_write_str(&mut out, s);
+        out
+    }
+
+    #[test]
+    fn opack_value_writer_boundaries() {
+        // Ints: 0x08+n up to 39, then 0x30 <u8>, 0x31 <u16 LE>, 0x32 <u32 LE>.
+        assert_eq!(opack_uint(0), [0x08]);
+        assert_eq!(opack_uint(39), [0x2F]);
+        assert_eq!(opack_uint(40), [0x30, 0x28]);
+        assert_eq!(opack_uint(46), [0x30, 0x2E]);
+        assert_eq!(opack_uint(255), [0x30, 0xFF]);
+        assert_eq!(opack_uint(256), [0x31, 0x00, 0x01]);
+        assert_eq!(opack_uint(301), [0x31, 0x2D, 0x01]);
+        assert_eq!(opack_uint(65535), [0x31, 0xFF, 0xFF]);
+        assert_eq!(opack_uint(65536), [0x32, 0x00, 0x00, 0x01, 0x00]);
+        assert_eq!(opack_uint(952696833), [0x32, 0x01, 0x00, 0xC9, 0x38]);
+
+        // Strings: 0x40+n up to 32 bytes, then 0x61 <u8 n> up to 255.
+        assert_eq!(opack_str(""), [0x40]);
+        let s32 = "a".repeat(32);
+        let enc32 = opack_str(&s32);
+        assert_eq!(enc32[0], 0x60);
+        assert_eq!(&enc32[1..], s32.as_bytes());
+        let s33 = "b".repeat(33);
+        let enc33 = opack_str(&s33);
+        assert_eq!(enc33[..2], [0x61, 0x21]);
+        assert_eq!(&enc33[2..], s33.as_bytes());
+        let s255 = "c".repeat(255);
+        assert_eq!(opack_str(&s255)[..2], [0x61, 0xFF]);
+
+        // true
+        let mut t = Vec::new();
+        opack_write_true(&mut t);
+        assert_eq!(t, [0x01]);
+    }
+
+    // Apple's relay payloads from #35 (mo's "Decision (mo, 2026-11-07):
+    // option (b)" comment): audioaccessoryd / BTSmartRoutingDaemon hex dumps
+    // of the OPACK dicts the iPhone sent through the AirPods, copied verbatim.
+    // The iPhone's address is replaced by 00:00:00:00:00:00 (same length).
+    const APPLE_BT_ADDRESS: &str = "00:00:00:00:00:00";
+    const APPLE_BT_NAME: &str = "iPhone";
+
+    const APPLE_MEDIA_INFORMATION_UNKNOWN_NO_100: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 47 55 6e 6b 6e 6f 77 6e 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 42 4e 4f 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 30 64";
+    const APPLE_MEDIA_INFORMATION_UNKNOWN_YES_100: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 47 55 6e 6b 6e 6f 77 6e 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 43 59 45 53 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 30 64";
+    const APPLE_MEDIA_INFORMATION_INSTAGRAM_NO_301: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 53 63 6f 6d 2e 62 75 72 62 6e 2e 69 6e 73 74 61 67 72 61 6d 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 42 4e 4f 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 31 2d 01";
+    const APPLE_MEDIA_INFORMATION_INSTAGRAM_YES_301: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 53 63 6f 6d 2e 62 75 72 62 6e 2e 69 6e 73 74 61 67 72 61 6d 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 43 59 45 53 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 31 2d 01";
+    const APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301: &str = "e5 4a 70 6c 61 79 69 6e 67 41 70 70 52 63 6f 6d 2e 73 70 6f 74 69 66 79 2e 63 6c 69 65 6e 74 52 68 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 43 59 45 53 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 31 2d 01";
+
+    const APPLE_TIPI_IDLE0_NEW_SCORE2: &str = "e5 48 69 64 6c 65 54 69 6d 65 08 47 6e 65 77 54 69 70 69 01 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 0a";
+    const APPLE_TIPI_IDLE0_NEW_SCORE6: &str = "e5 48 69 64 6c 65 54 69 6d 65 08 47 6e 65 77 54 69 70 69 01 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 0e";
+    const APPLE_TIPI_IDLE13_NEW_SCORE1: &str = "e5 48 69 64 6c 65 54 69 6d 65 15 47 6e 65 77 54 69 70 69 01 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 09";
+    const APPLE_TIPI_IDLE46_NEW_SCORE1: &str = "e5 48 69 64 6c 65 54 69 6d 65 30 2e 47 6e 65 77 54 69 70 69 01 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 09";
+    const APPLE_TIPI_IDLE0_SCORE1: &str = "e4 48 69 64 6c 65 54 69 6d 65 08 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 09";
+    const APPLE_TIPI_IDLE0_SCORE2: &str = "e4 48 69 64 6c 65 54 69 6d 65 08 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 0a";
+    const APPLE_TIPI_IDLE3_SCORE7: &str = "e4 48 69 64 6c 65 54 69 6d 65 0b 49 62 74 41 64 64 72 65 73 73 51 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 3a 30 30 46 62 74 4e 61 6d 65 46 69 50 68 6f 6e 65 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 0f";
+
+    // Apple payload 5: the iPhone's Hijackv2 request. 0xa5 is an OPACK
+    // back-reference to object #5 (301), so remotescore = 301.
+    const APPLE_HIJACK_REQUEST: &str = "e5 4a 6c 6f 63 61 6c 73 63 6f 72 65 30 64 46 72 65 61 73 6f 6e 48 48 69 6a 61 63 6b 76 32 51 61 75 64 69 6f 52 6f 75 74 69 6e 67 53 63 6f 72 65 31 2d 01 5f 61 75 64 69 6f 52 6f 75 74 69 6e 67 53 65 74 4f 77 6e 65 72 73 68 69 70 54 6f 46 61 6c 73 65 01 4b 72 65 6d 6f 74 65 73 63 6f 72 65 a5";
+    // Captured messages Linux does not send (#44); kept to exercise the walker.
+    const APPLE_ROUTED_TO_BLUETOOTH: &str = "e2 5f 61 75 64 69 6f 52 6f 75 74 69 6e 67 53 65 74 4f 77 6e 65 72 73 68 69 70 54 6f 46 61 6c 73 65 01 46 72 65 61 73 6f 6e 51 52 6f 75 74 65 64 54 6f 42 6c 75 65 74 6f 6f 74 68";
+    const APPLE_AUDIO_ROUTING_HIJACK_REQUEST: &str = "e3 59 61 75 64 69 6f 52 6f 75 74 69 6e 67 48 69 6a 61 63 6b 52 65 71 75 65 73 74 01 51 61 75 64 69 6f 52 6f 75 74 69 6e 67 53 63 6f 72 65 31 2d 01 55 61 75 64 69 6f 52 6f 75 74 69 6e 67 52 65 71 75 65 73 74 49 44 32 01 00 c9 38";
+
+    // Parses a space-separated hex dump as printed in #35.
+    fn capture_bytes(dump: &str) -> Vec<u8> {
+        dump.split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).expect("hex byte"))
+            .collect()
+    }
+
+    fn assert_media_information_matches_apple(
+        playing_app: &str,
+        host_streaming: bool,
+        audio_category: u32,
+        capture: &str,
+    ) {
+        assert_eq!(
+            media_information_body(
+                playing_app,
+                host_streaming,
+                APPLE_BT_ADDRESS,
+                APPLE_BT_NAME,
+                audio_category,
+            ),
+            capture_bytes(capture)
+        );
+    }
+
+    #[test]
+    fn golden_apple_media_information_unknown_not_streaming_100() {
+        assert_media_information_matches_apple(
+            "Unknown",
+            false,
+            100,
+            APPLE_MEDIA_INFORMATION_UNKNOWN_NO_100,
+        );
+    }
+
+    #[test]
+    fn golden_apple_media_information_unknown_streaming_100() {
+        assert_media_information_matches_apple(
+            "Unknown",
+            true,
+            100,
+            APPLE_MEDIA_INFORMATION_UNKNOWN_YES_100,
+        );
+    }
+
+    #[test]
+    fn golden_apple_media_information_instagram_not_streaming_301() {
+        assert_media_information_matches_apple(
+            "com.burbn.instagram",
+            false,
+            301,
+            APPLE_MEDIA_INFORMATION_INSTAGRAM_NO_301,
+        );
+    }
+
+    #[test]
+    fn golden_apple_media_information_instagram_streaming_301() {
+        assert_media_information_matches_apple(
+            "com.burbn.instagram",
+            true,
+            301,
+            APPLE_MEDIA_INFORMATION_INSTAGRAM_YES_301,
+        );
+    }
+
+    #[test]
+    fn golden_apple_media_information_spotify_streaming_301() {
+        assert_media_information_matches_apple(
+            "com.spotify.client",
+            true,
+            301,
+            APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301,
+        );
+    }
+
+    fn assert_tipi_matches_apple(idle_time: u32, new_tipi: bool, score: u32, capture: &str) {
+        assert_eq!(
+            tipi_body(idle_time, new_tipi, APPLE_BT_ADDRESS, APPLE_BT_NAME, score),
+            capture_bytes(capture)
+        );
+    }
+
+    #[test]
+    fn golden_apple_tipi_idle0_new_tipi_score2() {
+        assert_tipi_matches_apple(0, true, 2, APPLE_TIPI_IDLE0_NEW_SCORE2);
+    }
+
+    #[test]
+    fn golden_apple_tipi_idle0_new_tipi_score6() {
+        assert_tipi_matches_apple(0, true, 6, APPLE_TIPI_IDLE0_NEW_SCORE6);
+    }
+
+    #[test]
+    fn golden_apple_tipi_idle13_new_tipi_score1() {
+        assert_tipi_matches_apple(13, true, 1, APPLE_TIPI_IDLE13_NEW_SCORE1);
+    }
+
+    #[test]
+    fn golden_apple_tipi_idle46_new_tipi_score1() {
+        assert_tipi_matches_apple(46, true, 1, APPLE_TIPI_IDLE46_NEW_SCORE1);
+    }
+
+    #[test]
+    fn golden_apple_tipi_idle0_score1() {
+        assert_tipi_matches_apple(0, false, 1, APPLE_TIPI_IDLE0_SCORE1);
+    }
+
+    #[test]
+    fn golden_apple_tipi_idle0_score2() {
+        assert_tipi_matches_apple(0, false, 2, APPLE_TIPI_IDLE0_SCORE2);
+    }
+
+    #[test]
+    fn golden_apple_tipi_idle3_score7() {
+        assert_tipi_matches_apple(3, false, 7, APPLE_TIPI_IDLE3_SCORE7);
+    }
+
+    #[test]
+    fn golden_apple_hijack_request() {
+        // Skip opcode (2), reversed MAC (6), length (2) and the 0x01 byte.
+        let packet = encode_hijack_request(GOLDEN_TARGET_MAC);
+        let apple = capture_bytes(APPLE_HIJACK_REQUEST);
+        assert_eq!(apple.len(), 97);
+        assert_eq!(packet[11..], apple[..]);
+    }
+
+    // `Result` in this module is bluer's; the walker reports plain strings.
+    type WalkResult<T> = std::result::Result<T, String>;
+
+    // Test-only OPACK walker. Returns the offset just past the object that
+    // starts at `pos`, or an error for an unknown tag or a truncated value.
+    // Handles bools 0x01/0x02, ints 0x08-0x2F and 0x30/0x31/0x32, strings
+    // 0x40-0x60 and 0x61 <u8 len>, back-references 0xA0-0xBF and dicts
+    // 0xE0-0xEE (0xEF: until 0x03). Dict keys must be strings.
+    fn opack_walk(buf: &[u8], pos: usize) -> WalkResult<usize> {
+        let tag = *buf
+            .get(pos)
+            .ok_or_else(|| format!("truncated: no tag at {pos}"))?;
+        let take = |start: usize, n: usize| -> WalkResult<usize> {
+            if start + n > buf.len() {
+                Err(format!(
+                    "tag {tag:#04x} at {pos} needs {n} bytes at {start}, {} left",
+                    buf.len().saturating_sub(start)
+                ))
+            } else {
+                Ok(start + n)
+            }
+        };
+        let string = |start: usize, n: usize| -> WalkResult<usize> {
+            let end = take(start, n)?;
+            std::str::from_utf8(&buf[start..end])
+                .map_err(|e| format!("string at {pos} is not UTF-8: {e}"))?;
+            Ok(end)
+        };
+        let dict_key = |p: usize| -> WalkResult<usize> {
+            match buf.get(p) {
+                Some(0x40..=0x61) => opack_walk(buf, p),
+                Some(t) => Err(format!("dict key at {p} has non-string tag {t:#04x}")),
+                None => Err(format!("truncated: no dict key at {p}")),
+            }
+        };
+        match tag {
+            0x01 | 0x02 => Ok(pos + 1),
+            0x08..=0x2F => Ok(pos + 1),
+            0x30 => take(pos + 1, 1),
+            0x31 => take(pos + 1, 2),
+            0x32 => take(pos + 1, 4),
+            0x40..=0x60 => string(pos + 1, (tag - 0x40) as usize),
+            0x61 => {
+                let n = *buf
+                    .get(pos + 1)
+                    .ok_or_else(|| format!("truncated: no string length at {}", pos + 1))?;
+                string(pos + 2, n as usize)
+            }
+            0xA0..=0xBF => Ok(pos + 1),
+            0xE0..=0xEE => {
+                let mut p = pos + 1;
+                for _ in 0..(tag - 0xE0) {
+                    p = dict_key(p)?;
+                    p = opack_walk(buf, p)?;
+                }
+                Ok(p)
+            }
+            0xEF => {
+                let mut p = pos + 1;
+                while buf.get(p) != Some(&0x03) {
+                    p = dict_key(p)?;
+                    p = opack_walk(buf, p)?;
+                }
+                Ok(p + 1)
+            }
+            _ => Err(format!("unsupported OPACK tag {tag:#04x} at {pos}")),
+        }
+    }
+
+    // A smart-routing data packet (as the encoders return it) is framed as
+    // opcode (2), reversed MAC (6), u16 LE length of the rest, 0x01, then
+    // exactly one OPACK dict with nothing after it.
+    fn check_smart_routing_frame(packet: &[u8]) -> WalkResult<()> {
+        if packet.len() < 12 {
+            return Err(format!("packet too short: {} bytes", packet.len()));
+        }
+        if packet[..2] != [opcodes::SMART_ROUTING, 0x00] {
+            return Err(format!("not a smart-routing opcode: {:02x?}", &packet[..2]));
+        }
+        let length = u16::from_le_bytes([packet[8], packet[9]]) as usize;
+        if length != packet.len() - 10 {
+            return Err(format!(
+                "length field {length} != {} bytes after it",
+                packet.len() - 10
+            ));
+        }
+        if packet[10] != 0x01 {
+            return Err(format!("byte 10 is {:#04x}, expected 0x01", packet[10]));
+        }
+        if !(0xE0..=0xEF).contains(&packet[11]) {
+            return Err(format!("byte 11 is {:#04x}, not a dict", packet[11]));
+        }
+        let end = opack_walk(packet, 11)?;
+        if end != packet.len() {
+            return Err(format!(
+                "{} trailing bytes after the dict",
+                packet.len() - end
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn opack_framing_all_smart_routing_encoders() {
+        let packets = [
+            ("hijack_request", encode_hijack_request(GOLDEN_TARGET_MAC)),
+            (
+                "smart_routing_show_ui",
+                encode_smart_routing_show_ui(GOLDEN_TARGET_MAC),
+            ),
+            (
+                "media_information streaming",
+                encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true),
+            ),
+            (
+                "media_information not streaming",
+                encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, false),
+            ),
+            (
+                "media_information_new_device",
+                encode_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC),
+            ),
+            (
+                "add_tipi_device",
+                encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC),
+            ),
+            ("hijack_reversed", encode_hijack_reversed(GOLDEN_TARGET_MAC)),
+        ];
+        for (name, packet) in &packets {
+            if let Err(e) = check_smart_routing_frame(packet) {
+                panic!("{name}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn opack_walker_accepts_every_apple_capture() {
+        for capture in [
+            APPLE_MEDIA_INFORMATION_UNKNOWN_NO_100,
+            APPLE_MEDIA_INFORMATION_UNKNOWN_YES_100,
+            APPLE_MEDIA_INFORMATION_INSTAGRAM_NO_301,
+            APPLE_MEDIA_INFORMATION_INSTAGRAM_YES_301,
+            APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301,
+            APPLE_TIPI_IDLE0_NEW_SCORE2,
+            APPLE_TIPI_IDLE0_NEW_SCORE6,
+            APPLE_TIPI_IDLE13_NEW_SCORE1,
+            APPLE_TIPI_IDLE46_NEW_SCORE1,
+            APPLE_TIPI_IDLE0_SCORE1,
+            APPLE_TIPI_IDLE0_SCORE2,
+            APPLE_TIPI_IDLE3_SCORE7,
+            APPLE_HIJACK_REQUEST,
+            APPLE_ROUTED_TO_BLUETOOTH,
+            APPLE_AUDIO_ROUTING_HIJACK_REQUEST,
+        ] {
+            let bytes = capture_bytes(capture);
+            assert_eq!(opack_walk(&bytes, 0), Ok(bytes.len()), "{capture}");
+        }
+    }
+
+    // What linux-parity 345d400 sent before #35 (encoder output, no AACP
+    // header), for the walker's negative cases.
+    const LINUX_PARITY_MEDIA_INFORMATION_STREAMING: &str = "10 00 ff ee dd cc bb aa 82 00 01 e5 4a 50 6c 61 79 69 6e 67 41 70 70 56 63 6f 6d 2e 67 6f 6f 67 6c 65 2e 69 6f 73 2e 79 6f 75 74 75 62 65 52 48 6f 73 74 53 74 72 65 61 6d 69 6e 67 53 74 61 74 65 42 59 45 53 49 62 74 41 64 64 72 65 73 73 51 31 31 3a 32 32 3a 33 33 3a 34 34 3a 35 35 3a 36 36 62 74 4e 61 6d 65 43 4d 61 63 58 6f 74 68 65 72 44 65 76 69 63 65 41 75 64 69 6f 43 61 74 65 67 6f 72 79 31 2d 01 00 00 00 00 00";
+    const LINUX_PARITY_ADD_TIPI_DEVICE: &str = "10 00 ff ee dd cc bb aa 4e 00 01 e5 48 69 69 64 6c 65 54 69 6d 65 08 47 6e 65 77 54 69 70 69 01 49 62 74 41 64 64 72 65 73 73 51 31 31 3a 32 32 3a 33 33 3a 34 34 3a 35 35 3a 36 36 46 62 74 4e 61 6d 65 43 4d 61 63 50 6e 65 61 72 62 79 41 75 64 69 6f 53 63 6f 72 65 0e";
+
+    #[test]
+    fn opack_framing_rejects_linux_parity_media_information() {
+        // The full old packet: its length field matched its size, but the
+        // dict does not walk (0x42 "YE", then a bare "btName").
+        let old = capture_bytes(LINUX_PARITY_MEDIA_INFORMATION_STREAMING);
+        assert_eq!(old.len(), 140);
+        assert!(opack_walk(&old, 11).is_err());
+        assert!(check_smart_routing_frame(&old).is_err());
+
+        let good = encode_media_information(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, true);
+        assert_eq!(check_smart_routing_frame(&good), Ok(()));
+
+        // Only the bare btName: drop the 0x46 tag before "btName" (and fix the
+        // length). The walker reads 0x62 as a key tag it does not accept.
+        let tag = good
+            .windows(7)
+            .position(|w| w == b"\x46btName")
+            .expect("btName key");
+        let mut bare = good.clone();
+        bare.remove(tag);
+        let bare_length = (bare.len() - 10) as u16;
+        bare[8..10].copy_from_slice(&bare_length.to_le_bytes());
+        assert!(opack_walk(&bare, 11).is_err());
+        assert!(check_smart_routing_frame(&bare).is_err());
+
+        // Only the padding: the dict walks, but the zero bytes the length
+        // counts trail it.
+        let mut padded = good.clone();
+        padded.extend_from_slice(&[0x00; 5]);
+        let padded_length = (padded.len() - 10) as u16;
+        padded[8..10].copy_from_slice(&padded_length.to_le_bytes());
+        assert_eq!(opack_walk(&padded, 11), Ok(good.len()));
+        assert!(check_smart_routing_frame(&padded).is_err());
+    }
+
+    #[test]
+    fn opack_framing_rejects_linux_parity_add_tipi_device() {
+        // The stray 0x69 made the key "iidleTim" and left a bare 0x65 ('e').
+        let old = capture_bytes(LINUX_PARITY_ADD_TIPI_DEVICE);
+        assert!(opack_walk(&old, 11).is_err());
+        assert!(check_smart_routing_frame(&old).is_err());
     }
 
     // Parser vectors are payloads as receive_packet slices them (`&packet[4..]`,
