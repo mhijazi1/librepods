@@ -1,16 +1,19 @@
+use crate::a2dp_resume::{A2dpResumeIo, Action};
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use crate::bluetooth::aacp::{AACPManagerState, AudioSource, AudioSourceType, ConnectedDevice};
 use crate::pulse;
+use crate::stream_monitor::{AUDIBLE_PEAK, PeakSource, PulsePeaks};
 use dbus::arg::RefArg;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
+use futures::future::BoxFuture;
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -818,17 +821,25 @@ impl MediaController {
     }
 
     pub(crate) fn check_if_playing() -> bool {
-        let conn = match Connection::new_session() {
-            Ok(c) => c,
-            Err(_) => return false,
+        !Self::playing_mpris_players().is_empty()
+    }
+
+    /// The MPRIS players (KDE Connect's excluded) that report Playing.
+    /// Blocking.
+    fn playing_mpris_players() -> Vec<String> {
+        let Ok(conn) = Connection::new_session() else {
+            return Vec::new();
         };
-        Self::list_mpris_services(&conn).iter().any(|service| {
-            let proxy = conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-            proxy
-                .get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                .map(|s| s == "Playing")
-                .unwrap_or(false)
-        })
+        Self::list_mpris_services(&conn)
+            .into_iter()
+            .filter(|service| {
+                let proxy =
+                    conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
+                proxy
+                    .get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+                    .is_ok_and(|s| s == "Playing")
+            })
+            .collect()
     }
 
     fn is_kdeconnect_service(service: &str) -> bool {
@@ -1690,6 +1701,97 @@ impl MediaController {
             })
             .collect()
     }
+
+    /// Call MPRIS `method` (Pause, Play) on one player service. Blocking.
+    fn mpris_call(service: &str, method: &'static str) -> bool {
+        let Ok(conn) = Connection::new_session() else {
+            return false;
+        };
+        conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5))
+            .method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", method, ())
+            .is_ok()
+    }
+
+    /// One step of the A2DP resume chain (#200); false when it failed.
+    async fn resume_action(&self, action: Action) -> bool {
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        match action {
+            Action::SuspendSink(suspend) => match get_sink_name_by_mac(&mac).await {
+                Some(sink) => blocking(move || suspend_sink_sync(&sink, suspend)).await,
+                None => false,
+            },
+            Action::Pause(service) => blocking(move || Self::mpris_call(&service, "Pause")).await,
+            Action::Play(service) => blocking(move || Self::mpris_call(&service, "Play")).await,
+            Action::ProfileOff => match find_card_index(mac).await {
+                Some(index) => blocking(move || set_card_profile_sync(index, "off")).await,
+                None => false,
+            },
+            // Set directly: no WirePlumber restart or availability wait.
+            Action::ProfileA2dp => {
+                let Some(index) = find_card_index(mac).await else {
+                    return false;
+                };
+                match self.get_preferred_a2dp_profile(index).await {
+                    ProfileChoice::Activate(profile) => {
+                        blocking(move || set_card_profile_sync(index, &profile)).await
+                    }
+                    ProfileChoice::KeepActive(_) => true,
+                    ProfileChoice::Unavailable => false,
+                }
+            }
+        }
+    }
+}
+
+/// How long `audible` samples the peaks of the AirPods sink's streams.
+const AUDIBLE_SAMPLE: Duration = Duration::from_millis(500);
+
+/// The A2DP resume chain's production I/O (#200), on the controller clone
+/// `ControllerMedia` holds, so it never takes the outer MediaController
+/// mutex. The kick's Pause goes straight to MPRIS: it is no self-pause.
+impl A2dpResumeIo for MediaController {
+    fn act(&self, action: Action) -> BoxFuture<'static, ()> {
+        let controller = self.clone();
+        Box::pin(async move {
+            if !controller.resume_action(action.clone()).await {
+                warn!("A2DP resume: {action:?} failed");
+            }
+        })
+    }
+
+    /// Some uncorked stream on the AirPods sink peaks above `AUDIBLE_PEAK`
+    /// within `AUDIBLE_SAMPLE`.
+    fn audible(&self) -> BoxFuture<'static, bool> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mac = state.lock().await.connected_device_mac.clone();
+            let inputs = tokio::task::spawn_blocking(move || uncorked_inputs_on_sink_of(&mac))
+                .await
+                .unwrap_or_default();
+            if inputs.is_empty() {
+                return false;
+            }
+            let mut peaks = PulsePeaks::new();
+            peaks.levels(&inputs);
+            tokio::time::sleep(AUDIBLE_SAMPLE).await;
+            peaks
+                .levels(&inputs)
+                .values()
+                .any(|&peak| peak > AUDIBLE_PEAK)
+        })
+    }
+
+    fn playing(&self) -> BoxFuture<'static, Vec<String>> {
+        Box::pin(async {
+            tokio::task::spawn_blocking(Self::playing_mpris_players)
+                .await
+                .unwrap_or_default()
+        })
+    }
+}
+
+async fn blocking(f: impl FnOnce() -> bool + Send + 'static) -> bool {
+    tokio::task::spawn_blocking(f).await.unwrap_or(false)
 }
 
 // --- PulseAudio helpers ---
@@ -1770,6 +1872,50 @@ fn set_card_profile_sync(card_index: u32, profile_name: &str) -> bool {
     pulse::wait(&mut mainloop, &mut op, "card profile change").is_ok()
 }
 
+fn suspend_sink_sync(sink_name: &str, suspend: bool) -> bool {
+    let Ok((mut mainloop, context)) = pulse::connect("LibrePods") else {
+        return false;
+    };
+    let mut introspector = context.introspect();
+    let mut op = introspector.suspend_sink_by_name(sink_name, suspend, None);
+    pulse::wait(&mut mainloop, &mut op, "sink suspend").is_ok()
+}
+
+/// The uncorked sink inputs that play to the sink of the device `mac`.
+fn uncorked_inputs_on_sink_of(mac: &str) -> HashSet<u32> {
+    let Ok((mut mainloop, context)) = pulse::connect("LibrePods") else {
+        return HashSet::new();
+    };
+    let inputs: Rc<RefCell<Vec<(u32, u32)>>> = Rc::default();
+    let mut op = context.introspect().get_sink_input_info_list({
+        let inputs = Rc::downgrade(&inputs);
+        move |result| {
+            if let ListResult::Item(input) = result
+                && !input.corked
+            {
+                pulse::update(&inputs, |inputs| inputs.push((input.index, input.sink)));
+            }
+        }
+    });
+    if pulse::wait(&mut mainloop, &mut op, "sink input list").is_err() {
+        return HashSet::new();
+    }
+    let mut device_sink: HashMap<u32, bool> = HashMap::new();
+    inputs
+        .take()
+        .into_iter()
+        .filter(|&(_, sink)| {
+            *device_sink.entry(sink).or_insert_with(|| {
+                pulse::sinks("LibrePods", pulse::Sinks::Index(sink))
+                    .ok()
+                    .and_then(|sinks| sinks.into_iter().next())
+                    .is_some_and(|sink| sink_of_mac(&sink, mac))
+            })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
     // The lookup has its own connection (#193) and fails on a missing sink.
     let sinks = pulse::sinks("LibrePods", pulse::Sinks::Name(sink_name));
@@ -1799,35 +1945,32 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
 
     tokio::task::spawn_blocking(move || {
         let sink_list = pulse::sinks("LibrePods", pulse::Sinks::All).ok()?;
-
-        for sink in sink_list.iter() {
-            if let Some(device_string) = &sink.device_string
-                && device_string.to_uppercase().contains(&mac_clone.to_uppercase())
-                && let Some(name) = &sink.name
-            {
-                info!("Found sink name for MAC {}: {}", mac_clone, name);
-                return Some(name.to_string());
-            }
-            if let Some(bluez_path) = &sink.bluez_path {
-                let mac_from_path = bluez_path
-                    .split('/')
-                    .next_back()
-                    .unwrap_or("")
-                    .replace("dev_", "")
-                    .replace('_', ":");
-                if mac_from_path.eq_ignore_ascii_case(&mac_clone)
-                    && let Some(name) = &sink.name
-                {
-                    info!("Found sink name for MAC {}: {}", mac_clone, name);
-                    return Some(name.to_string());
-                }
-            }
+        let name = sink_list
+            .into_iter()
+            .find_map(|sink| sink.name.clone().filter(|_| sink_of_mac(&sink, &mac_clone)));
+        match &name {
+            Some(name) => info!("Found sink name for MAC {}: {}", mac_clone, name),
+            None => error!("No matching sink found for MAC address: {}", mac_clone),
         }
-        error!("No matching sink found for MAC address: {}", mac_clone);
-        None
+        name
     })
     .await
     .unwrap_or(None)
+}
+
+/// Whether `sink` belongs to the Bluetooth device `mac`.
+fn sink_of_mac(sink: &pulse::Sink, mac: &str) -> bool {
+    sink.device_string
+        .as_ref()
+        .is_some_and(|d| d.to_uppercase().contains(&mac.to_uppercase()))
+        || sink.bluez_path.as_ref().is_some_and(|path| {
+            path.split('/')
+                .next_back()
+                .unwrap_or("")
+                .replace("dev_", "")
+                .replace('_', ":")
+                .eq_ignore_ascii_case(mac)
+        })
 }
 
 #[cfg(test)]

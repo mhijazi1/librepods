@@ -1,3 +1,4 @@
+mod a2dp_resume;
 mod battery_provider;
 mod bluetooth;
 mod call_detect;
