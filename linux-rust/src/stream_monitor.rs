@@ -273,7 +273,7 @@ fn sink_input_muted(mute: bool, volume: &ChannelVolumes) -> bool {
 }
 
 /// A sink input as `call_detect` sees it.
-fn playback_stream(
+pub(crate) fn playback_stream(
     index: u32,
     proplist: &Proplist,
     corked: bool,
