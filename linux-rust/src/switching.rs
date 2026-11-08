@@ -2708,6 +2708,30 @@ mod tests {
             );
         }
 
+        /// #97/#101: the live pw-loopback playback stream, named and given
+        /// a role by user config, stays uncorked and loud.
+        #[test]
+        fn non_event_virtual_loopback() {
+            let twin = [
+                ("node.name", "output.pw-loopback-3412"),
+                ("node.group", "pw-loopback-3412"),
+                ("node.link-group", "pw-loopback-3412"),
+                ("stream.is-live", "true"),
+                (
+                    "target.object",
+                    "alsa_output.pci-0000_00_1f.3.analog-stereo",
+                ),
+                ("application.name", "pw-loopback"),
+                ("media.role", "Music"),
+            ];
+            let loopback = [&twin[..], &[("node.virtual", "true")]].concat();
+            assert_eq!(run(false, &[sink(&loopback)]).takes(), NO_TAKE);
+            assert_eq!(
+                run(false, &[sink(&twin)]).takes(),
+                [vec![SendOwnership(true)]]
+            );
+        }
+
         /// `ready`, then a wear report, then a fresh music stream with MPRIS.
         fn wearing(ears: [EarDetectionStatus; 2]) -> Pipeline {
             let mut p = Pipeline::ready();
