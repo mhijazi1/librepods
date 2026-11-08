@@ -31,6 +31,10 @@ const CYCLE_SETTLE: Duration = Duration::from_millis(1500);
 /// How long the production audibility read samples the peaks of the
 /// AirPods sink's streams.
 pub(crate) const AUDIBLE_SAMPLE: Duration = Duration::from_millis(500);
+/// How long before the window's end a chain Play must be due: the playback
+/// poll needs up to this long to see it, and a play edge seen after the
+/// window-end Tick comes after its release.
+const PLAY_EDGE_MARGIN: Duration = crate::switching::PLAYBACK_POLL;
 /// The chain's sleeps when nothing ever plays: every step runs, with its
 /// three audibility reads.
 const CHAIN_WORST_CASE_SLEEP: Duration = NUDGE_GAP
@@ -40,15 +44,17 @@ const CHAIN_WORST_CASE_SLEEP: Duration = NUDGE_GAP
     .saturating_add(CYCLE_SETTLE)
     .saturating_add(AUDIBLE_SAMPLE.saturating_mul(3));
 /// Run time of the chain's D-Bus and sound-server calls on top of its
-/// sleeps. Like `A2DP_RECOVERY_BOUND`, the window counts sleeps; this margin
-/// is an engineering default, not a measured bound. The chain also starts
-/// no kick or cycle that can't finish inside the window.
-const RESUME_MARGIN: Duration = Duration::from_secs(2);
+/// sleeps and the last Play's `PLAY_EDGE_MARGIN`. Like
+/// `A2DP_RECOVERY_BOUND`, the window counts sleeps; this margin is an
+/// engineering default, not a measured bound. The chain also starts no kick
+/// or cycle that can't finish inside the window.
+const RESUME_MARGIN: Duration = Duration::from_millis(1500);
 /// How long after the take's acknowledgement the core holds playback-stop
 /// releases while the chain may pause and play the players.
 pub(crate) const A2DP_RESUME_WINDOW: Duration = Duration::from_secs(8);
 const _: () = assert!(
     CHAIN_WORST_CASE_SLEEP
+        .saturating_add(PLAY_EDGE_MARGIN)
         .saturating_add(RESUME_MARGIN)
         .as_millis()
         <= A2DP_RESUME_WINDOW.as_millis()
@@ -108,23 +114,31 @@ impl Chain {
         self.due
     }
 
-    /// Whether the next step reads audibility and the playing players.
+    /// Whether the next step reads audibility.
     fn senses(&self) -> bool {
         matches!(self.stage, Stage::Nudged | Stage::Kicked | Stage::Cycled(_))
     }
 
+    /// Whether the next step reads the playing players. The replay after
+    /// the cycle doesn't: a slow read there would delay its Play.
+    fn reads_players(&self) -> bool {
+        matches!(self.stage, Stage::Nudged | Stage::Kicked)
+    }
+
     /// Run the step due at `now`: its actions, or None once the chain is
-    /// over. `audible` and `playing` matter only when `senses()`; audible
-    /// ends the chain there. Once the sink is suspended or the players
-    /// paused, the next step always undoes it. The kick and the cycle are
-    /// skipped, ending the chain, when the Play after them can't be due
-    /// before `until`: the core would release on the stop they cause.
+    /// over. `audible` matters only when `senses()`, and ends the chain
+    /// there; `playing` only when `reads_players()`. Once the sink is
+    /// suspended or the players paused, the next step always undoes it. The
+    /// kick and the cycle are skipped, ending the chain, when the Play after
+    /// them can't be due `PLAY_EDGE_MARGIN` before `until`: the core would
+    /// release on the stop they cause.
     fn step(&mut self, now: Instant, audible: bool, playing: &[String]) -> Option<Vec<Action>> {
-        let too_late = match self.stage {
-            Stage::Nudged => now + KICK_GAP >= self.until,
-            Stage::Kicked => now + CYCLE_SETTLE + AUDIBLE_SAMPLE >= self.until,
-            _ => false,
+        let play_at = match self.stage {
+            Stage::Nudged => Some(now + KICK_GAP),
+            Stage::Kicked => Some(now + CYCLE_SETTLE + AUDIBLE_SAMPLE),
+            _ => None,
         };
+        let too_late = play_at.is_some_and(|play| play + PLAY_EDGE_MARGIN >= self.until);
         if too_late || (audible && self.senses()) {
             self.stage = Stage::Done;
             return None;
@@ -192,16 +206,18 @@ pub(crate) async fn run(io: impl A2dpResumeIo, until: Instant, mut cancel: onesh
     let clock = || tokio::time::Instant::now().into_std();
     let mut chain = Chain::new(clock(), until, io.playing().await);
     loop {
-        let (due, senses) = (chain.due(), chain.senses());
+        let (due, senses, reads_players) = (chain.due(), chain.senses(), chain.reads_players());
         // The audio check gives way to a cancel too, so a yield during it
         // stops the chain before the step it decides.
         let sensed = async {
             tokio::time::sleep_until(due.into()).await;
-            if senses {
-                (io.audible().await, io.playing().await)
+            let audible = senses && io.audible().await;
+            let playing = if reads_players {
+                io.playing().await
             } else {
-                (false, Vec::new())
-            }
+                Vec::new()
+            };
+            (audible, playing)
         };
         let (audible, playing) = tokio::select! {
             biased;
@@ -303,6 +319,7 @@ fn transport_active(bus: &Connection, device: &str) -> Option<bool> {
 mod tests {
     use super::*;
     use Action::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
     const P: &str = "org.mpris.MediaPlayer2.firefox";
@@ -452,13 +469,52 @@ mod tests {
         let last = Duration::from_millis(steps.last().unwrap().0 as u64);
         // `drive`'s audibility reads take no time; the production ones do.
         assert_eq!(last + AUDIBLE_SAMPLE * 3, CHAIN_WORST_CASE_SLEEP);
-        assert!(A2DP_RESUME_WINDOW >= CHAIN_WORST_CASE_SLEEP + RESUME_MARGIN);
+        assert!(A2DP_RESUME_WINDOW >= CHAIN_WORST_CASE_SLEEP + PLAY_EDGE_MARGIN + RESUME_MARGIN);
+    }
+
+    #[test]
+    fn kick_or_cycle_due_within_play_edge_margin_of_window_end_is_skipped() {
+        let t0 = Instant::now();
+        let until = t0 + A2DP_RESUME_WINDOW;
+        let nudged = || {
+            let mut chain = Chain::new(t0, until, players(&[P]));
+            chain.step(t0, false, &[]);
+            chain.step(chain.due(), false, &[]);
+            chain
+        };
+        // The kick's Play would be due just PLAY_EDGE_MARGIN before the
+        // window's end: no Pause. 1 ms earlier, the kick runs.
+        let edge = until - KICK_GAP - PLAY_EDGE_MARGIN;
+        let mut chain = nudged();
+        assert_eq!(chain.step(edge, false, &players(&[P])), None);
+        assert_eq!(chain.cancel(), []);
+        let before = edge - Duration::from_millis(1);
+        assert_eq!(
+            nudged().step(before, false, &players(&[P])),
+            Some(vec![Pause(P.into())])
+        );
+
+        // The same for the cycle's replay Play.
+        let kicked = || {
+            let mut chain = nudged();
+            chain.step(chain.due(), false, &players(&[P]));
+            chain.step(chain.due(), false, &[]);
+            chain
+        };
+        let edge = until - CYCLE_SETTLE - AUDIBLE_SAMPLE - PLAY_EDGE_MARGIN;
+        assert_eq!(kicked().step(edge, false, &players(&[P])), None);
+        let before = edge - Duration::from_millis(1);
+        assert_eq!(
+            kicked().step(before, false, &players(&[P])),
+            Some(vec![ProfileCycle])
+        );
     }
 
     /// Resume I/O on tokio's clock: silent for `AUDIBLE_SAMPLE`, `P` always
-    /// Playing after `read`; records the actions.
+    /// Playing after `read(n)` for the n-th read; records the actions.
     struct SlowIo {
-        read: Duration,
+        read: fn(usize) -> Duration,
+        reads: AtomicUsize,
         acted: Arc<StdMutex<Vec<Action>>>,
     }
 
@@ -476,7 +532,7 @@ mod tests {
         }
 
         fn playing(&self) -> BoxFuture<'static, Vec<String>> {
-            let read = self.read;
+            let read = (self.read)(self.reads.fetch_add(1, Ordering::SeqCst));
             Box::pin(async move {
                 tokio::time::sleep(read).await;
                 players(&[P])
@@ -484,25 +540,28 @@ mod tests {
         }
     }
 
-    /// Run the chain to its end for a take acknowledged now, each
-    /// `playing()` read taking `read`; returns its actions.
-    async fn run_with_reads_of(read: Duration) -> Vec<Action> {
+    /// Run the chain to its end for a take acknowledged now, the n-th
+    /// `playing()` read taking `read(n)`; returns its actions and how long
+    /// it ran.
+    async fn run_with_reads_of(read: fn(usize) -> Duration) -> (Vec<Action>, Duration) {
         let acted = Arc::new(StdMutex::new(Vec::new()));
         let io = SlowIo {
             read,
+            reads: AtomicUsize::new(0),
             acted: acted.clone(),
         };
         let (_cancel, cancelled) = oneshot::channel();
-        let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
-        run(io, until, cancelled).await;
-        acted.lock().unwrap().clone()
+        let start = tokio::time::Instant::now();
+        run(io, start.into_std() + A2DP_RESUME_WINDOW, cancelled).await;
+        let actions = acted.lock().unwrap().clone();
+        (actions, start.elapsed())
     }
 
     #[tokio::test(start_paused = true)]
     async fn slow_player_reads_skip_a_kick_past_the_window() {
         // A hung MPRIS app: the reads end at 5 s, then at 12 s, past the
         // window, where the kick's stop would be released at once.
-        let acted = run_with_reads_of(Duration::from_secs(5)).await;
+        let (acted, _) = run_with_reads_of(|_| Duration::from_secs(5)).await;
         assert_eq!(acted, [SuspendSink(true), SuspendSink(false)]);
     }
 
@@ -510,7 +569,7 @@ mod tests {
     async fn profile_cycle_that_would_end_past_the_window_is_skipped() {
         // 1 s reads: the kick is at 4 s, the cycle would be at 7 s and its
         // Play at 9 s.
-        let acted = run_with_reads_of(Duration::from_secs(1)).await;
+        let (acted, _) = run_with_reads_of(|_| Duration::from_secs(1)).await;
         assert_eq!(
             acted,
             [
@@ -521,8 +580,21 @@ mod tests {
             ]
         );
         // Instant reads: the cycle at 4 s, its Play at 6 s.
-        let acted = run_with_reads_of(Duration::ZERO).await;
+        let (acted, _) = run_with_reads_of(|_| Duration::ZERO).await;
         assert_eq!(acted[4..], [ProfileCycle, Play(P.into())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_player_read_never_delays_the_replay_after_the_cycle() {
+        // Only a 4th read would be slow, longer than the whole window.
+        let (acted, ran) = run_with_reads_of(|n| match n {
+            3 => A2DP_RESUME_WINDOW,
+            _ => Duration::ZERO,
+        })
+        .await;
+        assert_eq!(acted[4..], [ProfileCycle, Play(P.into())]);
+        // The replay Play ends the run, at 6 s, in time for the poll.
+        assert!(ran + PLAY_EDGE_MARGIN < A2DP_RESUME_WINDOW, "{ran:?}");
     }
 
     #[test]
