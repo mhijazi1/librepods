@@ -143,6 +143,18 @@ pub(crate) fn monitor_sources(name: &str) -> io::Result<Vec<u32>> {
     Ok(sources.into_iter().flatten().collect())
 }
 
+/// The default sink's name, on a new connection named `name`. Read raw like
+/// `sinks`: the binding's server info converts `sample_spec` into an enum
+/// the same way (#40).
+pub(crate) fn default_sink_name(name: &str) -> io::Result<Option<String>> {
+    let cb = Some(server_cb as extern "C" fn(_, _, _));
+    let names: Vec<Option<String>> = query(name, "server info", |context, list| {
+        // SAFETY: `context` is Ready and `list` is what `server_cb` expects.
+        unsafe { sys::pa_context_get_server_info(context, cb, list) }
+    })?;
+    Ok(names.into_iter().next().flatten())
+}
+
 /// A libpulse-sys context on a binding `Mainloop`; libpulse-binding keeps
 /// its own context pointer private.
 struct RawContext(*mut sys::pa_context);
@@ -302,6 +314,26 @@ extern "C" fn source_cb(
     // SAFETY: `monitor_sources` passes a `List<Option<u32>>`; a non-null
     // `info` is a filled-in entry.
     unsafe { collect(list, eol, (!info.is_null()).then(|| monitor_source(info))) }
+}
+
+/// Server info has one callback and no end mark: a non-null `info` is the
+/// answer and ends the list; a null one is an error.
+extern "C" fn server_cb(
+    _: *mut sys::pa_context,
+    info: *const sys::pa_server_info,
+    list: *mut c_void,
+) {
+    // SAFETY: `default_sink_name` passes a `List<Option<String>>`; a
+    // non-null `info` is filled in, and only its `default_sink_name`, null
+    // or a C string, is read.
+    unsafe {
+        if info.is_null() {
+            collect::<Option<String>>(list, -1, None);
+        } else {
+            collect(list, 0, Some(string((*info).default_sink_name)));
+            collect::<Option<String>>(list, 1, None);
+        }
+    }
 }
 
 /// A sink's fields. Each is read alone through the raw pointer, so its
@@ -612,5 +644,30 @@ mod tests {
                 assert_eq!(monitor, expected, "state {state}");
             }
         }
+    }
+
+    #[test]
+    fn server_cb_copies_only_default_sink_name() {
+        let mut info = MaybeUninit::<sys::pa_server_info>::zeroed();
+        let p = info.as_mut_ptr();
+        let run = |info: *const sys::pa_server_info| {
+            let mut list = List::<Option<String>> {
+                items: Vec::new(),
+                eol: 0,
+            };
+            server_cb(ptr::null_mut(), info, (&raw mut list).cast());
+            (list.items, list.eol)
+        };
+        // SAFETY: field writes into `info`, which is never read whole; the
+        // sample format is a raw C int the sys enum lacks.
+        unsafe {
+            (&raw mut (*p).sample_spec.format).cast::<i32>().write(-7);
+            (*p).default_sink_name = c"alsa_output.dac".as_ptr();
+        }
+        assert_eq!(run(p), (vec![Some("alsa_output.dac".to_string())], 1));
+        // SAFETY: as above.
+        unsafe { (*p).default_sink_name = ptr::null() };
+        assert_eq!(run(p), (vec![None], 1));
+        assert_eq!(run(ptr::null()), (vec![], -1));
     }
 }

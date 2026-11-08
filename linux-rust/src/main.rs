@@ -2,6 +2,7 @@ mod a2dp_resume;
 mod battery_provider;
 mod bluetooth;
 mod call_detect;
+mod default_sink;
 mod devices;
 mod handoff;
 mod handoff_log;

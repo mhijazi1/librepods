@@ -28,6 +28,7 @@ use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers,
     ControlCommandIdentifiers as Control,
 };
+use crate::default_sink::{DefaultSinkRouter, SinkEvent};
 use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::handoff_log;
 use crate::media_controller::{self, MediaController};
@@ -97,6 +98,8 @@ pub(crate) trait MediaActions: Send + Sync {
     /// fires or its sender is dropped (checked between steps). It starts no
     /// kick or profile cycle whose Play can't be due before `until`.
     fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()>;
+    /// Enqueue a default sink route (#40); never waits for the sound server.
+    fn route_default_sink(&self, event: SinkEvent);
 }
 
 /// Blocking: pauses the local players and reports what it did.
@@ -111,6 +114,8 @@ type PausePlayers = Arc<dyn Fn() -> media_controller::PauseOutcome + Send + Sync
 pub(crate) struct ControllerMedia {
     controller: MediaController,
     pause_players: PausePlayers,
+    /// Its worker holds another clone of `controller`.
+    sinks: DefaultSinkRouter,
 }
 
 impl MediaActions for ControllerMedia {
@@ -133,6 +138,10 @@ impl MediaActions for ControllerMedia {
 
     fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()> {
         Box::pin(a2dp_resume::run(self.controller.clone(), until, cancel))
+    }
+
+    fn route_default_sink(&self, event: SinkEvent) {
+        self.sinks.route(event);
     }
 }
 
@@ -157,6 +166,7 @@ fn share_media(
     let media = ControllerMedia {
         controller: controller.clone(),
         pause_players,
+        sinks: DefaultSinkRouter::spawn(controller.clone()),
     };
     (Arc::new(Mutex::new(controller)), Arc::new(media))
 }
@@ -489,6 +499,8 @@ impl Shell {
                     let until = now + a2dp_resume::A2DP_RESUME_WINDOW;
                     tokio::spawn(self.media.resume_a2dp(until, cancelled));
                 }
+                Command::RouteToAirPods => self.media.route_default_sink(SinkEvent::Take),
+                Command::RouteAway => self.media.route_default_sink(SinkEvent::Yield),
                 Command::DropSession => {
                     self.resume = None;
                     info!(
@@ -610,7 +622,8 @@ async fn run_handoff(mut shell: Shell) {
     };
     let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true)
         .with_connect_mode(shell.connect_mode)
-        .with_last_owner_linux(last_owner_linux(&shell.mac));
+        .with_last_owner_linux(last_owner_linux(&shell.mac))
+        .with_default_sink_routing(true);
     for input in seed_inputs(facts) {
         if step(&mut core, &mut shell, input).await {
             return;
@@ -1070,6 +1083,8 @@ mod tests {
     struct Records {
         pauses: AtomicUsize,
         activations: AtomicUsize,
+        /// Not traced, so the trace assertions don't see them.
+        routes: StdMutex<Vec<SinkEvent>>,
     }
 
     /// Records the media actions instead of touching D-Bus or PipeWire. The
@@ -1100,6 +1115,10 @@ mod tests {
                 mac: self.mac.clone(),
             };
             Box::pin(a2dp_resume::run(io, until, cancel))
+        }
+
+        fn route_default_sink(&self, event: SinkEvent) {
+            self.records.routes.lock().unwrap().push(event);
         }
     }
 
@@ -1522,6 +1541,10 @@ mod tests {
 
         fn activations(&self) -> usize {
             self.records.activations.load(Ordering::SeqCst)
+        }
+
+        fn routes(&self) -> Vec<SinkEvent> {
+            self.records.routes.lock().unwrap().clone()
         }
     }
 
@@ -2480,6 +2503,53 @@ mod tests {
             sent.push(next_packet(&mut rx).await);
         }
         wait_until("the handler", || h.handler.finished().len() == 1).await;
+        media_controller::stop_playback_listener(mac);
+    }
+
+    #[tokio::test]
+    async fn handoff_take_and_yield_route_default_sink() {
+        let mac = "5A:00:00:00:00:28";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        expect_startup(&h, &mut rx).await;
+        expect_take(&h, &mut rx).await;
+        assert_eq!(h.routes(), []);
+        h.emit(owns(1));
+        wait_until("the take's route", || !h.routes().is_empty()).await;
+        // Another host takes the AirPods.
+        h.emit(owns(0));
+        wait_until("the yield's route", || h.routes().len() > 1).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.routes(), [SinkEvent::Take, SinkEvent::Yield]);
+        stop_handoff_task(mac);
+    }
+
+    /// Playback, a take's ACK and a loss, in a mode with no handoff core.
+    async fn take_and_loss_without_core(h: &Harness) {
+        h.play(false).await;
+        h.play(true).await;
+        h.emit(owns(1));
+        h.emit(owns(0));
+        wait_until("the handler", || h.handler.finished().len() == 2).await;
+        tokio::time::sleep(SETTLE).await;
+    }
+
+    #[tokio::test]
+    async fn off_never_routes_default_sink() {
+        let mac = "5A:00:00:00:00:29";
+        let (manager, _rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Off, mac, &manager).await;
+        take_and_loss_without_core(&h).await;
+        assert_eq!(h.routes(), []);
+    }
+
+    #[tokio::test]
+    async fn legacy_never_routes_default_sink() {
+        let mac = "5A:00:00:00:00:2A";
+        let (manager, _rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Legacy, mac, &manager).await;
+        take_and_loss_without_core(&h).await;
+        assert_eq!(h.routes(), []);
         media_controller::stop_playback_listener(mac);
     }
 
