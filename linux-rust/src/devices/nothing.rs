@@ -1,9 +1,10 @@
 use crate::bluetooth::att::{ATTHandles, ATTManager};
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
+use crate::settings_file::{parse_devices, write_settings_file};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::utils::get_devices_path;
 use bluer::Address;
-use log::{debug, info};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -84,7 +85,6 @@ impl NothingDevice {
             .expect("Failed to write");
 
         // let ui_tx_clone = ui_tx.clone();
-        let information_l = information.clone();
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
                 if data.starts_with(&[0x55, 0x20, 0x01, 0x42, 0x40]) {
@@ -93,27 +93,9 @@ impl NothingDevice {
                         "Received firmware version from Nothing device {}: {}",
                         mac_address, firmware_version
                     );
-                    let new_information = NothingInformation {
-                        serial_number: information_l.serial_number.clone(),
-                        firmware_version: firmware_version.clone(),
-                    };
-                    let mut new_devices = devices.clone();
-                    new_devices.insert(
-                        device_key.clone(),
-                        DeviceData {
-                            name: devices
-                                .get(&device_key)
-                                .map(|d| d.name.clone())
-                                .unwrap_or("Nothing Device".to_string()),
-                            type_: devices
-                                .get(&device_key)
-                                .map(|d| d.type_.clone())
-                                .unwrap_or(DeviceType::Nothing),
-                            information: Some(DeviceInformation::Nothing(new_information)),
-                        },
-                    );
-                    let json = serde_json::to_string(&new_devices).unwrap();
-                    std::fs::write(get_devices_path(), json).expect("Failed to write devices file");
+                    save_nothing_info(&mac_address.to_string(), |info| {
+                        info.firmware_version = firmware_version
+                    });
                 } else if data.starts_with(&[0x55, 0x20, 0x01, 0x06, 0x40]) {
                     let serial_number_start_position = data
                         .iter()
@@ -134,28 +116,9 @@ impl NothingDevice {
                             "Received serial number from Nothing device {}: {}",
                             mac_address, serial_number
                         );
-                        let new_information = NothingInformation {
-                            serial_number: serial_number.clone(),
-                            firmware_version: information_l.firmware_version.clone(),
-                        };
-                        let mut new_devices = devices.clone();
-                        new_devices.insert(
-                            device_key.clone(),
-                            DeviceData {
-                                name: devices
-                                    .get(&device_key)
-                                    .map(|d| d.name.clone())
-                                    .unwrap_or("Nothing Device".to_string()),
-                                type_: devices
-                                    .get(&device_key)
-                                    .map(|d| d.type_.clone())
-                                    .unwrap_or(DeviceType::Nothing),
-                                information: Some(DeviceInformation::Nothing(new_information)),
-                            },
-                        );
-                        let json = serde_json::to_string(&new_devices).unwrap();
-                        std::fs::write(get_devices_path(), json)
-                            .expect("Failed to write devices file");
+                        save_nothing_info(&mac_address.to_string(), |info| {
+                            info.serial_number = serial_number
+                        });
                     } else {
                         debug!(
                             "Serial number format unexpected from Nothing device {}: {:?}",
@@ -175,5 +138,153 @@ impl NothingDevice {
             att_manager,
             information,
         }
+    }
+}
+
+/// The devices.json contents after `update` is applied to `mac`'s Nothing
+/// information, given the result of reading the file. Every other entry and
+/// field is kept; a missing entry is created as "Nothing Device".
+fn devices_with_nothing_info(
+    existing: std::io::Result<String>,
+    mac: &str,
+    update: impl FnOnce(&mut NothingInformation),
+) -> std::io::Result<String> {
+    let mut devices = parse_devices(existing)?;
+    let device = devices.entry(mac.to_string()).or_insert(DeviceData {
+        name: "Nothing Device".to_string(),
+        type_: DeviceType::Nothing,
+        information: None,
+    });
+    let mut info = match device.information.take() {
+        Some(DeviceInformation::Nothing(info)) => info,
+        _ => NothingInformation {
+            serial_number: String::new(),
+            firmware_version: String::new(),
+        },
+    };
+    update(&mut info);
+    device.information = Some(DeviceInformation::Nothing(info));
+    Ok(serde_json::to_string(&devices)?)
+}
+
+/// Re-reads devices.json and saves `update` to `mac`'s entry; on any error
+/// logs it and leaves the file untouched.
+fn save_nothing_info(mac: &str, update: impl FnOnce(&mut NothingInformation)) {
+    let path = get_devices_path();
+    let result = devices_with_nothing_info(std::fs::read_to_string(&path), mac, update)
+        .and_then(|json| write_settings_file(&path, &json));
+    if let Err(e) = result {
+        error!(
+            "Not saving Nothing device {} info to {}: {}",
+            mac,
+            path.display(),
+            e
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAC: &str = "AA:AA:AA:AA:AA:AA";
+    const OTHER: &str = "BB:BB:BB:BB:BB:BB";
+
+    fn parse(json: &str) -> HashMap<String, DeviceData> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn nothing_info(device: &DeviceData) -> &NothingInformation {
+        match &device.information {
+            Some(DeviceInformation::Nothing(info)) => info,
+            other => panic!("not Nothing information: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_info_keeps_other_devices() {
+        let other = serde_json::json!({
+            OTHER: {"name": "My AirPods", "type_": "AirPods", "information": null}
+        });
+        let json = devices_with_nothing_info(Ok(other.to_string()), MAC, |i| {
+            i.firmware_version = "1.0".to_string()
+        })
+        .unwrap();
+        let written: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(written[OTHER], other[OTHER]);
+        assert_eq!(nothing_info(&parse(&json)[MAC]).firmware_version, "1.0");
+    }
+
+    #[test]
+    fn nothing_info_missing_file_creates_entry() {
+        let json = devices_with_nothing_info(Err(std::io::ErrorKind::NotFound.into()), MAC, |i| {
+            i.serial_number = "SH123".to_string()
+        })
+        .unwrap();
+        let devices = parse(&json);
+        assert_eq!(devices.len(), 1);
+        let device = &devices[MAC];
+        assert_eq!(device.name, "Nothing Device");
+        assert_eq!(device.type_, DeviceType::Nothing);
+        let info = nothing_info(device);
+        assert_eq!(info.serial_number, "SH123");
+        assert_eq!(info.firmware_version, "");
+    }
+
+    #[test]
+    fn nothing_info_unreadable_file_is_error() {
+        let err = devices_with_nothing_info(
+            Err(std::io::ErrorKind::PermissionDenied.into()),
+            MAC,
+            |_| panic!("updated after a read error"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn nothing_info_bad_json_is_error() {
+        for json in ["", "{"] {
+            let result = devices_with_nothing_info(Ok(json.to_string()), MAC, |_| {
+                panic!("updated after a parse error")
+            });
+            assert!(result.is_err(), "{json:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_info_updates_only_received_field() {
+        let stored = serde_json::json!({
+            MAC: {
+                "name": "My Ear (2)",
+                "type_": "Nothing",
+                "information": {
+                    "kind": "Nothing",
+                    "data": {"serial_number": "SH-OLD", "firmware_version": "0.9"}
+                }
+            }
+        })
+        .to_string();
+
+        let json = devices_with_nothing_info(Ok(stored.clone()), MAC, |i| {
+            i.firmware_version = "1.0".to_string()
+        })
+        .unwrap();
+        let device = &parse(&json)[MAC];
+        assert_eq!(device.name, "My Ear (2)");
+        assert_eq!(device.type_, DeviceType::Nothing);
+        let info = nothing_info(device);
+        assert_eq!(info.firmware_version, "1.0");
+        assert_eq!(info.serial_number, "SH-OLD");
+
+        let json =
+            devices_with_nothing_info(Ok(stored), MAC, |i| i.serial_number = "SH-NEW".to_string())
+                .unwrap();
+        let device = &parse(&json)[MAC];
+        assert_eq!(device.name, "My Ear (2)");
+        assert_eq!(device.type_, DeviceType::Nothing);
+        let info = nothing_info(device);
+        assert_eq!(info.serial_number, "SH-NEW");
+        assert_eq!(info.firmware_version, "0.9");
     }
 }
