@@ -353,7 +353,13 @@ struct Shell {
     play_rx: PlaybackSamples,
     /// Local call state changes (#11).
     call_rx: CallSamples,
+    /// Where the core's lines go after they are logged, if anywhere.
+    lines: Option<LineSink>,
 }
+
+/// Receives each line the handoff core emits, in order, right after it is
+/// logged and before the step's commands run.
+pub(crate) type LineSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl Shell {
     /// Wait until the router has forwarded every event still in the primary
@@ -431,9 +437,9 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     let commands = core.handle(Instant::now(), input);
     for line in core.take_lines() {
         info!("Handoff {}: {line}", shell.mac);
-        // debt: #64 production step() calls the test module's trace hook; replace with an injectable log sink
-        #[cfg(test)]
-        tests::trace(&shell.mac, line);
+        if let Some(sink) = &shell.lines {
+            sink(&line);
+        }
     }
     shell.execute(commands).await
 }
@@ -549,6 +555,8 @@ pub(crate) struct SwitchingSetup {
 pub(crate) struct Switching {
     airpods_mac: String,
     policy: Policy,
+    /// Given to the handoff task's `Shell`; `start_with_calls` sets none.
+    lines: Option<LineSink>,
 }
 
 enum Policy {
@@ -631,7 +639,17 @@ impl Switching {
         Switching {
             airpods_mac,
             policy,
+            lines: None,
         }
+    }
+
+    /// Also hand every line of the handoff core to `sink`, after it is
+    /// logged. Only the handoff mode emits lines. Test-only until #21 uses it
+    /// as a production sink.
+    #[cfg(test)]
+    pub(crate) fn with_line_sink(mut self, sink: LineSink) -> Self {
+        self.lines = Some(sink);
+        self
     }
 
     /// The device's AACP event dispatch, used by `AirPodsDevice::new`.
@@ -675,6 +693,7 @@ impl Switching {
                     flush: flush_tx,
                     play_rx,
                     call_rx,
+                    lines: self.lines,
                 };
                 spawn_handoff_task(self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
@@ -863,7 +882,7 @@ mod tests {
     static TRACES: LazyLock<StdMutex<HashMap<String, Vec<String>>>> =
         LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-    pub(super) fn trace(mac: &str, entry: String) {
+    fn trace(mac: &str, entry: String) {
         TRACES
             .lock()
             .unwrap()
@@ -1211,6 +1230,8 @@ mod tests {
             manager.set_event_channel(events.clone()).await;
             let (call_tx, call_rx) = mpsc::channel(8);
             let calls_for = mac.to_string();
+            let traced_mac = mac.to_string();
+            let sink: LineSink = Arc::new(move |line: &str| trace(&traced_mac, line.to_string()));
             let switching = Switching::start_with_calls(
                 SwitchingSetup {
                     mode,
@@ -1230,7 +1251,8 @@ mod tests {
                     call_rx
                 },
             )
-            .await;
+            .await
+            .with_line_sink(sink);
             switching.dispatch_events(events_rx, handler.clone().handle());
             Harness {
                 records,
