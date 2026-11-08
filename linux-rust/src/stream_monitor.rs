@@ -456,10 +456,14 @@ type ListingReply = std::sync::mpsc::SyncSender<io::Result<Vec<StreamProps>>>;
 /// context can't move between threads, so they live on one dedicated
 /// thread, which exits once this is dropped. `playback_streams` waits for
 /// its own request at most `bound`; at most one request waits for the
-/// thread, and a dead thread is an error at once.
+/// thread, and a stalled thread is an error. A dead thread (never spawned,
+/// or panicked) lists no streams at once, so stream playback fails safe to
+/// off instead of keeping its last state (#134).
 pub(crate) struct PulsePlaybackStreams {
     requests: std::sync::mpsc::SyncSender<ListingReply>,
     bound: Duration,
+    /// The thread is gone; its error is logged once.
+    dead: bool,
 }
 
 /// A libpulse connection kept between listings. `context` is declared
@@ -477,7 +481,7 @@ impl PulsePlaybackStreams {
                 list_reusing(
                     &mut connection,
                     || {
-                        let (mainloop, context) = pulse::connect("LibrePods call monitor")?;
+                        let (mainloop, context) = pulse::connect("LibrePods playback monitor")?;
                         Ok(PulseConnection { context, mainloop })
                     },
                     // Introspecting a context that isn't Ready panics.
@@ -505,23 +509,35 @@ impl PulsePlaybackStreams {
                 }
             })
         {
-            log::warn!("Stream monitor: no playback stream thread, so listings fail: {e}");
+            log::warn!("Stream monitor: no playback stream thread: {e}");
         }
-        PulsePlaybackStreams { requests, bound }
+        PulsePlaybackStreams {
+            requests,
+            bound,
+            dead: false,
+        }
     }
 }
 
 impl PlaybackSource for PulsePlaybackStreams {
     fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>> {
+        use std::sync::mpsc::TrySendError;
         let thread_error =
             |e: &dyn std::fmt::Display| io::Error::other(format!("playback stream thread: {e}"));
         let (reply, listing) = std::sync::mpsc::sync_channel(1);
-        self.requests
-            .try_send(reply)
-            .map_err(|e| thread_error(&e))?;
-        listing
-            .recv_timeout(self.bound)
-            .map_err(|e| thread_error(&e))?
+        match self.requests.try_send(reply) {
+            Ok(()) => match listing.recv_timeout(self.bound) {
+                Err(RecvTimeoutError::Disconnected) => {}
+                result => return result.map_err(|e| thread_error(&e))?,
+            },
+            Err(TrySendError::Disconnected(_)) => {}
+            Err(e) => return Err(thread_error(&e)),
+        }
+        if !self.dead {
+            self.dead = true;
+            log::error!("Stream monitor: playback stream thread died; stream playback stays off");
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -2566,15 +2582,50 @@ mod tests {
     }
 
     #[test]
-    fn playback_thread_dead_is_error_at_once() {
+    fn playback_thread_dead_lists_nothing_at_once_and_logs_once() {
         let mut source = PulsePlaybackStreams::spawn(Duration::from_secs(5), || {
             || -> io::Result<Vec<StreamProps>> { panic!("listing thread dies") }
         });
-        for _ in 0..2 {
+        assert!(!source.dead);
+        for _ in 0..3 {
             let start = Instant::now();
-            assert!(source.playback_streams().is_err());
+            assert_eq!(source.playback_streams().unwrap(), Vec::new());
             assert!(start.elapsed() < Duration::from_secs(1));
+            // Set by the first poll, so the error is logged only then.
+            assert!(source.dead);
         }
+    }
+
+    #[tokio::test]
+    async fn playback_thread_dead_drops_stream_playback() {
+        let die = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dying = die.clone();
+        // An empty baseline, then music until `die`, then the thread panics.
+        let source = PulsePlaybackStreams::spawn(Duration::from_secs(5), move || {
+            let mut n = 0;
+            move || {
+                n += 1;
+                if dying.load(std::sync::atomic::Ordering::SeqCst) {
+                    panic!("listing thread dies");
+                }
+                Ok(if n == 1 { Vec::new() } else { vec![music(1)] })
+            }
+        });
+        let mut rx = spawn_stream_playback(
+            source,
+            AllAudible,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
+            .await
+            .expect("stream playback")
+            .expect("monitor running");
+        die.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| !*playing))
+            .await
+            .expect("stream playback off once the thread died")
+            .expect("monitor running");
     }
 
     #[test]

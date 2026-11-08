@@ -54,7 +54,9 @@ pub(crate) enum Input {
     /// Connected hosts report: previous and new list. Linux announces itself
     /// for a remote host in `new` that the core does not already know; the
     /// report's `old` may be stale (a replay of a report already in the
-    /// session snapshot) and is not used for that decision (#58).
+    /// session snapshot) and is not used for that decision (#58). Until
+    /// `InitBacklogDrained` or a disconnect, a host in the `Reconnected`
+    /// snapshot is known too, so stale replays never re-announce (#79).
     ConnectedDevices {
         old: Vec<ConnectedDevice>,
         new: Vec<ConnectedDevice>,
@@ -70,11 +72,14 @@ pub(crate) enum Input {
     /// whose acknowledgement timed out is that release's late
     /// acknowledgement, not a loss (#55); a later 0 is a loss (#62).
     Ownership(Vec<u8>),
-    /// Another host asked Linux to give up ownership. A repeat while Linux's
-    /// release for an earlier request is pending sends nothing; a repeat
-    /// after that release timed out re-sends it without pausing again (#61).
-    /// During a local call Linux keeps the AirPods it holds or is taking and
-    /// refuses (#11).
+    /// Another host asked Linux to give up ownership. While any Linux release
+    /// is pending (playback/auto, user, quit or remote) the request joins it
+    /// and sends no second "not owning" (#61, #137). The join pauses at most
+    /// once, in automatic mode when Linux had taken: for a user/quit release
+    /// or a playback restart during the release. While a local call holds or
+    /// is taking the AirPods only a pending remote release is joined;
+    /// otherwise Linux keeps them and refuses (#11). A repeat after Linux's
+    /// remote release timed out re-sends it without pausing again (#61).
     RemoteOwnershipRequest,
     /// The shell found the control session dead (the AACP receive loop
     /// cleared it without an event) while some of its events may still be
@@ -93,8 +98,8 @@ pub(crate) enum Input {
     /// the echo of its last "not owning" in the probe, the pre-snapshot
     /// queue on the default path); later events are fresh. It ends the
     /// reconnect take's stale-report window, so a later 0 that acknowledges
-    /// nothing is a loss. Otherwise it changes nothing. Fed in queue order,
-    /// never on a timer.
+    /// nothing is a loss, and the snapshot hosts' announce exemption (#79).
+    /// Otherwise it changes nothing. Fed in queue order, never on a timer.
     InitBacklogDrained,
     /// Switch to automatic handoff (REPL `auto`). Its "not owning" is a
     /// pending release, so the reply is that release's acknowledgement and
@@ -225,6 +230,14 @@ pub(crate) struct Handoff {
     retry_at: Instant,
     retry_delay: Duration,
     hosts: Vec<ConnectedDevice>,
+    /// Hosts of the adopted `Reconnected` snapshot: replayed reports queued
+    /// before it never announce them (#79). Cleared at `InitBacklogDrained`
+    /// and on disconnect. Accepted limit: without that boundary (the
+    /// probe's echo timed out, or a manual/no-audio reconnect with an empty
+    /// backlog) they stay exempt until the next disconnect, so a snapshot
+    /// host that leaves and rejoins in that session is not re-announced.
+    /// A host outside the snapshot is always announced.
+    snapshot_hosts: Vec<ConnectedDevice>,
     ears: Vec<EarDetectionStatus>,
     audio: Option<AudioSource>,
     owner: Option<Vec<u8>>,
@@ -261,6 +274,7 @@ impl Handoff {
             retry_at: now,
             retry_delay: FIRST_RETRY,
             hosts: Vec::new(),
+            snapshot_hosts: Vec::new(),
             ears: Vec::new(),
             audio: None,
             owner: None,
@@ -321,15 +335,17 @@ impl Handoff {
                 // event's `old`: a report queued before the session snapshot
                 // (seed, Reconnected facts) is replayed with a stale `old`
                 // and must not announce a second time (#58).
-                // Known limit (#79): when two or more reports queue inside
-                // that window, the first replay regresses `self.hosts` and a
-                // later one re-announces; telling stale replays apart is for
-                // #79, on the shell's queue boundary (`InitBacklogDrained`).
+                // Reconnected snapshot hosts count as known until the boundary (#79).
                 if self.automatic
                     && self.live()
-                    && new
-                        .iter()
-                        .any(|d| d.mac != self.local && !self.hosts.iter().any(|h| h.mac == d.mac))
+                    && new.iter().any(|d| {
+                        d.mac != self.local
+                            && !self
+                                .hosts
+                                .iter()
+                                .chain(&self.snapshot_hosts)
+                                .any(|h| h.mac == d.mac)
+                    })
                 {
                     self.announce(out);
                 }
@@ -343,14 +359,30 @@ impl Handoff {
                     self.say("REMOTE requested ownership; control session lost");
                     return;
                 }
-                // A repeat of a request Linux already yielded to: that yield
-                // paused once, so this one must not pause again (#39, #61).
-                if self
+                // A release Linux already sent answers this request too: a
+                // second "not owning" would get a reply that acknowledges
+                // nothing and yields a later take (#61, #137). Join it,
+                // keeping its `since` so the ACK timeout is not pushed back,
+                // and make now the one pause its ACK would have made: a
+                // user/quit release, or a playback restart it would retake
+                // for. A remote release already paused when it was sent. A
+                // local call refuses (below) any release but a remote one, so
+                // the release still settles for the call (#11).
+                let call_holds = self.local_call && self.requested_take;
+                if let Some(p) = self
                     .pending
-                    .is_some_and(|p| !p.desired && p.cause == Cause::Remote)
+                    .as_mut()
+                    .filter(|p| !p.desired && (p.cause == Cause::Remote || !call_holds))
                 {
-                    // Keep the pending release and its `since`, so its ACK
-                    // timeout is not pushed back.
+                    if self.automatic
+                        && self.requested_take
+                        && (matches!(p.cause, Cause::User | Cause::Quit)
+                            || self.play_during_release)
+                    {
+                        out.push(Command::PauseMedia);
+                    }
+                    p.cause = Cause::Remote;
+                    self.play_during_release = false;
                     self.say("REMOTE requested ownership; release already pending");
                     return;
                 }
@@ -398,6 +430,7 @@ impl Handoff {
                 self.retry_delay = (self.retry_delay * 2).min(MAX_RETRY);
             }
             Input::InitBacklogDrained => {
+                self.snapshot_hosts.clear();
                 if std::mem::take(&mut self.reconnect_take_pending) {
                     self.say("BACKLOG drained; the reconnect take's stale-report window ended");
                 } else {
@@ -728,6 +761,7 @@ impl Handoff {
         self.stop_during_take = false;
         self.play_during_release = false;
         self.hosts.clear();
+        self.snapshot_hosts.clear();
         self.ears.clear();
         self.audio = None;
         self.owner = None;
@@ -751,6 +785,7 @@ impl Handoff {
         out.push(Command::AdoptSession);
         self.connected = true;
         self.session_lost = false;
+        self.snapshot_hosts = facts.hosts.clone();
         self.hosts = facts.hosts;
         self.ears = facts.ears;
         self.audio = facts.audio;
@@ -2241,6 +2276,134 @@ mod tests {
         );
     }
 
+    fn count(all: &[Vec<Command>], command: Command) -> usize {
+        all.iter().flatten().filter(|c| **c == command).count()
+    }
+
+    #[test]
+    fn remote_request_joins_pending_playback_release() {
+        // #137: a remote request during a playback-stop release joins it. No
+        // second "not owning" is sent, so no stray [0] yields the retake.
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        let all = [
+            p.play(1500, false),
+            p.feed(1800, Input::RemoteOwnershipRequest),
+            p.feed(1900, Input::Ownership(vec![0])),
+            p.play(2000, true),
+            p.feed(2100, Input::Ownership(vec![1])),
+        ];
+        assert_eq!(
+            all,
+            [
+                vec![SendOwnership(false)],
+                vec![],
+                vec![],
+                vec![SendOwnership(true)],
+                vec![],
+            ]
+        );
+        assert_eq!(count(&all, SendOwnership(false)), 1);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+
+        // The joined release's timeout still counts from its send at 1500.
+        let mut p = acked_auto_take();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1800, Input::RemoteOwnershipRequest), []);
+        p.core.take_lines();
+        let tick = 1500 + ACK_TIMEOUT.as_millis() as u64 + 1;
+        assert_eq!(p.feed(tick, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 1);
+
+        // Playback restarted during the release: the request pauses it once
+        // and the ACK neither retakes nor pauses again.
+        let mut p = acked_auto_take();
+        p.core.take_lines();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        assert_eq!(p.play(1600, true), []);
+        assert_eq!(p.feed(1700, Input::RemoteOwnershipRequest), [PauseMedia]);
+        assert_eq!(p.feed(1800, Input::Ownership(vec![0])), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+
+        // A call started during the release: refused as before (#11), so
+        // the ACK still retakes for the restarted playback.
+        let mut p = acked_auto_take();
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        assert_eq!(p.feed(1550, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play(1600, true), []);
+        p.core.take_lines();
+        assert_eq!(p.feed(1700, Input::RemoteOwnershipRequest), []);
+        assert_eq!(
+            p.core.take_lines(),
+            ["REMOTE requested ownership; refused during a local call"]
+        );
+        assert_eq!(
+            p.feed(1800, Input::Ownership(vec![0])),
+            [SendOwnership(true)]
+        );
+    }
+
+    #[test]
+    fn remote_request_joins_pending_auto_release() {
+        // #49's Auto release joined by a remote request (#137).
+        let mut p = Probe::new(false, true);
+        p.routing(SessionFacts {
+            owner: Some(vec![1]),
+            ..ready_facts()
+        });
+        let all = [
+            p.feed(100, Input::Auto),
+            p.feed(200, Input::RemoteOwnershipRequest),
+            p.feed(300, Input::Ownership(vec![0])),
+            p.play(400, false),
+            p.play(500, true),
+            p.feed(600, Input::Ownership(vec![1])),
+        ];
+        assert_eq!(
+            all,
+            [
+                vec![ConnectA2dp, SendOwnership(false), Announce],
+                vec![],
+                vec![],
+                vec![],
+                vec![SendOwnership(true)],
+                vec![],
+            ]
+        );
+        assert_eq!(count(&all, SendOwnership(false)), 1);
+        assert_eq!(count(&all, PauseMedia), 0);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+    }
+
+    #[test]
+    fn remote_request_joins_pending_user_or_quit_release() {
+        // A user or quit release of a live take: the request makes the one
+        // pause the release's ACK would have made (#137).
+        for (release, ack) in [(Input::Release, vec![]), (Input::Quit, vec![Exit])] {
+            let mut p = Probe::ready();
+            p.core.take_lines();
+            let all = [
+                p.feed(100, Input::Take),
+                p.feed(200, Input::Ownership(vec![1])),
+                p.feed(300, release),
+                p.feed(400, Input::RemoteOwnershipRequest),
+                p.feed(500, Input::Ownership(vec![0])),
+            ];
+            assert_eq!(
+                all,
+                [
+                    vec![SendOwnership(true)],
+                    vec![],
+                    vec![SendOwnership(false)],
+                    vec![PauseMedia],
+                    ack,
+                ]
+            );
+            assert_eq!(count(&all, PauseMedia), 1);
+            assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+        }
+    }
+
     /// `acked_auto_take` (playing at 1000 ms), then a local call starts.
     fn acked_take_in_call() -> Probe {
         let mut p = acked_auto_take();
@@ -2554,5 +2717,83 @@ mod tests {
         let mut p = Probe::ready();
         assert_eq!(p.feed(20, Input::LocalCall(true)), [AdvertiseCall(true)]);
         assert_eq!(p.feed(30, Input::LocalCall(false)), [AdvertiseCall(false)]);
+    }
+
+    fn report(old: &[&str], new: &[&str]) -> Input {
+        let hosts = |macs: &[&str]| macs.iter().map(|m| host(m)).collect();
+        Input::ConnectedDevices {
+            old: hosts(old),
+            new: hosts(new),
+        }
+    }
+
+    /// Drop the session at `ms` and adopt a reconnect reporting `hosts`,
+    /// which announces once.
+    fn reconnect_with(p: &mut Probe, ms: u64, hosts: &[&str]) {
+        assert_eq!(p.feed(ms, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(ms + 1000, Input::Tick), [Reconnect { audio: true }]);
+        let facts = SessionFacts {
+            hosts: hosts.iter().map(|m| host(m)).collect(),
+            ..SessionFacts::default()
+        };
+        let out = p.feed(ms + 1100, Input::Reconnected(facts));
+        assert_eq!(announces(&out), 1, "{out:?}");
+    }
+
+    const L: &str = LOCAL;
+    const R: &str = REMOTE;
+    const R2: &str = REMOTE_2;
+    const R3: &str = REMOTE_3;
+
+    #[test]
+    fn connected_devices_two_stale_replays_after_reconnect_no_reannounce() {
+        // #79: the probe adopts the reconnect, then replays its init backlog.
+        let mut p = Probe::new(true, true);
+        reconnect_with(&mut p, 100, &[L, R, R2]);
+        assert_eq!(p.feed(1300, report(&[L], &[L, R])), []);
+        // Without the snapshot exemption this one announced R2 again.
+        assert_eq!(p.feed(1400, report(&[L, R], &[L, R, R2])), []);
+        assert_eq!(p.feed(1500, Input::InitBacklogDrained), []);
+        assert_eq!(
+            p.feed(1600, report(&[L, R, R2], &[L, R, R2, R3])),
+            [Announce]
+        );
+    }
+
+    #[test]
+    fn connected_devices_two_stale_replays_default_order_one_announce() {
+        // run_handoff: seed, pre-snapshot backlog, Auto, boundary.
+        let mut p = Probe::new(false, true);
+        assert_eq!(p.feed(0, report(&[], &[L, R, R2])), []);
+        assert_eq!(p.feed(10, report(&[L], &[L, R])), []);
+        assert_eq!(p.feed(20, report(&[L, R], &[L, R, R2])), []);
+        let auto = p.feed(30, Input::Auto);
+        assert_eq!(announces(&auto), 1, "{auto:?}");
+        assert_eq!(p.feed(40, Input::InitBacklogDrained), []);
+        assert_eq!(p.feed(50, report(&[L, R, R2], &[L, R, R2, R3])), [Announce]);
+    }
+
+    #[test]
+    fn connected_devices_snapshot_exemption_ends_at_boundary_or_disconnect() {
+        // (a) After the boundary a snapshot host that leaves and rejoins is
+        // announced again.
+        let mut p = Probe::new(true, true);
+        reconnect_with(&mut p, 100, &[L, R, R2]);
+        assert_eq!(p.feed(1300, Input::InitBacklogDrained), []);
+        assert_eq!(p.feed(1400, report(&[L, R, R2], &[L, R])), []);
+        assert_eq!(p.feed(1500, report(&[L, R], &[L, R, R2])), [Announce]);
+
+        // (b) A disconnect ends it without a boundary.
+        let mut p = Probe::new(true, true);
+        reconnect_with(&mut p, 100, &[L, R, R2]);
+        reconnect_with(&mut p, 2000, &[L, R]);
+        assert_eq!(p.feed(3200, Input::InitBacklogDrained), []);
+        assert_eq!(p.feed(3300, report(&[L, R], &[L, R, R2])), [Announce]);
+
+        // (c) Before any boundary a host outside the snapshot is announced.
+        let mut p = Probe::new(true, true);
+        reconnect_with(&mut p, 100, &[L, R, R2]);
+        assert_eq!(p.feed(1300, report(&[L], &[L, R])), []);
+        assert_eq!(p.feed(1400, report(&[L, R], &[L, R, R3])), [Announce]);
     }
 }

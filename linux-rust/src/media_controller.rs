@@ -745,6 +745,20 @@ impl MediaController {
         old_statuses: Vec<EarDetectionStatus>,
         new_statuses: Vec<EarDetectionStatus>,
     ) {
+        self.handle_ear_detection_with(old_statuses, new_statuses, Self::pause_mpris_players)
+            .await;
+    }
+
+    /// `handle_ear_detection` with the blocking MPRIS pause injected, so the
+    /// self-pause marking can be tested without a session bus.
+    async fn handle_ear_detection_with<F>(
+        &self,
+        old_statuses: Vec<EarDetectionStatus>,
+        new_statuses: Vec<EarDetectionStatus>,
+        pause_players: F,
+    ) where
+        F: FnOnce() -> (Vec<String>, PauseOutcome) + Clone + Send + 'static,
+    {
         debug!(
             "Entering handle_ear_detection with old_statuses: {:?}, new_statuses: {:?}",
             old_statuses, new_statuses
@@ -806,8 +820,8 @@ impl MediaController {
         } else if new_all_out {
             debug!("Condition met: buds removed, pausing media");
             let was_playing = self.state.lock().await.is_playing;
-            // shortcut: real D-Bus pause() is not injectable, so this path is untested end to end (#133)
-            removal_self_paused = marks_self_pause(self.pause().await, was_playing);
+            removal_self_paused =
+                marks_self_pause(self.pause_with(pause_players.clone()).await, was_playing);
             {
                 let state = self.state.lock().await;
                 if state.disconnect_when_not_wearing {
@@ -845,7 +859,7 @@ impl MediaController {
             } else if !old_all_out {
                 debug!("Pausing media as buds are not fully in ear");
                 let was_playing = self.state.lock().await.is_playing;
-                let outcome = self.pause().await;
+                let outcome = self.pause_with(pause_players).await;
                 self.state.lock().await.i_paused_the_media |=
                     removal_self_paused || marks_self_pause(outcome, was_playing);
             } else {
@@ -1027,12 +1041,13 @@ impl MediaController {
         }
     }
 
-    async fn pause(&self) -> PauseOutcome {
+    async fn pause_with<F>(&self, pause_players: F) -> PauseOutcome
+    where
+        F: FnOnce() -> (Vec<String>, PauseOutcome) + Send + 'static,
+    {
         debug!("Pausing playback");
 
-        let (paused_services, outcome) = tokio::task::spawn_blocking(Self::pause_mpris_players)
-            .await
-            .unwrap();
+        let (paused_services, outcome) = tokio::task::spawn_blocking(pause_players).await.unwrap();
 
         if !paused_services.is_empty() {
             info!("Paused {} media player(s) via DBus", paused_services.len());
@@ -2218,6 +2233,92 @@ mod tests {
         assert!(state.i_paused_the_media);
         assert!(state.is_playing);
         assert_eq!(state.device_index, None);
+    }
+
+    /// Both buds in ear, then `new`, with the blocking pause injected: its
+    /// n-th call returns `outcomes[n]` (nothing paused past the end). A2DP
+    /// deactivation is off, so no test reaches PulseAudio. Returns the
+    /// controller and the pauser's call count.
+    async fn ear_removal(
+        new: [EarDetectionStatus; 2],
+        is_playing: bool,
+        outcomes: Vec<(Vec<String>, PauseOutcome)>,
+    ) -> (MediaController, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let controller = MediaController::new(String::new(), String::new());
+        {
+            let mut state = controller.state.lock().await;
+            state.is_playing = is_playing;
+            state.disconnect_when_not_wearing = false;
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let pauser = move || {
+            let n = counter.fetch_add(1, SeqCst);
+            outcomes.get(n).cloned().unwrap_or_default()
+        };
+        controller
+            .handle_ear_detection_with(
+                vec![EarDetectionStatus::InEar, EarDetectionStatus::InEar],
+                new.to_vec(),
+                pauser,
+            )
+            .await;
+        (controller, calls.load(SeqCst))
+    }
+
+    fn paused_one(service: &str) -> (Vec<String>, PauseOutcome) {
+        let outcome = PauseOutcome {
+            paused: 1,
+            ..Default::default()
+        };
+        (vec![service.to_string()], outcome)
+    }
+
+    #[tokio::test]
+    async fn ear_removal_one_bud_idle_leaves_self_pause_unset() {
+        use EarDetectionStatus::*;
+        for removed in [OutOfEar, InCase] {
+            let (controller, calls) = ear_removal([removed, InEar], false, vec![]).await;
+            assert_eq!(calls, 1, "{removed:?}");
+            assert!(
+                !controller.state.lock().await.i_paused_the_media,
+                "{removed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ear_removal_one_bud_playing_marks_self_pause() {
+        use EarDetectionStatus::*;
+        let player = "org.mpris.MediaPlayer2.test";
+        let (controller, calls) =
+            ear_removal([OutOfEar, InEar], true, vec![paused_one(player)]).await;
+        assert_eq!(calls, 1);
+        let state = controller.state.lock().await;
+        assert!(state.i_paused_the_media);
+        assert!(!state.is_playing);
+        assert_eq!(state.paused_by_app_services, vec![player.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ear_removal_both_buds_keeps_first_pause_verdict() {
+        use EarDetectionStatus::*;
+        let player = "org.mpris.MediaPlayer2.test";
+        let outcomes = vec![paused_one(player), (vec![], PauseOutcome::default())];
+        let (controller, calls) = ear_removal([OutOfEar, OutOfEar], true, outcomes).await;
+        assert_eq!(calls, 2);
+        let state = controller.state.lock().await;
+        assert!(state.i_paused_the_media);
+        assert_eq!(state.paused_by_app_services, vec![player.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ear_removal_both_buds_idle_leaves_self_pause_unset() {
+        use EarDetectionStatus::*;
+        let (controller, calls) = ear_removal([OutOfEar, OutOfEar], false, vec![]).await;
+        assert_eq!(calls, 2);
+        assert!(!controller.state.lock().await.i_paused_the_media);
     }
 
     #[tokio::test]
