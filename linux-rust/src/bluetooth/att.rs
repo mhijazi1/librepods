@@ -238,12 +238,14 @@ async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
                 }
                 if data[0] == OPCODE_HANDLE_VALUE_NTF {
                     // Notification
-                    let handle = (data[1] as u16) | ((data[2] as u16) << 8);
-                    let value = data[3..].to_vec();
+                    let Some((handle, value)) = parse_notification(data) else {
+                        debug!("Skipping notification shorter than 3 bytes");
+                        continue;
+                    };
                     let state = manager.state.lock().await;
                     if let Some(listeners) = state.listeners.get(&handle) {
                         for listener in listeners {
-                            let _ = listener.send(value.clone());
+                            let _ = listener.send(value.to_vec());
                         }
                     }
                 } else if data[0] == OPCODE_WRITE_RESPONSE {
@@ -263,6 +265,15 @@ async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
     state.sender = None;
 }
 
+/// The little-endian handle and value of a notification packet; None if it is
+/// too short to carry a handle.
+fn parse_notification(data: &[u8]) -> Option<(u16, &[u8])> {
+    match data {
+        [_, lo, hi, value @ ..] => Some((u16::from_le_bytes([*lo, *hi]), value)),
+        _ => None,
+    }
+}
+
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = sp.send(&data).await {
@@ -272,4 +283,23 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
         debug!("Sent {} bytes: {}", data.len(), hex::encode(&data));
     }
     info!("send thread finished.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_shorter_than_3_bytes_is_skipped() {
+        assert_eq!(parse_notification(&[OPCODE_HANDLE_VALUE_NTF]), None);
+        assert_eq!(parse_notification(&[OPCODE_HANDLE_VALUE_NTF, 0x05]), None);
+        assert_eq!(
+            parse_notification(&[OPCODE_HANDLE_VALUE_NTF, 0x05, 0x80]),
+            Some((0x8005, &[][..]))
+        );
+        assert_eq!(
+            parse_notification(&[OPCODE_HANDLE_VALUE_NTF, 0x05, 0x80, 1, 2, 3, 4, 5]),
+            Some((0x8005, &[1, 2, 3, 4, 5][..]))
+        );
+    }
 }

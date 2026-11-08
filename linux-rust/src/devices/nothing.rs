@@ -75,31 +75,17 @@ impl NothingDevice {
         // let ui_tx_clone = ui_tx.clone();
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
-                if data.starts_with(&[0x55, 0x20, 0x01, 0x42, 0x40]) {
-                    let firmware_version = String::from_utf8_lossy(&data[8..]).to_string();
-                    info!(
-                        "Received firmware version from Nothing device {}: {}",
-                        mac_address, firmware_version
-                    );
-                    save_nothing_info(&mac_address.to_string(), |info| {
-                        info.firmware_version = firmware_version
-                    });
-                } else if data.starts_with(&[0x55, 0x20, 0x01, 0x06, 0x40]) {
-                    let serial_number_start_position = data
-                        .iter()
-                        .position(|&b| b == "S".as_bytes()[0])
-                        .unwrap_or(8);
-                    let serial_number_end = data
-                        .iter()
-                        .skip(serial_number_start_position)
-                        .position(|&b| b == 0x0A)
-                        .map(|pos| pos + serial_number_start_position)
-                        .unwrap_or(data.len());
-                    if data.get(serial_number_start_position + 1) == Some(&"H".as_bytes()[0]) {
-                        let serial_number = String::from_utf8_lossy(
-                            &data[serial_number_start_position..serial_number_end],
-                        )
-                        .to_string();
+                match parse_nothing_reply(&data) {
+                    Some(NothingReply::Firmware(firmware_version)) => {
+                        info!(
+                            "Received firmware version from Nothing device {}: {}",
+                            mac_address, firmware_version
+                        );
+                        save_nothing_info(&mac_address.to_string(), |info| {
+                            info.firmware_version = firmware_version
+                        });
+                    }
+                    Some(NothingReply::Serial(serial_number)) => {
                         info!(
                             "Received serial number from Nothing device {}: {}",
                             mac_address, serial_number
@@ -107,12 +93,11 @@ impl NothingDevice {
                         save_nothing_info(&mac_address.to_string(), |info| {
                             info.serial_number = serial_number
                         });
-                    } else {
-                        debug!(
-                            "Serial number format unexpected from Nothing device {}: {:?}",
-                            mac_address, data
-                        );
                     }
+                    None => debug!(
+                        "No firmware version or serial number in reply from Nothing device {}",
+                        mac_address
+                    ),
                 }
 
                 debug!(
@@ -126,6 +111,37 @@ impl NothingDevice {
             att_manager,
             information,
         }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum NothingReply {
+    Firmware(String),
+    Serial(String),
+}
+
+/// The firmware version or serial number in a reply from the device; None for
+/// any other or malformed reply.
+fn parse_nothing_reply(data: &[u8]) -> Option<NothingReply> {
+    if data.starts_with(&[0x55, 0x20, 0x01, 0x42, 0x40]) {
+        let version = data.get(8..)?;
+        Some(NothingReply::Firmware(
+            String::from_utf8_lossy(version).to_string(),
+        ))
+    } else if data.starts_with(&[0x55, 0x20, 0x01, 0x06, 0x40]) {
+        let start = data.iter().position(|&b| b == b'S').unwrap_or(8);
+        if data.get(start + 1) != Some(&b'H') {
+            return None;
+        }
+        let end = data[start..]
+            .iter()
+            .position(|&b| b == 0x0A)
+            .map_or(data.len(), |pos| pos + start);
+        Some(NothingReply::Serial(
+            String::from_utf8_lossy(&data[start..end]).to_string(),
+        ))
+    } else {
+        None
     }
 }
 
@@ -271,5 +287,61 @@ mod tests {
         let info = nothing_info(device);
         assert_eq!(info.serial_number, "SH-NEW");
         assert_eq!(info.firmware_version, "0.9");
+    }
+
+    const FIRMWARE: [u8; 5] = [0x55, 0x20, 0x01, 0x42, 0x40];
+    const SERIAL: [u8; 5] = [0x55, 0x20, 0x01, 0x06, 0x40];
+
+    #[test]
+    fn nothing_reply_short_firmware_is_ignored() {
+        for len in 5..8 {
+            let mut data = FIRMWARE.to_vec();
+            data.resize(len, 0);
+            assert_eq!(parse_nothing_reply(&data), None, "length {len}");
+        }
+    }
+
+    #[test]
+    fn nothing_reply_firmware_parses() {
+        let mut data = [&FIRMWARE[..], &[0, 0, 0]].concat();
+        assert_eq!(
+            parse_nothing_reply(&data),
+            Some(NothingReply::Firmware(String::new()))
+        );
+        data.extend_from_slice(b"1.0.2");
+        assert_eq!(
+            parse_nothing_reply(&data),
+            Some(NothingReply::Firmware("1.0.2".to_string()))
+        );
+    }
+
+    #[test]
+    fn nothing_reply_serial_parses() {
+        let terminated = [&SERIAL[..], &[0, 0x13, 0], b"SH123\nrest"].concat();
+        assert_eq!(
+            parse_nothing_reply(&terminated),
+            Some(NothingReply::Serial("SH123".to_string()))
+        );
+        let unterminated = [&SERIAL[..], &[0, 0x13, 0], b"SH456"].concat();
+        assert_eq!(
+            parse_nothing_reply(&unterminated),
+            Some(NothingReply::Serial("SH456".to_string()))
+        );
+        for not_sh in [
+            [&SERIAL[..], &[0, 0x13, 0], b"SX123"].concat(),
+            [&SERIAL[..], &[0, 0x13, 0], b"12345"].concat(),
+            SERIAL.to_vec(),
+        ] {
+            assert_eq!(parse_nothing_reply(&not_sh), None, "{not_sh:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_reply_other_prefix_is_none() {
+        assert_eq!(
+            parse_nothing_reply(&[0x55, 0x20, 0x01, 0x99, 0x40, 0, 0, 0, b'S', b'H']),
+            None
+        );
+        assert_eq!(parse_nothing_reply(&[]), None);
     }
 }
