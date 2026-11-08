@@ -2482,9 +2482,10 @@ mod tests {
         streams.set(vec![music(4)]);
         streams.settle().await;
         // Hold the next listing; once it returns the stream has lasted the
-        // minimum, so it would count.
-        let held = hold.lock().unwrap();
+        // minimum, so it would count. A listing that begins before the
+        // hold may still pass; the one after it waits.
         let begun = started.load(Ordering::SeqCst) + 1;
+        let held = hold.lock().unwrap();
         wait_until("a held listing", || started.load(Ordering::SeqCst) >= begun).await;
         tokio::time::sleep(STREAM_TEST_MIN + STREAM_TEST_MIN / 5).await;
         rx.drain();
