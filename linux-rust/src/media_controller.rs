@@ -13,11 +13,111 @@ use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
+
+// Reconnecting AirPods creates a fresh MediaController. Keep the listener task
+// outside the controller so the replacement can stop its predecessor by MAC.
+static PLAYBACK_LISTENERS: LazyLock<StdMutex<HashMap<String, AbortHandle>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// What one playback poll observed, as far as the takeover decision cares.
+#[derive(Clone, Copy, Debug)]
+struct TakeoverInputs {
+    /// Whether an earlier poll already recorded the initial playback state.
+    baseline_taken: bool,
+    was_playing: bool,
+    is_playing: bool,
+    /// Set when LibrePods paused the players itself (ear removal, lost ownership).
+    i_paused_the_media: bool,
+    /// At least one bud reports `InEar`.
+    bud_in_ear: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TakeoverSkip {
+    /// First poll: `was_playing` is a placeholder, not an observation.
+    InitialState,
+    /// Playback did not go from stopped to playing.
+    NoTransition,
+    /// Players came back after a pause LibrePods made itself.
+    ResumeAfterOwnPause,
+    /// Playback started but nobody is wearing the buds.
+    NoBudInEar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TakeoverAction {
+    TakeOver,
+    Skip(TakeoverSkip),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TakeoverDecision {
+    action: TakeoverAction,
+    /// Consume `i_paused_the_media`: the resume it was waiting for has happened.
+    clear_self_pause: bool,
+}
+
+/// Decide whether a playback poll should take the AirPods away from another
+/// device. Pure, so the order of the guards (baseline, transition, self-pause,
+/// ear detection) is tested without D-Bus or AACP.
+fn decide_takeover(inputs: TakeoverInputs) -> TakeoverDecision {
+    let skip = |reason| TakeoverDecision {
+        action: TakeoverAction::Skip(reason),
+        clear_self_pause: false,
+    };
+    if !inputs.baseline_taken {
+        return skip(TakeoverSkip::InitialState);
+    }
+    if inputs.was_playing || !inputs.is_playing {
+        return skip(TakeoverSkip::NoTransition);
+    }
+    if inputs.i_paused_the_media {
+        return TakeoverDecision {
+            action: TakeoverAction::Skip(TakeoverSkip::ResumeAfterOwnPause),
+            clear_self_pause: true,
+        };
+    }
+    if !inputs.bud_in_ear {
+        return skip(TakeoverSkip::NoBudInEar);
+    }
+    TakeoverDecision {
+        action: TakeoverAction::TakeOver,
+        clear_self_pause: false,
+    }
+}
+
+/// How many times `get_audio_device_index` looks for the card (~3 s in total).
+const CARD_LOOKUP_ATTEMPTS: u32 = 12;
+const CARD_LOOKUP_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Call `lookup` until it finds a card index, at most `attempts` times,
+/// sleeping `interval` between tries (not after the last one). The lookup is
+/// injected so the retry budget is testable without a sound server.
+async fn retry_card_lookup<F, Fut>(attempts: u32, interval: Duration, mut lookup: F) -> Option<u32>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<u32>>,
+{
+    for attempt in 1..=attempts {
+        if let Some(index) = lookup().await {
+            if attempt > 1 {
+                debug!("Found audio card after {attempt} attempts");
+            }
+            return Some(index);
+        }
+        if attempt < attempts {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    None
+}
 
 #[derive(Clone, Debug)]
 struct OwnedCardProfileInfo {
@@ -105,14 +205,20 @@ impl MediaController {
             return;
         }
         state.playback_listener_running = true;
+        let connected_device_mac = state.connected_device_mac.clone();
         drop(state);
 
         let controller_clone = self.clone();
-        tokio::spawn(async move {
+        let mut listeners = PLAYBACK_LISTENERS.lock().unwrap();
+        if let Some(previous_listener) = listeners.remove(&connected_device_mac) {
+            previous_listener.abort();
+        }
+        let listener = tokio::spawn(async move {
             controller_clone
                 .playback_listener_loop(aacp_manager, control_tx)
                 .await;
         });
+        listeners.insert(connected_device_mac, listener.abort_handle());
     }
 
     async fn playback_listener_loop(
@@ -124,6 +230,9 @@ impl MediaController {
         )>,
     ) {
         info!("Starting playback listener loop");
+        // The first poll only records the playback state; see
+        // TakeoverSkip::InitialState.
+        let mut baseline_taken = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -131,53 +240,98 @@ impl MediaController {
                 .await
                 .unwrap_or(false);
 
+            // Snapshot the AACP state and release the guard straight away: the
+            // takeover below awaits profile activation and packet sends, and
+            // must not block incoming events or queued control commands. Taken
+            // before (not inside) the playback-state lock so the two are never
+            // nested. The guards still run in #724's order: decide_takeover
+            // checks baseline and self-pause before looking at the ears.
+            let (bud_in_ear, connected_devices) = {
+                let aacp_state = aacp_manager.state.lock().await;
+                (
+                    aacp_state
+                        .ear_detection_status
+                        .contains(&EarDetectionStatus::InEar),
+                    aacp_state.connected_devices.clone(),
+                )
+            };
+
+            // Read and consume the self-pause flag under the same lock as the
+            // playback state, so a pause_all_media racing with this poll is not
+            // lost.
             let mut state = self.state.lock().await;
             let was_playing = state.is_playing;
             state.is_playing = is_playing;
             let local_mac = state.local_mac.clone();
+            let decision = decide_takeover(TakeoverInputs {
+                baseline_taken,
+                was_playing,
+                is_playing,
+                i_paused_the_media: state.i_paused_the_media,
+                bud_in_ear,
+            });
+            if decision.clear_self_pause {
+                state.i_paused_the_media = false;
+            }
             drop(state);
+            baseline_taken = true;
 
-            if !was_playing && is_playing {
-                let aacp_state = aacp_manager.state.lock().await;
-                if !aacp_state
-                    .ear_detection_status
-                    .contains(&EarDetectionStatus::InEar)
-                {
-                    info!("Media playback started but buds not in ear, skipping takeover");
-                    continue;
-                }
-                info!("Media playback started, taking ownership and activating a2dp");
-                let _ = control_tx.send((
-                    crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
-                    vec![0x01],
-                ));
-                self.activate_a2dp_profile().await;
-
-                info!("already connected locally, hijacking connection by asking AirPods");
-
-                let connected_devices = aacp_state.connected_devices.clone();
-                for device in connected_devices {
-                    if device.mac != local_mac {
-                        if let Err(e) = aacp_manager
-                            .send_media_information(&local_mac, &device.mac, true)
-                            .await
-                        {
-                            error!("Failed to send media information to {}: {}", device.mac, e);
-                        }
-                        if let Err(e) = aacp_manager.send_smart_routing_show_ui(&device.mac).await {
-                            error!(
-                                "Failed to send smart routing show ui to {}: {}",
-                                device.mac, e
-                            );
-                        }
-                        if let Err(e) = aacp_manager.send_hijack_request(&device.mac).await {
-                            error!("Failed to send hijack request to {}: {}", device.mac, e);
-                        }
+            if let TakeoverAction::Skip(reason) = decision.action {
+                match reason {
+                    // `is_playing` starts false, which is a placeholder rather
+                    // than an observation. Whatever is already playing when this
+                    // loop starts would otherwise read as playback that just
+                    // began, and on a reconnect take the audio from a device the
+                    // user was listening on.
+                    TakeoverSkip::InitialState => {
+                        debug!("Recorded initial playback state ({is_playing}); not a transition")
+                    }
+                    TakeoverSkip::NoTransition => {}
+                    // Losing ownership pauses local players and drops the audio
+                    // profile. Players tend to resume on their own once the
+                    // profile comes back, and that resume is not the user asking
+                    // for the audio; treating it as one starts a tug of war with
+                    // the device that just took over.
+                    TakeoverSkip::ResumeAfterOwnPause => {
+                        debug!("Playback resumed after our own pause; not taking ownership")
+                    }
+                    TakeoverSkip::NoBudInEar => {
+                        info!("Media playback started but buds not in ear, skipping takeover")
                     }
                 }
-
-                debug!("completed playback takeover process");
+                continue;
             }
+
+            info!("Media playback started, taking ownership and activating a2dp");
+            let _ = control_tx.send((
+                crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
+                vec![0x01],
+            ));
+            self.activate_a2dp_profile().await;
+
+            info!("already connected locally, hijacking connection by asking AirPods");
+
+            for device in connected_devices {
+                if device.mac != local_mac {
+                    if let Err(e) = aacp_manager
+                        .send_media_information(&local_mac, &device.mac, true)
+                        .await
+                    {
+                        error!("Failed to send media information to {}: {}", device.mac, e);
+                    }
+                    if let Err(e) = aacp_manager.send_smart_routing_show_ui(&device.mac).await {
+                        error!(
+                            "Failed to send smart routing show ui to {}: {}",
+                            device.mac, e
+                        );
+                    }
+                    if let Err(e) = aacp_manager.send_hijack_request(&device.mac).await {
+                        error!("Failed to send hijack request to {}: {}", device.mac, e);
+                    }
+                }
+            }
+
+            debug!("completed playback takeover process");
         }
     }
 
@@ -234,6 +388,19 @@ impl MediaController {
                 debug!("Ear detection disabled, skipping");
                 return;
             }
+        }
+
+        // No previous reading means this is the first report after connecting,
+        // not a change the wearer made. It matters because `old_all_out` is
+        // vacuously true for an empty list, so an already-worn pair looks like
+        // it was just put in: playback resumes, and with a second device
+        // connected the resume escalates into taking the audio away from it.
+        // Record the baseline and wait for a real transition instead.
+        if old_statuses.is_empty() {
+            debug!("First ear reading after connecting: recording baseline, not acting");
+            let mut state = self.state.lock().await;
+            state.old_in_ear_data = new_in_ear_data;
+            return;
         }
 
         if new_has_at_least_one_in && old_all_out {
@@ -427,41 +594,24 @@ impl MediaController {
     }
 
     pub async fn pause_all_media(&self) {
+        self.pause_all_media_with(Self::pause_playing_mpris_players)
+            .await;
+    }
+
+    /// `pause_all_media` with the D-Bus side injected, so the self-pause
+    /// marking can be tested without a session bus.
+    async fn pause_all_media_with<F>(&self, pause_players: F)
+    where
+        F: FnOnce() -> usize + Send + 'static,
+    {
         debug!("Pausing all media (without tracking for resume)");
 
-        let paused_count = tokio::task::spawn_blocking(|| {
-            let conn = match Connection::new_session() {
-                Ok(c) => c,
-                Err(_) => return 0,
-            };
-            let mut paused_count = 0;
+        // Remember that the pause came from us, so the playback listener does
+        // not mistake the players coming back for the user starting something.
+        // Set before talking to D-Bus, so a failed pause still marks it.
+        self.state.lock().await.i_paused_the_media = true;
 
-            for service in Self::list_mpris_services(&conn) {
-                let proxy =
-                    conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-                if let Ok(playback_status) =
-                    proxy.get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                    && playback_status == "Playing"
-                {
-                    if proxy
-                        .method_call::<(), _, &str, &str>(
-                            "org.mpris.MediaPlayer2.Player",
-                            "Pause",
-                            (),
-                        )
-                        .is_ok()
-                    {
-                        info!("Paused playback for: {}", service);
-                        paused_count += 1;
-                    } else {
-                        error!("Failed to pause {}", service);
-                    }
-                }
-            }
-            paused_count
-        })
-            .await
-            .unwrap();
+        let paused_count = tokio::task::spawn_blocking(pause_players).await.unwrap();
 
         if paused_count > 0 {
             info!("Paused {} media player(s) due to ownership loss", paused_count);
@@ -469,6 +619,36 @@ impl MediaController {
         } else {
             debug!("No playing media players found to pause");
         }
+    }
+
+    /// Pause every MPRIS player that reports `Playing`; returns how many
+    /// paused. Blocking: run it on a blocking thread.
+    fn pause_playing_mpris_players() -> usize {
+        let conn = match Connection::new_session() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let mut paused_count = 0;
+
+        for service in Self::list_mpris_services(&conn) {
+            let proxy =
+                conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
+            if let Ok(playback_status) =
+                proxy.get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+                && playback_status == "Playing"
+            {
+                if proxy
+                    .method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Pause", ())
+                    .is_ok()
+                {
+                    info!("Paused playback for: {}", service);
+                    paused_count += 1;
+                } else {
+                    error!("Failed to pause {}", service);
+                }
+            }
+        }
+        paused_count
     }
 
     async fn resume(&self) {
@@ -617,22 +797,41 @@ impl MediaController {
         if mac.is_empty() {
             return None;
         }
-        let mac_clone = mac.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            for card in get_card_info_list_sync() {
-                if let Some(device_string) = card.proplist.get_str("device.string")
-                    && device_string.contains(&mac_clone)
-                {
-                    info!("Found audio device index for MAC {}: {}", mac_clone, card.index);
-                    return Some(card.index);
-                }
+        // Taking the connection back from another device makes the earbuds
+        // renegotiate, and the card briefly disappears from the sound server
+        // while that happens. A single lookup can land in that window and give
+        // up, leaving the audio nowhere: ownership already taken from the other
+        // device, but no local profile to play through. So poll for a moment.
+        let found = retry_card_lookup(CARD_LOOKUP_ATTEMPTS, CARD_LOOKUP_INTERVAL, || {
+            let mac_clone = mac.to_string();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    get_card_info_list_sync().into_iter().find_map(|card| {
+                        let device_string = card.proplist.get_str("device.string")?;
+                        device_string.contains(&mac_clone).then_some(card.index)
+                    })
+                })
+                .await
+                .unwrap_or(None)
             }
-            error!("No matching Bluetooth card found for MAC address: {}", mac_clone);
-            None
         })
-            .await
-            .unwrap_or(None)
+        .await;
+
+        match found {
+            Some(index) => {
+                info!("Found audio device index for MAC {}: {}", mac, index);
+                Some(index)
+            }
+            None => {
+                error!(
+                    "No matching Bluetooth card found for MAC address: {} after {:?}",
+                    mac,
+                    CARD_LOOKUP_INTERVAL * CARD_LOOKUP_ATTEMPTS
+                );
+                None
+            }
+        }
     }
 
     pub async fn deactivate_a2dp_profile(&self) {
@@ -1077,6 +1276,232 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
         error!("No matching sink found for MAC address: {}", mac_clone);
         None
     })
+    .await
+    .unwrap_or(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn playback_listener_replacement_is_scoped_to_device() {
+        let first_mac = "00:00:00:00:00:01";
+        let other_mac = "00:00:00:00:00:02";
+
+        let first = MediaController::new(first_mac.to_string(), String::new());
+        let (first_tx, _first_rx) = tokio::sync::mpsc::unbounded_channel();
+        first
+            .start_playback_listener(AACPManager::new(), first_tx)
+            .await;
+        let first_handle = PLAYBACK_LISTENERS
+            .lock()
+            .unwrap()
+            .get(first_mac)
+            .unwrap()
+            .clone();
+
+        let other = MediaController::new(other_mac.to_string(), String::new());
+        let (other_tx, _other_rx) = tokio::sync::mpsc::unbounded_channel();
+        other
+            .start_playback_listener(AACPManager::new(), other_tx)
+            .await;
+        assert!(!first_handle.is_finished());
+
+        let replacement = MediaController::new(first_mac.to_string(), String::new());
+        let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::unbounded_channel();
+        replacement
+            .start_playback_listener(AACPManager::new(), replacement_tx)
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .unwrap_or(None)
+        .expect("superseded playback listener should stop");
+
+        let listeners = PLAYBACK_LISTENERS.lock().unwrap();
+        listeners.get(first_mac).unwrap().abort();
+        listeners.get(other_mac).unwrap().abort();
+    }
+
+    fn takeover_inputs() -> TakeoverInputs {
+        // A genuine play: baseline recorded, stopped -> playing, no pause of
+        // our own pending, a bud in an ear.
+        TakeoverInputs {
+            baseline_taken: true,
+            was_playing: false,
+            is_playing: true,
+            i_paused_the_media: false,
+            bud_in_ear: true,
+        }
+    }
+
+    #[test]
+    fn takeover_skips_initial_playback_state() {
+        let decision = decide_takeover(TakeoverInputs {
+            baseline_taken: false,
+            ..takeover_inputs()
+        });
+        assert_eq!(
+            decision,
+            TakeoverDecision {
+                action: TakeoverAction::Skip(TakeoverSkip::InitialState),
+                clear_self_pause: false,
+            }
+        );
+
+        // The first poll is not a resume either, so a pending self-pause
+        // mark is left for the real one.
+        let decision = decide_takeover(TakeoverInputs {
+            baseline_taken: false,
+            i_paused_the_media: true,
+            ..takeover_inputs()
+        });
+        assert_eq!(
+            decision.action,
+            TakeoverAction::Skip(TakeoverSkip::InitialState)
+        );
+        assert!(!decision.clear_self_pause);
+    }
+
+    #[test]
+    fn takeover_skips_resume_after_own_pause() {
+        let decision = decide_takeover(TakeoverInputs {
+            i_paused_the_media: true,
+            ..takeover_inputs()
+        });
+        assert_eq!(
+            decision,
+            TakeoverDecision {
+                action: TakeoverAction::Skip(TakeoverSkip::ResumeAfterOwnPause),
+                clear_self_pause: true,
+            }
+        );
+    }
+
+    #[test]
+    fn takeover_on_genuine_play_with_bud_in_ear() {
+        assert_eq!(
+            decide_takeover(takeover_inputs()),
+            TakeoverDecision {
+                action: TakeoverAction::TakeOver,
+                clear_self_pause: false,
+            }
+        );
+    }
+
+    #[test]
+    fn takeover_skipped_when_no_bud_in_ear() {
+        assert_eq!(
+            decide_takeover(TakeoverInputs {
+                bud_in_ear: false,
+                ..takeover_inputs()
+            }),
+            TakeoverDecision {
+                action: TakeoverAction::Skip(TakeoverSkip::NoBudInEar),
+                clear_self_pause: false,
+            }
+        );
+    }
+
+    #[test]
+    fn takeover_skipped_without_stopped_to_playing_transition() {
+        for (was_playing, is_playing) in [(true, true), (true, false), (false, false)] {
+            let decision = decide_takeover(TakeoverInputs {
+                was_playing,
+                is_playing,
+                i_paused_the_media: true,
+                ..takeover_inputs()
+            });
+            assert_eq!(
+                decision,
+                TakeoverDecision {
+                    action: TakeoverAction::Skip(TakeoverSkip::NoTransition),
+                    clear_self_pause: false,
+                },
+                "was_playing={was_playing} is_playing={is_playing}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ear_detection_first_reading_is_baseline() {
+        let controller = MediaController::new(String::new(), String::new());
+        {
+            // Markers the insertion path would change: it sets
+            // user_played_the_media when playing, and a resume clears
+            // i_paused_the_media.
+            let mut state = controller.state.lock().await;
+            state.is_playing = true;
+            state.i_paused_the_media = true;
+        }
+
+        controller
+            .handle_ear_detection(
+                Vec::new(),
+                vec![EarDetectionStatus::InEar, EarDetectionStatus::InEar],
+            )
+            .await;
+
+        let state = controller.state.lock().await;
+        assert_eq!(state.old_in_ear_data, vec![true, true]);
+        assert!(!state.user_played_the_media);
+        assert!(state.i_paused_the_media);
+        assert!(state.is_playing);
+        assert_eq!(state.device_index, None);
+    }
+
+    #[tokio::test]
+    async fn pause_all_media_marks_self_pause() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.is_playing = true;
+
+        // D-Bus unavailable or nothing paused: still our pause.
+        controller.pause_all_media_with(|| 0).await;
+        {
+            let state = controller.state.lock().await;
+            assert!(state.i_paused_the_media);
+            assert!(state.is_playing);
+        }
+
+        controller.state.lock().await.i_paused_the_media = false;
+        controller.pause_all_media_with(|| 2).await;
+        let state = controller.state.lock().await;
+        assert!(state.i_paused_the_media);
+        assert!(!state.is_playing);
+    }
+
+    #[test]
+    fn card_lookup_budget_is_about_three_seconds() {
+        assert_eq!(CARD_LOOKUP_ATTEMPTS, 12);
+        assert_eq!(CARD_LOOKUP_INTERVAL, Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn card_lookup_retries_until_found() {
+        let mut calls = 0u32;
+        let found = retry_card_lookup(CARD_LOOKUP_ATTEMPTS, Duration::ZERO, || {
+            calls += 1;
+            let attempt = calls;
+            async move { (attempt == 4).then_some(7) }
+        })
+        .await;
+        assert_eq!(found, Some(7));
+        assert_eq!(calls, 4);
+    }
+
+    #[tokio::test]
+    async fn card_lookup_gives_up_after_budget() {
+        let mut calls = 0u32;
+        let found = retry_card_lookup(CARD_LOOKUP_ATTEMPTS, Duration::ZERO, || {
+            calls += 1;
+            async { None }
+        })
+        .await;
+        assert_eq!(found, None);
+        assert_eq!(calls, 12);
+    }
 }
