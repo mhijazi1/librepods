@@ -31,7 +31,8 @@ use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::handoff_log;
 use crate::media_controller::{self, MediaController};
 use crate::stream_monitor::{
-    self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PulsePeaks, PulseStreams,
+    self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PulsePeaks,
+    PulsePlaybackStreams,
 };
 use crate::utils::SwitchingMode;
 use futures::future::BoxFuture;
@@ -135,8 +136,7 @@ fn share_media(
 pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
     spawn_playback_poller_with(
         MediaController::check_if_playing,
-        // shortcut: a new libpulse connection every PLAYBACK_POLL; fold the connections or subscribe to sink-input events (#73)
-        PulseStreams,
+        PulsePlaybackStreams::new(),
         PulsePeaks::new(),
         MIN_STREAM_PLAYBACK,
         PLAYBACK_POLL,
