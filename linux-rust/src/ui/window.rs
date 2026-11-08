@@ -192,6 +192,21 @@ fn apply_save_result(
     }
 }
 
+/// The app settings file's JSON: all four app-wide settings.
+fn app_settings_json(
+    theme: MyTheme,
+    tray_text_mode: bool,
+    stem_control: bool,
+    preferred_codec: PreferredCodec,
+) -> serde_json::Value {
+    serde_json::json!({
+        "theme": theme,
+        "tray_text_mode": tray_text_mode,
+        "stem_control": stem_control,
+        "preferred_codec": preferred_codec,
+    })
+}
+
 /// Returns the devices JSON with `data` stored under `addr`, given the result of
 /// reading the current file. Only a missing file counts as empty; any other read,
 /// parse or serialize error is returned so the caller never drops existing devices.
@@ -420,6 +435,27 @@ impl App {
         "LibrePods".to_string()
     }
 
+    /// Writes the app settings to settings.json and records the outcome on the Settings tab.
+    fn save_app_settings(&mut self) {
+        let app_settings_path = get_app_settings_path();
+        let settings = app_settings_json(
+            self.selected_theme,
+            self.tray_text_mode,
+            self.stem_control,
+            self.preferred_codec,
+        );
+        debug!(
+            "Writing settings to {}: {}",
+            app_settings_path.to_str().unwrap(),
+            settings
+        );
+        let result = write_settings_file(&app_settings_path, &settings.to_string());
+        if let Err(e) = &result {
+            error!("Failed to write {}: {}", app_settings_path.display(), e);
+        }
+        apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::WindowOpened(id) => {
@@ -442,23 +478,7 @@ impl App {
             }
             Message::ThemeSelected(theme) => {
                 self.selected_theme = theme;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                    "preferred_codec": self.preferred_codec,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                let result = write_settings_file(&app_settings_path, &settings.to_string());
-                if let Err(e) = &result {
-                    error!("Failed to write {}: {}", app_settings_path.display(), e);
-                }
-                apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
+                self.save_app_settings();
                 Task::none()
             }
             Message::CopyToClipboard(data) => iced::clipboard::write(data),
@@ -823,44 +843,12 @@ impl App {
             }
             Message::TrayTextModeChanged(is_enabled) => {
                 self.tray_text_mode = is_enabled;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                    "preferred_codec": self.preferred_codec,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                let result = write_settings_file(&app_settings_path, &settings.to_string());
-                if let Err(e) = &result {
-                    error!("Failed to write {}: {}", app_settings_path.display(), e);
-                }
-                apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
+                self.save_app_settings();
                 Task::none()
             }
             Message::PreferredCodecChanged(codec) => {
                 self.preferred_codec = codec;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                    "preferred_codec": self.preferred_codec,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                let result = write_settings_file(&app_settings_path, &settings.to_string());
-                if let Err(e) = &result {
-                    error!("Failed to write {}: {}", app_settings_path.display(), e);
-                }
-                apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
+                self.save_app_settings();
                 Task::none()
             }
             Message::ConnectModeChanged(mac, mode) => {
@@ -897,23 +885,7 @@ impl App {
             }
             Message::StemControlChanged(is_enabled) => {
                 self.stem_control = is_enabled;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                    "preferred_codec": self.preferred_codec,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                let result = write_settings_file(&app_settings_path, &settings.to_string());
-                if let Err(e) = &result {
-                    error!("Failed to write {}: {}", app_settings_path.display(), e);
-                }
-                apply_save_result(&mut self.save_statuses, Tab::Settings, result.map_err(SaveError::Io));
+                self.save_app_settings();
                 Task::none()
             }
         }
@@ -2145,6 +2117,27 @@ mod tests {
             save_status_text(&SaveError::NotSettingsJson),
             "Couldn't save: preferences.json isn't valid settings JSON"
         );
+    }
+
+    #[test]
+    fn app_settings_json_has_all_four_keys() {
+        for (theme, flag, codec) in [
+            (MyTheme::Nord, true, PreferredCodec::SbcXq),
+            (MyTheme::Light, false, PreferredCodec::Aac),
+        ] {
+            let json = app_settings_json(theme, flag, !flag, codec);
+            let obj = json.as_object().unwrap();
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["preferred_codec", "stem_control", "theme", "tray_text_mode"]
+            );
+            assert_eq!(obj["theme"], serde_json::to_value(theme).unwrap());
+            assert_eq!(obj["tray_text_mode"], serde_json::to_value(flag).unwrap());
+            assert_eq!(obj["stem_control"], serde_json::to_value(!flag).unwrap());
+            assert_eq!(obj["preferred_codec"], serde_json::to_value(codec).unwrap());
+        }
     }
 
     fn denied() -> Result<(), SaveError> {
