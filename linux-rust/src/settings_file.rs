@@ -15,6 +15,24 @@ pub(crate) fn parse_devices(
     }
 }
 
+/// The only read-modify-write of devices.json: reads `path`, hands the read
+/// result unchanged to `rewrite` (so a missing file arrives as NotFound for
+/// `parse_devices`) and writes what it returns. If `rewrite` fails, nothing is
+/// written and its error is returned. A process-wide lock is held throughout,
+/// so concurrent callers can't drop each other's changes. Synchronous on
+/// purpose: the guard can never be held across an `.await`. `rewrite` must not
+/// call this again (the std Mutex would deadlock). In-process only: one
+/// librepods user service writes this file.
+pub(crate) fn rewrite_devices_file(
+    path: &std::path::Path,
+    rewrite: impl FnOnce(std::io::Result<String>) -> std::io::Result<String>,
+) -> std::io::Result<()> {
+    static DEVICES_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = DEVICES_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let json = rewrite(std::fs::read_to_string(path))?;
+    write_settings_file(path, &json)
+}
+
 /// Replaces the settings file at `path` with `contents` without ever leaving it
 /// half-written: a temp file next to the target is written, fsynced and renamed
 /// over it. An existing target is resolved first, so a symlink stays a symlink,
@@ -156,6 +174,73 @@ mod tests {
         for json in ["", "{", r#"{"AA:AA:AA:AA:AA:AA": 1}"#] {
             assert!(parse_devices(Ok(json.to_string())).is_err(), "{json:?}");
         }
+    }
+
+    #[test]
+    fn rewrite_devices_file_creates_missing_file() {
+        let dir = settings_dir("rewrite-missing");
+        let target = dir.join("devices.json");
+
+        rewrite_devices_file(&target, |existing| {
+            assert_eq!(existing.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            Ok("{}".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rewrite_devices_file_error_leaves_file_unchanged() {
+        let dir = settings_dir("rewrite-error");
+        let target = dir.join("devices.json");
+        std::fs::write(&target, "{").unwrap();
+
+        rewrite_devices_file(&target, |existing| {
+            parse_devices(existing).map(|_| panic!("parsed a truncated file"))
+        })
+        .unwrap_err();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"{");
+        assert_eq!(dir_names(&dir), ["devices.json"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_rewrites_keep_every_entry() {
+        const N: usize = 8;
+        let dir = settings_dir("rewrite-concurrent");
+        let target = dir.join("devices.json");
+        let barrier = std::sync::Barrier::new(N);
+
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let (target, barrier) = (&target, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    rewrite_devices_file(target, |existing| {
+                        let mut devices = parse_devices(existing)?;
+                        devices.insert(
+                            format!("AA:AA:AA:AA:AA:{i:02X}"),
+                            DeviceData {
+                                name: format!("Device {i}"),
+                                type_: DeviceType::AirPods,
+                                information: None,
+                            },
+                        );
+                        // Widen the read-to-write window so a missing lock loses entries.
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        Ok(serde_json::to_string(&devices)?)
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let devices = parse_devices(std::fs::read_to_string(&target)).unwrap();
+        assert_eq!(devices.len(), N);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

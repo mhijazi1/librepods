@@ -6,7 +6,7 @@ use crate::devices::enums::{
     AirPodsNoiseControlMode, AirPodsState, DeviceData, DeviceState, DeviceType, NothingAncMode,
     NothingState,
 };
-use crate::settings_file::{parse_devices, write_settings_file};
+use crate::settings_file::{parse_devices, rewrite_devices_file, write_settings_file};
 use crate::ui::airpods::airpods_view;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
@@ -767,17 +767,10 @@ impl App {
                         type_,
                         information: None,
                     };
-                    match devices_with_added(
-                        std::fs::read_to_string(&devices_path),
-                        &addr.to_string(),
-                        data,
-                    ) {
-                        Ok(updated_json) => {
-                            if let Err(e) = write_settings_file(&devices_path, &updated_json) {
-                                error!("Failed to write devices file: {}", e);
-                            }
-                        }
-                        Err(e) => error!("Not adding device, devices file unusable: {}", e),
+                    if let Err(e) = rewrite_devices_file(&devices_path, |existing| {
+                        devices_with_added(existing, &addr.to_string(), data)
+                    }) {
+                        error!("Not adding device to {}: {}", devices_path.display(), e);
                     }
                     self.selected_tab = Tab::Device(addr.to_string());
                 }
