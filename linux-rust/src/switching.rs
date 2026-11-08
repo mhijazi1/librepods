@@ -30,7 +30,9 @@ use crate::bluetooth::aacp::{
 use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::handoff_log;
 use crate::media_controller::{self, MediaController};
-use crate::stream_monitor::{self, CallSamples, MIN_STREAM_PLAYBACK, PlaybackSource, PulseStreams};
+use crate::stream_monitor::{
+    self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PulsePeaks, PulseStreams,
+};
 use crate::utils::SwitchingMode;
 use futures::future::BoxFuture;
 use log::{error, info};
@@ -127,14 +129,15 @@ fn share_media(
 }
 
 /// Poll local playback every `PLAYBACK_POLL`: playing when an MPRIS player
-/// plays or a takeover-worthy audio stream has been playing for
-/// `MIN_STREAM_PLAYBACK` (#10). The poller stops once the receiver is
+/// plays or a takeover-worthy audio stream has carried sound for
+/// `MIN_STREAM_PLAYBACK` (#10, #88). The poller stops once the receiver is
 /// dropped.
 pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
     spawn_playback_poller_with(
         MediaController::check_if_playing,
         // shortcut: a new libpulse connection every PLAYBACK_POLL; fold the connections or subscribe to sink-input events (#73)
         PulseStreams,
+        PulsePeaks::new(),
         MIN_STREAM_PLAYBACK,
         PLAYBACK_POLL,
     )
@@ -143,23 +146,26 @@ pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
 /// `spawn_playback_poller` with its sources, minimum stream duration and
 /// interval injected. Every `interval` it samples `mpris` on the blocking
 /// pool and sends `(sampled_at, mpris || streams)`, where `streams` is the
-/// latest state of the stream monitor. The stream monitor samples `streams`
-/// in its own task (`stream_monitor::spawn_stream_playback`), so a sound
-/// server that never answers leaves the stream state as it was but never
-/// holds up the MPRIS samples. Only edges reach the handoff core
-/// (`Input::Playback`), which keeps every takeover decision.
-fn spawn_playback_poller_with<M, S>(
+/// latest state of the stream monitor over `streams` and `peaks`. The
+/// stream monitor samples in its own task
+/// (`stream_monitor::spawn_stream_playback`), so a sound server that never
+/// answers leaves the stream state as it was but never holds up the MPRIS
+/// samples. Only edges reach the handoff core (`Input::Playback`), which
+/// keeps every takeover decision.
+fn spawn_playback_poller_with<M, S, P>(
     mpris: M,
     streams: S,
+    peaks: P,
     min_stream: Duration,
     interval: Duration,
 ) -> PlaybackSamples
 where
     M: Fn() -> bool + Send + Sync + 'static,
     S: PlaybackSource + 'static,
+    P: PeakSource + 'static,
 {
     let (play_tx, play_rx) = mpsc::channel(1);
-    let streams = stream_monitor::spawn_stream_playback(streams, min_stream, interval);
+    let streams = stream_monitor::spawn_stream_playback(streams, peaks, min_stream, interval);
     let mpris = Arc::new(mpris);
     tokio::spawn(async move {
         loop {
@@ -888,6 +894,7 @@ mod tests {
         encode_media_information_call,
     };
     use crate::call_detect::{StreamDirection, StreamProps};
+    use crate::stream_monitor::AllAudible;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
@@ -1217,7 +1224,13 @@ mod tests {
                 records,
                 Arc::new(DeviceHandler::default()),
                 (play_tx, move || {
-                    spawn_playback_poller_with(mpris, streams, min_stream, STREAM_TEST_POLL)
+                    spawn_playback_poller_with(
+                        mpris,
+                        streams,
+                        AllAudible,
+                        min_stream,
+                        STREAM_TEST_POLL,
+                    )
                 }),
             )
             .await
@@ -2214,6 +2227,7 @@ mod tests {
         let mut rx = spawn_playback_poller_with(
             move || reads.load(Ordering::SeqCst),
             LiveStreams::default(),
+            AllAudible,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
         );
@@ -2235,6 +2249,7 @@ mod tests {
         let mut rx = spawn_playback_poller_with(
             || false,
             streams.clone(),
+            AllAudible,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
         );
@@ -2262,6 +2277,7 @@ mod tests {
         let mut rx = spawn_playback_poller_with(
             move || reads.load(Ordering::SeqCst),
             StalledStreams(stalled),
+            AllAudible,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
         );
@@ -2431,6 +2447,9 @@ mod tests {
 
         const POLL_MS: u64 = PLAYBACK_POLL.as_millis() as u64;
         const MIN_MS: u64 = MIN_STREAM_PLAYBACK.as_millis() as u64;
+        /// Peak levels of a stream carrying sound and of a silent one (#88).
+        const LOUD: f32 = 0.5;
+        const SILENT: f32 = 0.0;
         /// When each scenario's event starts, after the baselines at 10 ms.
         const EVENT_MS: u64 = 500;
         /// Neither takes nor pauses.
@@ -2486,10 +2505,22 @@ mod tests {
                 commands
             }
 
-            /// One playback sample at `ms`: the stream listing, then the core.
+            /// One playback sample at `ms` with every candidate audible.
             fn step(&mut self, ms: u64, mpris: bool, streams: &[StreamProps]) -> Vec<Command> {
+                self.step_levels(ms, mpris, streams, LOUD)
+            }
+
+            /// One playback sample at `ms`: the stream listing with every
+            /// candidate's peak `level`, then the core.
+            fn step_levels(
+                &mut self,
+                ms: u64,
+                mpris: bool,
+                streams: &[StreamProps],
+                level: f32,
+            ) -> Vec<Command> {
                 let now = self.t0 + Duration::from_millis(ms);
-                if let Some(playing) = self.tracker.observe(now, streams) {
+                if let Some(playing) = self.tracker.observe_levels(now, streams, |_| level) {
                     self.streams_playing = playing;
                 }
                 let playing = mpris || self.streams_playing;
@@ -2505,8 +2536,18 @@ mod tests {
             /// A sample every `PLAYBACK_POLL` from `EVENT_MS` until over
             /// twice the minimum stream playback later.
             fn event(&mut self, mpris: bool, streams: &[StreamProps]) {
+                self.event_levels(mpris, streams, |_| LOUD);
+            }
+
+            /// `event`, with the candidates' peak level at each sample's ms.
+            fn event_levels(
+                &mut self,
+                mpris: bool,
+                streams: &[StreamProps],
+                level: impl Fn(u64) -> f32,
+            ) {
                 for ms in (EVENT_MS..=EVENT_MS + 2 * MIN_MS + POLL_MS).step_by(POLL_MS as usize) {
-                    self.step(ms, mpris, streams);
+                    self.step_levels(ms, mpris, streams, level(ms));
                 }
             }
 
@@ -2524,6 +2565,14 @@ mod tests {
         fn run(mpris: bool, streams: &[StreamProps]) -> Pipeline {
             let mut p = Pipeline::ready();
             p.event(mpris, streams);
+            p
+        }
+
+        /// `ready`, then `streams` with no MPRIS player from the event on,
+        /// at the peak level `level` gives for each sample's ms.
+        fn run_levels(streams: &[StreamProps], level: impl Fn(u64) -> f32) -> Pipeline {
+            let mut p = Pipeline::ready();
+            p.event_levels(false, streams, level);
             p
         }
 
@@ -2627,6 +2676,34 @@ mod tests {
             }
             assert_eq!(
                 run(false, &[tab(false, Volume::NORMAL)]).takes(),
+                [vec![SendOwnership(true)]]
+            );
+        }
+
+        /// #88: a paused SDL game keeps its Game stream uncorked and writes
+        /// silence into it.
+        #[test]
+        fn non_event_silent_game_stream() {
+            let game = [sink(&[
+                ("media.role", "Game"),
+                ("application.name", "SDL Application"),
+            ])];
+            assert_eq!(run_levels(&game, |_| SILENT).takes(), NO_TAKE);
+            assert_eq!(
+                run_levels(&game, |_| LOUD).takes(),
+                [vec![SendOwnership(true)]]
+            );
+        }
+
+        /// #88: an idle Chromium/Electron WebAudio stream (no role) after
+        /// one short notification sound.
+        #[test]
+        fn non_event_webaudio_blip() {
+            let webaudio = [sink(&[("application.name", "Chromium")])];
+            let blip = |ms| if ms == EVENT_MS { LOUD } else { SILENT };
+            assert_eq!(run_levels(&webaudio, blip).takes(), NO_TAKE);
+            assert_eq!(
+                run_levels(&webaudio, |_| LOUD).takes(),
                 [vec![SendOwnership(true)]]
             );
         }
