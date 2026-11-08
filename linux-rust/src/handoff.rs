@@ -1058,6 +1058,8 @@ impl Handoff {
             && self.pending.is_none()
             && self.was_playing != Some(true)
             && !self.quitting
+            // The A2DP resume window's end releases instead (#200).
+            && self.resume_until.is_none()
         {
             self.request(now, false, Cause::Playback, out);
             self.say("AUTO call ended with playback stopped; releasing ownership");
@@ -3492,5 +3494,18 @@ mod tests {
         assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
         assert_eq!(p.feed(window_end(), Input::Tick), []);
         assert_eq!(p.feed(window_end() + 200, Input::Tick), []);
+    }
+
+    #[test]
+    fn call_ending_during_resume_window_releases_at_window_end() {
+        let mut p = resumed_take();
+        assert_eq!(p.feed(700, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(
+            p.feed(2000, Input::LocalCall(false)),
+            [AdvertiseCall(false)]
+        );
+        assert_eq!(p.feed(window_end() - 1, Input::Tick), []);
+        assert_eq!(p.feed(window_end(), Input::Tick), [SendOwnership(false)]);
     }
 }
