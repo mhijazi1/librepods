@@ -498,6 +498,21 @@ impl AACPManager {
         state.event_tx = Some(tx);
     }
 
+    /// Attaches the event channel and returns the stored battery report
+    /// (empty when none has arrived) under one state-lock guard (#92). The
+    /// BATTERY_INFO arm stores and sends under the same lock, so each report
+    /// is either in the returned snapshot (it arrived before the attach) or
+    /// queued as `AACPEvent::BatteryInfo` (it arrived after), never both.
+    /// Nothing is awaited while the guard is held.
+    pub async fn attach_event_channel(
+        &self,
+        tx: mpsc::UnboundedSender<AACPEvent>,
+    ) -> Vec<BatteryInfo> {
+        let mut state = self.state.lock().await;
+        state.event_tx = Some(tx);
+        state.battery_info.clone()
+    }
+
     pub async fn subscribe_to_control_command(
         &self,
         identifier: ControlCommandIdentifiers,
