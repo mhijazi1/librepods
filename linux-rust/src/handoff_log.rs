@@ -132,6 +132,19 @@ fn write_record(file: &mut File, record: &Record) -> io::Result<()> {
     file.write_all(&bytes)
 }
 
+/// The warning for a rotation that did not leave a fresh log: when the
+/// rename happened (`renamed`), the session keeps appending to `rotated`.
+fn rotation_warning(path: &Path, rotated: &Path, renamed: bool, e: &io::Error) -> String {
+    let (path, rotated) = (path.display(), rotated.display());
+    if renamed {
+        format!(
+            "Handoff log: rotated {path} to {rotated} but cannot open a fresh {path}: {e}; appending to {rotated}"
+        )
+    } else {
+        format!("Handoff log: cannot rotate {path} to {rotated}: {e}; appending to it")
+    }
+}
+
 /// An open handoff log. A write error stops it after one warning.
 pub(crate) struct Log {
     path: PathBuf,
@@ -169,6 +182,7 @@ impl Log {
             let rotated = PathBuf::from(rotated);
             // The directory lock (dropped, so released, after the reopen)
             // makes check, rename and reopen one step for other openers.
+            // Ok holds whether the rename happened and the reopen's result.
             let fresh = File::open(path.parent().unwrap_or(Path::new("."))).and_then(|dir| {
                 #[cfg(test)]
                 if let Some(hook) = tests::BEFORE_LOCK.take() {
@@ -190,26 +204,26 @@ impl Log {
                 match moved {
                     Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
                     moved => {
-                        if let Ok(true) = moved {
+                        let renamed = matches!(moved, Ok(true));
+                        if renamed {
                             info!(
                                 "Handoff log: rotated {} to {}",
                                 path.display(),
                                 rotated.display()
                             );
+                            #[cfg(test)]
+                            if let Some(hook) = tests::AFTER_RENAME.take() {
+                                hook();
+                            }
                         }
-                        open()
+                        Ok((renamed, open()))
                     }
                 }
             });
-            match fresh {
-                Ok(fresh) => file = fresh,
-                // debt: a failed reopen after a successful rename also lands
-                // here, so "cannot rotate" is misleading then (#111).
-                Err(e) => warn!(
-                    "Handoff log: cannot rotate {} to {}: {e}; appending to it",
-                    path.display(),
-                    rotated.display()
-                ),
+            // An error before the rename (dir open, lock, metadata) moved nothing.
+            match fresh.unwrap_or_else(|e| (false, Err(e))) {
+                (_, Ok(fresh)) => file = fresh,
+                (renamed, Err(e)) => warn!("{}", rotation_warning(path, &rotated, renamed, &e)),
             }
         }
         let len = file.metadata()?.len();
@@ -671,6 +685,64 @@ mod tests {
         pub(super) static BEFORE_LOCK: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
         /// Runs in Log::open between the inode check and the rename.
         pub(super) static BEFORE_RENAME: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+        /// Runs in Log::open after a successful rename, before the reopen.
+        pub(super) static AFTER_RENAME: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+    }
+
+    #[test]
+    fn handoff_log_reopen_fails_after_rotation() {
+        let dir = temp_dir("reopen-fails");
+        let path = dir.join("handoff.jsonl");
+        let rotated = dir.join("handoff.jsonl.1");
+        let mut old = vec![b'x'; MAX_LOG_BYTES as usize + 1];
+        *old.last_mut().unwrap() = b'\n';
+        std::fs::write(&path, &old).unwrap();
+        // A directory at the path makes the create/append reopen fail (EISDIR).
+        AFTER_RENAME.set(Some(Box::new({
+            let path = path.clone();
+            move || std::fs::create_dir(&path).unwrap()
+        })));
+        let log = Log::open(&path, Source::App);
+        assert!(AFTER_RENAME.take().is_none(), "the hook did not run");
+        assert!(log.is_ok());
+        let text = std::fs::read(&rotated).unwrap();
+        let tail = text
+            .strip_prefix(old.as_slice())
+            .expect("the old bytes are not the prefix");
+        assert_eq!(tail.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert!(tail.ends_with(b"\n"));
+        assert!(matches!(
+            serde_json::from_slice(tail),
+            Ok(Record::SessionStart {
+                source: Source::App,
+                ..
+            })
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_log_rotation_warning_texts() {
+        let e = io::Error::from(io::ErrorKind::IsADirectory);
+        let (path, rotated) = (
+            Path::new("/s/handoff.jsonl"),
+            Path::new("/s/handoff.jsonl.1"),
+        );
+        let reopen = rotation_warning(path, rotated, true, &e);
+        assert_eq!(
+            reopen,
+            format!(
+                "Handoff log: rotated /s/handoff.jsonl to /s/handoff.jsonl.1 but cannot open a fresh /s/handoff.jsonl: {e}; appending to /s/handoff.jsonl.1"
+            )
+        );
+        assert!(reopen.contains("appending to /s/handoff.jsonl.1"));
+        assert!(!reopen.contains("cannot rotate"));
+        assert_eq!(
+            rotation_warning(path, rotated, false, &e),
+            format!(
+                "Handoff log: cannot rotate /s/handoff.jsonl to /s/handoff.jsonl.1: {e}; appending to it"
+            )
+        );
     }
 
     #[test]
