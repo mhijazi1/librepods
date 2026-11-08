@@ -233,7 +233,7 @@ impl Io {
 
     /// Execute the core's commands in order. Ok(true) when it asked to exit.
     /// No AACP state guard is held here; the sends take their own.
-    async fn execute(&mut self, now: Instant, commands: Vec<Command>) -> Result<bool> {
+    async fn execute(&mut self, commands: Vec<Command>) -> Result<bool> {
         for command in commands {
             match command {
                 Command::SendOwnership(owns) => {
@@ -305,7 +305,7 @@ impl Io {
                     }
                     self.adapter.device(self.address)?.disconnect().await?;
                 }
-                Command::DrainPlayback => self.play_rx.drain(now),
+                Command::DrainPlayback => self.play_rx.drain(),
                 Command::Exit => return Ok(true),
                 Command::Fail(reason) => return Err(reason.into()),
             }
@@ -319,13 +319,18 @@ impl Io {
 async fn step(core: &mut Handoff, io: &mut Io, input: Input) -> Result<bool> {
     let now = Instant::now();
     let commands = core.handle(now, input);
+    // Before ConnectA2dp and the sends are awaited (#90), as the daemon's.
+    // shortcut: a debounce ending between `now` and this request counts (#146)
+    if commands.contains(&Command::DrainPlayback) {
+        io.play_rx.rebaseline(now);
+    }
     for line in core.take_lines() {
         println!("{line}");
         if let Some(log) = &io.log {
             log.line(&io.address.to_string(), &line);
         }
     }
-    io.execute(now, commands).await
+    io.execute(commands).await
 }
 
 /// Feed one AACP event to the core and print STATUS after routing reports.
