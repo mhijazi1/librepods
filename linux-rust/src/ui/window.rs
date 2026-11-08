@@ -158,7 +158,6 @@ fn with_connect_mode(
 }
 
 /// Why a settings or preferences write didn't happen.
-#[derive(Debug)]
 enum SaveError {
     /// Reading preferences.json or `write_settings_file` failed.
     Io(std::io::Error),
