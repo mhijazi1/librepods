@@ -673,3 +673,4 @@ result-*
 .swarm/worktrees/
 .swarm/msg/
 .cargo-target/
+.swarm/project-cache.json
