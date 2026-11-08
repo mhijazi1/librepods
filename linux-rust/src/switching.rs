@@ -1075,14 +1075,39 @@ mod tests {
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
 
-        // The release ACK pauses once (#841: Linux took the AirPods).
+        // The release's ACK pauses nothing: playback already stopped
+        // (DECISIONS #39; handoff::tests::owns_connection_zero_after_own_release_is_noop).
         h.emit(owns(0));
-        wait_until("the pause", || h.pauses() >= 1).await;
+        wait_until("the release ACK", || {
+            traced(mac)
+                .iter()
+                .any(|l| l.starts_with("ACK owner=not-linux"))
+        })
+        .await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
-        assert_eq!(h.pauses(), 1);
+        assert_eq!(h.pauses(), 0);
         assert_eq!(h.activations(), 1);
         // The device handler saw both reports too.
         assert_eq!(h.handler.finished(), named(&[owns(1), owns(0)]));
+
+        // New playback takes again; another host then takes the AirPods
+        // (a [0] that acknowledges nothing): the core yields once, with
+        // exactly one pause and no packet (#39's `yield_take`).
+        h.play(true).await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        h.emit(owns(1));
+        h.emit(owns(0));
+        wait_until("the yield's pause", || h.pauses() >= 1).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+        let trace = traced(mac);
+        assert_eq!(
+            trace.iter().filter(|l| l.starts_with("YIELD")).count(),
+            1,
+            "{trace:#?}"
+        );
+        assert_eq!(h.activations(), 1);
 
         stop_handoff_task(mac);
     }
@@ -1102,6 +1127,12 @@ mod tests {
         assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 1);
+        // The yield's [0] ACK is not a second yield (#39).
+        h.emit(owns(0));
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 1);
+        let trace = traced(mac);
+        assert!(!trace.iter().any(|l| l.starts_with("YIELD")), "{trace:#?}");
 
         // A new remote host is announced once (Announce covers every
         // connected remote host, as the probe's `announce` does).
@@ -1215,9 +1246,11 @@ mod tests {
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;
         h.emit(owns(1));
-        // Playback stops: the release is pending.
+        // Playback stops: the release is pending. Playback restarts during
+        // it, so its ACK carries the deferred pause (#39 keeps that one).
         h.play(false).await;
         assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        h.play(true).await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
 
