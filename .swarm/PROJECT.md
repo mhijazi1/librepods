@@ -12,7 +12,12 @@ on a Mac in a household with an iPhone and a Mac on the same Apple Account:
 Background research (mo's vault): Research/Headphones/AirPods Automatic Switching.md and AirPods Switching on Linux.md.
 
 ## Current milestone
-Linux parity v1: the issues labelled `ready` in mhijazi1/librepods, built on branch `linux-parity`.
+**M1 Daily-driver switching.** Milestones, in order (GitHub milestones in mhijazi1/librepods, on branch `linux-parity`):
+1. **M1 Daily-driver switching**: Peaches <-> iPhone <-> Mac switching reliable enough to install. Exit: the NixOS module is installed on Peaches and the issues' switching hardware checklist passes.
+2. **M2 Calls**: calls on Linux use the AirPods mic; iPhone calls take over cleanly and hand back. Exit: verified on hardware.
+3. **M3 Mac-like polish**: notifications with Undo, auto-resume, sleep/reconnect, per-device connect setting, protocol parity (routing score, RoutedToBluetooth). Exit: daily use feels like a Mac.
+4. **M4 Battery & desktop**: correct battery in the tray, desktop and case popup. Exit: verified on hardware.
+Put new issues in the milestone whose outcome they serve.
 
 ## Constraints
 - **This is a fork. All issues, PRs and merges go to `mhijazi1/librepods` only, with base `linux-parity`. Never open, comment on or
