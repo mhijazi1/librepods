@@ -1,6 +1,6 @@
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::settings_file::{parse_devices, write_settings_file};
+use crate::settings_file::{parse_devices, rewrite_devices_file};
 use crate::utils::get_devices_path;
 use bluer::{
     Address, AddressType, Error, Result,
@@ -1435,26 +1435,12 @@ fn update_devices_file(
     path: &std::path::Path,
     update: impl FnOnce(HashMap<String, DeviceData>) -> HashMap<String, DeviceData>,
 ) -> bool {
-    let devices = match parse_devices(std::fs::read_to_string(path)) {
-        Ok(devices) => update(devices),
-        Err(e) => {
-            error!(
-                "Not saving devices, failed to read {}: {}",
-                path.display(),
-                e
-            );
-            return false;
-        }
-    };
-    let json = match serde_json::to_string(&devices) {
-        Ok(json) => json,
-        Err(e) => {
-            error!("Failed to serialize devices: {}", e);
-            return false;
-        }
-    };
-    if let Err(e) = write_settings_file(path, &json) {
-        error!("Failed to save devices: {}", e);
+    let result = rewrite_devices_file(path, |existing| {
+        let devices = update(parse_devices(existing)?);
+        Ok(serde_json::to_string(&devices)?)
+    });
+    if let Err(e) = result {
+        error!("Not saving devices to {}: {}", path.display(), e);
         return false;
     }
     true

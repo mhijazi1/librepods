@@ -1,6 +1,6 @@
 use crate::bluetooth::att::{ATTHandles, ATTManager};
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::settings_file::{parse_devices, write_settings_file};
+use crate::settings_file::{parse_devices, rewrite_devices_file};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::utils::get_devices_path;
 use bluer::Address;
@@ -172,8 +172,9 @@ fn devices_with_nothing_info(
 /// logs it and leaves the file untouched.
 fn save_nothing_info(mac: &str, update: impl FnOnce(&mut NothingInformation)) {
     let path = get_devices_path();
-    let result = devices_with_nothing_info(std::fs::read_to_string(&path), mac, update)
-        .and_then(|json| write_settings_file(&path, &json));
+    let result = rewrite_devices_file(&path, |existing| {
+        devices_with_nothing_info(existing, mac, update)
+    });
     if let Err(e) = result {
         error!(
             "Not saving Nothing device {} info to {}: {}",
