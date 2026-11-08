@@ -1109,10 +1109,6 @@ mod tests {
         packet
     }
 
-    fn drain(events: &mut tokio::sync::mpsc::UnboundedReceiver<AACPEvent>) -> Vec<AACPEvent> {
-        std::iter::from_fn(|| events.try_recv().ok()).collect()
-    }
-
     /// The (old, new) host lists of the ConnectedDevices events, in order.
     fn host_reports(events: &[AACPEvent]) -> Vec<(&[ConnectedDevice], &[ConnectedDevice])> {
         events
@@ -1156,7 +1152,7 @@ mod tests {
         drop(held);
         let (((_, mut events), backlog), facts) = cut.await.unwrap();
         report.await.unwrap();
-        (facts, backlog.events, drain(&mut events))
+        (facts, backlog.events, take_prefix(&mut events, usize::MAX))
     }
 
     /// (a) The cut queues before B: if it released the lock between the
@@ -1181,6 +1177,8 @@ mod tests {
     const L_MAC: [u8; 6] = [1, 2, 3, 4, 5, 6];
     const R_MAC: [u8; 6] = [7, 8, 9, 10, 11, 12];
     const R2_MAC: [u8; 6] = [13, 14, 15, 16, 17, 18];
+    /// R2_MAC as a host string, as CORE_LOCAL/CORE_REMOTE are for L_MAC/R_MAC.
+    const CORE_R2: &str = "0D:0E:0F:10:11:12";
     const M_MAC: [u8; 6] = [19, 20, 21, 22, 23, 24];
 
     fn hosts_input(old: &[&str], new: &[&str]) -> Input {
@@ -1196,7 +1194,7 @@ mod tests {
     /// lands after the cut. An automatic core reconnects and adopts it, and
     /// the Announce counts before and after the boundary are returned.
     async fn post_echo_reports_announces(late: Option<&[[u8; 6]]>) -> (usize, usize) {
-        let (l, r, r2) = (CORE_LOCAL, CORE_REMOTE, "0D:0E:0F:10:11:12");
+        let (l, r, r2) = (CORE_LOCAL, CORE_REMOTE, CORE_R2);
         let manager = AACPManager::new();
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         manager.set_event_channel(tx).await;
@@ -1239,7 +1237,11 @@ mod tests {
             .iter()
             .position(|i| *i == hosts_input(&[l, r], &[l, r, r2]));
         assert!(a.is_some() && a < b && b < Some(boundary), "{inputs:?}");
-        inputs.extend(drain(&mut events).into_iter().filter_map(event_input));
+        inputs.extend(
+            take_prefix(&mut events, usize::MAX)
+                .into_iter()
+                .filter_map(event_input),
+        );
 
         let t0 = Instant::now();
         let mut core = Handoff::new(CORE_LOCAL.to_string(), t0, true, true);
