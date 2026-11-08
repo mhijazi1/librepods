@@ -58,6 +58,38 @@ The Linux version runs as a system tray app. Connect your AirPods and enjoy:
 
 For installation and detailed info, see the [Linux README](/linux/README.md).
 
+#### Desktop battery (BlueZ BatteryProvider)
+
+LibrePods exports the AirPods battery to BlueZ as a battery provider, so it
+shows up in BlueZ's `org.bluez.Battery1`, in UPower (`upower -d`) and in
+desktop bars and battery widgets. BlueZ holds one percentage per device, so
+LibrePods exports a single value:
+
+- both buds worn (or both in the case): the lower bud;
+- one bud charging in the case: the bud you are wearing;
+- only one bud connected: that bud;
+- single-battery devices (headphones): the headset level.
+
+The case level is not exported. The per-bud and case levels stay in the tray
+and the LibrePods window.
+
+Depending on the BlueZ version, the battery provider API
+(`org.bluez.BatteryProviderManager1`) may only be available with experimental
+features on. If the desktop shows no AirPods battery, set
+`Experimental = true` in the `[General]` section of `/etc/bluetooth/main.conf`
+(NixOS: `hardware.bluetooth.settings.General.Experimental = true;`) and restart
+Bluetooth. Without it, LibrePods logs one warning and carries on without the
+export.
+
+To turn the export off, add `"exportBattery": false` at the top level of
+`~/.config/librepods/preferences.json`:
+
+```json
+{
+  "exportBattery": false
+}
+```
+
 #### NixOS and Home Manager
 
 The flake provides a NixOS module (`nixosModules.default`) and a Home Manager

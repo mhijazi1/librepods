@@ -1,3 +1,4 @@
+mod battery_provider;
 mod bluetooth;
 mod devices;
 mod handoff;

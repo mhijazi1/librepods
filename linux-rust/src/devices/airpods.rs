@@ -1,3 +1,4 @@
+use crate::battery_provider::{BatteryExporter, BluezBatteryProvider};
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
 use crate::media_controller::MediaController;
@@ -6,12 +7,12 @@ use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
 use bluer::Address;
 use ksni::Handle;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
-use crate::utils::{get_app_settings_path, load_switching_mode};
+use crate::utils::{get_app_settings_path, load_export_battery, load_switching_mode};
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
@@ -118,6 +119,17 @@ impl AirPodsDevice {
             .await
             .expect("Failed to get adapter address")
             .to_string();
+
+        // Desktop battery (BlueZ BatteryProvider1, battery_provider.rs). The
+        // exporter registers lazily on the first known level; a registration
+        // failure logs one warning and leaves the export off.
+        let battery_exporter = if load_export_battery() {
+            let provider = BluezBatteryProvider::new(adapter.name(), &mac_address.to_string());
+            Some(Arc::new(std::sync::Mutex::new(BatteryExporter::new(provider))))
+        } else {
+            info!("Desktop battery export disabled by preferences (exportBattery)");
+            None
+        };
 
         // The handoff media adapter shares the controller's state without
         // taking the outer mutex the handlers below lock (switching.rs).
@@ -239,6 +251,7 @@ impl AirPodsDevice {
             let mc_clone = mc_clone.clone();
             let tray_handle = tray_handle.clone();
             let ui_tx_clone = ui_tx_clone.clone();
+            let battery_exporter = battery_exporter.clone();
             async move {
                 let event_clone = event.clone();
                 match event {
@@ -292,6 +305,22 @@ impl AirPodsDevice {
                             event_clone,
                         ));
                         debug!("Sent BatteryInfo event to UI");
+
+                        if let Some(exporter) = battery_exporter {
+                            // Registration is a blocking D-Bus round trip:
+                            // keep it off the runtime. The lock lives only
+                            // inside the blocking closure.
+                            let exported = tokio::task::spawn_blocking(move || {
+                                exporter
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .update(&battery_info);
+                            })
+                            .await;
+                            if let Err(e) = exported {
+                                warn!("Desktop battery export task failed: {}", e);
+                            }
+                        }
                     }
                     AACPEvent::ControlCommand(status) => {
                         debug!("Received ControlCommand event: {:?}", status);
