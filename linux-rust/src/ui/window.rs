@@ -168,10 +168,22 @@ fn write_settings_file_with(
     let target = match std::fs::canonicalize(path) {
         Ok(target) => target,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(dir) = path.parent() {
+            // Follow a dangling symlink (chain) to the file it names, so the
+            // link is kept and its referent is created, as fs::write would.
+            let mut target = path.to_path_buf();
+            let mut hops = 0;
+            while std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+                hops += 1;
+                if hops > 40 {
+                    return Err(std::io::Error::other("too many levels of symbolic links"));
+                }
+                // A relative link resolves against the link's dir; an absolute one replaces it.
+                target = target.with_file_name(std::fs::read_link(&target)?);
+            }
+            if let Some(dir) = target.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            path.to_path_buf()
+            target
         }
         Err(e) => return Err(e),
     };
@@ -186,10 +198,11 @@ fn write_settings_file_with(
         .create_new(true)
         .open(&tmp)?;
     let result = (|| {
+        file.write_all(contents.as_bytes())?;
+        // After the write: a write by a non-root user clears setuid/setgid.
         if let Ok(meta) = std::fs::metadata(&target) {
             file.set_permissions(meta.permissions())?;
         }
-        file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         before_rename(&tmp)?;
         std::fs::rename(&tmp, &target)
@@ -1681,13 +1694,13 @@ mod tests {
         let dir = settings_dir("mode");
         let target = dir.join("settings.json");
         std::fs::write(&target, "original, longer than the new content").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o4700)).unwrap();
 
         write_settings_file(&target, "new").unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
-        assert_eq!(mode & 0o7777, 0o600);
+        assert_eq!(mode & 0o7777, 0o4700);
         assert_eq!(dir_names(&dir), ["settings.json"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1705,6 +1718,31 @@ mod tests {
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
         assert_eq!(dir_names(&dir), ["real.json", "settings.json"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_write_keeps_dangling_symlink_chain() {
+        let dir = settings_dir("dangling");
+        let link = dir.join("settings.json");
+        // settings.json -> mid.json (relative) -> <dir>/sub/real.json (absolute), nothing exists.
+        std::os::unix::fs::symlink("mid.json", &link).unwrap();
+        std::os::unix::fs::symlink(dir.join("sub/real.json"), dir.join("mid.json")).unwrap();
+
+        write_settings_file(&link, "new").unwrap();
+
+        for name in ["settings.json", "mid.json"] {
+            let meta = std::fs::symlink_metadata(dir.join(name)).unwrap();
+            assert!(
+                meta.file_type().is_symlink(),
+                "{name} is no longer a symlink"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/real.json")).unwrap(),
+            "new"
+        );
+        assert_eq!(dir_names(&dir.join("sub")), ["real.json"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
