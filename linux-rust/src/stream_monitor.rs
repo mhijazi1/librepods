@@ -209,8 +209,8 @@ pub(crate) struct PlaybackTracker {
     /// Candidates that are debouncing or counting, by index.
     gates: HashMap<u32, Gate>,
     /// Worthy, uncorked streams of the first successful listing (or
-    /// debouncing at a `rebaseline`) that have stayed so ever since; None
-    /// until that listing.
+    /// debouncing since before a `rebaseline`'s reset) that have stayed so
+    /// ever since; None until that listing.
     preexisting: Option<HashSet<u32>>,
     /// Whether a stream counts as playing (false before any change).
     playing: bool,
@@ -1575,7 +1575,7 @@ mod tests {
     #[test]
     fn tracker_rebaseline_late_request_keeps_start_after_reset() {
         let reset = Instant::now();
-        let mut tracker = started(reset - STEP);
+        let mut tracker = started(reset);
         // First audible after the core's reset, before its request arrives.
         let audible = reset + Duration::from_millis(500);
         assert_eq!(tracker.observe(audible, &[music(1)]), None);
