@@ -146,11 +146,11 @@ impl Chain {
     /// suspends the sink; unknown goes straight to the audible check, never
     /// stopping a transport that may carry audio. `audible` matters only
     /// when `senses()`, and ends the chain there; `playing` only when
-    /// `reads_players()`. Once the sink is
-    /// suspended or the players paused, the next step always undoes it. The
-    /// kick and the cycle are skipped, ending the chain, when the Play after
-    /// them can't be due `PLAY_EDGE_MARGIN` before `until`: the core would
-    /// release on the stop they cause.
+    /// `reads_players()`. Once the sink is suspended or the players paused,
+    /// the next step always undoes it. The kick and the cycle are skipped,
+    /// ending the chain, when the Play after them can't be due
+    /// `PLAY_EDGE_MARGIN` before `until`: the core would release on the stop
+    /// they cause.
     fn step(
         &mut self,
         now: Instant,
@@ -968,15 +968,15 @@ mod tests {
         assert_eq!(reads(&n), 1);
     }
 
-    /// The chain's actions, with no `SuspendSink`, then the kick: Pause then Play.
+    /// The chain kicked (Pause, then Play) without any `SuspendSink`.
     fn assert_kicked_without_nudge(acted: &[Action]) {
         assert!(
             !acted.iter().any(|a| matches!(a, SuspendSink(_))),
             "{acted:?}"
         );
         let at = |action: Action| acted.iter().position(|a| *a == action);
-        assert!(at(Pause(P.into())) < at(Play(P.into())), "{acted:?}");
         assert!(at(Pause(P.into())).is_some(), "{acted:?}");
+        assert!(at(Pause(P.into())) < at(Play(P.into())), "{acted:?}");
     }
 
     #[tokio::test(start_paused = true)]
