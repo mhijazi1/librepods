@@ -1807,6 +1807,17 @@ impl A2dpResumeIo for MediaController {
                 .unwrap_or_default()
         })
     }
+
+    fn transport_active(&self) -> BoxFuture<'static, Option<bool>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mac = state.lock().await.connected_device_mac.clone();
+            tokio::task::spawn_blocking(move || crate::a2dp_resume::read_transport_once(&mac))
+                .await
+                .ok()
+                .flatten()
+        })
+    }
 }
 
 async fn blocking(f: impl FnOnce() -> bool + Send + 'static) -> bool {
