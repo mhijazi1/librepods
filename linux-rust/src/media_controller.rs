@@ -291,13 +291,73 @@ fn handoff_block(trigger: TakeoverTrigger, guards: HandoffGuards) -> Option<Take
 const CARD_LOOKUP_ATTEMPTS: u32 = 12;
 const CARD_LOOKUP_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Card lookups per availability check inside the enumeration waits of
+/// `activate_a2dp_profile`. One attempt means no lookup-internal sleep: the
+/// wait's own `A2DP_ENUMERATION_INTERVAL` already spaces the checks, and the
+/// full ~3 s poll (#1/#724 renegotiation window) is spent once, on the
+/// initial lookup.
+const CARD_LOOKUP_ATTEMPTS_PER_CHECK: u32 = 1;
+
+/// Time WirePlumber gets to settle after a successful restart.
+const WIREPLUMBER_SETTLE: Duration = Duration::from_secs(2);
+
+/// Upper bound on the time `activate_a2dp_profile` may spend waiting for the
+/// card and its A2DP profile (see `a2dp_activation_worst_case_wait`).
+const A2DP_RECOVERY_BOUND: Duration = Duration::from_secs(15);
+
+/// Longest a `retry_card_lookup` with `attempts` tries sleeps when the card
+/// never shows up: `attempts - 1` intervals, as no sleep follows the last try.
+const fn card_lookup_max_wait(attempts: u32) -> Duration {
+    CARD_LOOKUP_INTERVAL.saturating_mul(attempts.saturating_sub(1))
+}
+
+/// Worst-case waiting in `activate_a2dp_profile`, from the production
+/// constants: the initial full card lookup finds the card on its last try,
+/// then the card is missing at every enumeration check, so both waits run all
+/// their checks (each a `CARD_LOOKUP_ATTEMPTS_PER_CHECK` lookup) and
+/// WirePlumber is restarted once in between. The run time of the lookups
+/// themselves and of `systemctl` is not counted.
+const fn a2dp_activation_worst_case_wait() -> Duration {
+    let wait = MediaController::A2DP_ENUMERATION_INTERVAL
+        .saturating_mul(MediaController::A2DP_ENUMERATION_ATTEMPTS.saturating_sub(1))
+        .saturating_add(
+            card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS_PER_CHECK)
+                .saturating_mul(MediaController::A2DP_ENUMERATION_ATTEMPTS),
+        );
+    card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS)
+        .saturating_add(wait)
+        .saturating_add(WIREPLUMBER_SETTLE)
+        .saturating_add(wait)
+}
+
+const _: () = assert!(
+    a2dp_activation_worst_case_wait().as_millis() <= A2DP_RECOVERY_BOUND.as_millis(),
+    "activate_a2dp_profile worst case exceeds A2DP_RECOVERY_BOUND"
+);
+
 /// Call `lookup` until it finds a card index, at most `attempts` times,
 /// sleeping `interval` between tries (not after the last one). The lookup is
 /// injected so the retry budget is testable without a sound server.
-async fn retry_card_lookup<F, Fut>(attempts: u32, interval: Duration, mut lookup: F) -> Option<u32>
+async fn retry_card_lookup<F, Fut>(attempts: u32, interval: Duration, lookup: F) -> Option<u32>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<u32>>,
+{
+    retry_card_lookup_with(attempts, interval, lookup, tokio::time::sleep).await
+}
+
+/// `retry_card_lookup` with the sleep injected, so tests can count sleeps.
+async fn retry_card_lookup_with<F, Fut, S, SFut>(
+    attempts: u32,
+    interval: Duration,
+    mut lookup: F,
+    mut sleep: S,
+) -> Option<u32>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<u32>>,
+    S: FnMut(Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
 {
     for attempt in 1..=attempts {
         if let Some(index) = lookup().await {
@@ -307,7 +367,7 @@ where
             return Some(index);
         }
         if attempt < attempts {
-            tokio::time::sleep(interval).await;
+            sleep(interval).await;
         }
     }
     None
@@ -359,13 +419,13 @@ fn select_a2dp_profile(
 /// The check, the restart and the sleep are injected so the sequence is
 /// testable without a sound server.
 ///
-/// Worst case in production (the check re-resolves the card by MAC, and
-/// `get_audio_device_index` itself polls for ~3 s when the card is missing):
-/// each wait is up to 5 × ~3 s lookups + 4 × 1 s sleeps ≈ 19 s, so with the
-/// first lookup (~3 s) and the restart (systemctl + 2 s) the whole call can
-/// take ~43 s. When the card is present but has no A2DP profile yet, the
-/// lookups are immediate and the bound is ~4 s + restart + ~4 s.
-// debt: #32 worst-case ~43 s activate_a2dp_profile wait (nested card-lookup polling)
+/// Worst case in production: every check after the first re-resolves the card
+/// by MAC with a single lookup (`CARD_LOOKUP_ATTEMPTS_PER_CHECK`, no sleep),
+/// so each wait is at most 4 × 1 s sleeps ≈ 4 s whether or not the card is
+/// there. With the initial full lookup in `activate_a2dp_profile` (11 × 250 ms
+/// ≈ 2.75 s) and the restart (systemctl + `WIREPLUMBER_SETTLE` 2 s) the whole
+/// activation waits ≈ 12.75 s plus lookup and systemctl run time, within
+/// `A2DP_RECOVERY_BOUND` (15 s); see `a2dp_activation_worst_case_wait`.
 async fn recover_a2dp_availability<C, CFut, R, RFut, S, SFut>(
     attempts: u32,
     interval: Duration,
@@ -801,12 +861,24 @@ impl MediaController {
 
     /// Resolves the card by Bluetooth MAC and refreshes the cached index.
     /// PipeWire can assign a different index after a disconnect/reconnect.
+    /// Polls the full `CARD_LOOKUP_ATTEMPTS` budget.
     async fn refresh_device_index(&self) -> Option<u32> {
+        self.refresh_device_index_within(CARD_LOOKUP_ATTEMPTS).await
+    }
+
+    /// `refresh_device_index` with a single lookup and no sleep, for the
+    /// checks inside the A2DP enumeration waits (#32).
+    async fn recheck_device_index(&self) -> Option<u32> {
+        self.refresh_device_index_within(CARD_LOOKUP_ATTEMPTS_PER_CHECK)
+            .await
+    }
+
+    async fn refresh_device_index_within(&self, attempts: u32) -> Option<u32> {
         let mac = self.state.lock().await.connected_device_mac.clone();
         if mac.is_empty() {
             return None;
         }
-        let index = self.get_audio_device_index(&mac).await;
+        let index = self.find_audio_device_index(&mac, attempts).await;
         self.state.lock().await.device_index = index;
         index
     }
@@ -820,7 +892,7 @@ impl MediaController {
         match result {
             Ok(output) if output.status.success() => {
                 info!("WirePlumber restarted successfully");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(WIREPLUMBER_SETTLE).await;
                 true
             }
             _ => {
@@ -846,6 +918,8 @@ impl MediaController {
 
         // The first check reuses the index resolved just above; every later
         // check re-resolves the card by MAC, as a reconnect can change it.
+        // Those re-checks are single-shot: the wait already spaces them, and
+        // nesting the ~3 s poll in each one made the worst case ~43 s (#32).
         let mut first_check = true;
         let available = recover_a2dp_availability(
             Self::A2DP_ENUMERATION_ATTEMPTS,
@@ -853,7 +927,7 @@ impl MediaController {
             || {
                 let refresh = !std::mem::replace(&mut first_check, false);
                 async move {
-                    (!refresh || self.refresh_device_index().await.is_some())
+                    (!refresh || self.recheck_device_index().await.is_some())
                         && self.is_a2dp_profile_available().await
                 }
             },
@@ -1118,16 +1192,23 @@ impl MediaController {
     }
 
     async fn get_audio_device_index(&self, mac: &str) -> Option<u32> {
-        if mac.is_empty() {
-            return None;
-        }
-
         // Taking the connection back from another device makes the earbuds
         // renegotiate, and the card briefly disappears from the sound server
         // while that happens. A single lookup can land in that window and give
         // up, leaving the audio nowhere: ownership already taken from the other
         // device, but no local profile to play through. So poll for a moment.
-        let found = retry_card_lookup(CARD_LOOKUP_ATTEMPTS, CARD_LOOKUP_INTERVAL, || {
+        self.find_audio_device_index(mac, CARD_LOOKUP_ATTEMPTS)
+            .await
+    }
+
+    /// Looks the card up by MAC at most `attempts` times, `CARD_LOOKUP_INTERVAL`
+    /// apart.
+    async fn find_audio_device_index(&self, mac: &str, attempts: u32) -> Option<u32> {
+        if mac.is_empty() {
+            return None;
+        }
+
+        let found = retry_card_lookup(attempts, CARD_LOOKUP_INTERVAL, || {
             let mac_clone = mac.to_string();
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -1147,11 +1228,20 @@ impl MediaController {
                 info!("Found audio device index for MAC {}: {}", mac, index);
                 Some(index)
             }
-            None => {
+            None if attempts >= CARD_LOOKUP_ATTEMPTS => {
                 error!(
-                    "No matching Bluetooth card found for MAC address: {} after {:?}",
+                    "No matching Bluetooth card found for MAC address: {} after {} attempts ({:?})",
                     mac,
-                    CARD_LOOKUP_INTERVAL * CARD_LOOKUP_ATTEMPTS
+                    attempts,
+                    card_lookup_max_wait(attempts)
+                );
+                None
+            }
+            None => {
+                // A short re-check inside a wait; the wait logs the outcome.
+                debug!(
+                    "No Bluetooth card for MAC address {} after {} attempt(s)",
+                    mac, attempts
                 );
                 None
             }
@@ -2104,6 +2194,143 @@ mod tests {
         .await;
         assert_eq!(found, None);
         assert_eq!(calls, 12);
+    }
+
+    /// Runs `retry_card_lookup_with` against a card that never shows up and
+    /// returns (lookup calls, sleeps, total slept).
+    async fn run_missing_card_lookup(attempts: u32) -> (u32, u32, Duration) {
+        let calls = std::cell::Cell::new(0u32);
+        let sleeps = std::cell::Cell::new(0u32);
+        let slept = std::cell::Cell::new(Duration::ZERO);
+        let found = retry_card_lookup_with(
+            attempts,
+            CARD_LOOKUP_INTERVAL,
+            || {
+                calls.set(calls.get() + 1);
+                async { None }
+            },
+            |interval| {
+                sleeps.set(sleeps.get() + 1);
+                slept.set(slept.get() + interval);
+                std::future::ready(())
+            },
+        )
+        .await;
+        assert_eq!(found, None);
+        (calls.get(), sleeps.get(), slept.get())
+    }
+
+    #[tokio::test]
+    async fn card_lookup_single_shot_never_sleeps() {
+        assert_eq!(CARD_LOOKUP_ATTEMPTS_PER_CHECK, 1);
+        assert_eq!(
+            run_missing_card_lookup(CARD_LOOKUP_ATTEMPTS_PER_CHECK).await,
+            (1, 0, Duration::ZERO)
+        );
+        assert_eq!(card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS_PER_CHECK), Duration::ZERO);
+        // The full poll used by the initial lookup and by deactivation keeps
+        // its budget: 12 lookups, 11 sleeps of 250 ms.
+        assert_eq!(
+            run_missing_card_lookup(CARD_LOOKUP_ATTEMPTS).await,
+            (
+                CARD_LOOKUP_ATTEMPTS,
+                CARD_LOOKUP_ATTEMPTS - 1,
+                card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS)
+            )
+        );
+        assert_eq!(
+            card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS),
+            Duration::from_millis(2750)
+        );
+    }
+
+    #[tokio::test]
+    async fn a2dp_recovery_worst_case_bound() {
+        assert_eq!(A2DP_RECOVERY_BOUND, Duration::from_secs(15));
+        assert_eq!(WIREPLUMBER_SETTLE, Duration::from_secs(2));
+
+        let attempts = MediaController::A2DP_ENUMERATION_ATTEMPTS;
+        let interval = MediaController::A2DP_ENUMERATION_INTERVAL;
+        let initial_lookup = CARD_LOOKUP_INTERVAL * (CARD_LOOKUP_ATTEMPTS - 1);
+        let per_check_lookup = CARD_LOOKUP_INTERVAL * (CARD_LOOKUP_ATTEMPTS_PER_CHECK - 1);
+        let wait = interval * (attempts - 1) + per_check_lookup * attempts;
+        let expected = initial_lookup + wait + WIREPLUMBER_SETTLE + wait;
+        assert_eq!(a2dp_activation_worst_case_wait(), expected);
+        assert!(expected <= A2DP_RECOVERY_BOUND, "{expected:?} > 15 s");
+        // Still within the bound when the initial lookup is charged its
+        // nominal CARD_LOOKUP_ATTEMPTS × CARD_LOOKUP_INTERVAL (~3 s).
+        let nominal = CARD_LOOKUP_INTERVAL * CARD_LOOKUP_ATTEMPTS + wait + WIREPLUMBER_SETTLE + wait;
+        assert!(nominal <= A2DP_RECOVERY_BOUND, "{nominal:?} > 15 s");
+
+        // Replay the production sequence on a virtual clock: the initial full
+        // lookup finds the card on its last try, then the card is missing at
+        // every enumeration check (single-shot re-lookups) and the restart
+        // succeeds.
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let lookups = std::cell::Cell::new(0u32);
+        let tick = |d: Duration| {
+            clock.set(clock.get() + d);
+            std::future::ready(())
+        };
+        let initial = retry_card_lookup_with(
+            CARD_LOOKUP_ATTEMPTS,
+            CARD_LOOKUP_INTERVAL,
+            || {
+                lookups.set(lookups.get() + 1);
+                let n = lookups.get();
+                async move { (n == CARD_LOOKUP_ATTEMPTS).then_some(3) }
+            },
+            tick,
+        )
+        .await;
+        assert_eq!(initial, Some(3));
+
+        let checks = std::cell::Cell::new(0u32);
+        let restarts = std::cell::Cell::new(0u32);
+        let recheck_lookups = std::cell::Cell::new(0u32);
+        let ok = recover_a2dp_availability(
+            attempts,
+            interval,
+            || {
+                checks.set(checks.get() + 1);
+                let refresh = checks.get() > 1;
+                let (clock, recheck_lookups) = (&clock, &recheck_lookups);
+                async move {
+                    // The first check reuses the resolved index; the card
+                    // has no A2DP profile yet.
+                    if !refresh {
+                        return false;
+                    }
+                    retry_card_lookup_with(
+                        CARD_LOOKUP_ATTEMPTS_PER_CHECK,
+                        CARD_LOOKUP_INTERVAL,
+                        || {
+                            recheck_lookups.set(recheck_lookups.get() + 1);
+                            async { None }
+                        },
+                        |d| {
+                            clock.set(clock.get() + d);
+                            std::future::ready(())
+                        },
+                    )
+                    .await
+                    .is_some()
+                }
+            },
+            || {
+                restarts.set(restarts.get() + 1);
+                clock.set(clock.get() + WIREPLUMBER_SETTLE);
+                std::future::ready(true)
+            },
+            tick,
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(checks.get(), 1 + 2 * attempts);
+        assert_eq!(restarts.get(), 1);
+        assert_eq!(recheck_lookups.get(), 2 * attempts * CARD_LOOKUP_ATTEMPTS_PER_CHECK);
+        assert_eq!(clock.get(), expected);
+        assert!(clock.get() <= A2DP_RECOVERY_BOUND);
     }
 
     use crate::utils::PreferredCodec;
