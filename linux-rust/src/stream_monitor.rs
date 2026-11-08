@@ -318,34 +318,20 @@ impl PlaybackTracker {
         });
     }
 
-    /// Sample `source` once, ask `peaks` for the levels of that listing's
-    /// candidates only, and `observe_levels` at the time `clock` gives.
-    /// `clock` is read only once the listing and the levels have returned,
-    /// so a slow listing can't date a stream's start back to before the
-    /// stream was seen. `rebaseline_requested` is asked right after
-    /// `clock`, and when it gives a reset time the tracker re-baselines at
-    /// it before observing, so a request made while the listing was in
-    /// flight applies to it. A
-    /// source error changes nothing and asks for no levels and no request:
-    /// the last state and the streams' timers are kept, and the baseline is
-    /// still the first successful listing.
-    pub(crate) fn poll_levels_rebaselining(
-        &mut self,
+    /// A sample's I/O: list `source`, then ask `peaks` for the levels of
+    /// that listing's candidates only. A source error gives None and asks
+    /// for no levels: the caller then changes nothing, so the last state and
+    /// the streams' timers are kept, and the baseline is still the first
+    /// successful listing.
+    pub(crate) fn sample(
+        &self,
         source: &mut dyn PlaybackSource,
         peaks: &mut dyn PeakSource,
-        clock: impl FnOnce() -> Instant,
-        rebaseline_requested: impl FnOnce() -> Option<Instant>,
-    ) -> Option<bool> {
+    ) -> Option<Sample> {
         match source.playback_streams() {
             Ok(streams) => {
                 let levels = peaks.levels(&self.candidates(&streams));
-                let now = clock();
-                if let Some(at) = rebaseline_requested() {
-                    self.rebaseline(at);
-                }
-                self.observe_levels(now, &streams, |index| {
-                    levels.get(&index).copied().unwrap_or(0.0)
-                })
+                Some((streams, levels))
             }
             Err(e) => {
                 log::debug!("Stream monitor: playback stream listing failed: {e}");
@@ -353,7 +339,29 @@ impl PlaybackTracker {
             }
         }
     }
+
+    /// Re-baseline at `request`'s reset time, if any, then `observe_levels`
+    /// a `sample` at `now`. `now` is read once the sample has returned, so a
+    /// slow listing can't date a stream's start back to before the stream
+    /// was seen, and a request made while the listing was in flight applies
+    /// to it.
+    pub(crate) fn observe_sample(
+        &mut self,
+        now: Instant,
+        request: Option<Instant>,
+        (streams, levels): &Sample,
+    ) -> Option<bool> {
+        if let Some(at) = request {
+            self.rebaseline(at);
+        }
+        self.observe_levels(now, streams, |index| {
+            levels.get(&index).copied().unwrap_or(0.0)
+        })
+    }
 }
+
+/// A playback listing with its candidates' peak levels.
+pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 
 /// Sample `source` and `peaks` every `interval` with a `PlaybackTracker`
 /// and publish the stream-playing state (initially false; streams already
@@ -365,8 +373,17 @@ impl PlaybackTracker {
 /// the last state is kept). Putting the core's reset time in `rebaseline`
 /// asks the tracker to re-baseline at it (`PlaybackTracker::rebaseline`)
 /// before it observes the next listing to return, even one already in
-/// flight (#90). The task stops once
-/// every receiver is dropped, dropping `peaks`; if sampling panics the state
+/// flight (#90).
+///
+/// `rebaseline`'s lock is the serialization point with the core's step
+/// (`switching::PlaybackSamples::handle`, #146): once the listing and the
+/// levels have returned (never across that I/O, so a stalled sound server
+/// never blocks a step), the worker holds it from its clock read through
+/// the request, the observe and the publish. Each observe so falls wholly
+/// before a step's reset (published before it) or wholly after its
+/// request. `observed` is called with each observe's time before the
+/// publish, under the lock (a test hook). The task stops once every
+/// receiver is dropped, dropping `peaks`; if sampling panics the state
 /// drops to false.
 pub(crate) fn spawn_stream_playback<S, P>(
     source: S,
@@ -374,39 +391,41 @@ pub(crate) fn spawn_stream_playback<S, P>(
     min: Duration,
     interval: Duration,
     rebaseline: Arc<Mutex<Option<Instant>>>,
+    observed: impl Fn(Instant) + Send + Sync + 'static,
 ) -> watch::Receiver<bool>
 where
     S: PlaybackSource + 'static,
     P: PeakSource + 'static,
 {
     let (tx, rx) = watch::channel(false);
+    let observed = Arc::new(observed);
     tokio::spawn(async move {
         let mut state = Some((PlaybackTracker::new(min), source, peaks));
         while !tx.is_closed() {
             let Some((mut tracker, mut source, mut peaks)) = state.take() else {
                 break;
             };
-            let rebaseline = rebaseline.clone();
+            let (rebaseline, observed, publish) =
+                (rebaseline.clone(), observed.clone(), tx.clone());
             let sampled = tokio::task::spawn_blocking(move || {
-                let change =
-                    tracker.poll_levels_rebaselining(&mut source, &mut peaks, Instant::now, || {
-                        rebaseline
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .take()
-                    });
-                (tracker, source, peaks, change)
+                if let Some(sample) = tracker.sample(&mut source, &mut peaks) {
+                    let mut request = rebaseline.lock().unwrap_or_else(PoisonError::into_inner);
+                    let now = Instant::now();
+                    let change = tracker.observe_sample(now, request.take(), &sample);
+                    observed(now);
+                    if let Some(playing) = change {
+                        publish.send_replace(playing);
+                    }
+                }
+                (tracker, source, peaks)
             })
             .await;
-            let Ok((tracker, source, peaks, change)) = sampled else {
+            let Ok(sampled) = sampled else {
                 log::error!("Stream playback monitor stopped: sampling panicked");
                 tx.send_replace(false);
                 break;
             };
-            state = Some((tracker, source, peaks));
-            if let Some(playing) = change {
-                tx.send_replace(playing);
-            }
+            state = Some(sampled);
             tokio::time::sleep(interval).await;
         }
     });
@@ -1385,6 +1404,21 @@ mod tests {
         ) -> Option<bool> {
             self.poll_levels_rebaselining(source, peaks, clock, || None)
         }
+
+        /// One sample in the stream worker's order, without its lock:
+        /// `sample`, then `clock` and `rebaseline_requested` (asked only
+        /// over a successful listing), then `observe_sample`.
+        fn poll_levels_rebaselining(
+            &mut self,
+            source: &mut dyn PlaybackSource,
+            peaks: &mut dyn PeakSource,
+            clock: impl FnOnce() -> Instant,
+            rebaseline_requested: impl FnOnce() -> Option<Instant>,
+        ) -> Option<bool> {
+            let sample = self.sample(source, peaks)?;
+            let now = clock();
+            self.observe_sample(now, rebaseline_requested(), &sample)
+        }
     }
 
     /// Feed `listings` to a fresh tracker, one per `STEP` from `start`, and
@@ -1952,6 +1986,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(5),
             Default::default(),
+            |_| (),
         );
         assert!(!*rx.borrow());
         tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
@@ -1981,6 +2016,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(5),
             Default::default(),
+            |_| (),
         );
         tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
             .await
@@ -2047,6 +2083,7 @@ mod tests {
             min,
             Duration::from_millis(5),
             Default::default(),
+            |_| (),
         );
         tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|playing| *playing))
             .await
@@ -2612,6 +2649,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(5),
             Default::default(),
+            |_| (),
         );
         tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
             .await
