@@ -132,6 +132,12 @@ pub(crate) struct Handoff {
     was_playing: Option<bool>,
     /// Samples taken before this instant are ignored.
     playback_baseline_at: Instant,
+    /// A take was sent for playback seen before the last baseline reset (a
+    /// reconnect for requested playback). Until the first post-baseline
+    /// sample arrives, release decisions treat playback as running, so a
+    /// "stopped" first sample is a stop edge. Takeover decisions still see
+    /// no baseline.
+    take_assumes_playing: bool,
     recovery: CaseRecovery,
     case_closed: bool,
     /// Playback stopped while a take was pending: release once it settles.
@@ -162,6 +168,7 @@ impl Handoff {
             requested_take: false,
             was_playing: None,
             playback_baseline_at: now,
+            take_assumes_playing: false,
             recovery: if connected {
                 CaseRecovery::Immediate
             } else {
@@ -310,8 +317,12 @@ impl Handoff {
             return;
         }
         let previous = self.was_playing.replace(playing);
+        let assumed_playing = std::mem::take(&mut self.take_assumes_playing);
         let fresh_play = previous == Some(false) && playing;
-        let stopped = previous == Some(true) && !playing;
+        // Release edges also count a take sent for playback before the
+        // baseline: the stop after a reconnect take must not be lost.
+        let stopped =
+            (previous == Some(true) || (previous.is_none() && assumed_playing)) && !playing;
         if !self.automatic {
             return;
         }
@@ -367,15 +378,22 @@ impl Handoff {
             .pending
             .filter(|p| value.as_slice() == [u8::from(p.desired)]);
         // Our own release was acknowledged while the user started playing
-        // again: the reconcile below takes the AirPods back, so pausing the
-        // players here would undo the play it is acting on.
+        // again: the reconcile below may take the AirPods back, and pausing
+        // the players first would undo the play it is acting on. The pause
+        // upstream #841 makes here is deferred until the reconcile has
+        // decided, and made unless it actually re-took.
         let replay_play = acked.is_some_and(|p| !p.desired)
             && self.play_during_release
             && self.was_playing == Some(true);
         self.owner = Some(value.clone());
+        let mut deferred_pause = false;
         if value == [0] {
-            if self.requested_take && self.automatic && !replay_play {
-                out.push(Command::PauseMedia);
+            if self.requested_take && self.automatic {
+                if replay_play {
+                    deferred_pause = true;
+                } else {
+                    out.push(Command::PauseMedia);
+                }
             }
             self.requested_take = false;
         }
@@ -396,10 +414,19 @@ impl Handoff {
             self.requested_take = false;
         }
         if self.quitting {
+            if deferred_pause {
+                out.push(Command::PauseMedia);
+            }
             out.push(Command::Exit);
             return;
         }
+        let first = out.len();
         self.reconcile(now, out);
+        if deferred_pause && !out[first..].contains(&Command::SendOwnership(true)) {
+            // The retake was blocked: the AirPods went to the other host, so
+            // stop playing here as upstream does.
+            out.push(Command::PauseMedia);
+        }
     }
 
     /// The pending request settled (acknowledged or timed out): act on a
@@ -438,6 +465,7 @@ impl Handoff {
         self.pending = None;
         self.requested_take = false;
         self.was_playing = None;
+        self.take_assumes_playing = false;
         self.stop_during_take = false;
         self.play_during_release = false;
         self.hosts.clear();
@@ -470,22 +498,29 @@ impl Handoff {
         if self.automatic {
             out.push(Command::Announce);
         }
-        match self
+        let took = match self
             .decide_take(TakeoverTrigger::ReconnectedForPlayback)
             .action
         {
             TakeoverAction::TakeOver => {
                 self.request(now, true, Cause::Playback, out);
                 self.say("AUTO reconnected for new playback; requested Linux ownership");
+                true
             }
             // An ordinary reconnect: no playback asked for it.
-            TakeoverAction::Skip(TakeoverSkip::AwaitingNewPlayback) => {}
-            TakeoverAction::Skip(_) => self.say(
-                "AUTO reconnected; takeover blocked by remote activity, wear, or missing host state",
-            ),
-        }
+            TakeoverAction::Skip(TakeoverSkip::AwaitingNewPlayback) => false,
+            TakeoverAction::Skip(_) => {
+                self.say(
+                    "AUTO reconnected; takeover blocked by remote activity, wear, or missing host state",
+                );
+                false
+            }
+        };
         self.recovery = CaseRecovery::Immediate;
         self.reset_baseline(now);
+        // The take was for playback seen before this baseline: a first
+        // sample that finds it stopped must release.
+        self.take_assumes_playing = took;
         out.push(Command::DrainPlayback);
         self.retry_delay = FIRST_RETRY;
         self.say("RECONNECTED with fresh routing and wear state");
@@ -546,6 +581,7 @@ impl Handoff {
 
     fn reset_baseline(&mut self, now: Instant) {
         self.was_playing = None;
+        self.take_assumes_playing = false;
         self.playback_baseline_at = now;
     }
 
@@ -973,6 +1009,108 @@ mod tests {
         assert_eq!(p.play(2000, false), []);
         assert_eq!(p.feed(2100, Input::Ownership(vec![0])), [PauseMedia]);
         assert_eq!(p.play(2500, false), []);
+    }
+
+    #[test]
+    fn stop_after_reconnect_take_releases_after_ack() {
+        // Automatic mode, case closed, then a disconnect.
+        let mut p = Probe::ready();
+        p.feed(20, Input::EarState(vec![InCase, InCase]));
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        // New playback asks for the reconnection.
+        assert_eq!(p.play(500, false), []);
+        assert_eq!(p.play(1000, true), []);
+        assert_eq!(p.feed(1100, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(1200, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
+        );
+        // Playback is no longer running by the first post-baseline sample.
+        assert_eq!(p.play(1500, false), []);
+        let mut settled = p.feed(1600, Input::Ownership(vec![1]));
+        settled.extend(p.play(2000, false));
+        assert_eq!(settled, [SendOwnership(false)]);
+        for ms in [2500, 3000, 3500] {
+            assert_eq!(p.play(ms, false), []);
+        }
+        assert_eq!(p.feed(3600, Input::Tick), []);
+        assert_eq!(p.feed(3700, Input::Ownership(vec![0])), [PauseMedia]);
+        for ms in [4000, 4500, 5000] {
+            assert_eq!(p.play(ms, false), []);
+        }
+        assert_eq!(p.feed(9000, Input::Tick), []);
+
+        // The first post-baseline sample arriving only after the ACK
+        // releases too.
+        let mut p = Probe::ready();
+        p.feed(20, Input::EarState(vec![InCase, InCase]));
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        assert_eq!(p.play(500, false), []);
+        assert_eq!(p.play(1000, true), []);
+        assert_eq!(p.feed(1100, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(1200, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
+        );
+        assert_eq!(p.feed(1300, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1500, false), [SendOwnership(false)]);
+        for ms in [2000, 2500, 3000] {
+            assert_eq!(p.play(ms, false), []);
+        }
+        assert_eq!(p.feed(3100, Input::Tick), []);
+
+        // Control: playback still running after the reconnect keeps the
+        // AirPods.
+        let mut p = Probe::ready();
+        p.feed(20, Input::EarState(vec![InCase, InCase]));
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        assert_eq!(p.play(500, false), []);
+        assert_eq!(p.play(1000, true), []);
+        assert_eq!(p.feed(1100, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(1200, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
+        );
+        assert_eq!(p.play(1500, true), []);
+        assert_eq!(p.feed(1600, Input::Ownership(vec![1])), []);
+        for ms in [2000, 2500, 3000] {
+            assert_eq!(p.play(ms, true), []);
+        }
+        assert_eq!(p.feed(9000, Input::Tick), []);
+        // A later stop releases as usual.
+        assert_eq!(p.play(9500, false), [SendOwnership(false)]);
+    }
+
+    #[test]
+    fn restart_during_pending_release_blocked_pauses() {
+        // A remote call starts while the release is in flight.
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1000, false), [SendOwnership(false)]);
+        assert_eq!(p.play(1500, true), []);
+        assert_eq!(
+            p.feed(
+                1550,
+                Input::AudioSource(source(REMOTE, AudioSourceType::Call))
+            ),
+            []
+        );
+        assert_eq!(p.feed(1600, Input::Ownership(vec![0])), [PauseMedia]);
+        for ms in [2000, 2500, 3000] {
+            assert_eq!(p.play(ms, true), []);
+        }
+        assert_eq!(p.feed(9000, Input::Tick), []);
+
+        // The buds come out while the release is in flight.
+        let mut p = Probe::ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(1000, false), [SendOwnership(false)]);
+        assert_eq!(p.play(1500, true), []);
+        assert_eq!(p.feed(1550, Input::EarState(vec![OutOfEar, InCase])), []);
+        assert_eq!(p.feed(1600, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(p.play(2000, true), []);
     }
 
     #[test]
