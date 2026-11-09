@@ -22,8 +22,9 @@ pub struct MyTray {
     pub battery_r_status: Option<BatteryStatus>,
     pub battery_c: Option<u8>,
     pub battery_c_status: Option<BatteryStatus>,
-    /// The AirPods MAC the case level belongs to: the last connected AirPods, or
-    /// the last LE advert with a case reading (#461).
+    /// The AirPods MAC the case level belongs to: the last connected AirPods, the
+    /// last LE advert with a case reading, or the last AACP report with a known
+    /// case level (#461).
     pub case_owner: Option<String>,
     pub connected: bool,
     pub listening_mode: Option<u8>,
@@ -58,6 +59,17 @@ impl MyTray {
                 BatteryComponent::Case => (&mut self.battery_c, &mut self.battery_c_status),
             };
             merge_into(level, status, b);
+        }
+    }
+
+    /// `apply_battery` for an AACP report from the AirPods `mac`: a known
+    /// (non-Disconnected) case level now belongs to `mac` (#461).
+    pub fn apply_aacp_battery(&mut self, mac: &str, infos: &[BatteryInfo]) {
+        self.apply_battery(infos);
+        if infos.iter().any(|b| {
+            b.component == BatteryComponent::Case && b.status != BatteryStatus::Disconnected
+        }) {
+            self.case_owner = Some(mac.to_string());
         }
     }
 
@@ -514,5 +526,39 @@ mod tests {
         assert_eq!(tray.battery_c_status, None);
         tray.apply_battery(&connect_report());
         assert!(tray.tool_tip().description.contains("C: -"));
+    }
+
+    /// Connected A; disconnected B advertises its case (owner B); then A's
+    /// AACP report replaces the case level, so the level is A's again.
+    fn tray_after_interleaved_le_and_aacp() -> MyTray {
+        let mut tray = MyTray::default();
+        tray.connect_reset(A);
+        tray.battery_c = Some(50);
+        tray.battery_c_status = Some(NotCharging);
+        tray.case_owner = Some(B.to_string());
+        tray.apply_aacp_battery(A, &[b(Case, 90, NotCharging)]);
+        assert_eq!(tray.case_owner.as_deref(), Some(A));
+        tray
+    }
+
+    #[test]
+    fn tray_interleaved_le_aacp_other_airpods_clears_case() {
+        let mut tray = tray_after_interleaved_le_and_aacp();
+        tray.connect_reset(B);
+        assert_eq!(tray.battery_c, None);
+        // A Disconnected report with nothing known stores (0, Disconnected),
+        // shown as `C: -` (tray_apply_battery_disconnected_with_nothing_known_is_stored).
+        tray.apply_aacp_battery(B, &[b(Case, 0, Disconnected)]);
+        assert_eq!(tray.case_owner.as_deref(), Some(B));
+        assert!(tray.tool_tip().description.contains("C: -"));
+    }
+
+    #[test]
+    fn tray_interleaved_le_aacp_same_airpods_keeps_case() {
+        let mut tray = tray_after_interleaved_le_and_aacp();
+        tray.connect_reset(A);
+        tray.apply_aacp_battery(A, &[b(Case, 0, Disconnected)]);
+        assert_eq!(tray.battery_c, Some(90));
+        assert!(tray.tool_tip().description.contains("C: 90%"));
     }
 }
