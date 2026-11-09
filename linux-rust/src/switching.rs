@@ -131,6 +131,10 @@ pub(crate) trait MediaActions: Send + Sync {
     /// Mark the A2DP hold (#264) at once, then enqueue its card write with
     /// the routes; never waits for the sound server.
     fn hold_a2dp(&self, hold: bool);
+    /// Ear detection's resume reports (#313); none by default.
+    fn ear_resumes(&self) -> mpsc::UnboundedReceiver<bool> {
+        mpsc::unbounded_channel().1
+    }
 }
 
 /// Blocking: pauses the local players whose bus owner PID the filter
@@ -190,6 +194,10 @@ impl MediaActions for ControllerMedia {
     fn hold_a2dp(&self, hold: bool) {
         self.controller.set_a2dp_held(hold);
         self.sinks.route(SinkEvent::Hold(hold));
+    }
+
+    fn ear_resumes(&self) -> mpsc::UnboundedReceiver<bool> {
+        self.controller.subscribe_ear_resumes()
     }
 }
 
@@ -526,6 +534,8 @@ struct Shell {
     call_rx: CallSamples,
     /// A2DP transport state changes (#200).
     a2dp_rx: mpsc::Receiver<bool>,
+    /// Ear detection's resume reports (#313).
+    ear_rx: mpsc::UnboundedReceiver<bool>,
     /// Stops the running A2DP resume chain when dropped.
     resume: Option<oneshot::Sender<()>>,
     /// Where the core's lines go after they are logged, if anywhere.
@@ -771,6 +781,13 @@ async fn run_handoff(mut shell: Shell) {
                     true
                 }
             },
+            // After events, so a reinsertion's EarState comes first, and
+            // before samples, so a queued `false` beats a ready play (#313).
+            Some(resumed) = shell.ear_rx.recv() => {
+                info!("Handoff {}: ear detection resumed a player: {resumed}", shell.mac);
+                sync_session(&mut core, &mut shell).await
+                    || step(&mut core, &mut shell, Input::EarResume { resumed }).await
+            }
             Some((sampled_at, category)) = shell.play_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::Playback { sampled_at, category }).await
@@ -971,6 +988,8 @@ impl Switching {
             } => {
                 let (events_tx, handoff_events) = mpsc::unbounded_channel();
                 let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+                // Before the router starts, so no reinsertion's report is lost.
+                let ear_rx = media.ear_resumes();
                 let shell = Shell {
                     mac: self.airpods_mac.clone(),
                     local,
@@ -982,6 +1001,7 @@ impl Switching {
                     call_rx,
                     // No poller: a closed channel, so no take resumes A2DP.
                     a2dp_rx: self.a2dp.unwrap_or_else(|| mpsc::channel(1).1),
+                    ear_rx,
                     resume: None,
                     lines: self.lines,
                     connect_mode: self.connect_mode,
@@ -2418,6 +2438,24 @@ mod tests {
         assert_eq!(h.pauses(), 1);
 
         stop_handoff_task(mac);
+    }
+
+    /// #313: the production adapter delivers the controller's ear resume
+    /// reports.
+    #[tokio::test]
+    async fn production_media_delivers_ear_resumes() {
+        let (outer, media) = share_media(
+            MediaController::new(String::new(), LOCAL.to_string()),
+            Arc::new(media_controller::PauseOutcome::default),
+        );
+        let mut ear_rx = media.ear_resumes();
+        use EarDetectionStatus::{InEar, OutOfEar};
+        outer
+            .lock()
+            .await
+            .handle_ear_detection(vec![InEar, OutOfEar], vec![InEar, InEar])
+            .await;
+        assert_eq!(ear_rx.try_recv(), Ok(false));
     }
 
     /// The production media adapter (`device_media`) never waits for the
