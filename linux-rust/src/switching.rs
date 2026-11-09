@@ -2815,7 +2815,7 @@ mod tests {
     /// yield, its PID from the stream monitor's own filter.
     #[tokio::test]
     async fn yield_pause_pauses_muted_local_player() {
-        let mac = "5A:00:00:00:03:07";
+        let mac = "5A:00:00:00:03:0B";
         let mut muted = StreamProps {
             muted: true,
             ..music(1)
