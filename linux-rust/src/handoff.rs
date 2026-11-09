@@ -566,8 +566,8 @@ impl Handoff {
                 self.say("AUTO enabled; waiting for a new playback start after the baseline");
             }
             Input::Manual => {
-                // Drops a held stop release (#205): Linux keeps the AirPods, as
-                // the Mac keeps them when its setting changes after a stop (#253, #255).
+                // A held stop release (#205) never fires while manual: Linux keeps the AirPods,
+                // as the Mac keeps them when its setting changes after a stop (#253, #255).
                 self.automatic = false;
                 self.say("AUTO disabled");
             }
