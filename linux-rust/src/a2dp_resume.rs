@@ -82,6 +82,7 @@ const SELF_PAUSE_GUARD: Duration = Duration::from_secs(3);
 const SELF_PAUSE_READ: Duration = Duration::from_millis(250);
 const _: () = assert!(
     SELF_PAUSE_GUARD
+        .saturating_add(SELF_PAUSE_READ)
         .saturating_add(PLAY_EDGE_MARGIN)
         .as_millis()
         <= A2DP_RESUME_WINDOW.as_millis()
@@ -374,43 +375,66 @@ fn clock() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
-/// Play once each of `replayable` that a Paused read started within
+/// Play once each of `replayable` that a Paused read due within
 /// `SELF_PAUSE_GUARD` of `routed_at` finds, while that Play can be due
-/// `PLAY_EDGE_MARGIN` before `until`: a read every `SELF_PAUSE_READ`, or
-/// right after a slower one, cut off at the guard's end. `cancel`, or a
-/// LibrePods pause since `pauses` was counted (at the take), ends it with no
-/// further Play; both are checked before each Play.
+/// `PLAY_EDGE_MARGIN` before `until`: reads are due every `SELF_PAUSE_READ`
+/// from `routed_at` (one due during a slower read starts right after it),
+/// and each is cut off `SELF_PAUSE_READ` after the guard's end. The Plays
+/// go out in turn beside the reads, so a slow one holds up no read.
+/// `cancel`, or a LibrePods pause since `pauses` was counted (at the take),
+/// ends it with no further Play; both are checked before each Play.
 async fn replay_self_pauses(
     io: &impl A2dpResumeIo,
     replayable: &Mutex<Vec<String>>,
     routed_at: Instant,
     until: Instant,
     pauses: usize,
-    mut cancel: impl Future + Unpin,
+    cancel: impl Future + Clone + Unpin,
 ) {
     let guard_end = routed_at + SELF_PAUSE_GUARD;
-    loop {
-        let read_at = clock();
-        if read_at > guard_end || replayable.lock().unwrap().is_empty() {
-            return;
+    // A read due by the guard's end may run into the next interval, and see
+    // a pause made after the guard.
+    let read_end = guard_end + SELF_PAUSE_READ;
+    let (queue, mut queued) = mpsc::unbounded_channel();
+    let mut read_cancel = cancel.clone();
+    let reads = async move {
+        // Fixed due times, so late wake-ups don't push the last read out.
+        let mut due = tokio::time::interval_at(routed_at.into(), SELF_PAUSE_READ);
+        due.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let read_at = tokio::select! {
+                biased;
+                _ = &mut read_cancel => return,
+                read_at = due.tick() => read_at.into_std(),
+            };
+            if read_at > guard_end || replayable.lock().unwrap().is_empty() {
+                return;
+            }
+            let paused = tokio::select! {
+                biased;
+                _ = &mut read_cancel => return,
+                paused = tokio::time::timeout_at(read_end.into(), io.paused()) => paused,
+            };
+            let Ok(paused) = paused else { return };
+            if clock() > read_end {
+                return;
+            }
+            let replay: Vec<String> = {
+                let mut replayable = replayable.lock().unwrap();
+                let (replay, keep) = replayable.drain(..).partition(|p| paused.contains(p));
+                *replayable = keep;
+                replay
+            };
+            for player in replay {
+                if queue.send(player).is_err() {
+                    return;
+                }
+            }
         }
-        // A read still running at the guard's end may see a pause made after it.
-        let paused = tokio::select! {
-            biased;
-            _ = &mut cancel => return,
-            paused = tokio::time::timeout_at(guard_end.into(), io.paused()) => paused,
-        };
-        let Ok(paused) = paused else { return };
-        if clock() > guard_end {
-            return;
-        }
-        let replay: Vec<String> = {
-            let mut replayable = replayable.lock().unwrap();
-            let (replay, keep) = replayable.drain(..).partition(|p| paused.contains(p));
-            *replayable = keep;
-            replay
-        };
-        for player in replay {
+    };
+    let plays = async move {
+        let mut cancel = cancel;
+        while let Some(player) = queued.recv().await {
             // A Play can be slow: re-check before each. LibrePods counts a
             // pause before making it, so the count is read after the Paused read.
             let now = clock();
@@ -424,12 +448,8 @@ async fn replay_self_pauses(
             info!("A2DP resume: {player} paused itself {ms} ms after the route; Play");
             io.act(Action::Play(player)).await;
         }
-        tokio::select! {
-            biased;
-            _ = &mut cancel => return,
-            _ = tokio::time::sleep_until((read_at + SELF_PAUSE_READ).into()) => {}
-        }
-    }
+    };
+    futures::join!(reads, plays);
 }
 
 async fn act(io: &impl A2dpResumeIo, actions: Vec<Action>) {
@@ -1501,7 +1521,12 @@ mod tests {
     async fn self_pause_within_guard_gets_one_play() {
         // The first transport read, active, ends the chain at 500 ms.
         assert_eq!(take(self_paused(&[50])).await, [(250, Play(Q.into()))]);
-        assert_eq!(take(self_paused(&[2900])).await, [(3000, Play(Q.into()))]);
+        // The read due at the guard's end gets time to finish.
+        let late = Take {
+            read: ms(20),
+            ..self_paused(&[2900])
+        };
+        assert_eq!(take(late).await, [(3020, Play(Q.into()))]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1515,16 +1540,31 @@ mod tests {
         assert_eq!(take(slow).await, []);
     }
 
-    /// P and Q pause themselves at the route, and each Play takes 1 s.
-    #[derive(Clone, Default)]
+    /// P and Q pause themselves at `paused_at` (ms after the route, the
+    /// test's start), and each Play takes 1 s.
+    #[derive(Clone)]
     struct TwoIo {
-        acted: Arc<StdMutex<Vec<Action>>>,
+        paused_at: [u64; 2],
+        start: tokio::time::Instant,
+        acted: Arc<StdMutex<Vec<(u128, Action)>>>,
         count: Arc<AtomicUsize>,
+    }
+
+    impl TwoIo {
+        fn new(paused_at: [u64; 2]) -> Self {
+            TwoIo {
+                paused_at,
+                start: tokio::time::Instant::now(),
+                acted: Arc::default(),
+                count: Arc::default(),
+            }
+        }
     }
 
     impl A2dpResumeIo for TwoIo {
         fn act(&self, action: Action) -> BoxFuture<'static, ()> {
-            self.acted.lock().unwrap().push(action);
+            let at = self.start.elapsed().as_millis();
+            self.acted.lock().unwrap().push((at, action));
             Box::pin(tokio::time::sleep(Duration::from_secs(1)))
         }
 
@@ -1541,7 +1581,14 @@ mod tests {
         }
 
         fn paused(&self) -> BoxFuture<'static, Vec<String>> {
-            Box::pin(async { players(&[P, Q]) })
+            let elapsed = self.start.elapsed();
+            let paused = [P, Q]
+                .into_iter()
+                .zip(self.paused_at)
+                .filter(|(_, at)| ms(*at) <= elapsed)
+                .map(|(p, _)| p.to_string())
+                .collect();
+            Box::pin(async { paused })
         }
 
         fn self_pauses(&self) -> usize {
@@ -1552,7 +1599,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancel_or_librepods_pause_during_a_slow_play_stops_the_next() {
         for cancel_it in [true, false] {
-            let io = TwoIo::default();
+            let io = TwoIo::new([0, 0]);
             let (cancel, cancelled) = oneshot::channel();
             let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
             let ready = std::future::ready(());
@@ -1565,8 +1612,25 @@ mod tests {
                 io.count.fetch_add(1, Ordering::SeqCst);
             }
             run.await.unwrap();
-            assert_eq!(*io.acted.lock().unwrap(), [Play(P.into())], "{cancel_it}");
+            assert_eq!(
+                *io.acted.lock().unwrap(),
+                [(0, Play(P.into()))],
+                "{cancel_it}"
+            );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_play_holds_up_no_paused_read() {
+        // P's Play runs from 2750 to 3750 ms; the 3000 ms read still sees Q.
+        let io = TwoIo::new([2750, 2900]);
+        let (_cancel, cancelled) = oneshot::channel();
+        let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
+        run(io.clone(), until, cancelled, std::future::ready(())).await;
+        assert_eq!(
+            *io.acted.lock().unwrap(),
+            [(2750, Play(P.into())), (3750, Play(Q.into()))]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1625,7 +1689,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn kick_and_cycle_plays_are_the_only_plays_for_players_they_pause() {
         // The kick pauses Q at 2.9 s; a Paused read sees it at 3 s, or,
-        // slow, at 5 s, after the cycle paused it again at 4.9 s.
+        // slow, is still running from 2.5 s when the watch ends at 3.25 s.
         for read in [Duration::ZERO, ms(2500)] {
             let acted = take(Take {
                 transport: Some(false),
