@@ -539,7 +539,10 @@ impl App {
                         let type_ = {
                             let devices_json = std::fs::read_to_string(get_devices_path())
                                 .unwrap_or_else(|e| {
-                                    error!("Failed to read devices file: {}", e);
+                                    error!(
+                                        "Failed to read devices file: {}",
+                                        crate::settings_file::devices_error_log(&e)
+                                    );
                                     "{}".to_string()
                                 });
                             let devices_list: HashMap<String, DeviceData> =
@@ -563,7 +566,10 @@ impl App {
                                 let device_name = {
                                     let devices_json = std::fs::read_to_string(get_devices_path())
                                         .unwrap_or_else(|e| {
-                                            error!("Failed to read devices file: {}", e);
+                                            error!(
+                                                "Failed to read devices file: {}",
+                                                crate::settings_file::devices_error_log(&e)
+                                            );
                                             "{}".to_string()
                                         });
                                     let devices_list: HashMap<String, DeviceData> =
@@ -828,7 +834,10 @@ impl App {
                 let type_ = {
                     let devices_json =
                         std::fs::read_to_string(get_devices_path()).unwrap_or_else(|e| {
-                            error!("Failed to read devices file: {}", e);
+                            error!(
+                                "Failed to read devices file: {}",
+                                crate::settings_file::devices_error_log(&e)
+                            );
                             "{}".to_string()
                         });
                     let devices_list: HashMap<String, DeviceData> =
@@ -922,7 +931,10 @@ impl App {
 
     fn view(&self, _id: window::Id) -> Element<'_, Message> {
         let devices_json = std::fs::read_to_string(get_devices_path()).unwrap_or_else(|e| {
-            error!("Failed to read devices file: {}", e);
+            error!(
+                "Failed to read devices file: {}",
+                crate::settings_file::devices_error_log(&e)
+            );
             "{}".to_string()
         });
         let devices_list: HashMap<String, DeviceData> = serde_json::from_str(&devices_json)
