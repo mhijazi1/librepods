@@ -110,6 +110,11 @@ impl PlaybackSamples {
     pub(crate) fn drain(&mut self) {
         while self.rx.try_recv().is_ok() {}
     }
+
+    /// The stream monitor's state now, for `Command::PauseMedia` (#302).
+    pub(crate) fn streams(&self) -> PlaybackState {
+        self.streams.borrow().clone()
+    }
 }
 
 /// The media side effects the handoff core can ask for, injected so tests
@@ -139,8 +144,25 @@ pub(crate) trait MediaActions: Send + Sync {
 
 /// Blocking: pauses the local players whose bus owner PID the filter
 /// accepts and reports what it did.
-type PausePlayers =
+pub(crate) type PausePlayers =
     Arc<dyn Fn(&dyn Fn(Option<u32>) -> bool) -> media_controller::PauseOutcome + Send + Sync>;
+
+/// Logged when `pause_own_players` matched nothing.
+pub(crate) const NOT_PAUSING: &str = "no MPRIS player with a live local stream; not pausing";
+
+/// Pause the Playing players whose bus owner PID `streams` says plays
+/// locally (`PlaybackState::live_or_unknown`, #302, #329); whether one
+/// matched. The app's yield and the probe both pause through this.
+pub(crate) async fn pause_own_players(
+    controller: &MediaController,
+    pause_players: PausePlayers,
+    streams: PlaybackState,
+) -> bool {
+    let outcome = controller
+        .pause_all_media_with(move || pause_players(&|owner| streams.live_or_unknown(owner)))
+        .await;
+    outcome.paused + outcome.failed > 0
+}
 
 /// Production media actions on a clone of the device's `MediaController`
 /// (its state is shared, DECISIONS #5). The device handlers lock the outer
@@ -159,14 +181,7 @@ impl MediaActions for ControllerMedia {
     fn pause(&self, streams: PlaybackState) -> BoxFuture<'static, bool> {
         let controller = self.controller.clone();
         let pause_players = self.pause_players.clone();
-        Box::pin(async move {
-            let outcome = controller
-                .pause_all_media_with(move || {
-                    pause_players(&|owner| streams.live_or_unknown(owner))
-                })
-                .await;
-            outcome.paused + outcome.failed > 0
-        })
+        Box::pin(async move { pause_own_players(&controller, pause_players, streams).await })
     }
 
     fn activate_a2dp(&self) -> BoxFuture<'static, ()> {
@@ -607,10 +622,9 @@ impl Shell {
                 Command::PauseMedia => {
                     // Before the pause, so the chain plays nothing after it.
                     self.resume = None;
-                    let streams = self.play_rx.streams.borrow().clone();
-                    if !self.media.pause(streams).await {
+                    if !self.media.pause(self.play_rx.streams()).await {
                         // Remote controls only, if anything (#302, #329).
-                        self.log("no MPRIS player with a live local stream; not pausing");
+                        self.log(NOT_PAUSING);
                     }
                 }
                 // Activation can take tens of seconds; it must not stall
@@ -2683,6 +2697,39 @@ mod tests {
             (players.to_vec(), true)
         );
         assert!(!not_pausing(mac), "{:#?}", traced(mac));
+    }
+
+    /// The probe's PauseMedia path (#319): the same gate, no D-Bus.
+    #[tokio::test]
+    async fn pause_own_players_gates_on_live_streams() {
+        let players = [Some(CONNECT_PID), Some(FIREFOX_PID), None];
+        let pause = async |live: Option<&[u32]>| {
+            let accepted = Arc::new(StdMutex::new(Vec::new()));
+            let seen = accepted.clone();
+            let paused = pause_own_players(
+                &MediaController::new(String::new(), LOCAL.to_string()),
+                Arc::new(move |own: &dyn Fn(Option<u32>) -> bool| {
+                    let mut seen = seen.lock().unwrap();
+                    seen.extend(players.iter().copied().filter(|&owner| own(owner)));
+                    media_controller::PauseOutcome {
+                        paused: seen.len(),
+                        ..Default::default()
+                    }
+                }),
+                PlaybackState {
+                    counted: false,
+                    live: live.map(|pids| pids.iter().copied().collect()),
+                },
+            )
+            .await;
+            (accepted.lock().unwrap().clone(), paused)
+        };
+        assert_eq!(
+            pause(Some(&[FIREFOX_PID])).await,
+            (vec![Some(FIREFOX_PID)], true)
+        );
+        assert_eq!(pause(Some(&[])).await, (vec![], false));
+        assert_eq!(pause(None).await, (players.to_vec(), true));
     }
 
     #[tokio::test]
