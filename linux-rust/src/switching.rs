@@ -1575,6 +1575,23 @@ mod tests {
             self.events.send(event).expect("event channel open");
         }
 
+        /// `emit`, then wait until the device handler has started the event:
+        /// the router queued it for the core first, and the core steps queued
+        /// events before later playback samples.
+        async fn emit_queued(&self, event: AACPEvent) {
+            let name = format!("{event:?}");
+            let seen = || {
+                self.handler
+                    .started()
+                    .iter()
+                    .filter(|e| **e == name)
+                    .count()
+            };
+            let before = seen();
+            self.emit(event);
+            wait_until("the device handler to start the event", || seen() > before).await;
+        }
+
         /// Drop the harness's sender of the primary event channel.
         fn close_events(&mut self) {
             self.events = mpsc::unbounded_channel().0;
@@ -1619,10 +1636,10 @@ mod tests {
         assert_eq!(h.pauses(), 0);
     }
 
-    /// The reply to Auto's "not owning" (#54), then playback stopped then
-    /// started: one take, OwnsConnection [1] only.
+    /// The AirPods' own owner report, [0], stepped before playback stopped
+    /// then started: one take, OwnsConnection [1] only.
     async fn expect_take(h: &Harness, rx: &mut mpsc::Receiver<Vec<u8>>) {
-        h.emit(owns(0));
+        h.emit_queued(owns(0)).await;
         h.play(false).await;
         h.play(true).await;
         assert_eq!(next_packet(rx).await, expected_owns(1).await);
@@ -1683,9 +1700,9 @@ mod tests {
         expect_startup(&h, &mut rx).await;
 
         // Take on new playback: OwnsConnection [1], no hijack, show-UI or
-        // media information packet. The reply to Auto's "not owning" comes
-        // first (#54).
-        h.emit(owns(0));
+        // media information packet. The AirPods' own owner report, [0],
+        // is stepped first, as on hardware.
+        h.emit_queued(owns(0)).await;
         h.play(false).await;
         h.play(true).await;
         let take = next_packet(&mut rx).await;
@@ -3359,8 +3376,8 @@ mod tests {
             Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
         assert!(h.playback_started.load(Ordering::SeqCst));
         expect_startup(&h, &mut rx).await;
-        // The reply to Auto's "not owning" (#54).
-        h.emit(owns(0));
+        // The AirPods' own owner report, stepped before the stream starts.
+        h.emit_queued(owns(0)).await;
         // The stream monitor's baseline has no stream.
         streams.settle().await;
 
@@ -3741,8 +3758,9 @@ mod tests {
         /// Under the minimum after `EVENT_MS`.
         const RESET_MS: u64 = EVENT_MS + 3 * POLL_MS;
 
-        /// `ready`, then a live `Input::Auto` (answered) at `RESET_MS`; a
-        /// music stream with no MPRIS player plays from `start` ms on.
+        /// `ready`, then a live `Input::Auto` and an owner report [0] at
+        /// `RESET_MS`; a music stream with no MPRIS player plays from
+        /// `start` ms on.
         fn auto_reset_case(start: u64) -> Pipeline {
             let mut p = Pipeline::ready();
             let stream = [music(1)];
@@ -3758,7 +3776,7 @@ mod tests {
                             Command::DrainPlayback
                         ]
                     );
-                    // The reply to Auto's "not owning" (#54).
+                    // The AirPods' own owner report.
                     assert_eq!(p.feed(ms, Input::Ownership(vec![0])), []);
                 }
                 let streams: &[StreamProps] = if ms >= start { &stream } else { &[] };

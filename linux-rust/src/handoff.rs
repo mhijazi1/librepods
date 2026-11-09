@@ -116,12 +116,16 @@ pub(crate) enum Input {
     /// leaves it in place. Otherwise it changes nothing. Fed in queue order,
     /// never on a timer.
     InitBacklogDrained,
-    /// Switch to automatic handoff (REPL `auto`). Its "not owning" is a
-    /// pending release, so the reply is that release's acknowledgement and
-    /// never a loss; a play edge before the reply is retaken once it
-    /// settles (#54). While any request is pending (a repeated Auto, a
-    /// release or a take) it sends no "not owning", so every one in flight
-    /// has a tracked acknowledgement.
+    /// Switch to automatic handoff (REPL `auto`). When the cached owner is
+    /// Linux ([1]) its "not owning" is a pending release, so the reply is
+    /// that release's acknowledgement and never a loss; a play edge before
+    /// the reply is retaken once it settles (#54). With owner [0] or unknown
+    /// it is sent untracked: the AirPods reply only to a real change (#159),
+    /// so nothing waits for a reply (#289). Accepted limit: with an unknown
+    /// owner while Linux did own, a take sent before that [0] arrives
+    /// yields to it. While any request is pending (a repeated Auto, a
+    /// release or a take) it sends no "not owning", so no reply is left
+    /// acknowledging nothing.
     Auto,
     /// Switch to manual mode (REPL `manual`).
     Manual,
@@ -552,10 +556,15 @@ impl Handoff {
                 self.snapshot_hosts.clear();
                 out.push(Command::ConnectA2dp);
                 if !self.requested_take && self.pending.is_none() {
-                    // Tracked like a playback-stop release (#54). A release
-                    // already pending covers it: a second "not owning" would
-                    // get a reply that acknowledges nothing.
+                    // Tracked like a playback-stop release (#54) only when
+                    // Linux owns: the AirPods reply only to a real change
+                    // (#159, #289). A release already pending covers it: a
+                    // second "not owning" would get a reply that
+                    // acknowledges nothing.
                     self.request(now, false, Cause::Playback, out);
+                    if self.owner.as_deref() != Some(&[1]) {
+                        self.pending = None;
+                    }
                 }
                 self.automatic = true;
                 self.announce(out);
@@ -2172,9 +2181,13 @@ mod tests {
     fn auto_release_reply_never_yields() {
         // #54: a stop->play edge lands before the reply to Auto's "not
         // owning"; the reply acknowledges that release and the edge is
-        // retaken, with no yield or pause.
+        // retaken, with no yield or pause. Owner [1]: the only case where
+        // the AirPods reply (#289).
         let mut p = Probe::new(false, true);
-        p.routing(ready_facts());
+        p.routing(SessionFacts {
+            owner: Some(vec![1]),
+            ..ready_facts()
+        });
         assert_eq!(
             p.feed(100, Input::Auto),
             [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
@@ -2194,8 +2207,12 @@ mod tests {
     fn repeated_auto_reply_never_yields() {
         // A second Auto while the first one's release is pending sends no
         // second "not owning", so no reply is left acknowledging nothing.
+        // Owner [1]: the only case where the AirPods reply (#289).
         let mut p = Probe::new(false, true);
-        p.routing(ready_facts());
+        p.routing(SessionFacts {
+            owner: Some(vec![1]),
+            ..ready_facts()
+        });
         let mut all = p.feed(100, Input::Auto);
         all.extend(p.feed(150, Input::Auto));
         all.extend(p.play(200, false));
@@ -2210,6 +2227,106 @@ mod tests {
         assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
         assert_eq!(p.play(600, false), []);
         assert_eq!(p.hold_ends(600), [SendOwnership(false)]);
+    }
+
+    #[test]
+    fn auto_tracked_when_linux_owner_acks() {
+        // Owner [1]: the AirPods reply to Auto's "not owning", and that [0]
+        // acknowledges it rather than being a loss (#54).
+        let mut p = Probe::new(false, true);
+        p.routing(SessionFacts {
+            owner: Some(vec![1]),
+            ..ready_facts()
+        });
+        assert_eq!(
+            p.feed(100, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+        );
+        assert!(p.core.pending.is_some());
+        p.core.take_lines();
+        assert_eq!(p.feed(200, Input::Ownership(vec![0])), []);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "ACK owner=not-linux"), 1);
+        assert_eq!(count_lines(&lines, "YIELD"), 0);
+        assert!(p.core.pending.is_none());
+    }
+
+    /// A manual, live session with `facts` gets Auto at 100 ms: owner [0] or
+    /// unknown, so its "not owning" is untracked (#289).
+    fn untracked_auto(facts: SessionFacts) -> Probe {
+        let mut p = Probe::new(false, true);
+        p.routing(facts);
+        assert_eq!(
+            p.feed(100, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+        );
+        assert!(p.core.pending.is_none());
+        p.core.take_lines();
+        p
+    }
+
+    #[test]
+    fn auto_untracked_when_not_owner_waits_for_nothing() {
+        // Owner [0]: the AirPods never reply to this "not owning" (#159).
+        let tick = 100 + ACK_TIMEOUT.as_millis() as u64 + 1;
+        let mut p = untracked_auto(ready_facts());
+        assert_eq!(p.feed(tick, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 0);
+        assert_eq!(p.core.timed_out_release, None);
+        // From the same point, 1 s after Auto: (a) a play edge takes in
+        // that step;
+        let mut p = untracked_auto(ready_facts());
+        assert_eq!(p.play(200, false), []);
+        assert_eq!(p.play(1100, true), [SendOwnership(true)]);
+        // (b) a take is not answered with WAIT;
+        let mut p = untracked_auto(ready_facts());
+        assert_eq!(p.feed(1100, Input::Take), [SendOwnership(true)]);
+        assert_eq!(count_lines(&p.core.take_lines(), "WAIT"), 0);
+        // (c) a quit exits without a Fail;
+        let mut p = untracked_auto(ready_facts());
+        assert_eq!(p.feed(1100, Input::Quit), [Exit]);
+        // (d) a remote request has no release to join.
+        let mut p = untracked_auto(ready_facts());
+        assert_eq!(p.feed(1100, Input::RemoteOwnershipRequest), []);
+        let lines = p.core.take_lines();
+        assert_eq!(
+            count_lines(
+                &lines,
+                "REMOTE requested ownership; release already pending"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn auto_untracked_with_unknown_owner() {
+        // The usual app case: the AirPods' owner report arrives after Auto.
+        let unknown = || SessionFacts {
+            owner: None,
+            ..ready_facts()
+        };
+        let tick = 100 + ACK_TIMEOUT.as_millis() as u64 + 1;
+        let mut p = untracked_auto(unknown());
+        assert_eq!(p.feed(tick, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 0);
+        let mut p = untracked_auto(unknown());
+        assert_eq!(p.play(200, false), []);
+        assert_eq!(p.play(1100, true), [SendOwnership(true)]);
+        // That report, a [0] with nothing pending, is no loss and leaves the
+        // last owner alone: only an unsolicited [0] after [1] clears it (#16).
+        let mut p = untracked_auto(unknown());
+        p.core.last_owner_linux = true;
+        assert_eq!(p.feed(200, Input::Ownership(vec![0])), []);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 0);
+        assert!(p.core.pending.is_none());
+        assert!(p.core.last_owner_linux);
+        // Accepted residual: if Linux did own, a take sent before that [0]
+        // arrives yields to it.
+        let mut p = untracked_auto(unknown());
+        assert_eq!(p.play(200, false), []);
+        assert_eq!(p.play(300, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(400, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
     }
 
     /// Automatic take for playback, acknowledged, playback still running at
