@@ -40,7 +40,8 @@ use crate::stream_monitor::{
     PulsePlaybackStreams, Starts,
 };
 use crate::utils::{self, ConnectMode, SwitchingMode};
-use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use log::{error, info};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -55,6 +56,10 @@ use tokio::task::AbortHandle;
 pub(crate) const TICK: Duration = Duration::from_millis(200);
 /// Interval between playback polls in production.
 pub(crate) const PLAYBACK_POLL: Duration = Duration::from_millis(500);
+/// How long a replacement task or an exit waits for a stopped task's A2DP
+/// hold release to settle (#294).
+pub(crate) const SHUTDOWN_RELEASE_WAIT: Duration = Duration::from_secs(2);
+const _: () = assert!(SHUTDOWN_RELEASE_WAIT.as_millis() <= 2000);
 
 type ControlTx = mpsc::UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>;
 type Events = mpsc::UnboundedReceiver<AACPEvent>;
@@ -153,6 +158,11 @@ pub(crate) trait MediaActions: Send + Sync {
     /// Mark the A2DP hold (#264) at once, then enqueue its card write with
     /// the routes; never waits for the sound server.
     fn hold_a2dp(&self, hold: bool);
+    /// Resolves once the hold writes enqueued before this call are applied
+    /// (#294); ready by default.
+    fn hold_settled(&self) -> BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
     /// Ear detection's resume reports (#313); none by default.
     fn ear_resumes(&self) -> mpsc::UnboundedReceiver<bool> {
         mpsc::unbounded_channel().1
@@ -241,6 +251,10 @@ impl MediaActions for ControllerMedia {
     fn hold_a2dp(&self, hold: bool) {
         self.controller.set_a2dp_held(hold);
         self.sinks.route(SinkEvent::Hold(hold));
+    }
+
+    fn hold_settled(&self) -> BoxFuture<'static, ()> {
+        Box::pin(self.sinks.settled())
     }
 
     fn ear_resumes(&self) -> mpsc::UnboundedReceiver<bool> {
@@ -527,12 +541,71 @@ async fn session_alive(manager: &AACPManager) -> bool {
 struct HandoffTask {
     id: u64,
     handle: AbortHandle,
+    released: Released,
+}
+
+/// A stopped task's A2DP hold release (#294): its settle, sent by the task's
+/// `Shell` as it drops; dropped unsent when the task held nothing.
+type Released = oneshot::Receiver<BoxFuture<'static, ()>>;
+
+/// Stopped tasks' releases, each bounded by `SHUTDOWN_RELEASE_WAIT` from its
+/// stop.
+type Pending = Shared<BoxFuture<'static, ()>>;
+
+#[derive(Default)]
+struct Registry {
+    tasks: HashMap<String, HandoffTask>,
+    /// Each MAC's pending releases, kept outside the abortable tasks so a
+    /// replacement replaced in turn still hands them on (#294).
+    releases: HashMap<String, Pending>,
+    /// Set by the exit's shutdown, which every exit request awaits; no task
+    /// starts after it.
+    shutdown: Option<Pending>,
+}
+
+impl Registry {
+    /// Abort this MAC's task, if one runs, and add its release to the
+    /// pending ones. Its drop releases its A2DP hold.
+    fn stop(&mut self, mac: &str) {
+        let Some(task) = self.tasks.remove(mac) else {
+            return;
+        };
+        task.handle.abort();
+        let release = tokio::time::timeout(SHUTDOWN_RELEASE_WAIT, async {
+            if let Ok(settled) = task.released.await {
+                settled.await;
+            }
+        });
+        let earlier = self.releases.remove(mac);
+        let pending = async move {
+            let _ = release.await;
+            if let Some(earlier) = earlier {
+                earlier.await;
+            }
+        };
+        self.releases
+            .insert(mac.to_string(), pending.boxed().shared());
+    }
+
+    /// Stop every task once; the result settles with all pending releases.
+    fn shutdown(&mut self) -> Pending {
+        if let Some(shutdown) = &self.shutdown {
+            return shutdown.clone();
+        }
+        let macs: Vec<_> = self.tasks.keys().cloned().collect();
+        for mac in macs {
+            self.stop(&mac);
+        }
+        let all = futures::future::join_all(self.releases.drain().map(|(_, pending)| pending));
+        let shutdown = all.map(drop).boxed().shared();
+        self.shutdown = Some(shutdown.clone());
+        shutdown
+    }
 }
 
 // One handoff task per AirPods MAC. A replacement AirPodsDevice for the same
 // MAC aborts its predecessor, like the legacy PLAYBACK_LISTENERS.
-static HANDOFF_TASKS: LazyLock<StdMutex<HashMap<String, HandoffTask>>> =
-    LazyLock::new(|| StdMutex::new(HashMap::new()));
+static HANDOFF_TASKS: LazyLock<StdMutex<Registry>> = LazyLock::new(StdMutex::default);
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
 // Whether Linux was the last owner of each AirPods MAC (#16). Outlives the
@@ -551,11 +624,24 @@ fn remember_last_owner_linux(mac: &str, value: bool) {
         .insert(mac.to_string(), value);
 }
 
-/// Stop the handoff task of this AirPods MAC, if one runs.
+/// Stop the handoff task of this AirPods MAC, if one runs. Its drop releases
+/// its A2DP hold (#294).
 pub(crate) fn stop_handoff_task(mac: &str) {
-    if let Some(task) = HANDOFF_TASKS.lock().unwrap().remove(mac) {
-        task.handle.abort();
-    }
+    HANDOFF_TASKS.lock().unwrap().stop(mac);
+}
+
+/// At exit: stop every handoff task, then wait, at most
+/// `SHUTDOWN_RELEASE_WAIT`, for the held ones' releases to settle (#294).
+/// Every call waits for the same shutdown.
+pub(crate) async fn stop_all_handoff_tasks() {
+    shutdown(&HANDOFF_TASKS).await;
+}
+
+fn shutdown(registry: &StdMutex<Registry>) -> Pending {
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .shutdown()
 }
 
 /// The running handoff task of this AirPods MAC.
@@ -564,6 +650,7 @@ pub(crate) fn handoff_task(mac: &str) -> Option<AbortHandle> {
     HANDOFF_TASKS
         .lock()
         .unwrap()
+        .tasks
         .get(mac)
         .map(|task| task.handle.clone())
 }
@@ -571,41 +658,55 @@ pub(crate) fn handoff_task(mac: &str) -> Option<AbortHandle> {
 /// Removes a finished task's registry entry, unless a replacement already
 /// took the MAC. Runs on return, abort and panic alike.
 struct Unregister {
+    registry: &'static StdMutex<Registry>,
     mac: String,
     id: u64,
 }
 
 impl Drop for Unregister {
     fn drop(&mut self) {
-        let mut tasks = HANDOFF_TASKS.lock().unwrap_or_else(|e| e.into_inner());
-        if tasks.get(&self.mac).is_some_and(|task| task.id == self.id) {
-            tasks.remove(&self.mac);
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        if registry
+            .tasks
+            .get(&self.mac)
+            .is_some_and(|task| task.id == self.id)
+        {
+            registry.tasks.remove(&self.mac);
         }
     }
 }
 
-fn spawn_handoff_task(mac: String, shell: Shell) {
-    let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+fn spawn_handoff_task(registry: &'static StdMutex<Registry>, mac: String, mut shell: Shell) {
     // Held across the spawn, so the new task cannot unregister before it is
     // registered.
-    let mut tasks = HANDOFF_TASKS.lock().unwrap();
-    if let Some(previous) = tasks.remove(&mac) {
-        info!("Stopping the previous handoff task for {mac}");
-        previous.handle.abort();
+    let mut tasks = registry.lock().unwrap();
+    if tasks.shutdown.is_some() {
+        info!("Exiting: no handoff task for {mac}");
+        return;
     }
+    if tasks.tasks.contains_key(&mac) {
+        info!("Stopping the previous handoff task for {mac}");
+    }
+    tasks.stop(&mac);
+    let previous = tasks.releases.get(&mac).cloned();
+    let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+    let (release_tx, released) = oneshot::channel();
+    shell.released = Some(release_tx);
     let unregister = Unregister {
+        registry,
         mac: mac.clone(),
         id,
     };
     let task = tokio::spawn(async move {
         let _unregister = unregister;
-        run_handoff(shell).await;
+        run_handoff(shell, previous).await;
     });
-    tasks.insert(
+    tasks.tasks.insert(
         mac,
         HandoffTask {
             id,
             handle: task.abort_handle(),
+            released,
         },
     );
 }
@@ -635,6 +736,23 @@ struct Shell {
     connect_mode: ConnectMode,
     /// Relay Linux's audio category to the other hosts (#272).
     relay_category: bool,
+    /// Whether the last `HoldA2dp` held (#264); released on drop (#294).
+    held: bool,
+    /// Where the drop sends its release's settle.
+    released: Option<oneshot::Sender<BoxFuture<'static, ()>>>,
+}
+
+/// The task's future drops its `Shell` on return, abort and panic alike,
+/// after its last poll, so no hold of its own can follow this release.
+impl Drop for Shell {
+    fn drop(&mut self) {
+        if self.held {
+            self.media.hold_a2dp(false);
+            if let Some(released) = self.released.take() {
+                let _ = released.send(self.media.hold_settled());
+            }
+        }
+    }
 }
 
 /// Receives each line the handoff core emits, in order, right after it is
@@ -720,7 +838,10 @@ impl Shell {
                 }
                 Command::RouteToAirPods => self.media.route_default_sink(SinkEvent::Take),
                 Command::RouteAway => self.media.route_default_sink(SinkEvent::Yield),
-                Command::HoldA2dp(hold) => self.media.hold_a2dp(hold),
+                Command::HoldA2dp(hold) => {
+                    self.held = hold;
+                    self.media.hold_a2dp(hold);
+                }
                 Command::DropSession => {
                     self.resume = None;
                     info!(
@@ -829,12 +950,17 @@ async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
     }
 }
 
-async fn run_handoff(mut shell: Shell) {
+async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     // A reconnect the watcher made for new playback takes for it once the
     // session reports its routing (#307); otherwise the normal start. Claimed
     // first, so the watcher still clears it on a stop during the wait; its
     // age is judged there only, so the wait can't expire it.
     let marked = reconnect::claim_marker(&shell.mac);
+    // The stopped tasks' card writes must not land after this session's
+    // first hold (#294).
+    if let Some(previous) = previous {
+        previous.await;
+    }
     let ready = marked && reconnect::routing_ready(&shell.manager).await;
     if marked && !ready {
         shell.log("RECONNECT host state not ready in 5 s; starting without a take");
@@ -1148,8 +1274,10 @@ impl Switching {
                     lines: self.lines,
                     connect_mode: self.connect_mode,
                     relay_category: self.relay_category,
+                    held: false,
+                    released: None,
                 };
-                spawn_handoff_task(self.airpods_mac, shell);
+                spawn_handoff_task(&HANDOFF_TASKS, self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
             }
             Policy::Legacy(legacy) => {
@@ -1364,6 +1492,9 @@ mod tests {
         routes: StdMutex<Vec<SinkEvent>>,
         /// `routes.len()` at each resume chain spawn (#264).
         resume_spawns: StdMutex<Vec<usize>>,
+        /// While set, `hold_settled` waits for one `gate` permit (#294).
+        gated: AtomicBool,
+        gate: Notify,
     }
 
     /// Records the media actions instead of touching D-Bus or PipeWire. The
@@ -1415,6 +1546,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(SinkEvent::Hold(hold));
+        }
+
+        fn hold_settled(&self) -> BoxFuture<'static, ()> {
+            let records = self.records.clone();
+            Box::pin(async move {
+                if records.gated.load(Ordering::SeqCst) {
+                    records.gate.notified().await;
+                }
+            })
         }
     }
 
@@ -3025,18 +3165,10 @@ mod tests {
         assert_eq!(ear_rx.try_recv(), Ok(false));
     }
 
-    /// #358: a reinsertion's `false` report handled while its EarState is
-    /// still queued (the report won the select) still ends the grace. Calls
-    /// the ear_rx arm directly: a current-thread runtime can't interleave
-    /// the select's polls with the router.
-    #[tokio::test]
-    async fn ear_report_drains_its_queued_ear_state() {
-        use EarDetectionStatus::{InEar, OutOfEar};
-        let mac = "5A:00:00:00:00:1E";
-        let (manager, mut rx, _tx) = ready_session().await;
+    /// A task's `Shell` on fake media, with no samples.
+    fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
         let (_records, (_, media)) = Harness::fake_media(mac);
-        let (events_tx, events) = mpsc::unbounded_channel();
-        let mut shell = Shell {
+        Shell {
             mac: mac.to_string(),
             local: LOCAL.to_string(),
             manager,
@@ -3051,7 +3183,22 @@ mod tests {
             lines: None,
             connect_mode: ConnectMode::default(),
             relay_category: false,
-        };
+            held: false,
+            released: None,
+        }
+    }
+
+    /// #358: a reinsertion's `false` report handled while its EarState is
+    /// still queued (the report won the select) still ends the grace. Calls
+    /// the ear_rx arm directly: a current-thread runtime can't interleave
+    /// the select's polls with the router.
+    #[tokio::test]
+    async fn ear_report_drains_its_queued_ear_state() {
+        use EarDetectionStatus::{InEar, OutOfEar};
+        let mac = "5A:00:00:00:00:1E";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let mut shell = bare_shell(mac, manager, events);
         // Remote owns and plays media; one bud out.
         let mut core = Handoff::new(LOCAL.to_string(), Instant::now(), true, true);
         for input in [
@@ -5904,5 +6051,233 @@ mod tests {
         // The chain was spawned after the release and the retake's route.
         assert_eq!(*h.records.resume_spawns.lock().unwrap(), [events.len()]);
         stop_handoff_task(mac);
+    }
+
+    /// #294: a started task on a `no_source_session`, holding A2DP after
+    /// another host's request.
+    async fn held_task(
+        mac: &str,
+        manager: &AACPManager,
+        rx: &mut mpsc::Receiver<Vec<u8>>,
+    ) -> Harness {
+        let h = Harness::start(SwitchingMode::Handoff, mac, manager).await;
+        expect_startup(&h, rx).await;
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        wait_until("the hold", || {
+            h.sink_events().ends_with(&[SinkEvent::Hold(true)])
+        })
+        .await;
+        // The request's answer.
+        assert_eq!(next_packet(rx).await, expected_owns(0).await);
+        h
+    }
+
+    /// The sink events once `mac`'s task has stopped and settled.
+    async fn after_stop(h: &Harness, task: AbortHandle) -> Vec<SinkEvent> {
+        wait_until("the task to stop", || task.is_finished()).await;
+        tokio::time::sleep(SETTLE).await;
+        h.sink_events()
+    }
+
+    #[tokio::test]
+    async fn stop_releases_a2dp_hold_when_held() {
+        let mac = "5A:00:00:00:08:01";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let h = held_task(mac, &manager, &mut rx).await;
+        let mut expected = h.sink_events();
+        let task = handoff_task(mac).expect("task");
+        stop_handoff_task(mac);
+        expected.push(SinkEvent::Hold(false));
+        assert_eq!(after_stop(&h, task).await, expected);
+        // No ownership packet at the stop (map Q1).
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    }
+
+    #[tokio::test]
+    async fn stop_releases_a2dp_hold_only_when_held() {
+        let mac = "5A:00:00:00:08:02";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        expect_startup(&h, &mut rx).await;
+        // The session start's release only: the last hold command is false.
+        assert_eq!(h.sink_events(), [SinkEvent::Hold(false)]);
+        let task = handoff_task(mac).expect("task");
+        stop_handoff_task(mac);
+        assert_eq!(after_stop(&h, task).await, [SinkEvent::Hold(false)]);
+    }
+
+    #[tokio::test]
+    async fn replacement_releases_a2dp_hold_before_its_start() {
+        let mac = "5A:00:00:00:08:03";
+        let (first_manager, mut first_rx, _first_tx) = no_source_session().await;
+        let first = held_task(mac, &first_manager, &mut first_rx).await;
+        let mut expected = first.sink_events();
+        first.records.gated.store(true, Ordering::SeqCst);
+
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let replacement = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        wait_until("the release", || first.sink_events().len() > expected.len()).await;
+        tokio::time::sleep(SETTLE).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(replacement.sink_events(), []);
+
+        first.records.gate.notify_one();
+        expect_startup(&replacement, &mut rx).await;
+        assert_eq!(replacement.sink_events(), [SinkEvent::Hold(false)]);
+        expected.push(SinkEvent::Hold(false));
+        assert_eq!(first.sink_events(), expected);
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_releases_a2dp_hold_starts_by_wait_unsettled() {
+        let mac = "5A:00:00:00:08:04";
+        let (first_manager, mut first_rx, _first_tx) = no_source_session().await;
+        let first = held_task(mac, &first_manager, &mut first_rx).await;
+        first.records.gated.store(true, Ordering::SeqCst);
+
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let replaced = tokio::time::Instant::now();
+        let _replacement = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        let waited = replaced.elapsed();
+        assert!(
+            waited >= SHUTDOWN_RELEASE_WAIT && waited < SHUTDOWN_RELEASE_WAIT + TICK,
+            "{waited:?}"
+        );
+        stop_handoff_task(mac);
+    }
+
+    /// Moves these MACs' tasks and pending releases out of the process-wide
+    /// registry, so a test's shutdown leaves the other tests alone.
+    fn private_registry(macs: &[&str]) -> &'static StdMutex<Registry> {
+        let mut global = HANDOFF_TASKS.lock().unwrap();
+        let mut private = Registry::default();
+        for &mac in macs {
+            if let Some(task) = global.tasks.remove(mac) {
+                private.tasks.insert(mac.to_string(), task);
+            }
+            if let Some(pending) = global.releases.remove(mac) {
+                private.releases.insert(mac.to_string(), pending);
+            }
+        }
+        Box::leak(Box::new(StdMutex::new(private)))
+    }
+
+    /// The exit path (`stop_all_handoff_tasks`) on this test's tasks only.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_releases_a2dp_holds() {
+        let held_mac = "5A:00:00:00:08:05";
+        let idle_mac = "5A:00:00:00:08:06";
+        let (held_manager, mut held_rx, _held_tx) = no_source_session().await;
+        let held = held_task(held_mac, &held_manager, &mut held_rx).await;
+        // Its release never settles.
+        held.records.gated.store(true, Ordering::SeqCst);
+        let (idle_manager, mut idle_rx, _idle_tx) = no_source_session().await;
+        let idle = Harness::start(SwitchingMode::Handoff, idle_mac, &idle_manager).await;
+        expect_startup(&idle, &mut idle_rx).await;
+        let mut expected_held = held.sink_events();
+        let expected_idle = idle.sink_events();
+
+        let registry = private_registry(&[held_mac, idle_mac]);
+        let stopped = tokio::time::Instant::now();
+        shutdown(registry).await;
+        assert!(stopped.elapsed() <= SHUTDOWN_RELEASE_WAIT);
+
+        expected_held.push(SinkEvent::Hold(false));
+        assert_eq!(held.sink_events(), expected_held);
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(held.sink_events(), expected_held);
+        assert_eq!(idle.sink_events(), expected_idle);
+    }
+
+    /// A→B→C: B, still waiting for A's release, holds nothing; C must wait
+    /// for A's release all the same.
+    #[tokio::test]
+    async fn second_replacement_releases_a2dp_hold_before_its_start() {
+        let mac = "5A:00:00:00:08:07";
+        let (first_manager, mut first_rx, _first_tx) = no_source_session().await;
+        let first = held_task(mac, &first_manager, &mut first_rx).await;
+        let mut expected = first.sink_events();
+        first.records.gated.store(true, Ordering::SeqCst);
+        let (second_manager, mut second_rx, _second_tx) = no_source_session().await;
+        let second = Harness::start(SwitchingMode::Handoff, mac, &second_manager).await;
+        wait_until("the release", || first.sink_events().len() > expected.len()).await;
+
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let third = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        tokio::time::sleep(SETTLE).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(third.sink_events(), []);
+
+        first.records.gate.notify_one();
+        expect_startup(&third, &mut rx).await;
+        assert_eq!(third.sink_events(), [SinkEvent::Hold(false)]);
+        assert!(second_rx.try_recv().is_err());
+        assert_eq!(second.sink_events(), []);
+        expected.push(SinkEvent::Hold(false));
+        assert_eq!(first.sink_events(), expected);
+        stop_handoff_task(mac);
+    }
+
+    /// A held task whose release is gated, replaced by a task that waits for
+    /// that release; both moved to a private registry.
+    async fn held_then_replaced(mac: &str) -> (Harness, Harness, &'static StdMutex<Registry>) {
+        let (first_manager, mut first_rx, _first_tx) = no_source_session().await;
+        let first = held_task(mac, &first_manager, &mut first_rx).await;
+        let held = first.sink_events().len();
+        first.records.gated.store(true, Ordering::SeqCst);
+        let (manager, _rx, _tx) = no_source_session().await;
+        let second = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        wait_until("the release", || first.sink_events().len() > held).await;
+        (first, second, private_registry(&[mac]))
+    }
+
+    /// The exit while a replacement waits for its predecessor's release
+    /// waits for that release too.
+    #[tokio::test]
+    async fn shutdown_releases_a2dp_holds_of_replaced_tasks() {
+        let (first, _second, registry) = held_then_replaced("5A:00:00:00:08:08").await;
+        let exit = tokio::spawn(shutdown(registry));
+        tokio::time::sleep(SETTLE).await;
+        assert!(!exit.is_finished());
+        first.records.gate.notify_one();
+        tokio::time::timeout(SETTLE, exit)
+            .await
+            .expect("the exit")
+            .unwrap();
+    }
+
+    /// A second exit request (tray Exit, then SIGTERM) waits for the first
+    /// one's releases.
+    #[tokio::test]
+    async fn shutdown_releases_a2dp_holds_for_every_exit_request() {
+        let (first, _second, registry) = held_then_replaced("5A:00:00:00:08:09").await;
+        let released = first.sink_events();
+        let exits = [shutdown(registry), shutdown(registry)].map(tokio::spawn);
+        tokio::time::sleep(SETTLE).await;
+        assert!(exits.iter().all(|exit| !exit.is_finished()));
+        first.records.gate.notify_one();
+        for exit in exits {
+            tokio::time::timeout(SETTLE, exit)
+                .await
+                .expect("the exit")
+                .unwrap();
+        }
+        assert_eq!(first.sink_events(), released);
+    }
+
+    /// No task starts once the exit has begun: nothing would release it.
+    #[tokio::test]
+    async fn shutdown_releases_a2dp_holds_before_any_new_task() {
+        let mac = "5A:00:00:00:08:0A";
+        let (first, _second, registry) = held_then_replaced(mac).await;
+        let exit = shutdown(registry);
+        let (manager, _rx, _tx) = no_source_session().await;
+        let shell = bare_shell(mac, manager, mpsc::unbounded_channel().1);
+        spawn_handoff_task(registry, mac.to_string(), shell);
+        assert!(registry.lock().unwrap().tasks.is_empty());
+        first.records.gate.notify_one();
+        exit.await;
     }
 }

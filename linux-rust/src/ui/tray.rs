@@ -218,7 +218,14 @@ impl ksni::Tray for MyTray {
             StandardItem {
                 label: "Exit".into(),
                 icon_name: "application-exit".into(),
-                activate: Box::new(|_| std::process::exit(0)),
+                // Releases the A2DP holds first (#294); ksni runs this on
+                // the tokio runtime.
+                activate: Box::new(|_| {
+                    tokio::spawn(async {
+                        crate::switching::stop_all_handoff_tasks().await;
+                        std::process::exit(0);
+                    });
+                }),
                 ..Default::default()
             }
             .into(),
