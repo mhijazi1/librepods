@@ -70,6 +70,10 @@ pub(crate) enum Input {
     Playback { sampled_at: Instant, category: u32 },
     /// Wear report (AACP ear detection).
     EarState(Vec<EarDetectionStatus>),
+    /// The shell's ear-detection resume for one reinsertion: whether it
+    /// played any player (#313). A `false` answering the last reinsertion
+    /// still due a report ends the ear-resume grace; a `true` keeps it.
+    EarResume { resumed: bool },
     /// Audio source report.
     AudioSource(AudioSource),
     /// Connected hosts report: previous and new list. Linux announces itself
@@ -343,6 +347,8 @@ pub(crate) struct Handoff {
     /// lost session or a disconnect end it; a stop sample doesn't, as the
     /// removal's stop may be polled after the reinsertion.
     ear_resume_until: Option<Instant>,
+    /// Reinsertions not yet answered by an `EarResume` report (#313).
+    ear_reports_due: u32,
 }
 
 impl Handoff {
@@ -395,6 +401,7 @@ impl Handoff {
             relays: HashMap::new(),
             category_relay: false,
             ear_resume_until: None,
+            ear_reports_due: 0,
         }
     }
 
@@ -491,8 +498,16 @@ impl Handoff {
                 if reinserted && self.remote_owns && !self.requested_take {
                     self.ear_resume_until = Some(now + EAR_RESUME_GRACE);
                 }
+                // The shell reports on every reinsertion, whoever owns.
+                self.ear_reports_due += u32::from(reinserted);
                 self.case_closed = case_closed_after(&ears, self.case_closed);
                 self.ears = ears;
+            }
+            Input::EarResume { resumed } => {
+                self.ear_reports_due = self.ear_reports_due.saturating_sub(1);
+                if !resumed && self.ear_reports_due == 0 {
+                    self.ear_resume_until = None;
+                }
             }
             Input::AudioSource(source) => {
                 if self.remote_took(&source) {
@@ -5459,5 +5474,99 @@ mod tests {
         // A play within the grace is not ear detection's resume.
         assert_eq!(p.play_category(700, MEDIA), [SendOwnership(true)]);
         assert!(!p.core.take_lines().contains(&EAR_RESUMED.to_string()));
+    }
+
+    // #313: the shell's report on its ear-detection resume.
+    fn resumed(p: &mut Probe, ms: u64, resumed: bool) {
+        assert_eq!(p.feed(ms, Input::EarResume { resumed }), []);
+    }
+
+    #[test]
+    fn ear_reinsert_without_resume_play_takes() {
+        for relayed in [MEDIA, IDLE] {
+            let mut p = bud_out(relayed, true);
+            resumed(&mut p, 250, false);
+            let mut all = p.play_category(700, MEDIA);
+            all.extend(p.play_category(1200, MEDIA));
+            assert_eq!(takes(&all), 1, "{relayed}: {all:?}");
+            assert!(!p.core.take_lines().contains(&EAR_RESUMED.to_string()));
+        }
+    }
+
+    #[test]
+    fn ear_reinsert_without_resume_during_auto_release() {
+        let timed_out = 100 + ACK_TIMEOUT.as_millis() as u64 + 100;
+        for (name, ms, settle) in [
+            ("ack", 1100, Input::Ownership(vec![0])),
+            ("timeout", timed_out, Input::Tick),
+        ] {
+            // ear_resume_during_auto_release_does_not_take's sequence, with
+            // the report after the reinsertion, or with no reinsertion.
+            let run = |reinsert: bool| {
+                let mut p = Probe::new(false, true);
+                p.routing(SessionFacts {
+                    owner: Some(vec![1]),
+                    ..ready_facts()
+                });
+                let mut all = p.feed(100, Input::Auto);
+                all.extend(p.feed(150, remote_media()));
+                all.extend(p.feed(160, relay(REMOTE, MEDIA)));
+                all.extend(p.play_category(200, MEDIA));
+                all.extend(p.feed(300, Input::EarState(vec![InEar, OutOfEar])));
+                if reinsert {
+                    all.extend(p.feed(400, Input::EarState(vec![InEar, InEar])));
+                    all.extend(p.feed(450, Input::EarResume { resumed: false }));
+                }
+                all.extend(p.play_category(500, IDLE));
+                all.extend(p.play_category(1000, MEDIA));
+                assert!(p.core.play_during_release, "{name}");
+                all.extend(p.feed(ms, settle.clone()));
+                let lines = p.core.take_lines();
+                assert!(!lines.contains(&EAR_RESUMED.to_string()), "{name}");
+                all
+            };
+            assert_eq!(run(true), run(false), "{name}");
+        }
+    }
+
+    #[test]
+    fn ear_resume_reported_still_does_not_take() {
+        for relayed in [MEDIA, IDLE] {
+            let mut p = bud_out(relayed, true);
+            resumed(&mut p, 250, true);
+            let mut all = p.play_category(700, MEDIA);
+            all.extend(p.play_category(1200, MEDIA));
+            assert_eq!(takes(&all), 0, "{relayed}: {all:?}");
+            assert_eq!(p.core.take_lines(), [EAR_RESUMED]);
+        }
+    }
+
+    #[test]
+    fn ear_resume_play_before_report_does_not_take() {
+        let mut p = bud_out(MEDIA, true);
+        assert_eq!(p.play_category(700, MEDIA), []);
+        assert_eq!(p.core.take_lines(), [EAR_RESUMED]);
+        resumed(&mut p, 800, false);
+        assert_eq!(p.play_category(1200, MEDIA), []);
+    }
+
+    #[test]
+    fn ear_resume_stale_report_keeps_later_grace() {
+        let mut p = bud_out(MEDIA, true);
+        p.feed(300, Input::EarState(vec![InEar, OutOfEar]));
+        p.feed(400, Input::EarState(vec![InEar, InEar]));
+        // The first reinsertion's report: the second is still due one.
+        resumed(&mut p, 450, false);
+        assert_eq!(p.play_category(700, MEDIA), []);
+        assert_eq!(p.core.take_lines(), [EAR_RESUMED]);
+        resumed(&mut p, 800, false);
+        assert_eq!(p.play_category(900, IDLE), []);
+        assert_eq!(p.play_category(1000, MEDIA), [SendOwnership(true)]);
+
+        // A stray report changes nothing.
+        let mut p = remote_playing(Some(MEDIA));
+        resumed(&mut p, 100, false);
+        assert_eq!(p.core.ear_resume_until, None);
+        assert_eq!(p.core.ear_reports_due, 0);
     }
 }
