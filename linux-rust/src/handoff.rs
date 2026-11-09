@@ -1462,15 +1462,13 @@ impl Handoff {
     /// Mac does (#324, spike #325): no take held or pending, the connect
     /// mode allows it, and the policy allows it with Linux asking at 100.
     fn connect_take_allowed(&self) -> bool {
-        let routing = RoutingSnapshot {
-            local_category: AUDIO_CATEGORY_IDLE,
-            ..self.routing()
-        };
-        let inputs = TakeoverInputs::handoff(TakeoverTrigger::Connected, routing, self.recovery);
         !self.requested_take
             && self.pending.is_none()
             && self.auto_take_allowed()
-            && decide_takeover(inputs).action == TakeoverAction::TakeOver
+            && self
+                .decide_take(TakeoverTrigger::Connected, AUDIO_CATEGORY_IDLE)
+                .action
+                == TakeoverAction::TakeOver
     }
 
     /// The connect take: only "owning" is sent. It is idle, so it stays
