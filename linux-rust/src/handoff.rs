@@ -461,6 +461,12 @@ impl Handoff {
         self.quitting
     }
 
+    /// Reconnected took ownership, and no boundary, ACK or timeout has ended
+    /// its stale-report window yet.
+    pub(crate) fn reconnect_take_pending(&self) -> bool {
+        self.reconnect_take_pending
+    }
+
     /// Protocol lines (READY/AUTO/ACK/TIMEOUT/YIELD/RECONNECT...) produced
     /// since the last call, for the shell to print.
     pub(crate) fn take_lines(&mut self) -> Vec<String> {
