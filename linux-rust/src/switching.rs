@@ -169,15 +169,16 @@ pub(crate) trait MediaActions: Send + Sync {
     }
 }
 
-/// Blocking: pauses the local players whose bus owner PID the filter
-/// accepts and reports what it did.
+/// Blocking: pauses the local players whose resolved owner
+/// (`media_controller::player_owner`) the filter accepts and reports what
+/// it did.
 pub(crate) type PausePlayers =
     Arc<dyn Fn(&dyn Fn(Option<u32>) -> bool) -> media_controller::PauseOutcome + Send + Sync>;
 
 /// Logged when `pause_own_players` matched nothing.
 pub(crate) const NOT_PAUSING: &str = "no MPRIS player with a live local stream; not pausing";
 
-/// Pause the Playing players whose bus owner PID `streams` says plays
+/// Pause the Playing players whose resolved owner `streams` says plays
 /// locally (`PlaybackState::live_or_unknown`, #302, #329); whether one
 /// matched or the session bus was unavailable. The app's yield and the
 /// probe both pause through this.
@@ -313,8 +314,9 @@ pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
 /// never holds up the MPRIS samples. Only edges reach the handoff core
 /// (`Input::Playback`), which keeps every takeover decision;
 /// `PlaybackSamples::handle` re-baselines the stream monitor when the core
-/// resets its baseline (#90). `mpris` gives the Playing players' bus owner
-/// PIDs, and `live` is whether one of them owns a live stream (#329).
+/// resets its baseline (#90). `mpris` gives the Playing players' resolved
+/// owners (`media_controller::player_owner`), and `live` is whether one of
+/// them owns a live stream (#329).
 fn spawn_playback_poller_with<M, S, P>(
     mpris: M,
     streams: S,
@@ -374,7 +376,7 @@ where
 /// one poller sample saw (#96).
 type Sources = (HashSet<Option<u32>>, u64, bool, HashSet<Option<u32>>);
 
-/// One poller sample over the Playing players' bus `owners` and the stream
+/// One poller sample over the Playing players' resolved `owners` and the stream
 /// monitor's state and stream starts: Linux's `local_category` and, against
 /// the previous sample's sources in `last` (none before the first sample),
 /// the category of a source new since then (#96): a player with a live local
@@ -6075,6 +6077,108 @@ mod tests {
                 lines.last().map(String::as_str),
                 Some("AUTO playback started; requested Linux ownership")
             );
+        }
+
+        // #349: MPRIS bridges, through `media_controller::player_owner`.
+        const BRIDGE_PID: u32 = 99_999_021;
+        const MPD_PID: u32 = 99_999_022;
+        const CHIME_PID: u32 = 99_999_023;
+
+        /// The Playing players resolved to `owners` beside `streams` (all
+        /// audible) while the iPhone owns at 301: Linux's takes over the
+        /// event, and whether the yield's filter (`pause_own_players`)
+        /// pauses one of them.
+        async fn bridged(
+            owners: &[Option<u32>],
+            streams: &[StreamProps],
+        ) -> (Vec<Vec<Command>>, bool) {
+            let mut p = remote_owns();
+            p.samples(
+                EVENT_MS,
+                EVENT_MS + 2 * MIN_MS + POLL_MS,
+                owners,
+                streams,
+                |_| LOUD,
+            );
+            let live = stream_monitor::live_stream_pids(streams, |_| None);
+            let owners = owners.to_vec();
+            let paused = pause_own_players(
+                &MediaController::new(String::new(), LOCAL.to_string()),
+                Arc::new(
+                    move |own: &dyn Fn(Option<u32>) -> bool| media_controller::PauseOutcome {
+                        paused: owners.iter().filter(|&&owner| own(owner)).count(),
+                        ..Default::default()
+                    },
+                ),
+                PlaybackState {
+                    counted: false,
+                    live: Some(live),
+                },
+            )
+            .await;
+            (p.takes(), paused)
+        }
+
+        /// The mpDris2 player (bus owner `BRIDGE_PID`) with `procs` as /proc.
+        fn mpd_player(procs: &[(u32, &str)]) -> Option<u32> {
+            media_controller::player_owner(
+                "org.mpris.MediaPlayer2.mpd",
+                Some(BRIDGE_PID),
+                |_| None,
+                || media_controller::mpd_pid(procs.iter().copied()),
+            )
+        }
+
+        /// mpDris2 beside MPD's stream. The twin: no local MPD, only a
+        /// pw-play chime.
+        #[tokio::test]
+        async fn bridge_mpd_player_takes_and_pauses_with_mpd_stream() {
+            let mpd = mpd_player(&[(CHIME_PID, "pw-play"), (MPD_PID, "mpd")]);
+            let mpd_stream = [owned_by(MPD_PID, music(1))];
+            assert_eq!(
+                bridged(&[mpd], &mpd_stream).await,
+                (vec![vec![SendOwnership(true)]], true)
+            );
+            let remote = mpd_player(&[(CHIME_PID, "pw-play")]);
+            let chime = [owned_by(
+                CHIME_PID,
+                sink(&[("application.name", "pw-play"), ("media.role", "music")]),
+            )];
+            assert_eq!(bridged(&[remote], &chime).await, (NO_TAKE, false));
+        }
+
+        /// The PBI host (`BRIDGE_PID`) is Firefox's child. The twin: only
+        /// an unrelated stream plays.
+        #[tokio::test]
+        async fn bridge_pbi_player_takes_and_pauses_with_browser_stream() {
+            let browser = media_controller::player_owner(
+                "org.mpris.MediaPlayer2.plasma-browser-integration",
+                Some(BRIDGE_PID),
+                |pid| (pid == BRIDGE_PID).then_some(FIREFOX_PID),
+                || unreachable!(),
+            );
+            let firefox = [owned_by(FIREFOX_PID, music(1))];
+            assert_eq!(
+                bridged(&[browser], &firefox).await,
+                (vec![vec![SendOwnership(true)]], true)
+            );
+            let other = [owned_by(CHIME_PID, music(1))];
+            assert_eq!(bridged(&[browser], &other).await, (NO_TAKE, false));
+        }
+
+        /// A Spotify Connect remote (no stream of its own) beside a live MPD
+        /// stream: the mpd rule doesn't credit it.
+        #[tokio::test]
+        async fn bridge_rules_spare_connect_remote_beside_mpd_stream() {
+            let connect = media_controller::player_owner(
+                "org.mpris.MediaPlayer2.spotify",
+                Some(CONNECT_PID),
+                |_| unreachable!(),
+                || unreachable!(),
+            );
+            assert_eq!(connect, Some(CONNECT_PID));
+            let mpd_stream = [owned_by(MPD_PID, music(1))];
+            assert_eq!(bridged(&[connect], &mpd_stream).await, (NO_TAKE, false));
         }
     }
 
