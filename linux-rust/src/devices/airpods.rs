@@ -13,7 +13,6 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
@@ -79,23 +78,9 @@ impl AirPodsDevice {
                 .await;
         }
 
-        info!("Sending handshake");
-        if let Err(e) = aacp_manager.send_handshake().await {
-            error!("Failed to send handshake to AirPods device: {}", e);
-        }
-
-        sleep(Duration::from_millis(300)).await;
-
-        info!("Setting feature flags");
-        if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
-            error!("Failed to set feature flags: {}", e);
-        }
-
-        sleep(Duration::from_millis(300)).await;
-
-        info!("Requesting notifications");
-        if let Err(e) = aacp_manager.send_notification_request().await {
-            error!("Failed to request notifications: {}", e);
+        info!("Initializing AACP session");
+        if let Err(e) = aacp_manager.initialize().await {
+            error!("Failed to initialize AACP session: {}", e);
         }
 
         info!("sending some packet");
