@@ -1046,6 +1046,10 @@ impl Handoff {
     /// so the start also restores a card an earlier run left `off`.
     fn sync_hold(&mut self, start: bool, out: &mut Vec<Command>) {
         let want = self.remote_owns && !self.quitting && !self.only_local_listed();
+        // No new hold after SessionLost (#287); Disconnected releases an earlier one.
+        if want && !self.live() {
+            return;
+        }
         if self.a2dp_hold && (start || self.held.is_some()) && self.held != Some(want) {
             self.held = Some(want);
             out.push(Command::HoldA2dp(want));
@@ -4589,6 +4593,41 @@ mod tests {
         let mut p = hold_ready(true);
         assert_eq!(p.feed(100, Input::SessionLost), []);
         assert_eq!(p.feed(200, Input::RemoteOwnershipRequest), []);
+    }
+
+    #[test]
+    fn hold_not_after_session_lost_audio_source() {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(100, Input::SessionLost), []);
+        assert_eq!(holds(&p.feed(200, remote_media())), []);
+        assert_eq!(p.feed(300, Input::Disconnected), [DropSession]);
+    }
+
+    #[test]
+    fn hold_not_after_session_lost_unsolicited_zero() {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(150, Input::SessionLost), []);
+        assert_eq!(holds(&p.feed(200, Input::Ownership(vec![0]))), []);
+        assert_eq!(p.feed(300, Input::Disconnected), [DropSession]);
+    }
+
+    #[test]
+    fn hold_session_lost_keeps_emitted_hold_until_disconnect() {
+        // A yield after SessionLost emits no hold.
+        let mut p = hold_take();
+        assert_eq!(p.feed(700, Input::SessionLost), []);
+        assert_eq!(holds(&p.feed(1100, Input::Ownership(vec![0]))), []);
+
+        // A hold emitted before SessionLost stays until Disconnected.
+        let mut p = held();
+        assert_eq!(p.feed(150, Input::SessionLost), []);
+        assert_eq!(holds(&p.feed(200, remote_media())), []);
+        assert_eq!(holds(&p.feed(300, Input::RemoteOwnershipRequest)), []);
+        assert_eq!(
+            p.feed(400, Input::Disconnected),
+            [HoldA2dp(false), DropSession]
+        );
     }
 
     #[test]
