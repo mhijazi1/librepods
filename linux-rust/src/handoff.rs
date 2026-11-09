@@ -1544,10 +1544,12 @@ mod tests {
         }
     }
 
-    /// A core driven with millisecond offsets from a fixed start.
+    /// A core driven with millisecond offsets from a fixed start, never
+    /// rewound (#383).
     struct Probe {
         core: Handoff,
         t0: Instant,
+        last_ms: u64,
     }
 
     impl Probe {
@@ -1556,6 +1558,7 @@ mod tests {
             Probe {
                 core: Handoff::new(LOCAL.to_string(), t0, automatic, connected),
                 t0,
+                last_ms: 0,
             }
         }
 
@@ -1587,6 +1590,8 @@ mod tests {
         }
 
         fn feed(&mut self, ms: u64, input: Input) -> Vec<Command> {
+            assert!(ms >= self.last_ms, "clock rewound: {ms} < {}", self.last_ms);
+            self.last_ms = ms;
             self.core.handle(self.at(ms), input)
         }
 
@@ -1601,6 +1606,19 @@ mod tests {
         /// A sample at `ms`; `playing` is a counted stream (201).
         fn play(&mut self, ms: u64, playing: bool) -> Vec<Command> {
             self.play_category(ms, if playing { STREAM } else { IDLE })
+        }
+
+        /// A stopped sample taken at `sampled_ms` but fed at `ms`.
+        fn stale_stop(&mut self, ms: u64, sampled_ms: u64) -> Vec<Command> {
+            let sampled_at = self.at(sampled_ms);
+            self.feed(
+                ms,
+                Input::Playback {
+                    sampled_at,
+                    category: IDLE,
+                    new_source: None,
+                },
+            )
         }
 
         fn play_category(&mut self, ms: u64, category: u32) -> Vec<Command> {
@@ -1641,6 +1659,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "clock rewound")]
+    fn probe_clock_never_rewinds() {
+        let mut p = Probe::ready();
+        p.feed(500, Input::Tick);
+        p.feed(400, Input::Tick);
+    }
+
+    #[test]
     fn takes_on_new_playback_when_worn() {
         let mut p = Probe::ready();
         assert_eq!(p.play(500, true), [SendOwnership(true)]);
@@ -1649,7 +1675,7 @@ mod tests {
         // Stopping keeps the AirPods: Linux is the idle owner (#262).
         assert_eq!(p.play(1500, false), []);
         p.idle_ticks(1500);
-        assert_eq!(p.play(2000, false), []);
+        assert_eq!(p.play(62_000, false), []);
     }
 
     #[test]
@@ -2027,7 +2053,7 @@ mod tests {
         // The reply to Auto's "not owning" (#54).
         assert_eq!(p.feed(1050, Input::Ownership(vec![0])), []);
         // A stopped sample from before the baseline is not an observation.
-        assert_eq!(p.play(900, false), []);
+        assert_eq!(p.stale_stop(1050, 900), []);
         assert_eq!(p.play(1100, true), []);
         assert_eq!(p.play(1600, true), []);
         assert_eq!(p.play(2100, false), []);
@@ -2042,7 +2068,7 @@ mod tests {
             [AdoptSession, Announce, DrainPlayback]
         );
         p.wear_in(5000);
-        assert_eq!(p.play(4900, false), []);
+        assert_eq!(p.stale_stop(5000, 4900), []);
         assert_eq!(p.play(5100, true), []);
         assert_eq!(p.play(5600, true), []);
         assert_eq!(p.play(6100, false), []);
@@ -2060,7 +2086,7 @@ mod tests {
         for ms in [1500, 2000, 2500] {
             assert_eq!(p.play(ms, false), []);
         }
-        p.idle_ticks(1100);
+        p.idle_ticks(2500);
     }
 
     #[test]
@@ -2072,7 +2098,7 @@ mod tests {
         // The timeout releases nothing either (#262).
         assert_eq!(p.feed(5600, Input::Tick), []);
         p.idle_ticks(5600);
-        assert_eq!(p.play(6000, false), []);
+        assert_eq!(p.play(66_000, false), []);
     }
 
     #[test]
@@ -2149,10 +2175,10 @@ mod tests {
         settled.extend(p.play(2000, false));
         // The take holds (#262).
         assert_eq!(settled, []);
-        p.idle_ticks(1600);
         for ms in [2500, 3000, 3500] {
             assert_eq!(p.play(ms, false), []);
         }
+        p.idle_ticks(3500);
 
         // The first post-baseline sample arriving only after the ACK keeps
         // them too.
@@ -2168,10 +2194,10 @@ mod tests {
         );
         assert_eq!(p.feed(1300, Input::Ownership(vec![1])), []);
         assert_eq!(p.play(1500, false), []);
-        p.idle_ticks(1500);
         for ms in [2000, 2500, 3000] {
             assert_eq!(p.play(ms, false), []);
         }
+        p.idle_ticks(3000);
 
         // Control: playback still running after the reconnect keeps the
         // AirPods.
@@ -2388,10 +2414,10 @@ mod tests {
         let mut settled = p.feed(1600, Input::Ownership(vec![1]));
         settled.extend(p.play(2000, false));
         assert_eq!(settled, []);
-        p.idle_ticks(1600);
         for ms in [2500, 3000, 3500] {
             assert_eq!(p.play(ms, false), []);
         }
+        p.idle_ticks(3500);
 
         // Playback keeps running: Linux keeps the AirPods, nothing pauses,
         // and a later stop keeps them too.
@@ -2816,7 +2842,7 @@ mod tests {
         assert_eq!(p.feed(1600, Input::Ownership(vec![1])), []);
         assert_eq!(p.play(2000, false), []);
         p.idle_ticks(2000);
-        assert_eq!(p.feed(2100, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(p.feed(62_100, Input::Ownership(vec![0])), [PauseMedia]);
         assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
     }
 
@@ -3400,7 +3426,7 @@ mod tests {
         );
         assert_eq!(p.play(1500, false), []);
         p.idle_ticks(1500);
-        assert_eq!(p.play(2000, false), []);
+        assert_eq!(p.play(62_000, false), []);
     }
 
     #[test]
@@ -3416,7 +3442,7 @@ mod tests {
         );
         assert_eq!(p.core.take_lines(), ["CALL ended on Linux"]);
         p.idle_ticks(2000);
-        assert_eq!(p.play(2500, false), []);
+        assert_eq!(p.play(62_500, false), []);
 
         // During the call, a new host still hears of it after its Announce,
         // and a remote request is still refused.
@@ -3542,6 +3568,7 @@ mod tests {
         let mut p = Probe {
             core: Handoff::new(LOCAL.to_string(), t0, true, true).with_connect_mode(mode),
             t0,
+            last_ms: 0,
         };
         p.routing(ready_facts());
         assert_eq!(p.play(10, false), []);
@@ -3605,7 +3632,7 @@ mod tests {
         assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
         assert_eq!(p.play(1000, false), []);
         p.idle_ticks(1000);
-        assert_eq!(p.play(1500, true), []);
+        assert_eq!(p.play(61_500, true), []);
         assert_eq!(skips(&mut p), 0);
 
         // An OwnsConnection=1 report alone does too.
@@ -3915,6 +3942,7 @@ mod tests {
                     .with_connect_mode(WhenLastConnected)
                     .with_last_owner_linux(seeded),
                 t0,
+                last_ms: 0,
             };
             p.routing(ready_facts());
             assert_eq!(p.play(10, false), []);
@@ -3979,7 +4007,7 @@ mod tests {
         // nothing.
         assert_eq!(p.play(1000, false), []);
         p.idle_ticks(1000);
-        assert_eq!(p.play(2000, true), []);
+        assert_eq!(p.play(62_000, true), []);
     }
 
     #[test]
@@ -3989,7 +4017,7 @@ mod tests {
         assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
         assert_eq!(p.play(1000, false), []);
         p.idle_ticks(1000);
-        assert_eq!(p.play(2000, true), []);
+        assert_eq!(p.play(62_000, true), []);
     }
 
     #[test]
@@ -4062,7 +4090,7 @@ mod tests {
             // The next play edge while Linux owns resumes, once.
             p.core.take_lines();
             assert_eq!(
-                p.play_category(2000, MEDIA),
+                p.play_category(62_000, MEDIA),
                 [relayed(MEDIA), vec![ResumeA2dp]].concat()
             );
             assert_eq!(
@@ -4072,9 +4100,9 @@ mod tests {
                     "A2DP transport idle after the take; resuming it"
                 ]
             );
-            assert_eq!(p.play_category(2500, IDLE), relayed(IDLE));
-            assert_eq!(p.play_category(3000, MEDIA), relayed(MEDIA));
-            p.idle_ticks(3000);
+            assert_eq!(p.play_category(62_500, IDLE), relayed(IDLE));
+            assert_eq!(p.play_category(63_000, MEDIA), relayed(MEDIA));
+            p.idle_ticks(63_000);
         }
 
         // An active transport, or a local call, needs no resume.
@@ -4153,7 +4181,7 @@ mod tests {
         let mut p = resumed_take();
         assert_eq!(p.play(1000, false), []);
         p.idle_ticks(1000);
-        assert_eq!(p.play(window_end() + 300, false), []);
+        assert_eq!(p.play(window_end() + 60_300, false), []);
     }
 
     #[test]
@@ -4325,8 +4353,8 @@ mod tests {
         // Linux keeps the AirPods idle (#262): no RouteAway, and the next
         // play edge routes nothing again.
         p.idle_ticks(1000);
-        assert_eq!(p.play(1500, true), []);
-        assert_eq!(p.feed(1600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play(61_500, true), []);
+        assert_eq!(p.feed(61_600, Input::Ownership(vec![1])), []);
     }
 
     #[test]
@@ -4396,7 +4424,10 @@ mod tests {
         // A play edge soon after the stop, and minutes later.
         for play in [2000, 1000 + 120_000] {
             let mut p = idle_owner(false);
-            p.idle_ticks(1000);
+            // The idle minute of ticks fits only before the later edge.
+            if play > 61_000 {
+                p.idle_ticks(1000);
+            }
             p.core.take_lines();
             assert_eq!(p.play_category(play, MEDIA), [RelayCategory(MEDIA)]);
             assert_eq!(
@@ -4436,10 +4467,10 @@ mod tests {
             assert_eq!(p.feed(2000, Input::Ownership(vec![0])), yielded);
             assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
             p.idle_ticks(2000);
-            assert_eq!(p.feed(2100, Input::Ownership(vec![0])), []);
+            assert_eq!(p.feed(62_100, Input::Ownership(vec![0])), []);
             // An idle remote: the next play edge takes afresh.
             assert_eq!(
-                p.play_category(3000, MEDIA),
+                p.play_category(63_000, MEDIA),
                 [RelayCategory(MEDIA), SendOwnership(true)]
             );
         }
@@ -4463,7 +4494,7 @@ mod tests {
             );
             assert_eq!(count_lines(&lines, "YIELD"), 0);
             assert_eq!(
-                p.play_category(3000, MEDIA),
+                p.play_category(63_000, MEDIA),
                 [RelayCategory(MEDIA), SendOwnership(true)]
             );
         }
