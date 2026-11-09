@@ -141,6 +141,21 @@ fn ble_tray_entry(
     }
 }
 
+/// The warning to log instead of an error when the LE monitor failed because BlueZ
+/// has no AdvertisementMonitorManager1 (it is experimental); None for any other error.
+pub fn missing_monitor_manager_hint(err: &str) -> Option<&'static str> {
+    let unknown = err.contains("org.freedesktop.DBus.Error.UnknownMethod")
+        || err.contains("org.freedesktop.DBus.Error.UnknownInterface");
+    let monitor = err.contains("AdvertisementMonitorManager1") || err.contains("RegisterMonitor");
+    (unknown && monitor).then_some(
+        "BlueZ has no org.bluez.AdvertisementMonitorManager1, so the LE features are off \
+         (auto-connect when the AirPods leave the case, the case-open popup, advert battery). \
+         To turn them on, set `Experimental = true` in the [General] section of \
+         /etc/bluetooth/main.conf (NixOS: `hardware.bluetooth.settings.General.Experimental = true;`) \
+         and restart Bluetooth.",
+    )
+}
+
 pub async fn start_le_monitor(
     tray_handle: Option<ksni::Handle<MyTray>>,
     ui_tx: UnboundedSender<BluetoothUIMessage>,
@@ -463,6 +478,51 @@ mod tests {
         0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1,
         0xF0,
     ];
+
+    const PEACHES_ERR: &str = "internal error: D-Bus error org.freedesktop.DBus.Error.UnknownMethod: Method \"RegisterMonitor\" with signature \"o\" on interface \"org.bluez.AdvertisementMonitorManager1\" doesn't exist";
+
+    #[test]
+    fn missing_monitor_manager_gives_hint() {
+        assert!(missing_monitor_manager_hint(PEACHES_ERR).is_some());
+        assert!(
+            missing_monitor_manager_hint(
+                "D-Bus error org.freedesktop.DBus.Error.UnknownInterface: Unknown interface \
+                 org.bluez.AdvertisementMonitorManager1"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn other_le_monitor_errors_give_no_hint() {
+        assert_eq!(
+            missing_monitor_manager_hint(
+                "D-Bus error org.bluez.Error.Failed: RegisterMonitor failed"
+            ),
+            None
+        );
+        assert_eq!(
+            missing_monitor_manager_hint("org.bluez.Error.NotReady: Resource Not Ready"),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_monitor_manager_hint_names_the_fix() {
+        let hint = missing_monitor_manager_hint(PEACHES_ERR).unwrap();
+        for s in [
+            "Experimental = true",
+            "/etc/bluetooth/main.conf",
+            "hardware.bluetooth.settings.General.Experimental",
+            "AdvertisementMonitorManager1",
+            "LE features are off",
+            "auto-connect when the AirPods leave the case",
+            "case-open popup",
+            "advert battery",
+        ] {
+            assert!(hint.contains(s), "hint lacks {s:?}");
+        }
+    }
 
     // The address string verify_rpa reads for a given hash and prand: the
     // 6-byte little-endian array is hash then prand, and the string is that

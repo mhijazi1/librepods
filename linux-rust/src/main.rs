@@ -241,7 +241,10 @@ async fn async_main(
     tokio::spawn(async move {
         info!("Starting LE monitor...");
         if let Err(e) = start_le_monitor(le_tray_clone, le_ui_tx).await {
-            log::error!("LE monitor error: {}", e);
+            match crate::bluetooth::le::missing_monitor_manager_hint(&e.to_string()) {
+                Some(hint) => warn!("{}", hint),
+                None => log::error!("LE monitor error: {}", e),
+            }
         }
     });
 
