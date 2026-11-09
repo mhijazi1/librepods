@@ -170,8 +170,9 @@ pub(crate) trait PlaybackSource: Send {
 /// How loud playback streams are (#88): the sinks' monitors in production
 /// (`PulsePeaks`), a fake in tests.
 pub(crate) trait PeakSource: Send {
-    /// Each candidate's highest peak level (0.0 to 1.0) since the previous
-    /// call. A candidate missing from the result is silent. Never waits on
+    /// Each asked stream's highest peak level (0.0 to 1.0) since the previous
+    /// call. A candidate missing from the result is silent; a baseline
+    /// stream missing from it is not (`PlaybackTracker`). Never waits on
     /// the sound server.
     fn levels(&mut self, candidates: &HashSet<u32>) -> HashMap<u32, f32>;
 }
@@ -205,13 +206,18 @@ enum Gate {
 /// stream counts.
 ///
 /// The first successful listing is the baseline: streams already playing in
-/// it (worthy, uncorked and unmuted, whatever their level) never count, as
-/// MPRIS playback running at the handoff core's baseline is no new start,
-/// and they are not measured. Such a stream becomes a candidate only once it
-/// has been corked (or reclassified) and plays again, and then counts only
-/// after an audible `min`; a new stream is a candidate as usual.
-/// `rebaseline` moves the baseline when the handoff core resets its own
-/// (#90).
+/// it (worthy, uncorked and unmuted, whatever their level) never count while
+/// they stay in it, as MPRIS playback running at the handoff core's baseline
+/// is no new start. Baseline streams are measured too (#456): one leaves the
+/// baseline once it has been corked (or reclassified), or once it has read
+/// measured-silent (a level at or below `AUDIBLE_PEAK`) in every sample for
+/// `SILENCE_HOLD`, so a game silent at the connect can take once its sound
+/// starts. An audible sample, or one with no level, restarts that silence
+/// run: a missing level is not silence, so music playing at the connect
+/// stays baseline through peak warm-up and record-stream gaps. A stream
+/// that left the baseline is a candidate and counts only after an audible
+/// `min`; a new stream is a candidate as usual. `rebaseline` moves the
+/// baseline when the handoff core resets its own (#90).
 #[derive(Debug)]
 pub(crate) struct PlaybackTracker {
     min: Duration,
@@ -221,6 +227,8 @@ pub(crate) struct PlaybackTracker {
     /// debouncing since before a `rebaseline`'s reset) that have stayed so
     /// ever since; None until that listing.
     preexisting: Option<HashSet<u32>>,
+    /// Baseline streams measured-silent in every sample since this one.
+    quiet: HashMap<u32, Instant>,
     /// Whether a stream counts as playing (false before any change).
     playing: bool,
     /// How many times a stream started counting (#96): a stream that stops
@@ -243,6 +251,7 @@ impl PlaybackTracker {
             min,
             gates: HashMap::new(),
             preexisting: None,
+            quiet: HashMap::new(),
             playing: false,
             starts: 0,
         }
@@ -269,14 +278,37 @@ impl PlaybackTracker {
         streams: &[StreamProps],
         level: impl Fn(u32) -> f32,
     ) -> Option<bool> {
+        self.observe_measured(now, streams, |index| Some(level(index)))
+    }
+
+    /// `observe_levels` where a stream may have no level (None): a
+    /// candidate with none is silent, a baseline stream with none ends its
+    /// measured-silence run.
+    fn observe_measured(
+        &mut self,
+        now: Instant,
+        streams: &[StreamProps],
+        level: impl Fn(u32) -> Option<f32>,
+    ) -> Option<bool> {
+        let since = |at: Instant| now.saturating_duration_since(at);
         let live = live_streams(streams);
         let preexisting = self.preexisting.get_or_insert_with(|| live.clone());
-        preexisting.retain(|index| live.contains(index));
+        preexisting.retain(|&index| {
+            if !live.contains(&index) {
+                return false;
+            }
+            if level(index).is_some_and(|level| level <= AUDIBLE_PEAK) {
+                let quiet = *self.quiet.entry(index).or_insert(now);
+                return since(quiet) < SILENCE_HOLD;
+            }
+            self.quiet.remove(&index);
+            true
+        });
+        self.quiet.retain(|index, _| preexisting.contains(index));
         let candidates = self.candidates(streams);
         self.gates.retain(|index, _| candidates.contains(index));
         for index in candidates {
-            let audible = level(index) > AUDIBLE_PEAK;
-            let since = |at: Instant| now.saturating_duration_since(at);
+            let audible = level(index).unwrap_or(0.0) > AUDIBLE_PEAK;
             let gate = match (self.gates.get(&index).copied(), audible) {
                 (None, true) => Some(Gate::Debounce(now)),
                 (Some(Gate::Debounce(start)), true) if since(start) >= self.min => {
@@ -327,8 +359,10 @@ impl PlaybackTracker {
     /// The handoff core reset its playback baseline at `at` (#90): streams
     /// whose audible debounce began before `at` join the baseline, as MPRIS
     /// playback running at the core's baseline is no new start, so they
-    /// count only after they stop and play again. Streams first audible at
-    /// or after `at` keep debouncing, however late the request arrives.
+    /// count only after they leave it, as any baseline stream does: corked
+    /// or reclassified, or measured-silent for `SILENCE_HOLD` (a missing
+    /// level is not silence), then audible for `min`. Streams first audible
+    /// at or after `at` keep debouncing, however late the request arrives.
     /// Counted streams keep counting (no false edge), and silent candidates
     /// stay candidates. Before the first successful listing there is
     /// nothing to move: that listing is still the baseline.
@@ -346,10 +380,12 @@ impl PlaybackTracker {
     }
 
     /// A sample's I/O: list `source`, then ask `peaks` for the levels of
-    /// that listing's candidates only. A source error gives None and asks
-    /// for no levels: the caller then changes nothing, so the last state and
-    /// the streams' timers are kept, and the baseline is still the first
-    /// successful listing.
+    /// that listing's live streams, baseline streams included, as they are
+    /// measured too (none before the first successful listing, the
+    /// baseline). A baseline stream missing from the levels is not silent.
+    /// A source error gives None and asks for no levels: the caller then
+    /// changes nothing, so the last state and the streams' timers are kept,
+    /// and the baseline is still the first successful listing.
     pub(crate) fn sample(
         &self,
         source: &mut dyn PlaybackSource,
@@ -357,7 +393,11 @@ impl PlaybackTracker {
     ) -> Option<Sample> {
         match source.playback_streams() {
             Ok(streams) => {
-                let levels = peaks.levels(&self.candidates(&streams));
+                let measured = match self.preexisting {
+                    Some(_) => live_streams(&streams),
+                    None => HashSet::new(),
+                };
+                let levels = peaks.levels(&measured);
                 Some((streams, levels))
             }
             Err(e) => {
@@ -381,13 +421,11 @@ impl PlaybackTracker {
         if let Some(at) = request {
             self.rebaseline(at);
         }
-        self.observe_levels(now, streams, |index| {
-            levels.get(&index).copied().unwrap_or(0.0)
-        })
+        self.observe_measured(now, streams, |index| levels.get(&index).copied())
     }
 }
 
-/// A playback listing with its candidates' peak levels.
+/// A playback listing with its live streams' peak levels.
 pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 
 /// The counting streams' starts the monitor publishes beside
@@ -2597,17 +2635,41 @@ mod tests {
     #[test]
     fn baseline_audible_stream_never_counts() {
         let start = Instant::now();
+        let samples = ((SILENCE_HOLD + MIN * 4).as_millis() / STEP.as_millis()) as u32;
+        // Music playing at the connect: audible in every measured sample, or
+        // silent in only the first one or two (PulsePeaks warm-up).
+        for warmup in 0..=2 {
+            let mut source = FakePlayback::new(vec![Ok(vec![music(1)])]);
+            let mut peaks = RecordingPeaks::new(Some(SILENT));
+            let mut tracker = PlaybackTracker::new(MIN);
+            for i in 0..=samples {
+                if i > warmup {
+                    peaks.level = Some(LOUD);
+                }
+                let now = start + STEP * i;
+                assert_eq!(
+                    tracker.poll_levels(&mut source, &mut peaks, || now),
+                    None,
+                    "{warmup} {i}"
+                );
+            }
+            assert!(!tracker.playing);
+            // The baseline listing asks for no level; every later sample
+            // measures the baseline stream.
+            assert_eq!(peaks.asked[0], Vec::<u32>::new());
+            assert!(
+                peaks.asked[1..].iter().all(|asked| asked == &[1]),
+                "{:?}",
+                peaks.asked
+            );
+        }
         let mut source = FakePlayback::new(vec![Ok(vec![music(1)])]);
         let script = source.script.clone();
         let mut peaks = RecordingPeaks::new(Some(LOUD));
         let mut tracker = PlaybackTracker::new(MIN);
-        for i in 0..20 {
-            let now = start + STEP * i;
-            assert_eq!(tracker.poll_levels(&mut source, &mut peaks, || now), None);
-        }
-        assert!(peaks.asked.iter().all(Vec::is_empty), "{:?}", peaks.asked);
+        assert_eq!(tracker.poll_levels(&mut source, &mut peaks, || start), None);
         script.lock().unwrap().push_back(Ok(vec![corked_music(1)]));
-        let corked = start + STEP * 20;
+        let corked = start + STEP;
         assert_eq!(
             tracker.poll_levels(&mut source, &mut peaks, || corked),
             None
@@ -2626,6 +2688,138 @@ mod tests {
             tracker.poll_levels(&mut source, &mut peaks, || counted),
             Some(true)
         );
+    }
+
+    /// One `observe_sample` of `music(1)` at `now` with peak `level`, or
+    /// with no level when None.
+    fn observe_music(
+        tracker: &mut PlaybackTracker,
+        now: Instant,
+        level: Option<f32>,
+    ) -> Option<bool> {
+        let levels = level.map(|level| HashMap::from([(1, level)]));
+        tracker.observe_sample(now, None, &(vec![music(1)], levels.unwrap_or_default()))
+    }
+
+    /// Observe `music(1)` at `level` every `STEP` from `from` while before
+    /// `until`, expecting no change; returns `until`.
+    fn hold_music(
+        tracker: &mut PlaybackTracker,
+        from: Instant,
+        until: Instant,
+        level: Option<f32>,
+    ) -> Instant {
+        let mut now = from;
+        while now < until {
+            assert_eq!(observe_music(tracker, now, level), None, "{level:?}");
+            now += STEP;
+        }
+        until
+    }
+
+    /// A tracker whose baseline, at `start` (no levels yet), is `music(1)`.
+    fn music_baseline(start: Instant) -> PlaybackTracker {
+        let mut tracker = PlaybackTracker::new(MIN);
+        assert_eq!(observe_music(&mut tracker, start, None), None);
+        tracker
+    }
+
+    #[test]
+    fn baseline_silent_stream_counts_after_audible_min() {
+        let start = Instant::now();
+        // Digital silence, and peaks at (not above) the threshold.
+        for level in [SILENT, AUDIBLE_PEAK] {
+            let mut tracker = music_baseline(start);
+            let silent = start + STEP;
+            let held = hold_music(&mut tracker, silent, silent + SILENCE_HOLD, Some(level));
+            assert!(tracker.candidates(&[music(1)]).is_empty());
+            // Measured-silent for the hold: a candidate now.
+            assert_eq!(observe_music(&mut tracker, held, Some(level)), None);
+            assert_eq!(tracker.candidates(&[music(1)]), HashSet::from([1]));
+            let audible = held + STEP;
+            let counted = hold_music(&mut tracker, audible, audible + MIN, Some(LOUD));
+            assert_eq!(
+                observe_music(&mut tracker, counted, Some(LOUD)),
+                Some(true),
+                "{level}"
+            );
+            assert_eq!(tracker.started(&HashMap::new()), [(1, HashSet::new())]);
+        }
+    }
+
+    #[test]
+    fn baseline_short_silence_stays_baseline() {
+        let start = Instant::now();
+        let mut tracker = music_baseline(start);
+        let silent = start + STEP;
+        let almost = silent + SILENCE_HOLD - Duration::from_millis(1);
+        let last = hold_music(&mut tracker, silent, almost, Some(SILENT));
+        assert_eq!(observe_music(&mut tracker, last, Some(SILENT)), None);
+        let audible = silent + SILENCE_HOLD;
+        hold_music(&mut tracker, audible, audible + MIN * 4, Some(LOUD));
+        assert!(!tracker.playing);
+        assert!(tracker.candidates(&[music(1)]).is_empty());
+    }
+
+    #[test]
+    fn baseline_missing_level_stays_baseline() {
+        let start = Instant::now();
+        // No level for well over the hold.
+        let mut tracker = music_baseline(start);
+        let missing = start + STEP;
+        let audible = hold_music(&mut tracker, missing, missing + SILENCE_HOLD * 2, None);
+        hold_music(&mut tracker, audible, audible + MIN * 4, Some(LOUD));
+        assert!(!tracker.playing);
+        // One sample with no level ends a measured-silence run.
+        let mut tracker = music_baseline(start);
+        let silent = start + STEP;
+        let gap = hold_music(
+            &mut tracker,
+            silent,
+            silent + Duration::from_secs(4),
+            Some(SILENT),
+        );
+        assert_eq!(observe_music(&mut tracker, gap, None), None);
+        let again = gap + STEP;
+        let audible = hold_music(
+            &mut tracker,
+            again,
+            again + Duration::from_secs(4),
+            Some(SILENT),
+        );
+        hold_music(&mut tracker, audible, audible + MIN * 4, Some(LOUD));
+        assert!(!tracker.playing);
+        assert!(tracker.candidates(&[music(1)]).is_empty());
+    }
+
+    #[test]
+    fn baseline_silent_stream_never_counts() {
+        let start = Instant::now();
+        let mut tracker = music_baseline(start);
+        let silent = start + STEP;
+        hold_music(
+            &mut tracker,
+            silent,
+            silent + SILENCE_HOLD + MIN * 4,
+            Some(SILENT),
+        );
+        assert!(!tracker.playing);
+        assert_eq!(tracker.starts, 0);
+    }
+
+    #[test]
+    fn tracker_rebaseline_stream_counts_after_silence_and_replay() {
+        let start = Instant::now();
+        let mut tracker = rebaselined_while_debouncing(start);
+        let rebaselined = start + STEP * 2;
+        assert_eq!(observe_music(&mut tracker, rebaselined, Some(LOUD)), None);
+        assert!(tracker.candidates(&[music(1)]).is_empty());
+        let silent = rebaselined + STEP;
+        let held = hold_music(&mut tracker, silent, silent + SILENCE_HOLD, Some(SILENT));
+        assert_eq!(observe_music(&mut tracker, held, Some(SILENT)), None);
+        let audible = held + STEP;
+        let counted = hold_music(&mut tracker, audible, audible + MIN, Some(LOUD));
+        assert_eq!(observe_music(&mut tracker, counted, Some(LOUD)), Some(true));
     }
 
     #[test]

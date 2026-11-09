@@ -76,6 +76,27 @@ fn merge_battery(prev: &[BatteryInfo], update: &[BatteryInfo]) -> Vec<BatteryInf
     merged
 }
 
+/// Remembers the first non-Disconnected Case entry of `battery` for `mac`, for the
+/// next connect seed. A missing or Disconnected Case leaves the map alone.
+fn remember_case(last_case: &mut HashMap<String, BatteryInfo>, mac: &str, battery: &[BatteryInfo]) {
+    if let Some(case) = battery
+        .iter()
+        .find(|b| b.component == BatteryComponent::Case && b.status != BatteryStatus::Disconnected)
+    {
+        last_case.insert(mac.to_string(), case.clone());
+    }
+}
+
+/// The battery an AirPods tab starts with on connect: the case entry remembered at
+/// its last disconnect or from an advert while disconnected, merged with the AACP
+/// report, so a Disconnected case in the report keeps the remembered level (#461).
+fn connect_seed(last_case: Option<&BatteryInfo>, aacp: &[BatteryInfo]) -> Vec<BatteryInfo> {
+    merge_battery(
+        last_case.map(std::slice::from_ref).unwrap_or_default(),
+        aacp,
+    )
+}
+
 /// Text for one battery level in the window. `None` means the level is not known.
 fn battery_level_label(level: Option<u8>) -> String {
     match level {
@@ -270,6 +291,9 @@ pub struct App {
     bluetooth_state: BluetoothState,
     paired_devices: HashMap<String, Address>,
     device_states: HashMap<String, DeviceState>,
+    /// Each AirPods' last known (non-Disconnected) case entry, kept across a
+    /// disconnect for the next connect's seed (#461).
+    last_case: HashMap<String, BatteryInfo>,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     pending_add_device: Option<(String, Address)>,
     device_type_state: combo_box::State<DeviceType>,
@@ -422,6 +446,7 @@ impl App {
                 bluetooth_state,
                 paired_devices: HashMap::new(),
                 device_states,
+                last_case: HashMap::new(),
                 pending_add_device: None,
                 device_type_state: combo_box::State::new(vec![DeviceType::Nothing]),
                 selected_device_type: None,
@@ -539,12 +564,18 @@ impl App {
                         let type_ = {
                             let devices_json = std::fs::read_to_string(get_devices_path())
                                 .unwrap_or_else(|e| {
-                                    error!("Failed to read devices file: {}", e);
+                                    error!(
+                                        "Failed to read devices file: {}",
+                                        crate::settings_file::devices_error_log(&e)
+                                    );
                                     "{}".to_string()
                                 });
                             let devices_list: HashMap<String, DeviceData> =
                                 serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                                    error!("Deserialization failed: {}", e);
+                                    error!(
+                                        "Could not parse devices.json: {}",
+                                        crate::settings_file::devices_error_log(&e.into())
+                                    );
                                     HashMap::new()
                                 });
                             devices_list.get(&mac).map(|d| d.type_.clone())
@@ -560,12 +591,18 @@ impl App {
                                 let device_name = {
                                     let devices_json = std::fs::read_to_string(get_devices_path())
                                         .unwrap_or_else(|e| {
-                                            error!("Failed to read devices file: {}", e);
+                                            error!(
+                                                "Failed to read devices file: {}",
+                                                crate::settings_file::devices_error_log(&e)
+                                            );
                                             "{}".to_string()
                                         });
                                     let devices_list: HashMap<String, DeviceData> =
                                         serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                                            error!("Deserialization failed: {}", e);
+                                            error!(
+                                                "Could not parse devices.json: {}",
+                                                crate::settings_file::devices_error_log(&e.into())
+                                            );
                                             HashMap::new()
                                         });
                                     devices_list
@@ -578,7 +615,7 @@ impl App {
                                 self.switching_mode = crate::utils::load_switching_mode();
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
-                                    battery: state.battery_info.clone(),
+                                    battery: connect_seed(self.last_case.get(&mac), &state.battery_info),
                                     noise_control_mode: state.control_command_status_list.iter().find_map(|status| {
                                         if status.identifier == ControlCommandIdentifiers::ListeningMode {
                                             status.value.first().map(AirPodsNoiseControlMode::from_byte)
@@ -646,7 +683,9 @@ impl App {
                             .connected_devices
                             .retain(|device| device != &mac);
 
-                        self.device_states.remove(&mac);
+                        if let Some(DeviceState::AirPods(state)) = self.device_states.remove(&mac) {
+                            remember_case(&mut self.last_case, &mac, &state.battery);
+                        }
 
                         if matches!(&self.selected_tab, Tab::Device(selected_mac) if selected_mac == &mac)
                         {
@@ -750,6 +789,9 @@ impl App {
                                 {
                                     state.battery = merge_battery(&state.battery, &battery_info);
                                     debug!("Updated battery info for {}: {:?}", mac, state.battery);
+                                } else if !self.device_states.contains_key(&mac) {
+                                    // LE advert while disconnected: keep its case for the connect seed.
+                                    remember_case(&mut self.last_case, &mac, &battery_info);
                                 }
                             }
                             _ => {}
@@ -801,7 +843,11 @@ impl App {
                     if let Err(e) = rewrite_devices_file(&devices_path, |existing| {
                         devices_with_added(existing, &addr.to_string(), data)
                     }) {
-                        error!("Not adding device to {}: {}", devices_path.display(), e);
+                        error!(
+                            "Not adding device to {}: {}",
+                            devices_path.display(),
+                            crate::settings_file::devices_error_log(&e)
+                        );
                     }
                     self.selected_tab = Tab::Device(addr.to_string());
                 }
@@ -818,12 +864,18 @@ impl App {
                 let type_ = {
                     let devices_json =
                         std::fs::read_to_string(get_devices_path()).unwrap_or_else(|e| {
-                            error!("Failed to read devices file: {}", e);
+                            error!(
+                                "Failed to read devices file: {}",
+                                crate::settings_file::devices_error_log(&e)
+                            );
                             "{}".to_string()
                         });
                     let devices_list: HashMap<String, DeviceData> =
                         serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                            error!("Deserialization failed: {}", e);
+                            error!(
+                                "Could not parse devices.json: {}",
+                                crate::settings_file::devices_error_log(&e.into())
+                            );
                             HashMap::new()
                         });
                     devices_list.get(&mac).map(|d| d.type_.clone())
@@ -909,12 +961,18 @@ impl App {
 
     fn view(&self, _id: window::Id) -> Element<'_, Message> {
         let devices_json = std::fs::read_to_string(get_devices_path()).unwrap_or_else(|e| {
-            error!("Failed to read devices file: {}", e);
+            error!(
+                "Failed to read devices file: {}",
+                crate::settings_file::devices_error_log(&e)
+            );
             "{}".to_string()
         });
         let devices_list: HashMap<String, DeviceData> = serde_json::from_str(&devices_json)
             .unwrap_or_else(|e| {
-                error!("Deserialization failed: {}", e);
+                error!(
+                    "Could not parse devices.json: {}",
+                    crate::settings_file::devices_error_log(&e.into())
+                );
                 HashMap::new()
             });
         let pane_grid = pane_grid::PaneGrid::new(&self.panes, |_pane_id, pane, _is_maximized| {
@@ -2050,6 +2108,82 @@ mod tests {
             battery_tab_label(&[]),
             "\u{1018E5} -- \u{1018E8} -- \u{100E6C} --"
         );
+    }
+
+    /// The connect AACP report of AirPods with both buds out of the case.
+    fn connect_report() -> Vec<BatteryInfo> {
+        vec![
+            info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+            info(BatteryComponent::Right, 70, BatteryStatus::NotCharging),
+            case_disconnected(0),
+        ]
+    }
+
+    #[test]
+    fn connect_seed_reconnect_keeps_remembered_case() {
+        let last = info(BatteryComponent::Case, 90, BatteryStatus::NotCharging);
+        assert_eq!(
+            battery_tab_label(&connect_seed(Some(&last), &connect_report())),
+            "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} 90%"
+        );
+    }
+
+    #[test]
+    fn connect_seed_without_remembered_case_shows_dashes() {
+        assert_eq!(
+            battery_tab_label(&connect_seed(None, &connect_report())),
+            "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} --"
+        );
+    }
+
+    #[test]
+    fn remember_case_advert_while_disconnected_seeds_connect() {
+        let mut last_case = HashMap::new();
+        remember_case(
+            &mut last_case,
+            MAC,
+            &[
+                info(BatteryComponent::Left, 85, BatteryStatus::NotCharging),
+                info(BatteryComponent::Case, 70, BatteryStatus::NotCharging),
+            ],
+        );
+        assert_eq!(
+            battery_tab_label(&connect_seed(last_case.get(MAC), &connect_report())),
+            "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} 70%"
+        );
+    }
+
+    #[test]
+    fn remember_case_newer_advert_replaces_remembered() {
+        let mut last_case = HashMap::from([(
+            MAC.to_string(),
+            info(BatteryComponent::Case, 60, BatteryStatus::NotCharging),
+        )]);
+        remember_case(
+            &mut last_case,
+            MAC,
+            &[info(BatteryComponent::Case, 80, BatteryStatus::Charging)],
+        );
+        assert_eq!(
+            battery_tab_label(&connect_seed(last_case.get(MAC), &connect_report())),
+            "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} 80%\u{1002E6}"
+        );
+    }
+
+    #[test]
+    fn remember_case_without_usable_case_keeps_map() {
+        let kept = info(BatteryComponent::Case, 90, BatteryStatus::NotCharging);
+        let mut last_case = HashMap::from([(MAC.to_string(), kept.clone())]);
+        let mut empty = HashMap::new();
+        for battery in [
+            vec![info(BatteryComponent::Left, 80, BatteryStatus::NotCharging)],
+            vec![case_disconnected(0)],
+        ] {
+            remember_case(&mut last_case, MAC, &battery);
+            remember_case(&mut empty, MAC, &battery);
+        }
+        assert_eq!(last_case, HashMap::from([(MAC.to_string(), kept)]));
+        assert!(empty.is_empty());
     }
 
     const MAC: &str = "AA:BB:CC:DD:EE:FF";

@@ -1,6 +1,6 @@
 use crate::bluetooth::att::{ATTHandles, ATTManager};
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::settings_file::{parse_devices, rewrite_devices_file};
+use crate::settings_file::{devices_error_log, parse_devices, rewrite_devices_file};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::utils::get_devices_path;
 use bluer::Address;
@@ -180,7 +180,7 @@ fn save_nothing_info(mac: &str, update: impl FnOnce(&mut NothingInformation)) {
             "Not saving Nothing device {} info to {}: {}",
             mac,
             path.display(),
-            e
+            devices_error_log(&e)
         );
     }
 }

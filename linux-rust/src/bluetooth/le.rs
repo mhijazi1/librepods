@@ -7,13 +7,12 @@ use crate::utils::{ah, get_devices_path, load_auto_connect};
 use aes::Aes128;
 use aes::cipher::Array;
 use aes::cipher::{BlockCipherDecrypt, KeyInit};
+use bluer::Session;
 use bluer::monitor::{Monitor, MonitorEvent, Pattern};
-use bluer::{Address, Session};
 use futures::StreamExt;
 use hex;
-use log::{debug, info};
-use serde_json;
-use std::collections::{HashMap, HashSet};
+use log::{debug, info, warn};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -117,13 +116,83 @@ fn verify_rpa(addr: &str, irk: &[u8; 16]) -> bool {
     hash == computed_hash
 }
 
+/// 16 bytes from a stored hex key; None if it is empty, not hex or another length.
+fn key16(hex_key: &str) -> Option<[u8; 16]> {
+    hex::decode(hex_key).ok()?.try_into().ok()
+}
+
+/// The AirPods in `devices` whose IRK resolves `addr`: its MAC and its enc key, if valid.
+fn rpa_lookup(
+    addr: &str,
+    devices: &HashMap<String, DeviceData>,
+) -> Option<(String, Option<[u8; 16]>)> {
+    devices.iter().find_map(|(mac, data)| {
+        let (DeviceType::AirPods, Some(DeviceInformation::AirPods(info))) =
+            (&data.type_, &data.information)
+        else {
+            return None;
+        };
+        let irk = key16(&info.le_keys.irk)?;
+        debug!("Verifying RPA {} for AirPods MAC {}", addr, mac);
+        verify_rpa(addr, &irk).then(|| (mac.clone(), key16(&info.le_keys.enc_key)))
+    })
+}
+
+fn read_error_message(addr: &str, e: &std::io::Error) -> String {
+    format!(
+        "Could not read devices.json to check {addr}: {}",
+        crate::settings_file::devices_error_log(e)
+    )
+}
+
+/// Addresses no stored IRK resolved, kept only while the stored IRKs stay the same.
+#[derive(Default)]
+struct UnmatchedRpas {
+    irks: BTreeSet<String>,
+    addrs: HashSet<String>,
+}
+
+impl UnmatchedRpas {
+    /// `rpa_lookup` against `devices_json`, devices.json as read just now. A read or
+    /// parse error matches nothing and caches nothing, so the next advert re-checks.
+    fn lookup(
+        &mut self,
+        addr: &str,
+        devices_json: std::io::Result<String>,
+    ) -> Option<(String, Option<[u8; 16]>)> {
+        let devices = crate::settings_file::parse_devices(devices_json)
+            .inspect_err(|e| warn!("{}", read_error_message(addr, e)))
+            .ok()?;
+        let irks = devices
+            .values()
+            .filter_map(|d| match &d.information {
+                Some(DeviceInformation::AirPods(info)) => Some(info.le_keys.irk.clone()),
+                _ => None,
+            })
+            .collect();
+        if irks != self.irks {
+            self.irks = irks;
+            self.addrs.clear();
+        }
+        if self.addrs.contains(addr) {
+            return None;
+        }
+        let found = rpa_lookup(addr, &devices);
+        if found.is_none() {
+            debug!("Device {} did not match any of our irks", addr);
+            self.addrs.insert(addr.to_string());
+        }
+        found
+    }
+}
+
 /// The tray's new (level, status) for one battery component (L, R or Case) after a
 /// BLE proximity advertisement whose raw byte for it is `raw`. Bit 7 is the charging
 /// flag and bits 0-6 are the level; `0xff` means no reading (e.g. the case after its
 /// lid closes). The byte is mapped to an update and the keep/replace decision is left
 /// to `merge_battery_entry`, so a `0xff` never clears a known non-Disconnected level.
 /// When the result is Disconnected the level is `None`, as the tray had before.
-fn ble_tray_entry(
+pub(crate) fn ble_tray_entry(
     prev_level: Option<u8>,
     prev_status: Option<BatteryStatus>,
     raw: u8,
@@ -164,13 +233,7 @@ pub async fn start_le_monitor(
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
-    let all_devices: HashMap<String, DeviceData> = std::fs::read_to_string(get_devices_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-
-    let mut verified_macs: HashMap<Address, String> = HashMap::new();
-    let mut failed_macs: HashSet<Address> = HashSet::new();
+    let mut unmatched = UnmatchedRpas::default();
     let retry = Arc::new(Mutex::new(ConnectRetry::default()));
 
     let pattern = Pattern {
@@ -202,56 +265,17 @@ pub async fn start_le_monitor(
             let addr = dev.address();
             let addr_str = addr.to_string();
 
-            let matched_airpods_mac: Option<String>;
-            let mut matched_enc_key: Option<[u8; 16]> = None;
-
-            if let Some(airpods_mac) = verified_macs.get(&addr) {
-                matched_airpods_mac = Some(airpods_mac.clone());
-            } else if failed_macs.contains(&addr) {
+            // Read now, not at startup: keys stored by a connect in this run must match.
+            let Some((airpods_mac, matched_enc_key)) =
+                unmatched.lookup(&addr_str, std::fs::read_to_string(get_devices_path()))
+            else {
                 continue;
-            } else {
-                debug!("Checking RPA for device: {}", addr_str);
-                let mut found_mac = None;
-                for (airpods_mac, device_data) in &all_devices {
-                    if device_data.type_ == DeviceType::AirPods
-                        && let Some(DeviceInformation::AirPods(info)) = &device_data.information
-                        && let Ok(irk_bytes) = hex::decode(&info.le_keys.irk)
-                        && irk_bytes.len() == 16
-                    {
-                        let irk: [u8; 16] = irk_bytes.as_slice().try_into().unwrap();
-                        debug!(
-                            "Verifying RPA {} for airpods MAC {} with IRK {}",
-                            addr_str, airpods_mac, info.le_keys.irk
-                        );
-                        if verify_rpa(&addr_str, &irk) {
-                            info!(
-                                "Matched our device ({}) with the irk for {}",
-                                addr, airpods_mac
-                            );
-                            verified_macs.insert(addr, airpods_mac.clone());
-                            found_mac = Some(airpods_mac.clone());
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(mac) = found_mac {
-                    matched_airpods_mac = Some(mac);
-                } else {
-                    failed_macs.insert(addr);
-                    debug!("Device {} did not match any of our irks", addr);
-                    continue;
-                }
-            }
-
-            if let Some(ref mac) = matched_airpods_mac
-                && let Some(device_data) = all_devices.get(mac)
-                && let Some(DeviceInformation::AirPods(info)) = &device_data.information
-                && let Ok(enc_key_bytes) = hex::decode(&info.le_keys.enc_key)
-                && enc_key_bytes.len() == 16
-            {
-                matched_enc_key = Some(enc_key_bytes.as_slice().try_into().unwrap());
-            }
+            };
+            info!(
+                "Matched our device ({}) with the irk for {}",
+                addr, airpods_mac
+            );
+            let matched_airpods_mac = Some(airpods_mac);
 
             if matched_airpods_mac.is_some() {
                 let mut events = dev.events().await?;
@@ -356,27 +380,17 @@ pub async fn start_le_monitor(
                                             (case_byte & 0x7F, (case_byte & 0x80) != 0)
                                         };
 
-                                        if let Some(handle) = &tray_handle_clone {
+                                        if let Some(handle) = &tray_handle_clone
+                                            && let Some(mac) = matched_airpods_mac.as_deref()
+                                        {
                                             handle
                                                 .update(|tray: &mut MyTray| {
-                                                    (tray.battery_l, tray.battery_l_status) =
-                                                        ble_tray_entry(
-                                                            tray.battery_l,
-                                                            tray.battery_l_status,
-                                                            left_byte as u8,
-                                                        );
-                                                    (tray.battery_r, tray.battery_r_status) =
-                                                        ble_tray_entry(
-                                                            tray.battery_r,
-                                                            tray.battery_r_status,
-                                                            right_byte as u8,
-                                                        );
-                                                    (tray.battery_c, tray.battery_c_status) =
-                                                        ble_tray_entry(
-                                                            tray.battery_c,
-                                                            tray.battery_c_status,
-                                                            case_byte as u8,
-                                                        );
+                                                    tray.apply_le_battery(
+                                                        mac,
+                                                        left_byte as u8,
+                                                        right_byte as u8,
+                                                        case_byte as u8,
+                                                    )
                                                 })
                                                 .await;
                                         }
@@ -569,6 +583,120 @@ mod tests {
     use BatteryStatus::{Charging, Disconnected, NotCharging};
 
     const MAC: &str = "AA:BB:CC:DD:EE:FF";
+
+    /// devices.json holding one AirPods (MAC) with these hex keys.
+    fn devices_json(irk: &str, enc_key: &str) -> String {
+        let s = String::new;
+        let info = crate::devices::airpods::AirPodsInformation {
+            name: s(),
+            model_number: s(),
+            manufacturer: s(),
+            serial_number: s(),
+            version1: s(),
+            version2: s(),
+            hardware_revision: s(),
+            updater_identifier: s(),
+            left_serial_number: s(),
+            right_serial_number: s(),
+            version3: s(),
+            le_keys: crate::bluetooth::aacp::AirPodsLEKeys {
+                irk: irk.to_string(),
+                enc_key: enc_key.to_string(),
+            },
+        };
+        let device = DeviceData {
+            name: "AirPods".to_string(),
+            type_: DeviceType::AirPods,
+            information: Some(DeviceInformation::AirPods(info)),
+        };
+        serde_json::to_string(&HashMap::from([(MAC.to_string(), device)])).unwrap()
+    }
+
+    /// An RPA that IRK resolves.
+    fn our_rpa() -> String {
+        let prand = [0x01, 0x02, 0x5A];
+        rpa_string(ah(&IRK, &prand), prand)
+    }
+
+    #[test]
+    fn rpa_matches_after_keys_stored_later() {
+        let addr = our_rpa();
+        let mut unmatched = UnmatchedRpas::default();
+        assert_eq!(unmatched.lookup(&addr, Ok(devices_json("", ""))), None);
+        // Cached as failed while the keys stay the same.
+        assert!(unmatched.addrs.contains(&addr));
+        assert_eq!(unmatched.lookup(&addr, Ok(devices_json("", ""))), None);
+
+        let found = unmatched.lookup(&addr, Ok(devices_json(&hex::encode(IRK), "")));
+        assert_eq!(found, Some((MAC.to_string(), None)));
+    }
+
+    #[test]
+    fn unreadable_devices_file_does_not_cache_failure() {
+        let addr = our_rpa();
+        let stored = devices_json(&hex::encode(IRK), "");
+        let mut unmatched = UnmatchedRpas::default();
+        // The IRK is already seen, so only a cached failure could block the match below.
+        assert_eq!(
+            unmatched.lookup("11:22:33:44:55:66", Ok(stored.clone())),
+            None
+        );
+
+        let errors: [std::io::Result<String>; 3] = [
+            Err(std::io::ErrorKind::PermissionDenied.into()),
+            Err(std::io::ErrorKind::InvalidData.into()),
+            Ok("{".to_string()),
+        ];
+        for err in errors {
+            assert_eq!(unmatched.lookup(&addr, err), None);
+            assert!(!unmatched.addrs.contains(&addr));
+        }
+        assert_eq!(
+            unmatched.lookup(&addr, Ok(stored)),
+            Some((MAC.to_string(), None))
+        );
+    }
+
+    #[test]
+    fn read_error_message_hides_key_bytes() {
+        let irk = hex::encode(IRK);
+        let stored = devices_json(&irk, "");
+        let keys = format!(r#"{{"irk":"{irk}","enc_key":""}}"#);
+        assert!(stored.contains(&keys));
+        let bad = stored.replace(&keys, &format!("\"{irk}\""));
+        let err = crate::settings_file::parse_devices(Ok(bad)).unwrap_err();
+        // serde quotes the bad value, so the raw error would leak the IRK.
+        assert!(err.to_string().contains(&irk));
+        let msg = read_error_message(MAC, &err);
+        assert!(msg.contains(MAC), "{msg}");
+        assert!(!msg.to_lowercase().contains(&irk), "{msg}");
+    }
+
+    #[test]
+    fn lookup_returns_current_enc_key() {
+        let addr = our_rpa();
+        let irk = hex::encode(IRK);
+        let enc = [0x5Au8; 16];
+        let lookup = |enc_key: &str| {
+            let devices = crate::settings_file::parse_devices(Ok(devices_json(&irk, enc_key)));
+            rpa_lookup(&addr, &devices.unwrap())
+        };
+        assert_eq!(
+            lookup(&hex::encode(enc)),
+            Some((MAC.to_string(), Some(enc)))
+        );
+        for bad in [
+            "",
+            "zz",
+            &hex::encode([0x5Au8; 15]),
+            &hex::encode([0x5Au8; 17]),
+        ] {
+            assert_eq!(lookup(bad), Some((MAC.to_string(), None)), "{bad:?}");
+        }
+        // Another IRK doesn't resolve it.
+        let devices = crate::settings_file::parse_devices(Ok(devices_json(&"11".repeat(16), "")));
+        assert_eq!(rpa_lookup(&addr, &devices.unwrap()), None);
+    }
 
     #[test]
     fn le_connect_slot_freed_on_every_outcome() {

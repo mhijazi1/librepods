@@ -1,6 +1,6 @@
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::settings_file::{parse_devices, rewrite_devices_file};
+use crate::settings_file::{devices_error_log, parse_devices, rewrite_devices_file};
 use crate::utils::get_devices_path;
 use bluer::{
     Address, AddressType, Error, Result,
@@ -811,8 +811,8 @@ impl AACPManager {
             opcodes::PROXIMITY_KEYS_RSP => {
                 if payload.len() < 4 {
                     error!(
-                        "Proximity Keys Response packet too short: {}",
-                        hex::encode(payload)
+                        "Proximity Keys Response packet too short: {} bytes",
+                        payload.len()
                     );
                     return;
                 }
@@ -823,8 +823,8 @@ impl AACPManager {
                 for _ in 0..key_count {
                     if offset + 3 >= payload.len() {
                         error!(
-                            "Proximity Keys Response packet too short while parsing keys: {}",
-                            hex::encode(payload)
+                            "Proximity Keys Response packet too short while parsing keys: {} bytes",
+                            payload.len()
                         );
                         return;
                     }
@@ -833,8 +833,8 @@ impl AACPManager {
                     offset += 4;
                     if offset + key_length > payload.len() {
                         error!(
-                            "Proximity Keys Response packet too short for key data: {}",
-                            hex::encode(payload)
+                            "Proximity Keys Response packet too short for key data: {} bytes",
+                            payload.len()
                         );
                         return;
                     }
@@ -843,10 +843,8 @@ impl AACPManager {
                     offset += key_length;
                 }
                 info!(
-                    "Received Proximity Keys Response: {:?}",
-                    keys.iter()
-                        .map(|(kt, kd)| (kt, hex::encode(kd)))
-                        .collect::<Vec<_>>()
+                    "Received Proximity Keys Response: {}",
+                    proximity_keys_summary(&keys)
                 );
                 let state = self.state.lock().await;
                 if let Some(mac) = state.airpods_mac {
@@ -1505,21 +1503,58 @@ pub(crate) fn parse_connected_devices(payload: &[u8]) -> Option<Vec<ConnectedDev
     Some(devices)
 }
 
-/// `devices` with `info` set on `mac`'s entry; a missing entry is not created.
+/// `devices` with `info` set on `mac`'s entry, keeping each stored LE key that
+/// `info` leaves empty; a missing entry is not created.
 fn devices_with_information(
     mut devices: HashMap<String, DeviceData>,
     mac: &str,
     info: &AirPodsInformation,
 ) -> HashMap<String, DeviceData> {
     if let Some(device_data) = devices.get_mut(mac) {
+        let mut info = info.clone();
+        if let Some(DeviceInformation::AirPods(stored)) = &device_data.information {
+            if info.le_keys.irk.is_empty() {
+                info.le_keys.irk = stored.le_keys.irk.clone();
+            }
+            if info.le_keys.enc_key.is_empty() {
+                info.le_keys.enc_key = stored.le_keys.enc_key.clone();
+            }
+        }
         device_data.name = info.name.clone();
-        device_data.information = Some(DeviceInformation::AirPods(info.clone()));
+        device_data.information = Some(DeviceInformation::AirPods(info));
     }
     devices
 }
 
+/// Key types and lengths of `keys`, never the key bytes.
+fn proximity_keys_summary(keys: &[(u8, Vec<u8>)]) -> String {
+    keys.iter()
+        .map(|(kt, kd)| match ProximityKeyType::from_u8(*kt) {
+            Some(t) => format!("{t:?} ({} bytes)", kd.len()),
+            None => format!("type {kt:#04x} ({} bytes)", kd.len()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// recv_thread's debug text for `data`: the full hex, except for a Proximity
+/// Keys Response (at any length, as a cut-off one still holds key bytes).
+fn received_packet_debug(data: &[u8]) -> String {
+    if data.starts_with(&HEADER_BYTES) && data.get(4) == Some(&opcodes::PROXIMITY_KEYS_RSP) {
+        format!(
+            "Received {} bytes: Proximity Keys Response (opcode {:#04x}), key bytes redacted",
+            data.len(),
+            opcodes::PROXIMITY_KEYS_RSP
+        )
+    } else {
+        format!("Received {} bytes: {}", data.len(), hex::encode(data))
+    }
+}
+
 /// `devices` with each known key in `keys` stored on `mac`'s entry, which is
-/// created (named after the MAC) if missing.
+/// created (named after the MAC) if missing. An entry without information gets
+/// AirPods information with empty strings, so the keys survive until the
+/// Information packet fills the rest in.
 fn devices_with_proximity_keys(
     mut devices: HashMap<String, DeviceData>,
     mac: &str,
@@ -1534,11 +1569,30 @@ fn devices_with_proximity_keys(
             type_: DeviceType::AirPods,
             information: None,
         });
-        match (kt, device_data.information.as_mut()) {
-            (ProximityKeyType::Irk, Some(DeviceInformation::AirPods(info))) => {
+        let information = device_data.information.get_or_insert_with(|| {
+            DeviceInformation::AirPods(AirPodsInformation {
+                name: String::new(),
+                model_number: String::new(),
+                manufacturer: String::new(),
+                serial_number: String::new(),
+                version1: String::new(),
+                version2: String::new(),
+                hardware_revision: String::new(),
+                updater_identifier: String::new(),
+                left_serial_number: String::new(),
+                right_serial_number: String::new(),
+                version3: String::new(),
+                le_keys: AirPodsLEKeys {
+                    irk: String::new(),
+                    enc_key: String::new(),
+                },
+            })
+        });
+        match (kt, information) {
+            (ProximityKeyType::Irk, DeviceInformation::AirPods(info)) => {
                 info.le_keys.irk = hex::encode(key_data);
             }
-            (ProximityKeyType::EncKey, Some(DeviceInformation::AirPods(info))) => {
+            (ProximityKeyType::EncKey, DeviceInformation::AirPods(info)) => {
                 info.le_keys.enc_key = hex::encode(key_data);
             }
             (ProximityKeyType::Irk, _) => {
@@ -1564,7 +1618,11 @@ fn update_devices_file(
         Ok(serde_json::to_string(&devices)?)
     });
     if let Err(e) = result {
-        error!("Not saving devices to {}: {}", path.display(), e);
+        error!(
+            "Not saving devices to {}: {}",
+            path.display(),
+            devices_error_log(&e)
+        );
         return false;
     }
     true
@@ -1759,7 +1817,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
             }
             Ok(n) => {
                 let data = &buf[..n];
-                debug!("Received {} bytes: {}", n, hex::encode(data));
+                debug!("{}", received_packet_debug(data));
                 manager.receive_packet(data).await;
             }
             Err(e) => {
@@ -3521,7 +3579,143 @@ mod tests {
         let airpods = &updated[AIRPODS_MAC];
         assert_eq!(airpods.name, AIRPODS_MAC);
         assert!(matches!(airpods.type_, DeviceType::AirPods));
-        assert!(airpods.information.is_none());
+        let Some(DeviceInformation::AirPods(info)) = &airpods.information else {
+            panic!("keys not stored");
+        };
+        assert_eq!(info.le_keys.irk, "11");
+    }
+
+    const IRK: [u8; 16] = [0xA1; 16];
+    const ENC_KEY: [u8; 16] = [0xB2; 16];
+
+    fn stored_keys(devices: &HashMap<String, DeviceData>) -> (String, String) {
+        let Some(DeviceInformation::AirPods(info)) = &devices[AIRPODS_MAC].information else {
+            panic!("AirPods information lost");
+        };
+        (info.le_keys.irk.clone(), info.le_keys.enc_key.clone())
+    }
+
+    #[test]
+    fn information_keeps_stored_le_keys() {
+        let mut stored = airpods_info("Old Name");
+        stored.model_number = "A0000".to_string();
+        stored.serial_number = "OLDSN".to_string();
+        stored.version1 = "0".to_string();
+        stored.le_keys.irk = hex::encode(IRK);
+        stored.le_keys.enc_key = hex::encode(ENC_KEY);
+        let airpods = DeviceData {
+            name: "Old Name".to_string(),
+            type_: DeviceType::AirPods,
+            information: Some(DeviceInformation::AirPods(stored)),
+        };
+        let packet = airpods_info("My AirPods");
+
+        let updated =
+            devices_with_information(devices(vec![(AIRPODS_MAC, airpods)]), AIRPODS_MAC, &packet);
+
+        assert_eq!(
+            stored_keys(&updated),
+            (hex::encode(IRK), hex::encode(ENC_KEY))
+        );
+        let Some(DeviceInformation::AirPods(info)) = &updated[AIRPODS_MAC].information else {
+            panic!("AirPods information lost");
+        };
+        assert_eq!(updated[AIRPODS_MAC].name, packet.name);
+        assert_eq!(info.name, packet.name);
+        assert_eq!(info.model_number, packet.model_number);
+        assert_eq!(info.serial_number, packet.serial_number);
+        assert_eq!(info.version1, packet.version1);
+    }
+
+    #[test]
+    fn proximity_keys_before_information_kept() {
+        let keys = [(0x01, IRK.to_vec()), (0x04, ENC_KEY.to_vec())];
+        let no_info = DeviceData {
+            name: AIRPODS_MAC.to_string(),
+            type_: DeviceType::AirPods,
+            information: None,
+        };
+        let packet = airpods_info("My AirPods");
+        // An entry without information, and a missing entry.
+        for start in [devices(vec![(AIRPODS_MAC, no_info)]), devices(vec![])] {
+            let updated = devices_with_proximity_keys(start, AIRPODS_MAC, &keys);
+            assert_eq!(
+                stored_keys(&updated),
+                (hex::encode(IRK), hex::encode(ENC_KEY))
+            );
+
+            let updated = devices_with_information(updated, AIRPODS_MAC, &packet);
+
+            assert_eq!(
+                stored_keys(&updated),
+                (hex::encode(IRK), hex::encode(ENC_KEY))
+            );
+            let mut expected = packet.clone();
+            expected.le_keys.irk = hex::encode(IRK);
+            expected.le_keys.enc_key = hex::encode(ENC_KEY);
+            assert_eq!(
+                serde_json::to_value(&updated[AIRPODS_MAC].information).unwrap(),
+                serde_json::to_value(Some(DeviceInformation::AirPods(expected))).unwrap()
+            );
+            assert_eq!(updated[AIRPODS_MAC].name, packet.name);
+        }
+
+        // An entry with non-AirPods information is left unchanged.
+        let updated = devices_with_proximity_keys(
+            devices(vec![(OTHER_MAC, other_device())]),
+            OTHER_MAC,
+            &keys,
+        );
+        assert_other_unchanged(&updated);
+    }
+
+    #[test]
+    fn proximity_keys_summary_has_no_key_bytes() {
+        let summary = proximity_keys_summary(&[(0x01, IRK.to_vec()), (0x04, ENC_KEY.to_vec())]);
+
+        assert!(summary.contains("Irk"), "{summary}");
+        assert!(summary.contains("EncKey"), "{summary}");
+        assert!(summary.contains("16"), "{summary}");
+        for key in [IRK, ENC_KEY] {
+            assert!(!summary.contains(&hex::encode(key)), "{summary}");
+            assert!(!summary.contains(&hex::encode_upper(key)), "{summary}");
+        }
+    }
+
+    #[test]
+    fn received_packet_debug_has_no_key_bytes() {
+        // Non-repeating keys, so any 4-byte slice of one is unique.
+        let irk: [u8; 16] = std::array::from_fn(|i| 0x80 + i as u8);
+        let enc_key: [u8; 16] = std::array::from_fn(|i| 0xC0 + i as u8);
+        let mut payload = vec![opcodes::PROXIMITY_KEYS_RSP, 0x00, 0x02];
+        for (kt, key) in [(0x01, irk), (0x04, enc_key)] {
+            payload.extend([kt, 0x00, 16, 0x00]);
+            payload.extend(key);
+        }
+        let full = [HEADER_BYTES.as_slice(), &payload].concat();
+        // Cut off six bytes into the IRK.
+        let truncated = &full[..HEADER_BYTES.len() + 3 + 4 + 6];
+
+        for packet in [full.as_slice(), truncated] {
+            let text = received_packet_debug(packet);
+            assert!(text.contains(&format!("{} bytes", packet.len())), "{text}");
+            assert!(text.contains("Proximity Keys Response"), "{text}");
+            assert!(text.contains("0x31"), "{text}");
+            for slice in irk.windows(4).chain(enc_key.windows(4)) {
+                assert!(!text.contains(&hex::encode(slice)), "{text}");
+                assert!(!text.contains(&hex::encode_upper(slice)), "{text}");
+            }
+        }
+
+        let battery = [
+            HEADER_BYTES.as_slice(),
+            &[opcodes::BATTERY_INFO, 0x00, 0x01],
+        ]
+        .concat();
+        assert_eq!(
+            received_packet_debug(&battery),
+            format!("Received 7 bytes: {}", hex::encode(&battery))
+        );
     }
 
     /// A fresh directory under the system temp dir.

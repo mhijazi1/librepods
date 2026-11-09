@@ -15,6 +15,24 @@ pub(crate) fn parse_devices(
     }
 }
 
+/// A devices.json read, parse or write error for the log: its kind and, for a
+/// parse error, where it failed. Never its text: serde quotes bad values, keys included.
+pub(crate) fn devices_error_log(e: &std::io::Error) -> String {
+    match e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<serde_json::Error>())
+    {
+        Some(s) => format!(
+            "{:?} ({:?} error at line {} column {})",
+            e.kind(),
+            s.classify(),
+            s.line(),
+            s.column()
+        ),
+        None => format!("{:?}", e.kind()),
+    }
+}
+
 /// The only read-modify-write of devices.json: reads `path`, hands the read
 /// result unchanged to `rewrite` (so a missing file arrives as NotFound for
 /// `parse_devices`) and writes what it returns. If `rewrite` fails, nothing is
@@ -174,6 +192,30 @@ mod tests {
         for json in ["", "{", r#"{"AA:AA:AA:AA:AA:AA": 1}"#] {
             assert!(parse_devices(Ok(json.to_string())).is_err(), "{json:?}");
         }
+    }
+
+    #[test]
+    fn devices_error_log_hides_key_bytes() {
+        let irk = "0123456789abcdef0123456789abcdef";
+        let json = format!(
+            r#"{{"AA:BB:CC:DD:EE:FF":{{"name":"AirPods","type_":"AirPods","information":{{"kind":"AirPods","data":{{"le_keys":"{irk}"}}}}}}}}"#
+        );
+        let err = parse_devices(Ok(json.clone())).unwrap_err();
+        // serde quotes the bad value, so the raw error would leak the IRK.
+        assert!(err.to_string().contains(irk), "{err}");
+        let serde_err = serde_json::from_str::<HashMap<String, DeviceData>>(&json).unwrap_err();
+        for msg in [
+            devices_error_log(&err),
+            devices_error_log(&serde_err.into()),
+        ] {
+            assert!(
+                msg.starts_with("InvalidData (Data error at line 1 column "),
+                "{msg}"
+            );
+            assert!(!msg.to_lowercase().contains(irk), "{msg}");
+        }
+        let read_err = std::io::ErrorKind::PermissionDenied.into();
+        assert_eq!(devices_error_log(&read_err), "PermissionDenied");
     }
 
     #[test]

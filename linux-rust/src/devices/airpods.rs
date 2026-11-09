@@ -64,17 +64,7 @@ impl AirPodsDevice {
 
         if let Some(handle) = &tray_handle {
             handle
-                .update(|tray: &mut MyTray| {
-                    tray.connected = true;
-                    tray.battery_headphone = None;
-                    tray.battery_headphone_status = None;
-                    tray.battery_l = None;
-                    tray.battery_l_status = None;
-                    tray.battery_r = None;
-                    tray.battery_r_status = None;
-                    tray.battery_c = None;
-                    tray.battery_c_status = None;
-                })
+                .update(|tray: &mut MyTray| tray.connect_reset(&mac_address.to_string()))
                 .await;
         }
 
@@ -170,7 +160,9 @@ impl AirPodsDevice {
             );
             if let Some(handle) = &tray_handle {
                 handle
-                    .update(|tray: &mut MyTray| tray.apply_battery(&seed))
+                    .update(|tray: &mut MyTray| {
+                        tray.apply_aacp_battery(&mac_address.to_string(), &seed)
+                    })
                     .await;
             }
             if let Some(exporter) = battery_exporter.clone() {
@@ -310,7 +302,9 @@ impl AirPodsDevice {
                         if let Some(handle) = &tray_handle {
                             // Same per-component rule as the window (#52).
                             handle
-                                .update(|tray: &mut MyTray| tray.apply_battery(&battery_info))
+                                .update(|tray: &mut MyTray| {
+                                    tray.apply_aacp_battery(&mac_address.to_string(), &battery_info)
+                                })
                                 .await;
                         }
                         debug!("Updated tray with new battery info");

@@ -387,15 +387,20 @@ pub(crate) fn mpd_pid(procs: impl IntoIterator<Item = (u32, impl AsRef<str>)>) -
 
 /// `mpd_pid` over every process in /proc.
 fn proc_mpd_pid() -> Option<u32> {
-    let procs = std::fs::read_dir("/proc")
-        .ok()?
+    mpd_pid(proc_comms())
+}
+
+/// Every process in /proc as (pid, `comm` without its trailing newline).
+fn proc_comms() -> impl Iterator<Item = (u32, String)> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
         .flatten()
         .filter_map(|entry| {
             let pid = entry.file_name().to_str()?.parse().ok()?;
             let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
             Some((pid, comm.trim_end().to_string()))
-        });
-    mpd_pid(procs)
+        })
 }
 
 /// The #841 guards, in order: case recovery, live session, Linux plus a
@@ -5982,6 +5987,16 @@ mod tests {
             assert_eq!(mpd_pid([(7, comm)]), None, "{comm}");
         }
         assert_eq!(mpd_pid([(9, "mpd"), (3, "mpd"), (1, "mpDris2")]), Some(3));
+    }
+
+    #[test]
+    fn proc_comms_reads_this_process_trimmed() {
+        let own = std::fs::read_to_string("/proc/self/comm").unwrap();
+        let comm = proc_comms()
+            .find(|(pid, _)| *pid == std::process::id())
+            .map(|(_, comm)| comm);
+        assert_eq!(comm.as_deref(), Some(own.trim_end()));
+        assert!(!own.trim_end().is_empty());
     }
 
     #[test]
