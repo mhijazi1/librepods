@@ -12,6 +12,20 @@ use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::window::merge_battery_entry;
 use crate::utils::get_app_settings_path;
 
+type CommandTx = UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>;
+
+/// A connected AirPods' menu target and last reports, restored when the tray
+/// moves to it (#467).
+#[derive(Debug, Clone)]
+pub struct TrayDevice {
+    mac: String,
+    command_tx: CommandTx,
+    listening_mode: Option<u8>,
+    allow_off_option: Option<u8>,
+    conversation_detect_enabled: Option<bool>,
+    battery: Vec<BatteryInfo>,
+}
+
 #[derive(Debug, Default)]
 pub struct MyTray {
     pub conversation_detect_enabled: Option<bool>,
@@ -30,10 +44,12 @@ pub struct MyTray {
     /// The AirPods MAC the tray shows: the last one to connect. Battery reports
     /// from other AirPods are ignored once it is set (#464).
     pub device: Option<String>,
+    /// The connected AirPods, oldest connect first (#467).
+    pub devices: Vec<TrayDevice>,
     pub connected: bool,
     pub listening_mode: Option<u8>,
     pub allow_off_option: Option<u8>,
-    pub command_tx: Option<UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>>,
+    pub command_tx: Option<CommandTx>,
     pub ui_tx: Option<UnboundedSender<BluetoothUIMessage>>,
 }
 
@@ -76,6 +92,9 @@ impl MyTray {
     /// (non-Disconnected) case level now belongs to `mac` (#461). Ignored when
     /// `mac` is not the tray's device (#464).
     pub fn apply_aacp_battery(&mut self, mac: &str, infos: &[BatteryInfo]) {
+        if let Some(d) = self.stored(mac) {
+            d.battery = infos.to_vec();
+        }
         if self.is_other_device(mac) {
             return;
         }
@@ -124,6 +143,87 @@ impl MyTray {
         }
         // From now on this device's AACP reports fill the case.
         self.case_owner = Some(mac.to_string());
+    }
+
+    /// The AirPods `mac` connected: the tray shows it (`connect_reset`) with no
+    /// control state yet, and the menu sends to `command_tx`.
+    pub fn connect_device(&mut self, mac: &str, command_tx: CommandTx) {
+        self.devices.retain(|d| d.mac != mac);
+        self.devices.push(TrayDevice {
+            mac: mac.to_string(),
+            command_tx: command_tx.clone(),
+            listening_mode: None,
+            allow_off_option: None,
+            conversation_detect_enabled: None,
+            battery: Vec::new(),
+        });
+        self.connect_reset(mac);
+        self.command_tx = Some(command_tx);
+        self.listening_mode = None;
+        self.allow_off_option = None;
+        self.conversation_detect_enabled = None;
+    }
+
+    /// The AirPods `mac` disconnected. If the tray shows it, the tray moves to
+    /// the most recently connected AirPods still connected, restoring its menu
+    /// target, control state and last AACP bud levels (the case follows
+    /// `connect_reset`). With none left the display stays, disconnected.
+    pub fn device_disconnected(&mut self, mac: &str) {
+        self.devices.retain(|d| d.mac != mac);
+        if self.device.as_deref() != Some(mac) {
+            return;
+        }
+        let Some(d) = self.devices.last().cloned() else {
+            self.connected = false;
+            self.command_tx = None;
+            return;
+        };
+        self.connect_reset(&d.mac);
+        let buds: Vec<BatteryInfo> = d
+            .battery
+            .into_iter()
+            .filter(|b| b.component != BatteryComponent::Case)
+            .collect();
+        self.apply_battery(&buds);
+        self.command_tx = Some(d.command_tx);
+        self.listening_mode = d.listening_mode;
+        self.allow_off_option = d.allow_off_option;
+        self.conversation_detect_enabled = d.conversation_detect_enabled;
+    }
+
+    fn stored(&mut self, mac: &str) -> Option<&mut TrayDevice> {
+        self.devices.iter_mut().find(|d| d.mac == mac)
+    }
+
+    /// A listening-mode report from `mac`: stored, and shown if `mac` is the
+    /// tray's device.
+    pub fn apply_listening_mode(&mut self, mac: &str, mode: u8) {
+        if let Some(d) = self.stored(mac) {
+            d.listening_mode = Some(mode);
+        }
+        if !self.is_other_device(mac) {
+            self.listening_mode = Some(mode);
+        }
+    }
+
+    /// An allow-off report from `mac`, as `apply_listening_mode`.
+    pub fn apply_allow_off(&mut self, mac: &str, value: u8) {
+        if let Some(d) = self.stored(mac) {
+            d.allow_off_option = Some(value);
+        }
+        if !self.is_other_device(mac) {
+            self.allow_off_option = Some(value);
+        }
+    }
+
+    /// A conversation-detect state of `mac`, as `apply_listening_mode`.
+    pub fn apply_conversation_detect(&mut self, mac: &str, enabled: bool) {
+        if let Some(d) = self.stored(mac) {
+            d.conversation_detect_enabled = Some(enabled);
+        }
+        if !self.is_other_device(mac) {
+            self.conversation_detect_enabled = Some(enabled);
+        }
     }
 }
 
@@ -277,7 +377,9 @@ impl ksni::Tray for MyTray {
                             ControlCommandIdentifiers::ConversationDetectConfig,
                             vec![value],
                         ));
-                        this.conversation_detect_enabled = Some(new_state);
+                        // Through the shown device's MAC so its stored state follows.
+                        let mac = this.device.clone().unwrap_or_default();
+                        this.apply_conversation_detect(&mac, new_state);
                     }
                 }),
                 ..Default::default()
@@ -715,5 +817,166 @@ mod tests {
         assert_eq!(tray.battery_c, Some(90));
         assert_eq!(tray.battery_c_status, Some(NotCharging));
         assert_eq!(tray.case_owner.as_deref(), Some(B));
+    }
+
+    const C: &str = "CC:CC:CC:CC:CC:CC";
+
+    type CommandRx = tokio::sync::mpsc::UnboundedReceiver<(ControlCommandIdentifiers, Vec<u8>)>;
+
+    /// `connect_device(mac)` with a fresh command channel; keep the receiver.
+    fn connect(tray: &mut MyTray, mac: &str) -> CommandRx {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tray.connect_device(mac, tx);
+        rx
+    }
+
+    /// Sends a listening-mode command the way the tray menu does.
+    fn menu_send(tray: &MyTray) {
+        let tx = tray.command_tx.as_ref().expect("menu target");
+        tx.send((ControlCommandIdentifiers::ListeningMode, vec![0x02]))
+            .unwrap();
+    }
+
+    fn controls(t: &MyTray) -> (Option<u8>, Option<u8>, Option<bool>) {
+        (
+            t.listening_mode,
+            t.allow_off_option,
+            t.conversation_detect_enabled,
+        )
+    }
+
+    #[test]
+    fn tray_ignores_other_airpods_control_reports() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        let _rx_b = connect(&mut tray, B);
+        tray.apply_listening_mode(B, 0x02);
+        tray.apply_allow_off(B, 0x00);
+        tray.apply_conversation_detect(B, false);
+        tray.apply_listening_mode(A, 0x03);
+        tray.apply_allow_off(A, 0x01);
+        tray.apply_conversation_detect(A, true);
+        assert_eq!(controls(&tray), (Some(0x02), Some(0x00), Some(false)));
+    }
+
+    #[test]
+    fn tray_device_control_reports_apply() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        let _rx_b = connect(&mut tray, B);
+        assert_eq!(controls(&tray), (None, None, None));
+        tray.apply_listening_mode(B, 0x04);
+        tray.apply_allow_off(B, 0x01);
+        tray.apply_conversation_detect(B, true);
+        assert_eq!(controls(&tray), (Some(0x04), Some(0x01), Some(true)));
+    }
+
+    #[test]
+    fn tray_menu_targets_last_connected_device() {
+        let mut tray = MyTray::default();
+        let mut rx_a = connect(&mut tray, A);
+        let mut rx_b = connect(&mut tray, B);
+        menu_send(&tray);
+        assert!(rx_b.try_recv().is_ok());
+        assert!(rx_a.try_recv().is_err());
+    }
+
+    #[test]
+    fn tray_disconnect_moves_to_other_connected_airpods() {
+        let mut tray = MyTray::default();
+        let mut rx_a = connect(&mut tray, A);
+        tray.apply_allow_off(A, 0x01);
+        tray.apply_aacp_battery(
+            A,
+            &[
+                b(Left, 55, NotCharging),
+                b(Right, 65, Charging),
+                b(Case, 90, NotCharging),
+            ],
+        );
+        let mut rx_c = connect(&mut tray, C);
+        let mut rx_b = connect(&mut tray, B);
+        tray.apply_listening_mode(A, 0x03);
+
+        tray.device_disconnected(B);
+        assert_eq!(tray.device.as_deref(), Some(C));
+        assert!(tray.connected);
+        assert_eq!(controls(&tray), (None, None, None));
+        menu_send(&tray);
+        assert!(rx_c.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_err());
+
+        tray.device_disconnected(C);
+        assert_eq!(tray.device.as_deref(), Some(A));
+        assert!(tray.connected);
+        assert_eq!(controls(&tray), (Some(0x03), Some(0x01), None));
+        assert_eq!(tray.battery_l, Some(55));
+        assert_eq!(tray.battery_l_status, Some(NotCharging));
+        assert_eq!(tray.battery_r, Some(65));
+        assert_eq!(tray.battery_r_status, Some(Charging));
+        // The case owner was C, not A: connect_reset clears the case.
+        assert_eq!(tray.case_owner.as_deref(), Some(A));
+        assert_eq!(tray.battery_c, None);
+        assert_eq!(tray.battery_c_status, None);
+        menu_send(&tray);
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_c.try_recv().is_err());
+    }
+
+    #[test]
+    fn tray_conversation_toggle_keeps_stored_state() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        tray.apply_conversation_detect(A, false);
+        let _rx_b = connect(&mut tray, B);
+        tray.device_disconnected(B);
+        assert_eq!(tray.conversation_detect_enabled, Some(false));
+        // The menu's Conversation Detection toggle, as it runs on activate.
+        let mac = tray.device.clone().unwrap();
+        tray.apply_conversation_detect(&mac, true);
+        let _rx_b = connect(&mut tray, B);
+        tray.device_disconnected(B);
+        assert_eq!(tray.conversation_detect_enabled, Some(true));
+    }
+
+    #[test]
+    fn tray_disconnect_other_airpods_changes_nothing() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        let mut rx_b = connect(&mut tray, B);
+        tray.apply_aacp_battery(B, &[b(Left, 80, NotCharging), b(Case, 60, NotCharging)]);
+        tray.apply_listening_mode(B, 0x02);
+        let before = (fields(&tray), controls(&tray));
+        tray.device_disconnected(A);
+        assert_eq!((fields(&tray), controls(&tray)), before);
+        assert_eq!(tray.device.as_deref(), Some(B));
+        assert!(tray.connected);
+        menu_send(&tray);
+        assert!(rx_b.try_recv().is_ok());
+        // A is no longer a switch target: B's disconnect leaves no AirPods.
+        tray.device_disconnected(B);
+        assert_eq!(tray.device.as_deref(), Some(B));
+        assert!(!tray.connected);
+    }
+
+    #[test]
+    fn tray_last_device_disconnect_keeps_display() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        tray.apply_aacp_battery(A, &[b(Left, 80, NotCharging), b(Right, 70, Charging)]);
+        tray.apply_le_battery(A, 0xff, 0xff, 0x5a);
+        let before = fields(&tray);
+        tray.device_disconnected(A);
+        assert_eq!(fields(&tray), before);
+        assert_eq!(tray.device.as_deref(), Some(A));
+        assert!(!tray.connected);
+        assert!(tray.command_tx.is_none());
+    }
+
+    #[test]
+    fn tray_mac_matches_bluez_address_form() {
+        let bluez = "AA:BB:CC:DD:EE:0F";
+        let addr: bluer::Address = bluez.parse().unwrap();
+        assert_eq!(addr.to_string(), bluez);
     }
 }
