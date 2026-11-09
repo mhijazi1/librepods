@@ -283,7 +283,7 @@ pub async fn start_le_monitor(
                                             );
                                             // Every skip only skips the connect; the battery block below still runs.
                                             if !auto_connect {
-                                                info!(
+                                                debug!(
                                                     "Auto-connect is disabled for {}, not attempting to connect.",
                                                     mac
                                                 );
@@ -302,7 +302,7 @@ pub async fn start_le_monitor(
                                                     Instant::now(),
                                                 );
                                             } else {
-                                                info!(
+                                                debug!(
                                                     "A connect to {} is in flight or failed recently, skipping.",
                                                     mac
                                                 );
