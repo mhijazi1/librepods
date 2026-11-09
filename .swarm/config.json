@@ -1,5 +1,5 @@
 {
-  "check": "T=\"$(git rev-parse --show-toplevel)/.cargo-target\"; CARGO_TARGET_DIR=\"$T\" nix develop -c bash -c \"cd linux-rust && cargo build --locked && cargo test --locked\" && nix flake check --no-build",
+  "check": "T=\"$(git rev-parse --show-toplevel)/.cargo-target\"; CARGO_TARGET_DIR=\"$T\" nix develop -c bash -c \"cd linux-rust && cargo fmt --check && cargo build --locked && cargo test --locked\" && nix flake check --no-build",
   "base": "linux-parity",
   "project": {
     "owner": "mhijazi1",
