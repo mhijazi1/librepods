@@ -1074,22 +1074,8 @@ mod tests {
     /// reconnect take is a loss and yields once, not a stale report.
     #[tokio::test]
     async fn release_echo_boundary_ends_reconnect_take_window() {
-        let (mut core, at, commands) = reconnect_take_core(ready_facts(vec![0]));
-        assert!(
-            commands.contains(&Command::SendOwnership(true)),
-            "{commands:?}"
-        );
-        for input in adoption_inputs(backlog_around_send(None).await) {
-            assert_eq!(core.handle(at, input), []);
-        }
-        let lines = core.take_lines();
-        assert!(
-            lines
-                .last()
-                .unwrap()
-                .starts_with("BACKLOG drained; the reconnect take"),
-            "{lines:?}"
-        );
+        let inputs = adoption_inputs(backlog_around_send(None).await);
+        let (mut core, at) = reconnect_take_core(ready_facts(vec![0]), inputs);
         assert_eq!(
             core.handle(at, Input::Ownership(vec![0])),
             [Command::PauseMedia]
@@ -1150,9 +1136,9 @@ mod tests {
     }
 
     /// An automatic core whose session dropped with the case closed, then
-    /// reconnected for new playback with `facts`. Returns the core, the
-    /// reconnect time and the `Reconnected` step's commands.
-    fn reconnect_take_core(facts: SessionFacts) -> (Handoff, Instant, Vec<Command>) {
+    /// reconnected for new playback with `facts`, took ownership and adopted
+    /// `inputs`, ending the backlog. Returns the core and the reconnect time.
+    fn reconnect_take_core(facts: SessionFacts, inputs: Vec<Input>) -> (Handoff, Instant) {
         use crate::media_controller::{AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_STREAM};
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -1176,8 +1162,23 @@ mod tests {
             [Command::Reconnect { audio: true }]
         );
         let commands = core.handle(at(1200), Input::Reconnected(facts));
+        assert!(
+            commands.contains(&Command::SendOwnership(true)),
+            "{commands:?}"
+        );
         core.take_lines();
-        (core, at(1300), commands)
+        for input in inputs {
+            assert_eq!(core.handle(at(1300), input), []);
+        }
+        let lines = core.take_lines();
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with("BACKLOG drained; the reconnect take"),
+            "{lines:?}"
+        );
+        (core, at(1300))
     }
 
     /// #290: the AirPods report OwnsConnection only on a real change (#159),
@@ -1213,23 +1214,7 @@ mod tests {
         let owner = inputs.iter().position(|i| *i == Input::Ownership(vec![0]));
         assert!(hosts.is_some() && hosts < owner, "{inputs:?}");
         assert_eq!(inputs.last(), Some(&Input::InitBacklogDrained));
-
-        let (mut core, at, commands) = reconnect_take_core(facts);
-        assert!(
-            commands.contains(&Command::SendOwnership(true)),
-            "{commands:?}"
-        );
-        for input in inputs {
-            assert_eq!(core.handle(at, input), []);
-        }
-        let lines = core.take_lines();
-        assert!(
-            lines
-                .last()
-                .unwrap()
-                .starts_with("BACKLOG drained; the reconnect take"),
-            "{lines:?}"
-        );
+        reconnect_take_core(facts, inputs);
     }
 
     #[test]
