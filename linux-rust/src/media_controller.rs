@@ -408,7 +408,11 @@ const fn card_lookup_max_wait(attempts: u32) -> Duration {
 }
 
 /// BlueZ's A2DP Sink profile, asked for when BlueZ never connected it (#310).
-const A2DP_SINK: uuid::Uuid = uuid::Uuid::from_u128(0x0000110b_0000_1000_8000_00805f9b34fb);
+pub(crate) const A2DP_SINK: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000110b_0000_1000_8000_00805f9b34fb);
+
+/// `connect_if_connected`'s refusal: no ConnectProfile was sent (#320).
+const NOT_CONNECTED: &str = "AirPods not connected";
 
 /// Longest the A2DP profile connect may take (the handoff probe's value).
 const A2DP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -537,7 +541,8 @@ where
 
 /// Ask BlueZ for the A2DP profile once, cut at `A2DP_CONNECT_TIMEOUT`, then
 /// look for the card it brings with `A2DP_CONNECT_LOOKUP_ATTEMPTS` tries of
-/// `find`. `None` after one `warn!` naming the cause (#310).
+/// `find`. `None` after one `warn!` naming the cause (#310), or one `debug!`
+/// when the AirPods were not connected, so nothing was asked (#320).
 async fn connect_a2dp_then_find<T, C, CFut, F, FFut, S, SFut>(
     connect: C,
     find: F,
@@ -551,7 +556,6 @@ where
     S: FnMut(Duration) -> SFut,
     SFut: Future<Output = ()>,
 {
-    info!("No AirPods card: asking BlueZ to ConnectProfile A2DP Sink");
     // shortcut: a ConnectProfile cut here can outlive `profile_write` (#316):
     // it can still finish in BlueZ after the lock is released, so a later
     // hold may miss its card.
@@ -563,6 +567,10 @@ where
                 return found;
             }
             "still no AirPods card".to_string()
+        }
+        Ok(Err(e)) if e == NOT_CONNECTED => {
+            debug!("A2DP profile connect skipped: {e}");
+            return None;
         }
         Ok(Err(e)) => e,
         Err(_) => format!("no reply within {A2DP_CONNECT_TIMEOUT:?}"),
@@ -583,14 +591,19 @@ async fn connect_a2dp_profile(mac: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     connect_if_connected(
         || async { device.is_connected().await.unwrap_or(false) },
-        || async {
-            device
-                .connect_profile(&A2DP_SINK)
-                .await
-                .map_err(|e| e.to_string())
-        },
+        || async { connect_profile_reply(device.connect_profile(&A2DP_SINK).await) },
     )
     .await
+}
+
+/// A connect already under way (`InProgress`) or done (`AlreadyConnected`)
+/// still brings the card, so it goes on to the re-lookup like success (#321).
+fn connect_profile_reply(reply: bluer::Result<()>) -> Result<(), String> {
+    use bluer::ErrorKind::{AlreadyConnected, InProgress};
+    match reply {
+        Err(e) if !matches!(e.kind, InProgress | AlreadyConnected) => Err(e.to_string()),
+        _ => Ok(()),
+    }
 }
 
 /// Connect only while connected, so a hold released on a disconnect never
@@ -603,8 +616,9 @@ where
     CFut: Future<Output = Result<(), String>>,
 {
     if !is_connected().await {
-        return Err("AirPods not connected".to_string());
+        return Err(NOT_CONNECTED.to_string());
     }
+    info!("No AirPods card: asking BlueZ to ConnectProfile A2DP Sink");
     connect().await
 }
 
@@ -4754,7 +4768,48 @@ mod tests {
             )
             .await;
             assert_eq!(calls.get(), usize::from(connected));
-            assert_eq!(result.is_ok(), connected);
+            let refused = Err(NOT_CONNECTED.to_string());
+            assert_eq!(result, if connected { Ok(()) } else { refused });
         }
+    }
+
+    fn bluez_error(kind: bluer::ErrorKind) -> bluer::Result<()> {
+        let message = format!("{kind:?}");
+        Err(bluer::Error { kind, message })
+    }
+
+    #[test]
+    fn connect_profile_reply_maps_bluez_errors() {
+        use bluer::ErrorKind::*;
+        assert_eq!(connect_profile_reply(Ok(())), Ok(()));
+        for kind in [InProgress, AlreadyConnected] {
+            assert_eq!(
+                connect_profile_reply(bluez_error(kind.clone())),
+                Ok(()),
+                "{kind:?}"
+            );
+        }
+        for kind in [Failed, NotAvailable, NotReady] {
+            assert!(
+                connect_profile_reply(bluez_error(kind.clone())).is_err(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_a2dp_in_progress_still_relooks() {
+        let finds = std::cell::Cell::new(0u32);
+        let found = connect_a2dp_then_find(
+            || async { connect_profile_reply(bluez_error(bluer::ErrorKind::InProgress)) },
+            || {
+                finds.set(finds.get() + 1);
+                let n = finds.get();
+                async move { (n == 3).then_some(7) }
+            },
+            |_| std::future::ready(()),
+        )
+        .await;
+        assert_eq!((found, finds.get()), (Some(7), 3));
     }
 }

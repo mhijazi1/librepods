@@ -159,6 +159,12 @@ pub(crate) trait PlaybackSource: Send {
     /// Every playback stream with its index, properties and corked state.
     /// A failed or truncated listing is an error, never a short list.
     fn playback_streams(&mut self) -> io::Result<Vec<StreamProps>>;
+
+    /// The source can no longer list (a dead thread), so an Ok listing says
+    /// nothing about live presence: `live` is unknown (None).
+    fn dead(&self) -> bool {
+        false
+    }
 }
 
 /// How loud playback streams are (#88): the sinks' monitors in production
@@ -366,15 +372,17 @@ pub(crate) struct PlaybackState {
     /// A stream counts as playing (`PlaybackTracker`).
     pub(crate) counted: bool,
     /// The PIDs owning a live stream in the last successful listing
-    /// (`live_stream_pids`); None before the first one (#302).
+    /// (`live_stream_pids`); None before the first one (#302) and once
+    /// the source is dead (`PlaybackSource::dead`, #318).
     pub(crate) live: Option<HashSet<u32>>,
 }
 
 impl PlaybackState {
     /// Whether the MPRIS player whose bus owner is `owner` plays locally:
     /// it owns a live stream (#329), unknown counting as live: before the
-    /// first successful listing (a stalled sound server, #83) every player
-    /// plays as before #302. A failed owner lookup (None) owns nothing.
+    /// first successful listing (a stalled sound server, #83) or with a
+    /// dead stream thread (#318), every player plays as before #302. A
+    /// failed owner lookup (None) owns nothing.
     pub(crate) fn live_or_unknown(&self, owner: Option<u32>) -> bool {
         self.live
             .as_ref()
@@ -504,7 +512,7 @@ where
                     observed(now);
                     let state = PlaybackState {
                         counted: tracker.playing,
-                        live: Some(live),
+                        live: (!source.dead()).then_some(live),
                     };
                     if *publish.borrow() != state {
                         publish.send_replace(state);
@@ -587,7 +595,8 @@ type ListingReply = std::sync::mpsc::SyncSender<io::Result<Vec<StreamProps>>>;
 /// its own request at most `bound`; at most one request waits for the
 /// thread, and a stalled thread is an error. A dead thread (never spawned,
 /// or panicked) lists no streams at once, so stream playback fails safe to
-/// off instead of keeping its last state (#134).
+/// off instead of keeping its last state (#134), and reports itself `dead`,
+/// so live presence is unknown (None) and MPRIS counts as before #302.
 pub(crate) struct PulsePlaybackStreams {
     requests: std::sync::mpsc::SyncSender<ListingReply>,
     bound: Duration,
@@ -656,6 +665,10 @@ impl PlaybackSource for PulsePlaybackStreams {
             log::error!("Stream monitor: playback stream thread died; stream playback stays off");
         }
         Ok(Vec::new())
+    }
+
+    fn dead(&self) -> bool {
+        self.dead
     }
 }
 
@@ -2823,6 +2836,64 @@ mod tests {
             .await
             .expect("stream playback off once the thread died")
             .expect("monitor running");
+    }
+
+    #[tokio::test]
+    async fn playback_thread_dead_makes_live_unknown() {
+        let die = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dying = die.clone();
+        // No such process, so /proc names no parent.
+        const PID: u32 = 99_999_999;
+        // An empty baseline, then music until `die`, then the thread panics.
+        let source = PulsePlaybackStreams::spawn(Duration::from_secs(5), move || {
+            let mut n = 0;
+            move || {
+                n += 1;
+                if dying.load(std::sync::atomic::Ordering::SeqCst) {
+                    panic!("listing thread dies");
+                }
+                Ok(if n == 1 {
+                    Vec::new()
+                } else {
+                    vec![with_pid(music(1), PID)]
+                })
+            }
+        });
+        let mut rx = spawn_stream_playback(
+            source,
+            AllAudible,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            Default::default(),
+            |_| (),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            rx.wait_for(|s| s.counted && s.live == Some(HashSet::from([PID]))),
+        )
+        .await
+        .expect("stream playback")
+        .expect("monitor running");
+        die.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            rx.wait_for(|s| s.live.is_none() && !s.counted),
+        )
+        .await
+        .expect("live unknown once the thread died")
+        .expect("monitor running");
+        // It stays so over later polls.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *rx.borrow(),
+            PlaybackState {
+                counted: false,
+                live: None
+            }
+        );
+        // Unknown again: every Playing player counts, even one whose owner
+        // lookup failed (#83, #329).
+        assert!(rx.borrow().live_or_unknown(None));
     }
 
     #[test]
