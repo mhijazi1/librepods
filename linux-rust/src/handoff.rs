@@ -449,6 +449,11 @@ impl Handoff {
         self.last_owner_linux
     }
 
+    #[cfg(test)]
+    pub(crate) fn ear_reports_due(&self) -> u32 {
+        self.ear_reports_due
+    }
+
     pub(crate) fn connected(&self) -> bool {
         self.connected
     }

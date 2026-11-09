@@ -694,6 +694,22 @@ async fn sync_session(core: &mut Handoff, shell: &mut Shell) -> bool {
     step(core, shell, Input::Disconnected).await
 }
 
+/// Ear detection's resume report (#313). The router queues its reinsertion's
+/// EarState here before the handlers see it, but the select can still poll
+/// the report first: step the queued events so it never counts early (#358).
+async fn on_ear_resume(core: &mut Handoff, shell: &mut Shell, resumed: bool) -> bool {
+    info!(
+        "Handoff {}: ear detection resumed a player: {resumed}",
+        shell.mac
+    );
+    while let Ok(event) = shell.events.try_recv() {
+        if mark_session_lost(core, shell).await || on_event(core, shell, event).await {
+            return true;
+        }
+    }
+    sync_session(core, shell).await || step(core, shell, Input::EarResume { resumed }).await
+}
+
 /// The event stream closed: no event can reach the core any more, so it
 /// stops through SessionLost and Disconnected whether or not the session is
 /// still alive.
@@ -775,9 +791,7 @@ async fn run_handoff(mut shell: Shell) {
             // After events, so a reinsertion's EarState comes first, and
             // before samples, so a queued `false` beats a ready play (#313).
             Some(resumed) = shell.ear_rx.recv() => {
-                info!("Handoff {}: ear detection resumed a player: {resumed}", shell.mac);
-                sync_session(&mut core, &mut shell).await
-                    || step(&mut core, &mut shell, Input::EarResume { resumed }).await
+                on_ear_resume(&mut core, &mut shell, resumed).await
             }
             Some((sampled_at, category)) = shell.play_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
@@ -2447,6 +2461,82 @@ mod tests {
             .handle_ear_detection(vec![InEar, OutOfEar], vec![InEar, InEar])
             .await;
         assert_eq!(ear_rx.try_recv(), Ok(false));
+    }
+
+    /// #358: a reinsertion's `false` report handled while its EarState is
+    /// still queued (the report won the select) still ends the grace. Calls
+    /// the ear_rx arm directly: a current-thread runtime can't interleave
+    /// the select's polls with the router.
+    #[tokio::test]
+    async fn ear_report_drains_its_queued_ear_state() {
+        use EarDetectionStatus::{InEar, OutOfEar};
+        let mac = "5A:00:00:00:00:1E";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let (_records, (_, media)) = Harness::fake_media(mac);
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let mut shell = Shell {
+            mac: mac.to_string(),
+            local: LOCAL.to_string(),
+            manager,
+            media,
+            events,
+            flush: mpsc::unbounded_channel().0,
+            play_rx: Harness::play_channel().1(),
+            call_rx: mpsc::channel(1).1,
+            a2dp_rx: mpsc::channel(1).1,
+            ear_rx: mpsc::unbounded_channel().1,
+            resume: None,
+            lines: None,
+            connect_mode: ConnectMode::default(),
+            relay_category: false,
+        };
+        // Remote owns and plays media; one bud out.
+        let mut core = Handoff::new(LOCAL.to_string(), Instant::now(), true, true);
+        for input in [
+            Input::ConnectedDevices {
+                old: Vec::new(),
+                new: vec![host(LOCAL), host(REMOTE)],
+            },
+            Input::EarState(vec![InEar, InEar]),
+            Input::Ownership(vec![0]),
+            Input::Playback {
+                sampled_at: Instant::now(),
+                category: AUDIO_CATEGORY_IDLE,
+            },
+            Input::AudioSource(AudioSource {
+                mac: REMOTE.to_string(),
+                r#type: AudioSourceType::Media,
+            }),
+            Input::MediaInformation {
+                host: REMOTE.to_string(),
+                category: AUDIO_CATEGORY_MEDIA,
+            },
+            Input::EarState(vec![InEar, OutOfEar]),
+        ] {
+            core.handle(Instant::now(), input);
+        }
+        events_tx
+            .send(AACPEvent::EarDetection(
+                vec![InEar, OutOfEar],
+                vec![InEar, InEar],
+            ))
+            .unwrap();
+        assert!(!on_ear_resume(&mut core, &mut shell, false).await);
+        // Whatever is still queued is stepped next, as the select would.
+        while let Ok(event) = shell.events.try_recv() {
+            assert!(!on_event(&mut core, &mut shell, event).await);
+        }
+        let play = Input::Playback {
+            sampled_at: Instant::now(),
+            category: AUDIO_CATEGORY_MEDIA,
+        };
+        assert!(!step(&mut core, &mut shell, play).await);
+        let mut packets = Vec::new();
+        while let Ok(packet) = rx.try_recv() {
+            packets.push(packet);
+        }
+        assert_eq!(packets, [expected_owns(1).await]);
+        assert_eq!(core.ear_reports_due(), 0);
     }
 
     /// The production media adapter (`device_media`) never waits for the
