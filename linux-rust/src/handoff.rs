@@ -707,9 +707,10 @@ impl Handoff {
                 self.snapshot_hosts.clear();
                 let take = self.connect_take_allowed();
                 // The AirPods already report Linux (an app restart while it
-                // owned): keep them as an idle take (#324), so hold nothing.
+                // owned): keep them as an idle take (#324).
                 let keep = take && self.owner.as_deref() == Some(&[1]);
-                if keep {
+                // An idle other host (#324): Linux takes, so hold nothing.
+                if take {
                     self.remote_owns = false;
                 }
                 // A session start: restores a card an earlier run left `off`
@@ -820,7 +821,9 @@ impl Handoff {
         // baseline: a stop during a reconnect take defers its resume (#205).
         let stopped =
             (previous == Some(true) || (previous.is_none() && assumed_playing)) && !playing;
-        let resume_deferred = playing && std::mem::take(&mut self.resume_deferred);
+        // Only a play edge uses the deferral: a session's first sample
+        // (#324's take defers at connect) is no edge.
+        let resume_deferred = fresh_play && std::mem::take(&mut self.resume_deferred);
         if !self.automatic {
             return;
         }
@@ -5924,6 +5927,67 @@ mod tests {
         });
         p.feed(0, relay(REMOTE, IDLE));
         assert_eq!(takes(&p.feed(MINUTES, Input::Auto)), 1);
+    }
+
+    #[test]
+    fn connect_take_from_relayed_idle_media_holds_nothing() {
+        // The media report asked for the hold, but its relay of 100 lets
+        // Linux take: the card is not held off and the ACK only routes.
+        let mut p = Probe::new(false, true);
+        p.core.default_sink_routing = true;
+        p.core.a2dp_hold = true;
+        p.routing(SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Media)),
+            ..ready_facts()
+        });
+        p.feed(5, relay(REMOTE, IDLE));
+        assert_eq!(p.feed(6, idle_transport()), []);
+        assert_eq!(
+            p.feed(10, Input::Auto),
+            [
+                HoldA2dp(false),
+                ConnectA2dp,
+                SendOwnership(true),
+                Announce,
+                DrainPlayback
+            ]
+        );
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), [RouteToAirPods]);
+    }
+
+    #[test]
+    fn connect_take_first_sample_before_ack_keeps_resume_deferred() {
+        // A session's first playing sample is no play edge: the ACK only
+        // routes, and the first real edge resumes.
+        let (mut p, _) = session_start(ready_facts(), false);
+        assert_eq!(p.play(50, true), []);
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), [RouteToAirPods]);
+        assert_eq!(p.play(200, false), []);
+        assert_eq!(p.play(700, true), [ResumeA2dp]);
+        assert_eq!(p.play(1200, false), []);
+        assert_eq!(p.play(1700, true), []);
+    }
+
+    #[test]
+    fn connect_take_first_sample_after_ack_keeps_resume_deferred() {
+        let linux = SessionFacts {
+            owner: Some(vec![1]),
+            ..ready_facts()
+        };
+        // The acked take, and the keep path at owner [1].
+        for mut p in [acked_connect_take(false), session_start(linux, false).0] {
+            assert_eq!(p.play(200, true), []);
+            assert_eq!(p.play(700, false), []);
+            p.core.take_lines();
+            assert_eq!(p.play(1200, true), [ResumeA2dp]);
+            assert_eq!(
+                count_lines(
+                    &p.core.take_lines(),
+                    "AUTO playback started; Linux already owns"
+                ),
+                1
+            );
+        }
     }
 
     /// No connect take for `facts` in `mode` (with `relayed` from REMOTE
