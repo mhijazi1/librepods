@@ -299,9 +299,13 @@ pub(crate) struct Handoff {
     local_call: bool,
     /// Last `Input::A2dpTransport` report; None until one arrives.
     a2dp_active: Option<bool>,
-    /// The take's ACK skipped the A2DP resume for a stop during it; the next
-    /// play edge while Linux owns resumes (#205). Any playing sample, request,
-    /// yield or disconnect clears it.
+    /// The A2DP resume Linux's take owes, put off until Linux plays. Set by
+    /// a take's ACK for a stop during the take (#205), and by #324's idle
+    /// connect take (its ACK then skips the resume) or keep at owner [1].
+    /// The next play edge, or the session's first playing sample, uses it:
+    /// while Linux owns it resumes once (`resume_if_idle`); while the take
+    /// is pending its ACK resumes instead. Any request, yield or disconnect
+    /// clears it.
     resume_deferred: bool,
     recovery: CaseRecovery,
     case_closed: bool,
@@ -821,9 +825,10 @@ impl Handoff {
         // baseline: a stop during a reconnect take defers its resume (#205).
         let stopped =
             (previous == Some(true) || (previous.is_none() && assumed_playing)) && !playing;
-        // Only a play edge uses the deferral: a session's first sample
-        // (#324's take defers at connect) is no edge.
-        let resume_deferred = fresh_play && std::mem::take(&mut self.resume_deferred);
+        // A session's first playing sample also uses the deferral: Linux
+        // already played when #324's take connected.
+        let resume_deferred = (fresh_play || (playing && previous.is_none()))
+            && std::mem::take(&mut self.resume_deferred);
         if !self.automatic {
             return;
         }
@@ -849,7 +854,7 @@ impl Handoff {
         match self.pending {
             // Linux stayed the idle owner (#262), as the Mac does: a fresh
             // take's host and wear policy is moot.
-            None if owning && fresh_play => {
+            None if owning && (fresh_play || resume_deferred) => {
                 self.say("AUTO playback started; Linux already owns");
                 if resume_deferred {
                     self.resume_if_idle(out);
@@ -1029,8 +1034,8 @@ impl Handoff {
         if held && self.default_sink_routing {
             out.push(Command::RouteToAirPods);
         }
-        // A stop during the take (#205) defers the resume to the next play
-        // edge while Linux owns.
+        // A stop during the take (#205), or an idle connect take (#324),
+        // defers the resume until Linux plays.
         if held && self.automatic && !self.resume_deferred {
             self.resume_if_idle(out);
         }
@@ -1453,7 +1458,7 @@ impl Handoff {
     }
 
     /// The connect take: only "owning" is sent. It is idle, so it stays
-    /// (#262) and its ACK leaves the A2DP resume to the first play edge.
+    /// (#262) and its A2DP resume waits until Linux plays.
     fn connect_take(&mut self, now: Instant, out: &mut Vec<Command>) {
         self.request(now, true, Cause::Playback, out);
         self.resume_deferred = true;
@@ -5956,30 +5961,50 @@ mod tests {
     }
 
     #[test]
-    fn connect_take_first_sample_before_ack_keeps_resume_deferred() {
-        // A session's first playing sample is no play edge: the ACK only
-        // routes, and the first real edge resumes.
+    fn connect_take_first_sample_before_ack_resumes() {
+        // Linux already plays at connect (c10 a): the ACK resumes once.
+        for owner in [None, Some(vec![0])] {
+            let facts = SessionFacts {
+                owner: owner.clone(),
+                ..ready_facts()
+            };
+            let (mut p, _) = session_start(facts, false);
+            assert_eq!(p.play(50, true), [], "{owner:?}");
+            assert_eq!(
+                p.feed(100, Input::Ownership(vec![1])),
+                [RouteToAirPods, ResumeA2dp],
+                "{owner:?}"
+            );
+            assert_eq!(p.play(200, false), []);
+            assert_eq!(p.play(700, true), [], "{owner:?}");
+        }
+        // A streaming transport has nothing to resume.
         let (mut p, _) = session_start(ready_facts(), false);
+        assert_eq!(p.feed(20, Input::A2dpTransport { active: true }), []);
         assert_eq!(p.play(50, true), []);
         assert_eq!(p.feed(100, Input::Ownership(vec![1])), [RouteToAirPods]);
         assert_eq!(p.play(200, false), []);
+        assert_eq!(p.play(700, true), []);
+        // A stop before the ACK still defers to the next play edge (#205).
+        let (mut p, _) = session_start(ready_facts(), false);
+        assert_eq!(p.play(50, true), []);
+        assert_eq!(p.play(70, false), []);
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), [RouteToAirPods]);
         assert_eq!(p.play(700, true), [ResumeA2dp]);
         assert_eq!(p.play(1200, false), []);
         assert_eq!(p.play(1700, true), []);
     }
 
     #[test]
-    fn connect_take_first_sample_after_ack_keeps_resume_deferred() {
-        let linux = SessionFacts {
+    fn connect_take_first_sample_after_ack_resumes() {
+        let linux = || SessionFacts {
             owner: Some(vec![1]),
             ..ready_facts()
         };
-        // The acked take, and the keep path at owner [1].
-        for mut p in [acked_connect_take(false), session_start(linux, false).0] {
-            assert_eq!(p.play(200, true), []);
-            assert_eq!(p.play(700, false), []);
+        // The acked take (c10 b) and the keep path at owner [1] (c10 c).
+        for mut p in [acked_connect_take(false), session_start(linux(), false).0] {
             p.core.take_lines();
-            assert_eq!(p.play(1200, true), [ResumeA2dp]);
+            assert_eq!(p.play(200, true), [ResumeA2dp]);
             assert_eq!(
                 count_lines(
                     &p.core.take_lines(),
@@ -5987,6 +6012,15 @@ mod tests {
                 ),
                 1
             );
+            assert_eq!(p.play(700, false), []);
+            assert_eq!(p.play(1200, true), []);
+        }
+        // A streaming transport has nothing to resume.
+        for mut p in [acked_connect_take(false), session_start(linux(), false).0] {
+            assert_eq!(p.feed(150, Input::A2dpTransport { active: true }), []);
+            assert_eq!(p.play(200, true), []);
+            assert_eq!(p.play(700, false), []);
+            assert_eq!(p.play(1200, true), []);
         }
     }
 
