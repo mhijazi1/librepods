@@ -591,14 +591,19 @@ async fn connect_a2dp_profile(mac: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     connect_if_connected(
         || async { device.is_connected().await.unwrap_or(false) },
-        || async {
-            device
-                .connect_profile(&A2DP_SINK)
-                .await
-                .map_err(|e| e.to_string())
-        },
+        || async { connect_profile_reply(device.connect_profile(&A2DP_SINK).await) },
     )
     .await
+}
+
+/// A connect already under way (`InProgress`) or done (`AlreadyConnected`)
+/// still brings the card, so it goes on to the re-lookup like success (#321).
+fn connect_profile_reply(reply: bluer::Result<()>) -> Result<(), String> {
+    use bluer::ErrorKind::{AlreadyConnected, InProgress};
+    match reply {
+        Err(e) if !matches!(e.kind, InProgress | AlreadyConnected) => Err(e.to_string()),
+        _ => Ok(()),
+    }
 }
 
 /// Connect only while connected, so a hold released on a disconnect never
@@ -4727,5 +4732,45 @@ mod tests {
             let refused = Err(NOT_CONNECTED.to_string());
             assert_eq!(result, if connected { Ok(()) } else { refused });
         }
+    }
+
+    fn bluez_error(kind: bluer::ErrorKind) -> bluer::Result<()> {
+        let message = format!("{kind:?}");
+        Err(bluer::Error { kind, message })
+    }
+
+    #[test]
+    fn connect_profile_reply_maps_bluez_errors() {
+        use bluer::ErrorKind::*;
+        assert_eq!(connect_profile_reply(Ok(())), Ok(()));
+        for kind in [InProgress, AlreadyConnected] {
+            assert_eq!(
+                connect_profile_reply(bluez_error(kind.clone())),
+                Ok(()),
+                "{kind:?}"
+            );
+        }
+        for kind in [Failed, NotAvailable, NotReady] {
+            assert!(
+                connect_profile_reply(bluez_error(kind.clone())).is_err(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_a2dp_in_progress_still_relooks() {
+        let finds = std::cell::Cell::new(0u32);
+        let found = connect_a2dp_then_find(
+            || async { connect_profile_reply(bluez_error(bluer::ErrorKind::InProgress)) },
+            || {
+                finds.set(finds.get() + 1);
+                let n = finds.get();
+                async move { (n == 3).then_some(7) }
+            },
+            |_| std::future::ready(()),
+        )
+        .await;
+        assert_eq!((found, finds.get()), (Some(7), 3));
     }
 }
