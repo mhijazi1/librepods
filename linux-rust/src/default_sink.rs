@@ -542,9 +542,11 @@ struct ParkMover {
 }
 
 impl ParkMover {
+    /// False once the watch is stopped.
     fn running(&self) -> bool {
         matches!(self.stopped.try_recv(), Err(TryRecvError::Empty))
     }
+
     fn event(&mut self, io: &mut impl ParkIo, (event, index): pulse::SinkInputEvent) {
         if event & sys::PA_SUBSCRIPTION_EVENT_TYPE_MASK == sys::PA_SUBSCRIPTION_EVENT_REMOVE {
             self.moves.remove(&index);
