@@ -4143,6 +4143,39 @@ mod tests {
             assert_eq!(sent(&p, true), 1);
             assert_eq!(sent(&p, false), 1);
         }
+
+        /// #301/#304: a Spotify-Connect-like MPRIS player (no stream) plays
+        /// while the iPhone owns; ear detection pauses it on a bud out and
+        /// resumes it on the bud in. The twin with no reinsertion takes.
+        #[test]
+        fn non_event_ear_resume_while_remote_owns() {
+            let run = |reinsert: bool| {
+                let mut p = Pipeline::ready();
+                let iphone = AudioSource {
+                    mac: REMOTE.to_string(),
+                    r#type: AudioSourceType::Media,
+                };
+                p.feed(20, Input::AudioSource(iphone));
+                let relay = Input::MediaInformation {
+                    host: REMOTE.to_string(),
+                    category: crate::media_controller::AUDIO_CATEGORY_MEDIA,
+                };
+                p.feed(20, relay);
+                // Already playing at the session start's baseline: no edge.
+                p.feed(30, Input::Auto);
+                p.step(40, true, &[]);
+                p.feed(100, Input::EarState(vec![InEar, OutOfEar]));
+                p.step(150, false, &[]);
+                p.step(200, false, &[]);
+                if reinsert {
+                    p.feed(300, Input::EarState(vec![InEar, InEar]));
+                }
+                p.event(true, &[]);
+                p.takes()
+            };
+            assert_eq!(run(true), NO_TAKE);
+            assert_eq!(run(false), [vec![SendOwnership(true)]]);
+        }
     }
 
     #[test]
