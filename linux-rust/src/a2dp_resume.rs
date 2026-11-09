@@ -1377,59 +1377,21 @@ mod tests {
         assert_eq!(reads(&n), 11);
     }
 
-    /// Resume I/O on tokio's clock: silent, `P` Playing, each transport read
-    /// back idle 170 ms (more than `TRANSPORT_REREAD`) after its issue;
-    /// records each read's issue and each action, in ms since `start`.
-    struct SlowTransportIo {
-        start: tokio::time::Instant,
-        issued: Arc<StdMutex<Vec<u128>>>,
-        acted: Arc<StdMutex<Vec<(u128, Action)>>>,
-    }
-
-    impl A2dpResumeIo for SlowTransportIo {
-        fn act(&self, action: Action) -> BoxFuture<'static, ()> {
-            let at = self.start.elapsed().as_millis();
-            self.acted.lock().unwrap().push((at, action));
-            Box::pin(async {})
-        }
-
-        fn audible(&self) -> BoxFuture<'static, bool> {
-            Box::pin(async { false })
-        }
-
-        fn playing(&self) -> BoxFuture<'static, Vec<String>> {
-            Box::pin(async { players(&[P]) })
-        }
-
-        fn transport_active(&self) -> BoxFuture<'static, Option<bool>> {
-            self.issued
-                .lock()
-                .unwrap()
-                .push(self.start.elapsed().as_millis());
-            read_after(170, false)
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn slow_idle_read_back_after_nudge_time_never_nudges() {
-        let start = tokio::time::Instant::now();
-        let io = SlowTransportIo {
-            start,
-            issued: Arc::default(),
-            acted: Arc::default(),
-        };
-        let (issued, acted) = (Arc::clone(&io.issued), Arc::clone(&io.acted));
+        // 170 ms idle reads issued at 500, 770, 1040, 1310, 1580, 1850 and
+        // 2020 ms: the 1850 ms read is back at 2020 ms, after the nudge time,
+        // so it reads again at once, and only that read nudges.
         let (_cancel, cancelled) = oneshot::channel();
-        let until = start.into_std() + A2DP_RESUME_WINDOW;
-        run(io, until, cancelled, std::future::ready(())).await;
-        // The read issued at 1850 ms is back idle at 2020 ms, after the
-        // nudge time: it reads again at once, and only that read nudges.
-        assert_eq!(
-            *issued.lock().unwrap(),
-            [500, 770, 1040, 1310, 1580, 1850, 2020]
-        );
+        let (acted, n, _chain) = spawn_with_transport(|_| read_after(170, false), cancelled);
         assert_eq!(TRANSPORT_START_WAIT, ms(2000));
-        assert_eq!(acted.lock().unwrap()[0], (2190, SuspendSink(true)));
+        tokio::time::sleep(ms(2189)).await;
+        assert_eq!(*acted.lock().unwrap(), []);
+        assert_eq!(reads(&n), 7);
+        tokio::time::sleep(ms(1)).await;
+        // The 2020 ms read's timer fires with ours; let the chain act on it.
+        tokio::task::yield_now().await;
+        assert_eq!(*acted.lock().unwrap(), [SuspendSink(true)]);
     }
 
     /// Run the chain on transport reads `read` that stay idle: nothing acts
