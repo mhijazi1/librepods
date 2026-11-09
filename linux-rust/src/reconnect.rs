@@ -413,6 +413,10 @@ pub(crate) trait Connector: Send + Sync + 'static {
     fn connected(&self, mac: &str) -> impl Future<Output = bool> + Send;
     /// Connect the device; the error to log on failure.
     fn connect(&self, mac: &str) -> impl Future<Output = Result<(), String>> + Send;
+    /// Read on every sample; the full `settings` only at a play edge.
+    fn mode(&self, mac: &str) -> SwitchingMode {
+        self.settings(mac).mode
+    }
     fn settings(&self, mac: &str) -> Settings;
     fn log(&self, mac: &str, line: &str);
 }
@@ -456,6 +460,10 @@ impl Connector for Bluez {
         Err(format!("{} {}", stdout.trim(), stderr.trim())
             .trim()
             .to_string())
+    }
+
+    fn mode(&self, _: &str) -> SwitchingMode {
+        utils::load_switching_mode()
     }
 
     fn settings(&self, mac: &str) -> Settings {
@@ -503,14 +511,14 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
             }
             return;
         }
-        let settings = io.settings(&mac);
-        if settings.mode != SwitchingMode::Handoff {
+        if io.mode(&mac) != SwitchingMode::Handoff {
             io.log(&mac, "not reconnecting: switching mode is not handoff");
             return;
         }
         if !edge {
             continue;
         }
+        let settings = io.settings(&mac);
         let facts = Facts {
             host_driven: host_driven == Some(true),
             case_closed,
@@ -599,7 +607,7 @@ mod tests {
     use crate::media_controller::AUDIO_CATEGORY_MEDIA;
     use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
     const REMOTE: &str = "org.bluez.Reason.Remote";
@@ -838,6 +846,8 @@ mod tests {
         guarded: Mutex<Vec<bool>>,
         lines: Mutex<Vec<String>>,
         settings: Mutex<Option<Settings>>,
+        mode_reads: AtomicUsize,
+        settings_reads: AtomicUsize,
         /// How long each `connect` takes.
         delay: Mutex<Duration>,
     }
@@ -856,7 +866,13 @@ mod tests {
             self.results.lock().unwrap().pop_front().unwrap_or(Ok(()))
         }
 
+        fn mode(&self, _: &str) -> SwitchingMode {
+            self.mode_reads.fetch_add(1, Ordering::SeqCst);
+            self.settings.lock().unwrap().unwrap_or_else(settings).mode
+        }
+
         fn settings(&self, _: &str) -> Settings {
+            self.settings_reads.fetch_add(1, Ordering::SeqCst);
             self.settings.lock().unwrap().unwrap_or_else(settings)
         }
 
@@ -1247,6 +1263,31 @@ mod tests {
         });
         rig.play_edge().await;
         assert!(rig.task.is_finished());
+        assert_eq!(fake.connects(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_watcher_reads_settings_only_at_edges() {
+        let mac = "7E:00:00:00:04:10";
+        host_driven_drop(mac);
+        let fake = Arc::new(Fake::default());
+        // Every edge waits, so every sample goes through the main loop.
+        *fake.settings.lock().unwrap() = Some(Settings {
+            auto_connect: false,
+            ..settings()
+        });
+        let rig = Rig::start(mac, fake.clone());
+        // Baseline playing, then three edges among non-edge samples.
+        let samples = [
+            true, true, false, true, true, false, false, true, false, true,
+        ];
+        for playing in samples {
+            rig.sample(playing).await;
+        }
+        assert!(!rig.task.is_finished());
+        assert_eq!(fake.lines("not reconnecting: autoConnect is off"), 3);
+        assert_eq!(fake.settings_reads.load(Ordering::SeqCst), 3);
+        assert_eq!(fake.mode_reads.load(Ordering::SeqCst), samples.len());
         assert_eq!(fake.connects(), 0);
     }
 
