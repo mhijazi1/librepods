@@ -4777,17 +4777,10 @@ mod tests {
         assert_eq!(holds(&all), []);
     }
 
-    fn hosts_now(new: Vec<ConnectedDevice>) -> Input {
-        Input::ConnectedDevices {
-            old: two_hosts(),
-            new,
-        }
-    }
-
     /// `hold_ready(true)` with the AirPods listing only Linux: released.
     fn listed_alone() -> Probe {
         let mut p = hold_ready(true);
-        assert_eq!(p.feed(50, hosts_now(vec![host(LOCAL)])), []);
+        assert_eq!(p.feed(50, report(&[LOCAL, REMOTE], &[LOCAL])), []);
         p
     }
 
@@ -4798,10 +4791,13 @@ mod tests {
             assert_eq!(holds(&p.feed(200 + 100 * i as u64, input.clone())), []);
         }
         assert_eq!(
-            holds(&p.feed(1000, hosts_now(two_hosts()))),
+            holds(&p.feed(1000, report(&[LOCAL, REMOTE], &[LOCAL, REMOTE]))),
             [HoldA2dp(true)]
         );
-        assert_eq!(holds(&p.feed(1100, hosts_now(two_hosts()))), []);
+        assert_eq!(
+            holds(&p.feed(1100, report(&[LOCAL, REMOTE], &[LOCAL, REMOTE]))),
+            []
+        );
     }
 
     #[test]
@@ -4809,7 +4805,10 @@ mod tests {
         assert_holds_once_listed(listed_alone(), &[remote_media()]);
         // The same from a hold the host list released.
         let mut p = held();
-        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
+        assert_eq!(
+            p.feed(150, report(&[LOCAL, REMOTE], &[LOCAL])),
+            [HoldA2dp(false)]
+        );
         assert_holds_once_listed(p, &[remote_media()]);
     }
 
@@ -4832,12 +4831,15 @@ mod tests {
             [HoldA2dp(true)]
         );
         assert_eq!(
-            p.feed(1200, hosts_now(vec![host(LOCAL)])),
+            p.feed(1200, report(&[LOCAL, REMOTE], &[LOCAL])),
             [HoldA2dp(false)]
         );
         assert_eq!(holds(&p.feed(1100 + 5001, Input::Tick)), []);
         assert!(matches!(p.core.timed_out_release, Some((Cause::Remote, _))));
-        assert_eq!(holds(&p.feed(6200, hosts_now(two_hosts()))), []);
+        assert_eq!(
+            holds(&p.feed(6200, report(&[LOCAL, REMOTE], &[LOCAL, REMOTE]))),
+            []
+        );
         assert_eq!(
             p.feed(6300, Input::RemoteOwnershipRequest),
             [SendOwnership(false), HoldA2dp(true)]
@@ -4847,16 +4849,22 @@ mod tests {
     #[test]
     fn hold_host_list_alone_adds_no_hold() {
         let mut p = held();
-        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
-        let mut all = p.feed(200, hosts_now(two_hosts()));
+        assert_eq!(
+            p.feed(150, report(&[LOCAL, REMOTE], &[LOCAL])),
+            [HoldA2dp(false)]
+        );
+        let mut all = p.feed(200, report(&[LOCAL, REMOTE], &[LOCAL, REMOTE]));
         for ms in (300..10_000).step_by(500) {
             all.extend(p.feed(ms, Input::Tick));
         }
         assert_eq!(holds(&all), []);
         // An empty list after only Linux was listed holds nothing either.
         let mut p = held();
-        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
-        assert_eq!(holds(&p.feed(200, hosts_now(vec![]))), []);
+        assert_eq!(
+            p.feed(150, report(&[LOCAL, REMOTE], &[LOCAL])),
+            [HoldA2dp(false)]
+        );
+        assert_eq!(holds(&p.feed(200, report(&[LOCAL, REMOTE], &[]))), []);
     }
 
     /// The c1/c2 sequences of the tests above; every command, in order.
