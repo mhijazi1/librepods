@@ -1551,12 +1551,6 @@ impl MediaController {
     /// from one card read (#264). A release then waits for the AirPods sink,
     /// at most `HOLD_RELEASE_WAIT`. Never suspends a sink or moves streams.
     pub(crate) async fn apply_a2dp_hold(&self, hold: bool) {
-        if self.a2dp_held.load(Ordering::SeqCst) != hold {
-            // The opposite hold was emitted since and is queued behind this
-            // one: writing now would only flap the transport.
-            debug!("A2DP hold({hold}): superseded, card left as is");
-            return;
-        }
         let (mac, cached) = {
             let state = self.state.lock().await;
             (
@@ -1565,42 +1559,72 @@ impl MediaController {
             )
         };
         let card_mac = mac.clone();
-        let card = tokio::task::spawn_blocking(move || {
-            get_card_info_list_sync().into_iter().find(|card| {
-                card.device_string
-                    .as_deref()
-                    .is_some_and(|d| d.contains(&card_mac))
+        let read = || async move {
+            tokio::task::spawn_blocking(move || {
+                get_card_info_list_sync().into_iter().find(|card| {
+                    card.device_string
+                        .as_deref()
+                        .is_some_and(|d| d.contains(&card_mac))
+                })
             })
+            .await
+            .ok()
+            .flatten()
+        };
+        let write =
+            |index, profile: String| blocking(move || set_card_profile_sync(index, &profile));
+        let preferred = crate::utils::load_preferred_codec();
+        self.apply_a2dp_hold_with(hold, &cached, preferred, read, write, || {
+            get_sink_name_by_mac(&mac)
         })
-        .await
-        .ok()
-        .flatten();
-        let Some(card) = card else {
-            debug!("A2DP hold({hold}): no card for {mac}");
+        .await;
+    }
+
+    /// `apply_a2dp_hold` with the card read, the profile write and the sink
+    /// lookup injected.
+    async fn apply_a2dp_hold_with<R, RFut, W, WFut, S, SFut>(
+        &self,
+        hold: bool,
+        cached: &str,
+        preferred: crate::utils::PreferredCodec,
+        read: R,
+        write: W,
+        sink: S,
+    ) where
+        R: FnOnce() -> RFut,
+        RFut: Future<Output = Option<pulse::Card>>,
+        W: FnOnce(u32, String) -> WFut,
+        WFut: Future<Output = bool>,
+        S: FnMut() -> SFut,
+        SFut: Future<Output = Option<String>>,
+    {
+        let Some(card) = read().await else {
+            debug!("A2DP hold({hold}): no AirPods card");
             return;
         };
         let active = card.active_profile.as_deref();
         let profile = if hold {
             hold_profile(active).map(str::to_string)
         } else {
-            release_profile(
-                &card.profiles,
-                active,
-                Some(&cached),
-                crate::utils::load_preferred_codec(),
-            )
+            release_profile(&card.profiles, active, Some(cached), preferred)
         };
         let Some(profile) = profile else {
             debug!("A2DP hold({hold}): card profile {active:?} left as is");
             return;
         };
-        let (index, write) = (card.index, profile.clone());
-        if !blocking(move || set_card_profile_sync(index, &write)).await {
+        // Checked right before the write: the opposite hold may have been
+        // emitted during the awaits above and is queued behind this one, so
+        // writing now would only flap the transport (#267).
+        if self.a2dp_held.load(Ordering::SeqCst) != hold {
+            debug!("A2DP hold({hold}): superseded, card left as is");
+            return;
+        }
+        if !write(card.index, profile.clone()).await {
             warn!("A2DP hold({hold}): failed to set the card to {profile}");
             return;
         }
         info!("A2DP hold({hold}): card set to {profile}");
-        if !hold && !wait_for_sink(|| get_sink_name_by_mac(&mac)).await {
+        if !hold && !wait_for_sink(sink).await {
             info!("A2DP hold released; no AirPods sink within {HOLD_RELEASE_WAIT:?}");
         }
     }
@@ -3846,5 +3870,46 @@ mod tests {
     async fn activate_skips_hold_set_mid_activation() {
         let sets = activate_held(false, |c| c.set_a2dp_held(true)).await;
         assert_eq!(sets, Vec::<String>::new());
+    }
+
+    /// A `hold` whose card read (A2DP for a hold, `off` for a release) runs
+    /// `during`. Returns the profiles written.
+    async fn apply_hold(hold: bool, during: impl FnOnce(&MediaController)) -> Vec<String> {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(hold);
+        let sets = std::cell::RefCell::new(Vec::new());
+        let card = pulse::Card {
+            index: 3,
+            name: None,
+            device_string: None,
+            profiles: profiles(&["off", "a2dp-sink"]),
+            active_profile: Some(if hold { "a2dp-sink" } else { "off" }.into()),
+        };
+        let read = || {
+            during(&controller);
+            async { Some(card) }
+        };
+        let write = |_, profile| {
+            sets.borrow_mut().push(profile);
+            async { true }
+        };
+        let sink = || async { Some("bluez_output.AA".to_string()) };
+        controller
+            .apply_a2dp_hold_with(hold, "", PreferredCodec::Aac, read, write, sink)
+            .await;
+        sets.into_inner()
+    }
+
+    #[tokio::test]
+    async fn hold_write_runs_when_current() {
+        assert_eq!(apply_hold(true, |_| {}).await, ["off"]);
+        assert_eq!(apply_hold(false, |_| {}).await, ["a2dp-sink"]);
+    }
+
+    #[tokio::test]
+    async fn hold_write_skipped_when_superseded_during_the_read() {
+        let none = Vec::<String>::new();
+        assert_eq!(apply_hold(true, |c| c.set_a2dp_held(false)).await, none);
+        assert_eq!(apply_hold(false, |c| c.set_a2dp_held(true)).await, none);
     }
 }

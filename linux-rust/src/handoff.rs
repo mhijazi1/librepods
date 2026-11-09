@@ -471,6 +471,11 @@ impl Handoff {
                     self.announce(out);
                 }
                 self.hosts = new;
+                // The other host left: nothing to hold A2DP for (#264).
+                if self.hosts.iter().all(|d| d.mac == self.local) {
+                    self.remote_owns = false;
+                    self.sync_hold(false, out);
+                }
             }
             Input::Ownership(value) => self.ownership(now, value, out),
             Input::RemoteOwnershipRequest => {
@@ -841,6 +846,7 @@ impl Handoff {
             if late_release.is_some() {
                 // The timeout already reconciled; nothing more to decide.
                 self.say("ACK owner=not-linux late (after TIMEOUT); release confirmed");
+                self.hold_if_remote_source(out);
             }
             return;
         };
@@ -872,6 +878,7 @@ impl Handoff {
             // stop playing here as upstream does.
             out.push(Command::PauseMedia);
         }
+        self.hold_if_remote_source(out);
         // The take holds unless the reconcile just released it.
         let held = pending.desired && self.live() && self.requested_take && self.pending.is_none();
         // Before the resume, so its audible check finds the stream on the
@@ -941,6 +948,15 @@ impl Handoff {
     fn hold_for_remote(&mut self, out: &mut Vec<Command>) {
         self.remote_owns = true;
         self.sync_hold(false, out);
+    }
+
+    /// A remote source seen while Linux's release was pending (the
+    /// `AudioSource` arm skips it then) holds once the release settled and
+    /// Linux has no take (#264).
+    fn hold_if_remote_source(&mut self, out: &mut Vec<Command>) {
+        if !self.requested_take && self.audio.as_ref().is_some_and(|a| self.remote_took(a)) {
+            self.hold_for_remote(out);
+        }
     }
 
     /// Emit the hold the facts ask for when it differs from the last one
@@ -4402,6 +4418,51 @@ mod tests {
         assert_eq!(p.feed(200, Input::Quit), [HoldA2dp(false), Exit]);
     }
 
+    #[test]
+    fn hold_remote_source_during_own_release() {
+        // A playback-stop release, a remote source while it is pending, then
+        // its ACK: the ACK holds once Linux has no take.
+        let mut p = hold_take();
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(p.hold_ends(1000), [SendOwnership(false)]);
+        assert_eq!(p.feed(1050, remote_media()), []);
+        assert_eq!(p.feed(1100, Input::Ownership(vec![0])), [HoldA2dp(true)]);
+        assert_eq!(p.feed(1200, Input::Tick), []);
+        assert_eq!(p.feed(1300, Input::Ownership(vec![0])), []);
+
+        // A user release acknowledged late (#55), after its timeout.
+        let mut p = hold_take();
+        assert_eq!(p.feed(700, Input::Release), [SendOwnership(false)]);
+        assert_eq!(p.feed(800, remote_media()), []);
+        assert_eq!(p.feed(700 + 5001, Input::Tick), []);
+        assert_eq!(
+            p.feed(5800, Input::Ownership(vec![0])),
+            [PauseMedia, HoldA2dp(true)]
+        );
+    }
+
+    #[test]
+    fn hold_remote_source_after_own_release_ack() {
+        let mut p = hold_take();
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(p.hold_ends(1000), [SendOwnership(false)]);
+        assert_eq!(p.feed(1100, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(1200, remote_media()), [HoldA2dp(true)]);
+    }
+
+    #[test]
+    fn hold_ends_when_the_other_host_leaves() {
+        let mut p = held();
+        let only = |hosts| Input::ConnectedDevices {
+            old: two_hosts(),
+            new: hosts,
+        };
+        // The other host is still there: still held.
+        assert_eq!(p.feed(200, only(two_hosts())), []);
+        assert_eq!(p.feed(300, only(vec![host(LOCAL)])), [HoldA2dp(false)]);
+        assert_eq!(p.feed(400, only(vec![host(LOCAL)])), []);
+    }
+
     /// The c1/c2 sequences of the tests above; every command, in order.
     fn hold_sequences(hold: bool) -> Vec<Command> {
         let mut all = Vec::new();
@@ -4434,6 +4495,21 @@ mod tests {
         all.extend(p.feed(200, Input::Disconnected));
         all.extend(p.feed(1200, Input::Tick));
         all.extend(p.feed(1300, Input::Reconnected(ready_facts())));
+
+        let mut p = hold_ready(hold);
+        all.extend(p.play(500, true));
+        all.extend(p.feed(600, Input::Ownership(vec![1])));
+        all.extend(p.play(1000, false));
+        all.extend(p.hold_ends(1000));
+        all.extend(p.feed(1050, remote_media()));
+        all.extend(p.feed(1100, Input::Ownership(vec![0])));
+        all.extend(p.feed(
+            1200,
+            Input::ConnectedDevices {
+                old: two_hosts(),
+                new: vec![host(LOCAL)],
+            },
+        ));
         all
     }
 
