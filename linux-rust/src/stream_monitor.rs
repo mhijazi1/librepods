@@ -371,9 +371,9 @@ pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 pub(crate) struct PlaybackState {
     /// A stream counts as playing (`PlaybackTracker`).
     pub(crate) counted: bool,
-    /// The PIDs owning a live stream in the last successful listing
-    /// (`live_stream_pids`); None before the first one (#302) and once
-    /// the source is dead (`PlaybackSource::dead`, #318).
+    /// The PIDs owning a live stream, muted or not, in the last successful
+    /// listing (`live_stream_pids`); None before the first one (#302) and
+    /// once the source is dead (`PlaybackSource::dead`, #318).
     pub(crate) live: Option<HashSet<u32>>,
 }
 
@@ -396,7 +396,9 @@ const PROCESS_ID: &str = "application.process.id";
 /// How many ancestors of a live stream's process own it too (#329).
 const OWNER_DEPTH: usize = 16;
 
-/// The PIDs that own a live stream (`live_streams`): each one's process id
+/// The PIDs that own a live stream: a worthy, uncorked one, muted or not
+/// (unlike `live_streams`), as a player muted at its own slider still plays
+/// on the Mac (#328). Each one's process id
 /// (`PROCESS_ID`; a stream without one owns nothing) and its ancestors by
 /// `ppid`, at most `OWNER_DEPTH` of them, stopping at PID 1, an unknown
 /// parent or a repeat within that stream's walk. An MPRIS player owns a
@@ -406,9 +408,11 @@ pub(crate) fn live_stream_pids(
     streams: &[StreamProps],
     ppid: impl Fn(u32) -> Option<u32>,
 ) -> HashSet<u32> {
-    let live = live_streams(streams);
     let mut pids = HashSet::new();
-    for stream in streams.iter().filter(|s| live.contains(&s.index)) {
+    for stream in streams
+        .iter()
+        .filter(|s| !s.corked && is_takeover_worthy(s))
+    {
         let mut walked = HashSet::new();
         let mut next = stream_pid(&stream.props, None);
         for _ in 0..=OWNER_DEPTH {
@@ -2192,16 +2196,46 @@ mod tests {
         }
     }
 
-    /// (f) The owner's corked, muted or event stream is not live.
+    /// (f) The owner's corked or event stream is not live.
     #[test]
     fn own_stream_not_live_not_matched() {
-        for stream in [corked_music(1), muted_music(1), event_sound(1)] {
+        for stream in [corked_music(1), event_sound(1)] {
             let stream = with_pid(stream, OWNER);
             assert!(
                 !owns(Some(OWNER), &[(stream.clone(), None)], &[]),
                 "{stream:?}"
             );
         }
+    }
+
+    /// #328: the owner's uncorked stream muted by flag or at every channel's
+    /// `Volume::MUTED` (a player's slider at 0) is still its own live one.
+    #[test]
+    fn own_stream_muted_matched() {
+        let mut proplist = Proplist::new().expect("proplist");
+        proplist.set_str("media.role", "Music").unwrap();
+        proplist.set_str(PROCESS_ID, &OWNER.to_string()).unwrap();
+        let silenced = [
+            with_pid(muted_music(1), OWNER),
+            playback_stream(1, &proplist, false, false, &volume(&[Volume::MUTED; 2])),
+            playback_stream(1, &proplist, false, true, &volume(&[Volume::NORMAL; 2])),
+        ];
+        for stream in silenced {
+            assert!(stream.muted, "{stream:?}");
+            assert!(
+                owns(Some(OWNER), &[(stream.clone(), None)], &[]),
+                "{stream:?}"
+            );
+        }
+    }
+
+    /// #328: a muted own stream is live for MPRIS only; it never counts.
+    #[test]
+    fn own_stream_muted_live_but_not_counted() {
+        let listing = [with_pid(muted_music(1), OWNER)];
+        assert!(live_streams(&listing).is_empty());
+        assert!(started(Instant::now()).candidates(&listing).is_empty());
+        assert!(live_stream_pids(&listing, |_| None).contains(&OWNER));
     }
 
     /// (c4) A failed owner lookup owns nothing once a listing is known, and
