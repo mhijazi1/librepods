@@ -2034,7 +2034,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn in_flight_librepods_pause_at_the_take_is_never_undone() {
-        // The ear-removal pause in flight at the take finishes at 200 ms, or
+        // Q pauses itself at 100 ms; a Play would undo that pause. The
+        // ear-removal pause in flight at the take finishes at 200 ms, or
         // never; with a 100 ms route it has finished by the route: counts
         // (1, 1) against the take's (1, 0). So at the first (0 ms) tick a
         // pause is in flight or the counts moved: the read loop stops, no
