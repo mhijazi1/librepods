@@ -904,22 +904,24 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     // On the commands' queue (#311): an unpark to the local sink ahead of
     // the step's hold release, which may wait seconds for the AirPods sink;
     // a park after its hold, an unpark to the AirPods after the ACK's route.
+    // `parked` changes only once its route is queued, so a drop in between
+    // still unparks.
     let park = core.park();
-    let route = ((park == Park::Parked) != shell.parked).then(|| {
-        shell.parked = park == Park::Parked;
-        match park {
-            Park::Parked => SinkEvent::Park,
-            Park::AirPods => SinkEvent::Unpark(UnparkTo::AirPods),
-            Park::Local | Park::FallenBack => SinkEvent::Unpark(UnparkTo::Local),
-        }
+    let parked = park == Park::Parked;
+    let route = (parked != shell.parked).then(|| match park {
+        Park::Parked => SinkEvent::Park,
+        Park::AirPods => SinkEvent::Unpark(UnparkTo::AirPods),
+        Park::Local | Park::FallenBack => SinkEvent::Unpark(UnparkTo::Local),
     });
     let local = SinkEvent::Unpark(UnparkTo::Local);
     if route == Some(local) {
         shell.media.route_default_sink(local);
+        shell.parked = parked;
     }
     let end = shell.execute(now, commands).await;
     if let Some(route) = route.filter(|&route| route != local) {
         shell.media.route_default_sink(route);
+        shell.parked = parked;
     }
     end
 }
@@ -1542,6 +1544,8 @@ mod tests {
         gate: Notify,
         /// Record the park routes (#311) too.
         parks: AtomicBool,
+        /// Panic right after recording a `Take` route (#311).
+        panic_at_take: AtomicBool,
     }
 
     /// Records the media actions instead of touching D-Bus or PipeWire. The
@@ -1592,6 +1596,9 @@ mod tests {
                 return;
             }
             self.records.routes.lock().unwrap().push(event);
+            if event == SinkEvent::Take && self.records.panic_at_take.load(Ordering::SeqCst) {
+                panic!("test: a failure right after the take's route");
+            }
         }
 
         fn hold_a2dp(&self, hold: bool) {
@@ -6566,6 +6573,30 @@ mod tests {
         stop_handoff_task(mac);
     }
 
+    /// The task dropped inside the ACK step's commands, after the take's
+    /// route, still unparks. No await follows that route, so a panic stands
+    /// in for an abort: both drop the `Shell` there.
+    #[tokio::test]
+    async fn park_drop_after_the_acks_route_still_unparks() {
+        let mac = "5A:00:00:00:11:08";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let h = park_task(mac, &mut rx, &manager).await;
+        park_after_remote_request(&h, &mut rx).await;
+        h.play(false).await;
+        h.play(true).await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        h.records.panic_at_take.store(true, Ordering::SeqCst);
+        let task = handoff_task(mac).expect("task");
+        h.emit(owns(1));
+        let events = after_stop(&h, task).await;
+        use SinkEvent::{Hold, Take, Unpark};
+        assert!(
+            events.ends_with(&[Hold(false), Take, Unpark(UnparkTo::Local)]),
+            "{events:?}"
+        );
+        stop_handoff_task(mac);
+    }
+
     #[tokio::test]
     async fn park_yield_while_playing_parks_on_the_idle_sample() {
         let mac = "5A:00:00:00:11:02";
@@ -6647,12 +6678,15 @@ mod tests {
     /// A sound server for a real `DefaultSinkRouter` (#311): the local sink
     /// is default and the AirPods sink never shows up, so once `stuck` a
     /// hold release waits its full `HOLD_RELEASE_WAIT`, or until `found`.
+    /// The park's watch fails to connect, at once or, with a `connect`
+    /// gate, once the gate's sender drops.
     #[derive(Clone)]
     struct ParkSinks {
         calls: Arc<StdMutex<Vec<String>>>,
         default: Arc<StdMutex<String>>,
         stuck: Arc<AtomicBool>,
         found: Arc<Notify>,
+        connect: Arc<StdMutex<Option<std::sync::mpsc::Receiver<()>>>>,
     }
 
     impl ParkSinks {
@@ -6710,8 +6744,14 @@ mod tests {
         }
 
         fn watch_park(&self, local: String) -> ParkWatch {
-            let none = || Err::<crate::pulse::ParkConnection, _>(io::Error::other("test"));
-            ParkWatch::spawn(none, local)
+            let gate = self.connect.lock().unwrap().take();
+            let connect = move || {
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+                Err::<crate::pulse::ParkConnection, _>(io::Error::other("test"))
+            };
+            ParkWatch::spawn(connect, local)
         }
     }
 
@@ -6754,18 +6794,20 @@ mod tests {
         }
     }
 
-    /// `park_task` on a real router over `ParkSinks`, parked by another
-    /// host's request.
+    /// `park_task` on a real router over `ParkSinks` with the `connect`
+    /// gate, parked by another host's request.
     async fn router_parked_task(
         mac: &str,
         rx: &mut mpsc::Receiver<Vec<u8>>,
         manager: &AACPManager,
+        connect: Option<std::sync::mpsc::Receiver<()>>,
     ) -> (Harness, ParkSinks) {
         let sinks = ParkSinks {
             calls: Arc::default(),
             default: Arc::new(StdMutex::new(LOCAL_SINK.to_string())),
             stuck: Arc::default(),
             found: Arc::default(),
+            connect: Arc::new(StdMutex::new(connect)),
         };
         let records = Arc::new(Records::default());
         records.parks.store(true, Ordering::SeqCst);
@@ -6802,7 +6844,7 @@ mod tests {
     async fn park_shutdown_unparks_before_a_slow_release() {
         let mac = "5A:00:00:00:11:05";
         let (manager, mut rx, _tx) = no_source_session().await;
-        let (_h, sinks) = router_parked_task(mac, &mut rx, &manager).await;
+        let (_h, sinks) = router_parked_task(mac, &mut rx, &manager, None).await;
         let registry = private_registry(&[mac]);
         let stopped = tokio::time::Instant::now();
         shutdown(registry).await;
@@ -6819,13 +6861,30 @@ mod tests {
         assert_eq!(sinks.default(), LOCAL_SINK);
     }
 
+    /// The exit path while parked, with the park's watch still connecting:
+    /// the unpark sets the local sink and unloads the park sink before it
+    /// waits for the watch, which outlasts `SHUTDOWN_RELEASE_WAIT`. Real
+    /// time: the watch runs on its own thread.
+    #[tokio::test]
+    async fn park_shutdown_unparks_before_a_slow_watch_stops() {
+        let mac = "5A:00:00:00:11:09";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let (connected, gate) = std::sync::mpsc::channel();
+        let (_h, sinks) = router_parked_task(mac, &mut rx, &manager, Some(gate)).await;
+        shutdown(private_registry(&[mac])).await;
+        let calls = sinks.calls();
+        assert!(calls.contains(&"unload 7".to_string()), "{calls:?}");
+        assert_eq!(sinks.default(), LOCAL_SINK);
+        drop(connected);
+    }
+
     /// A task that ends by itself while parked hands its unpark and release
     /// on: a replacement for the MAC waits for them.
     #[tokio::test]
     async fn park_disconnected_while_parked_replacement_waits_for_the_unpark() {
         let mac = "5A:00:00:00:11:06";
         let (manager, mut rx, _tx) = no_source_session().await;
-        let (h, sinks) = router_parked_task(mac, &mut rx, &manager).await;
+        let (h, sinks) = router_parked_task(mac, &mut rx, &manager, None).await;
         let task = handoff_task(mac).expect("task");
         manager.disconnect().await;
         wait_until("the task to end", || task.is_finished()).await;

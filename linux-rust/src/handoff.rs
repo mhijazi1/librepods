@@ -6556,7 +6556,11 @@ mod tests {
         assert_eq!(p.play(1500, false), []);
         assert_eq!(p.play(2000, true), []);
         assert_eq!(p.feed(3000, Input::Tick), []);
-        assert_eq!(p.core.park(), Park::Parked, "the first edge's deadline");
+        assert_eq!(
+            p.core.park(),
+            Park::Parked,
+            "the second edge restarted the deadline to 4000"
+        );
         park_falls_back_at(&mut p, 4000);
     }
 

@@ -174,7 +174,7 @@ async fn run(
             remembered = match (apply(&io, remembered, event).await, &park) {
                 // A take while parked replaced the park sink: remember the
                 // local sink it replaced in turn.
-                (Some(sink), Some(parked)) if sink == PARK_SINK => parked.local.clone(),
+                (Some(sink), Some(parked)) if sink == PARK_SINK => Some(parked.local.clone()),
                 (next, _) => next,
             };
         }
@@ -185,9 +185,9 @@ async fn run(
 /// A park in place (#311).
 struct Parked {
     module: u32,
-    /// The default it replaced, unless that couldn't be read.
-    local: Option<String>,
-    watch: Option<ParkWatch>,
+    /// The default it replaced.
+    local: String,
+    watch: ParkWatch,
 }
 
 /// Park or unpark; returns the park in place after `event`.
@@ -198,7 +198,12 @@ async fn apply_park(
 ) -> Option<Parked> {
     match (event, park) {
         (SinkEvent::Park, None) => {
-            let local = io.current_default().await.filter(|sink| sink != PARK_SINK);
+            // With no local sink, no event path could move notifications
+            // and calls off the park sink.
+            let Some(local) = io.current_default().await.filter(|sink| sink != PARK_SINK) else {
+                warn!("Default sink: no local default sink to park from; not parking");
+                return None;
+            };
             let Some(module) = io.load_park_sink().await else {
                 warn!("Default sink: failed to load {PARK_SINK}");
                 return None;
@@ -209,8 +214,8 @@ async fn apply_park(
                 unload_park(io, module, true).await;
                 return None;
             }
-            info!("Default sink: Park set {PARK_SINK}, replacing {local:?}");
-            let watch = local.clone().map(|local| io.watch_park(local));
+            info!("Default sink: Park set {PARK_SINK}, replacing {local}");
+            let watch = io.watch_park(local.clone());
             Some(Parked {
                 module,
                 local,
@@ -225,32 +230,27 @@ async fn apply_park(
     }
 }
 
-/// Stop the event path, set an explicit default while the park sink is
-/// still the default (the user's own change wins), then unload it:
+/// Signal the event path to stop, set an explicit default while the park
+/// sink is still the default (the user's own change wins), then unload it:
 /// WirePlumber would keep naming the gone sink as the configured default,
-/// and a re-loaded park sink would win it back (spike #314).
+/// and a re-loaded park sink would win it back (spike #314). Only then wait
+/// for the event path, so a slow one never holds the park sink past an
+/// exit's `SHUTDOWN_RELEASE_WAIT`.
 async fn unpark(io: &impl DefaultSinkIo, parked: Parked, to: UnparkTo) {
-    if let Some(watch) = parked.watch {
-        watch.stop().await;
-    }
+    let stopped = parked.watch.stop();
     let park_default = io.current_default().await.as_deref() == Some(PARK_SINK);
-    let target = match to {
-        UnparkTo::AirPods => io.airpods_sink().await.or(parked.local),
+    let sink = match to {
+        UnparkTo::AirPods => io.airpods_sink().await.unwrap_or(parked.local),
         UnparkTo::Local => parked.local,
     };
-    let set = match target {
-        Some(sink) if park_default => {
-            let set = io.set_default(sink.clone()).await;
-            if set {
-                info!("Default sink: Unpark({to:?}) set {sink}");
-            } else {
-                warn!("Default sink: Unpark({to:?}) failed to set {sink}");
-            }
-            set
-        }
-        _ => false,
-    };
+    let set = park_default && io.set_default(sink.clone()).await;
+    if set {
+        info!("Default sink: Unpark({to:?}) set {sink}");
+    } else if park_default {
+        warn!("Default sink: Unpark({to:?}) failed to set {sink}");
+    }
     unload_park(io, parked.module, park_default && !set).await;
+    stopped.await;
 }
 
 /// Unload the park sink's `module`; with `pin`, make the default the server
@@ -421,7 +421,7 @@ impl ParkWatch {
                     Ok(io) => io,
                     Err(e) => return warn!("Park: no event path: {e}"),
                 };
-                watch_events(&mut io, &local, &stopped);
+                watch_events(&mut io, &local, stopped);
                 // Before `io` drops: its clearers may still linger.
                 drop(finished);
             });
@@ -431,12 +431,14 @@ impl ParkWatch {
         ParkWatch { stop, done }
     }
 
-    /// Stop the event path; resolves once it handles no more events, or
-    /// after `PARK_STOP_WAIT`.
-    async fn stop(self) {
+    /// Stop the event path now; the future resolves once it handles no more
+    /// events, or after `PARK_STOP_WAIT`.
+    fn stop(self) -> impl Future<Output = ()> {
         drop(self.stop);
         let done = self.done;
-        let _ = tokio::task::spawn_blocking(move || done.recv_timeout(PARK_STOP_WAIT)).await;
+        async move {
+            let _ = tokio::task::spawn_blocking(move || done.recv_timeout(PARK_STOP_WAIT)).await;
+        }
     }
 }
 
@@ -495,7 +497,7 @@ impl ParkIo for pulse::ParkConnection {
 
 /// The event path's loop: the park sink's non-worthy streams already there,
 /// then each sink input event, until `stopped` is disconnected.
-fn watch_events(io: &mut impl ParkIo, local: &str, stopped: &Receiver<()>) {
+fn watch_events(io: &mut impl ParkIo, local: &str, stopped: Receiver<()>) {
     let (Some(park), Some(local)) = (io.sink_index(PARK_SINK), io.sink_index(local)) else {
         return warn!("Park: no {PARK_SINK} or {local} sink; no event path");
     };
@@ -503,22 +505,22 @@ fn watch_events(io: &mut impl ParkIo, local: &str, stopped: &Receiver<()>) {
         park,
         local,
         moves: HashMap::new(),
+        stopped,
     };
-    let running = || matches!(stopped.try_recv(), Err(TryRecvError::Empty));
-    // A watch stopped while it connected moves nothing.
-    if !running() {
+    // A watch stopped while it connected lists nothing.
+    if !mover.running() {
         return;
     }
     for input in io.sink_inputs(None) {
         mover.input(io, input);
     }
-    while running() {
+    while mover.running() {
         let events = match io.next(PARK_POLL) {
             Ok(events) => events,
             Err(e) => return warn!("Park: event path ended: {e}"),
         };
         for event in events {
-            if !running() {
+            if !mover.running() {
                 return;
             }
             mover.event(io, event);
@@ -535,9 +537,14 @@ struct ParkMover {
     local: u32,
     /// The moves made so far, by sink input.
     moves: HashMap<u32, u8>,
+    /// Disconnected once the park ends: no move or reset follows.
+    stopped: Receiver<()>,
 }
 
 impl ParkMover {
+    fn running(&self) -> bool {
+        matches!(self.stopped.try_recv(), Err(TryRecvError::Empty))
+    }
     fn event(&mut self, io: &mut impl ParkIo, (event, index): pulse::SinkInputEvent) {
         if event & sys::PA_SUBSCRIPTION_EVENT_TYPE_MASK == sys::PA_SUBSCRIPTION_EVENT_REMOVE {
             self.moves.remove(&index);
@@ -551,14 +558,26 @@ impl ParkMover {
     }
 
     /// Move a non-worthy stream on the park sink to the local sink, then
-    /// reset the target that move stored for its key.
+    /// reset the target that move stored for its key. Each step first checks
+    /// the park still runs.
     fn input(&mut self, io: &mut impl ParkIo, input: pulse::SinkInput) {
         // A stream not linked yet has no sink: moved now, none of it plays
         // on the park sink (spike #314).
-        if input.sink != self.park && input.sink != sys::PA_INVALID_INDEX {
+        let unlinked = input.sink == sys::PA_INVALID_INDEX;
+        if !self.running() || (input.sink != self.park && !unlinked) {
             return;
         }
         let props = &input.props;
+        // Unless it targets another sink of its own.
+        let park = self.park.to_string();
+        if unlinked
+            && ["target.object", "node.target"]
+                .into_iter()
+                .filter_map(|key| props.get(key).map(|v| v.trim()))
+                .any(|target| target != PARK_SINK && target != park)
+        {
+            return;
+        }
         let stream = StreamProps {
             direction: StreamDirection::Playback,
             props: props.clone(),
@@ -592,10 +611,13 @@ impl ParkMover {
             }
             return;
         };
+        if !self.running() {
+            return;
+        }
         let Some(own) = io.open_corked(key, value) else {
             return;
         };
-        if !io.move_to_default(own) {
+        if self.running() && !io.move_to_default(own) {
             warn!("Park: failed to reset the target of {key}={value}");
         }
         io.close(own);
@@ -772,8 +794,9 @@ mod tests {
 
     impl DefaultSinkIo for FakeSinks {
         fn current_default(&self) -> BoxFuture<'static, Option<String>> {
-            let default = self.default.lock().unwrap().clone();
-            Box::pin(async move { Some(default) })
+            // An empty default reads as none.
+            let default = Some(self.default.lock().unwrap().clone()).filter(|d| !d.is_empty());
+            Box::pin(async move { default })
         }
 
         fn airpods_sink(&self) -> BoxFuture<'static, Option<String>> {
@@ -857,6 +880,8 @@ mod tests {
         watching: bool,
         calls: Vec<String>,
         clearers: u32,
+        /// When set, the next `open_corked` waits for its sender to drop.
+        open_gate: Option<Receiver<()>>,
     }
 
     impl FakePulse {
@@ -921,6 +946,10 @@ mod tests {
 
         /// A LibrePods stream on the park sink, announced like any other.
         fn open_corked(&mut self, key: &str, value: &str) -> Option<u32> {
+            let gate = self.0.lock().unwrap().open_gate.take();
+            if let Some(gate) = gate {
+                let _ = gate.recv();
+            }
             let mut pulse = self.0.lock().unwrap();
             pulse.clearers += 1;
             let index = 100 + pulse.clearers;
@@ -1351,6 +1380,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn park_lifecycle_no_local_sink_parks_nothing() {
+        // Unreadable, or the park sink itself: no event path could run.
+        for default in ["", PARK_SINK] {
+            let sinks = FakeSinks::new(false);
+            *sinks.default.lock().unwrap() = default.to_string();
+            route_all(&sinks, &[Park, Unpark(ToLocal)]).await;
+            assert_eq!(sinks.sets(), Vec::<String>::new(), "{default:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn park_lifecycle_startup_unloads_a_leftover() {
         // The leftover was the default: the server's pick is made explicit.
         let sinks = FakeSinks {
@@ -1403,22 +1443,30 @@ mod tests {
         assert_eq!(key(&[]), None);
     }
 
-    /// A `ParkMover` between the park sink and the DAC on `pulse`.
-    fn mover(pulse: &Arc<Mutex<FakePulse>>) -> (ParkMover, FakePulseIo) {
+    /// A `ParkMover` between the park sink and the DAC on `pulse`; it runs
+    /// while the returned sender lives.
+    fn mover(pulse: &Arc<Mutex<FakePulse>>) -> (ParkMover, FakePulseIo, Sender<()>) {
+        let (running, stopped) = std::sync::mpsc::channel();
         let mover = ParkMover {
             park: PARK_INDEX,
             local: DAC_INDEX,
             moves: HashMap::new(),
+            stopped,
         };
-        (mover, FakePulseIo(pulse.clone()))
+        (mover, FakePulseIo(pulse.clone()), running)
     }
 
     /// The I/O one NEW for a sink input 5 with `props` on the park sink
     /// gives.
     fn new_on_park(props: &[(&str, &str)]) -> Vec<String> {
+        new_on(PARK_INDEX, props)
+    }
+
+    /// The I/O one NEW for a sink input 5 with `props` on `sink` gives.
+    fn new_on(sink: u32, props: &[(&str, &str)]) -> Vec<String> {
         let pulse = Arc::<Mutex<FakePulse>>::default();
-        pulse.lock().unwrap().put(input(5, PARK_INDEX, props), 0);
-        let (mut mover, mut io) = mover(&pulse);
+        pulse.lock().unwrap().put(input(5, sink, props), 0);
+        let (mut mover, mut io, _running) = mover(&pulse);
         mover.event(&mut io, (sys::PA_SUBSCRIPTION_EVENT_NEW, 5));
         pulse.lock().unwrap().calls.clone()
     }
@@ -1444,10 +1492,17 @@ mod tests {
         let pulse = Arc::<Mutex<FakePulse>>::default();
         let unlinked = event_on(5, sys::PA_INVALID_INDEX);
         pulse.lock().unwrap().put(unlinked, 0);
-        let (mut mover, mut io) = mover(&pulse);
+        let (mut mover, mut io, _running) = mover(&pulse);
         mover.event(&mut io, (sys::PA_SUBSCRIPTION_EVENT_NEW, 5));
         let calls = pulse.lock().unwrap().calls.clone();
         assert_eq!(calls, moved_and_reset("media.role=event"));
+        // Or when it targets the park sink, by name or index.
+        let park = PARK_INDEX.to_string();
+        for target in [("target.object", PARK_SINK), ("node.target", park.as_str())] {
+            let props = [("media.role", "event"), target];
+            let calls = new_on(sys::PA_INVALID_INDEX, &props);
+            assert_eq!(calls, moved_and_reset("media.role=event"), "{target:?}");
+        }
     }
 
     #[test]
@@ -1475,16 +1530,23 @@ mod tests {
         assert_eq!(new_on_park(&music), Vec::<String>::new());
         let pulse = Arc::<Mutex<FakePulse>>::default();
         pulse.lock().unwrap().put(event_on(5, DAC_INDEX), 0);
-        let (mut mover, mut io) = mover(&pulse);
+        let (mut mover, mut io, _running) = mover(&pulse);
         mover.event(&mut io, (sys::PA_SUBSCRIPTION_EVENT_NEW, 5));
         assert_eq!(pulse.lock().unwrap().calls, Vec::<String>::new());
+        // Nor an unlinked stream that targets a sink of its own: its stored
+        // target would be reset too.
+        for target in [("target.object", "alsa_output.usb"), ("node.target", "42")] {
+            let props = [event[0], target];
+            let calls = new_on(sys::PA_INVALID_INDEX, &props);
+            assert_eq!(calls, Vec::<String>::new(), "{target:?}");
+        }
     }
 
     #[test]
     fn park_event_change_still_on_park_retries_once() {
         let pulse = Arc::<Mutex<FakePulse>>::default();
         pulse.lock().unwrap().put(event_on(5, PARK_INDEX), 0);
-        let (mut mover, mut io) = mover(&pulse);
+        let (mut mover, mut io, _running) = mover(&pulse);
         mover.event(&mut io, (sys::PA_SUBSCRIPTION_EVENT_NEW, 5));
         // A CHANGE once it is on the local sink: nothing.
         let change = sys::PA_SUBSCRIPTION_EVENT_SINK_INPUT | sys::PA_SUBSCRIPTION_EVENT_CHANGE;
@@ -1587,6 +1649,35 @@ mod tests {
         let ended = done.recv_timeout(Duration::from_secs(3));
         assert_eq!(ended, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
         assert_eq!(pulse.lock().unwrap().calls, Vec::<String>::new());
+    }
+
+    /// A watch stopped during a reset finishes only the clearer it is
+    /// opening: no reset move, and the listing's next stream stays.
+    #[test]
+    fn park_event_watch_stopped_during_a_reset_moves_nothing_more() {
+        let pulse = Arc::<Mutex<FakePulse>>::default();
+        let (release, gate) = std::sync::mpsc::channel();
+        {
+            let mut pulse = pulse.lock().unwrap();
+            pulse.put(event_on(5, PARK_INDEX), 0);
+            pulse.put(event_on(6, PARK_INDEX), 0);
+            pulse.open_gate = Some(gate);
+        }
+        let io = FakePulseIo(pulse.clone());
+        let ParkWatch { stop, done } = ParkWatch::spawn(move || Ok(io), DAC.to_string());
+        let opening = std::time::Instant::now();
+        while pulse.lock().unwrap().open_gate.is_some() {
+            assert!(opening.elapsed() < Duration::from_secs(3), "no open_corked");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(stop);
+        drop(release);
+        let ended = done.recv_timeout(Duration::from_secs(3));
+        assert_eq!(ended, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+        let calls = pulse.lock().unwrap().calls.clone();
+        let opened = "open media.role=event -> 101".to_string();
+        let expected = [format!("move 5 -> {DAC_INDEX}"), opened, "close 101".into()];
+        assert_eq!(calls, expected);
     }
 
     #[tokio::test]
