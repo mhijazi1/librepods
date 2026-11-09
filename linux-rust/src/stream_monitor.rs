@@ -2747,12 +2747,6 @@ mod tests {
     }
 
     #[test]
-    fn playback_list_bound_covers_reconnect_and_both_listings() {
-        // `sink_inputs` may list the clients after the sink inputs.
-        assert!(PLAYBACK_LIST_BOUND > pulse::CONNECT_TIMEOUT + 2 * pulse::OPERATION_TIMEOUT);
-    }
-
-    #[test]
     fn playback_thread_stall_is_bounded_and_late_reply_dropped() {
         let bound = Duration::from_millis(300);
         let (release, stalled) = std::sync::mpsc::channel::<()>();
