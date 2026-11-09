@@ -14,10 +14,82 @@ use hex;
 use log::{debug, info};
 use serde_json;
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Bounds one auto-connect, like the watcher's connect in reconnect.rs.
+const LE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The least spacing before a failed auto-connect to the same AirPods is retried.
+const LE_CONNECT_RETRY: Duration = crate::reconnect::RECONNECT_BACKOFF_MIN;
+
+/// How one `bluetoothctl connect` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectOutcome {
+    Connected,
+    Failed,
+    SpawnError,
+    TimedOut,
+}
+
+/// When each AirPods public MAC's last auto-connect failed.
+#[derive(Default)]
+struct ConnectRetry(HashMap<String, Instant>);
+
+impl ConnectRetry {
+    fn ready(&self, mac: &str, now: Instant) -> bool {
+        self.0
+            .get(mac)
+            .is_none_or(|&failed| now.saturating_duration_since(failed) >= LE_CONNECT_RETRY)
+    }
+
+    fn finished(&mut self, mac: &str, outcome: ConnectOutcome, now: Instant) {
+        if outcome == ConnectOutcome::Connected {
+            self.0.remove(mac);
+        } else {
+            self.0.insert(mac.to_string(), now);
+        }
+    }
+}
+
+// A sync lock: the per-device task must never hold it across an await.
+fn lock(retry: &Mutex<ConnectRetry>) -> MutexGuard<'_, ConnectRetry> {
+    retry.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// bluetoothctl, as bluer's connect doesn't work here.
+async fn le_connect(mac: &str) -> ConnectOutcome {
+    let command = tokio::process::Command::new("bluetoothctl")
+        .arg("connect")
+        .arg(mac)
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(LE_CONNECT_TIMEOUT, command).await {
+        Ok(Ok(output)) if output.status.success() => {
+            info!("Successfully connected to AirPods {}", mac);
+            ConnectOutcome::Connected
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            info!("Failed to connect to AirPods {}: {}", mac, stderr);
+            ConnectOutcome::Failed
+        }
+        Ok(Err(e)) => {
+            info!(
+                "Failed to execute bluetoothctl to connect to AirPods {}: {}",
+                mac, e
+            );
+            ConnectOutcome::SpawnError
+        }
+        Err(_elapsed) => {
+            info!(
+                "bluetoothctl connect to AirPods {} timed out after {:?}",
+                mac, LE_CONNECT_TIMEOUT
+            );
+            ConnectOutcome::TimedOut
+        }
+    }
+}
 
 fn decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(&Array::from(*key));
@@ -80,7 +152,7 @@ pub async fn start_le_monitor(
 
     let mut verified_macs: HashMap<Address, String> = HashMap::new();
     let mut failed_macs: HashSet<Address> = HashSet::new();
-    let connecting_macs = Arc::new(Mutex::new(HashSet::<Address>::new()));
+    let retry = Arc::new(Mutex::new(ConnectRetry::default()));
 
     let pattern = Pattern {
         data_type: 0xFF, // Manufacturer specific data
@@ -166,7 +238,7 @@ pub async fn start_le_monitor(
                 let mut events = dev.events().await?;
                 let tray_handle_clone = tray_handle.clone();
                 let ui_tx_clone = ui_tx.clone();
-                let connecting_macs_clone = Arc::clone(&connecting_macs);
+                let retry_clone = Arc::clone(&retry);
                 tokio::spawn(async move {
                     while let Some(ev) = events.next().await {
                         match ev {
@@ -191,90 +263,42 @@ pub async fn start_le_monitor(
                                         debug!("Connection state: {}", connection_state);
                                         if connection_state == 0x00 {
                                             // Tolerates top-level keys such as `switching`.
-                                            let auto_connect = load_auto_connect(
-                                                matched_airpods_mac.as_ref().unwrap(),
-                                            );
+                                            let mac = matched_airpods_mac.as_ref().unwrap();
+                                            let auto_connect = load_auto_connect(mac);
                                             debug!(
                                                 "Auto-connect preference for {}: {}",
-                                                matched_airpods_mac.as_ref().unwrap(),
-                                                auto_connect
+                                                mac, auto_connect
                                             );
-                                            // One connect at a time with the playback reconnect (#307).
-                                            if auto_connect
-                                                && let Some(_connect_guard) =
-                                                    crate::reconnect::ConnectGuard::try_new(
-                                                        matched_airpods_mac.as_ref().unwrap(),
-                                                    )
+                                            // Every skip only skips the connect; the battery block below still runs.
+                                            if !auto_connect {
+                                                info!(
+                                                    "Auto-connect is disabled for {}, not attempting to connect.",
+                                                    mac
+                                                );
+                                            } else if !lock(&retry_clone).ready(mac, Instant::now())
                                             {
-                                                let real_address =
-                                                    Address::from_str(&addr_str).unwrap();
-                                                let mut cm = connecting_macs_clone.lock().await;
-                                                if cm.contains(&real_address) {
-                                                    info!(
-                                                        "Already connecting to {}, skipping duplicate attempt.",
-                                                        matched_airpods_mac.as_ref().unwrap()
-                                                    );
-                                                    return;
-                                                }
-                                                cm.insert(real_address);
-                                                // let adapter_clone = adapter_monitor_clone.clone();
-                                                // let real_device = adapter_clone.device(real_address).unwrap();
+                                                debug!(
+                                                    "Last connect to {} failed, retrying later.",
+                                                    mac
+                                                );
+                                            } else if let Some(_connect_guard) =
+                                                crate::reconnect::ConnectGuard::try_new(mac)
+                                            {
+                                                // One connect at a time with the playback reconnect (#307).
                                                 info!(
                                                     "AirPods are disconnected, attempting to connect to {}",
-                                                    matched_airpods_mac.as_ref().unwrap()
+                                                    mac
                                                 );
-                                                // if let Err(e) = real_device.connect().await {
-                                                //     info!("Failed to connect to AirPods {}: {}", matched_airpods_mac.as_ref().unwrap(), e);
-                                                // } else {
-                                                //     info!("Successfully connected to AirPods {}", matched_airpods_mac.as_ref().unwrap());
-                                                // }
-                                                // call bluetoothctl connect <mac> for now, I don't know why bluer connect isn't working
-                                                let output =
-                                                    tokio::process::Command::new("bluetoothctl")
-                                                        .arg("connect")
-                                                        .arg(matched_airpods_mac.as_ref().unwrap())
-                                                        .output()
-                                                        .await;
-                                                match output {
-                                                    Ok(output) => {
-                                                        if output.status.success() {
-                                                            info!(
-                                                                "Successfully connected to AirPods {}",
-                                                                matched_airpods_mac
-                                                                    .as_ref()
-                                                                    .unwrap()
-                                                            );
-                                                            cm.remove(&real_address);
-                                                        } else {
-                                                            let stderr = String::from_utf8_lossy(
-                                                                &output.stderr,
-                                                            );
-                                                            info!(
-                                                                "Failed to connect to AirPods {}: {}",
-                                                                matched_airpods_mac
-                                                                    .as_ref()
-                                                                    .unwrap(),
-                                                                stderr
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        info!(
-                                                            "Failed to execute bluetoothctl to connect to AirPods {}: {}",
-                                                            matched_airpods_mac.as_ref().unwrap(),
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            } else if auto_connect {
-                                                info!(
-                                                    "A connect to {} is already in flight, skipping.",
-                                                    matched_airpods_mac.as_ref().unwrap()
+                                                let outcome = le_connect(mac).await;
+                                                lock(&retry_clone).finished(
+                                                    mac,
+                                                    outcome,
+                                                    Instant::now(),
                                                 );
                                             } else {
                                                 info!(
-                                                    "Auto-connect is disabled for {}, not attempting to connect.",
-                                                    matched_airpods_mac.as_ref().unwrap()
+                                                    "A connect to {} is already in flight, skipping.",
+                                                    mac
                                                 );
                                             }
                                         }
@@ -485,6 +509,40 @@ mod tests {
     }
 
     use BatteryStatus::{Charging, Disconnected, NotCharging};
+
+    const MAC: &str = "AA:BB:CC:DD:EE:FF";
+
+    #[test]
+    fn le_connect_slot_freed_on_every_outcome() {
+        use ConnectOutcome::*;
+        let t0 = Instant::now();
+        for outcome in [Connected, Failed, SpawnError, TimedOut] {
+            let mut retry = ConnectRetry::default();
+            assert!(retry.ready(MAC, t0));
+            retry.finished(MAC, outcome, t0);
+            // Failures wait out the spacing; a success doesn't.
+            assert_eq!(retry.ready(MAC, t0), outcome == Connected, "{outcome:?}");
+            assert!(retry.ready(MAC, t0 + LE_CONNECT_RETRY), "{outcome:?}");
+            // Only that MAC waits.
+            assert!(retry.ready("11:22:33:44:55:66", t0), "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn le_connect_retry_spaced_after_failure() {
+        assert!(LE_CONNECT_RETRY >= Duration::from_secs(10));
+        let t0 = Instant::now();
+        let ms = Duration::from_millis(1);
+
+        let mut retry = ConnectRetry::default();
+        retry.finished(MAC, ConnectOutcome::Failed, t0);
+        assert!(!retry.ready(MAC, t0 + LE_CONNECT_RETRY - ms));
+        assert!(retry.ready(MAC, t0 + LE_CONNECT_RETRY));
+
+        // A success clears the spacing an earlier failure left.
+        retry.finished(MAC, ConnectOutcome::Connected, t0);
+        assert!(retry.ready(MAC, t0 + ms));
+    }
 
     #[test]
     fn ble_tray_entry_0xff_keeps_known_level() {
