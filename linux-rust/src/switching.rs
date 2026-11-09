@@ -37,7 +37,7 @@ use crate::media_controller::{
 use crate::reconnect;
 use crate::stream_monitor::{
     self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PlaybackState, PulsePeaks,
-    PulsePlaybackStreams,
+    PulsePlaybackStreams, Starts,
 };
 use crate::utils::{self, ConnectMode, SwitchingMode};
 use futures::future::BoxFuture;
@@ -69,8 +69,8 @@ pub(crate) struct PlaybackSamples {
     /// Asks the stream monitor to re-baseline at the core's reset (#90).
     rebaseline: Arc<StdMutex<Option<Instant>>>,
     /// The stream monitor's state, read at `Command::PauseMedia` (#302) and
-    /// `Command::ResumeA2dp` (#330), with its count of stream starts (#96).
-    streams: watch::Receiver<(PlaybackState, u64)>,
+    /// `Command::ResumeA2dp` (#330), with its counting streams' starts (#96).
+    streams: watch::Receiver<(PlaybackState, Starts)>,
 }
 
 impl PlaybackSamples {
@@ -355,8 +355,8 @@ where
     }
 }
 
-/// The players with a live local stream and the stream starts one poller
-/// sample saw (#96).
+/// The players with a live local stream and the newest stream start one
+/// poller sample saw (#96).
 type Sources = (HashSet<Option<u32>>, u64);
 
 /// One poller sample over the Playing players' bus `owners` and the stream
@@ -364,10 +364,11 @@ type Sources = (HashSet<Option<u32>>, u64);
 /// the previous sample's sources in `last` (none before the first sample),
 /// the category of a source new since then (#96): a player with a live local
 /// stream whose owner had none (301), else a stream that started counting
-/// (201).
+/// (201) and is no such player's own stream (#329: its process or a recorded
+/// ancestor is the player's owner; a stream with no resolved PID is new).
 fn sample_sources(
     owners: &[Option<u32>],
-    (state, starts): &(PlaybackState, u64),
+    (state, started): &(PlaybackState, Starts),
     last: &mut Option<Sources>,
 ) -> (u32, Option<u32>) {
     let live: HashSet<_> = owners
@@ -376,14 +377,20 @@ fn sample_sources(
         .filter(|&owner| state.live_or_unknown(owner))
         .collect();
     let category = local_category(!owners.is_empty(), !live.is_empty(), state.counted);
-    let new_source = last.as_ref().and_then(|(was_live, was_starts)| {
+    let seen = last.as_ref().map_or(0, |&(_, seen)| seen);
+    let own = |pids: &HashSet<u32>| live.iter().flatten().any(|pid| pids.contains(pid));
+    let new_source = last.as_ref().and_then(|(was_live, _)| {
         if !live.is_subset(was_live) {
             Some(AUDIO_CATEGORY_MEDIA)
         } else {
-            (starts > was_starts).then_some(AUDIO_CATEGORY_STREAM)
+            started
+                .iter()
+                .any(|(start, pids)| *start > seen && !own(pids))
+                .then_some(AUDIO_CATEGORY_STREAM)
         }
     });
-    *last = Some((live, *starts));
+    let newest = started.last().map_or(seen, |&(start, _)| start.max(seen));
+    *last = Some((live, newest));
     (category, new_source)
 }
 
@@ -3180,7 +3187,7 @@ mod tests {
                 counted: false,
                 live: live.map(|pids| pids.iter().copied().collect()),
             },
-            0,
+            Vec::new(),
         ))
         .1;
         let h = Harness::start_playback(
@@ -4833,12 +4840,14 @@ mod tests {
                 if let Some(playing) = self.tracker.observe_levels(now, streams, level) {
                     self.streams_playing = playing;
                 }
+                let owned = stream_monitor::stream_owners(streams, |_| None);
                 let state = PlaybackState {
                     counted: self.streams_playing,
-                    live: Some(stream_monitor::live_stream_pids(streams, |_| None)),
+                    live: Some(owned.values().flatten().copied().collect()),
                 };
+                let started = self.tracker.started(&owned);
                 let (category, new_source) =
-                    sample_sources(owners, &(state, self.tracker.starts), &mut self.last);
+                    sample_sources(owners, &(state, started), &mut self.last);
                 self.feed(
                     ms,
                     Input::Playback {
@@ -5440,11 +5449,16 @@ mod tests {
             assert_eq!(run(IDLE).0, [SendOwnership(true)]);
         }
 
-        /// The second player (its own new stream) starts at `ms`: a new
-        /// source at 301, then one at 201.
+        /// The second player (its own new stream) starts at `ms` beside a
+        /// stream of a third process: a new source at 301, then one at 201
+        /// (the player's own stream is none, #329).
         fn new_player(p: &mut Pipeline, ms: u64) -> Vec<Command> {
             let both = [Some(PLAYER_PID), Some(SECOND_PID)];
-            let streams = [music(1), owned_by(SECOND_PID, music(2))];
+            let streams = [
+                music(1),
+                owned_by(SECOND_PID, music(2)),
+                owned_by(SECOND_PID + 1, music(3)),
+            ];
             p.samples(ms, past_min(ms), &both, &streams, |_| LOUD)
         }
 
@@ -5575,7 +5589,7 @@ mod tests {
         }
 
         /// #301: a bud back in while the iPhone owns; the second player's
-        /// 301 and its stream's 201 both come within the grace.
+        /// 301 and the third process's 201 both come within the grace.
         #[test]
         fn fresh_source_non_event_ear_resume_grace() {
             let (mut p, ms) = yielded(&[Some(PLAYER_PID)], &[music(1)], IDLE);
@@ -5620,10 +5634,70 @@ mod tests {
             assert_eq!(after_reset(false), []);
             // The twin: a second sample takes at 301.
             assert_eq!(after_reset(true), [SendOwnership(true)]);
-            let state = (PlaybackState::default(), 1);
+            let state = (PlaybackState::default(), vec![(1, HashSet::new())]);
             assert_eq!(
                 sample_sources(&player(true), &state, &mut None),
                 (MEDIA, None)
+            );
+        }
+
+        /// #96 with #301: a bud back in while the iPhone owns, relaying 100;
+        /// the player resumes with its own stream silent for 1.5 s, so the
+        /// stream counts after the grace. That stream is the player's (#329):
+        /// no new source. With `other`, a stream of another process counts
+        /// then too: one take.
+        fn own_stream_after_ear_resume(other: bool) -> (Vec<Command>, Vec<String>) {
+            let mut p = Pipeline::ready();
+            let remote = AudioSource {
+                mac: REMOTE.to_string(),
+                r#type: AudioSourceType::Media,
+            };
+            p.feed(20, Input::AudioSource(remote));
+            let relay = Input::MediaInformation {
+                host: REMOTE.to_string(),
+                category: IDLE,
+            };
+            p.feed(20, relay);
+            p.feed(30, Input::Auto);
+            p.step(40, true, &[music(1)]);
+            p.feed(100, Input::EarState(vec![InEar, OutOfEar]));
+            p.step(150, false, &[]);
+            p.step(200, false, &[]);
+            p.feed(300, Input::EarState(vec![InEar, InEar]));
+            p.core.take_lines();
+            let mut streams = vec![music(1)];
+            if other {
+                streams.push(owned_by(SECOND_PID, music(2)));
+            }
+            let audible = EVENT_MS + 1500;
+            let grace_end = 300 + crate::handoff::EAR_RESUME_GRACE.as_millis() as u64;
+            assert!(audible + MIN_MS > grace_end);
+            let mut all = Vec::new();
+            for ms in (EVENT_MS..=past_min(audible)).step_by(POLL_MS as usize) {
+                let level = if ms < audible { SILENT } else { LOUD };
+                all.extend(p.sample(ms, &player(true), &streams, |_| level));
+            }
+            assert!(p.streams_playing);
+            (all, p.core.take_lines())
+        }
+
+        #[test]
+        fn fresh_source_own_stream_after_ear_resume_no_take() {
+            let resumed =
+                "AUTO playback resumed by ear detection while another host owns; not taking";
+            assert_eq!(
+                own_stream_after_ear_resume(false),
+                (vec![], vec![resumed.to_string()])
+            );
+        }
+
+        #[test]
+        fn fresh_source_own_stream_twin_other_pid_takes() {
+            let (all, lines) = own_stream_after_ear_resume(true);
+            assert_eq!(all, [SendOwnership(true)]);
+            assert_eq!(
+                lines.last().map(String::as_str),
+                Some("AUTO playback started; requested Linux ownership")
             );
         }
     }

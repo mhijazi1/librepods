@@ -305,8 +305,8 @@ pub(crate) struct Handoff {
     /// resume.
     stop_during_take: bool,
     /// Playback restarted while an automatic release was pending: take once
-    /// it settles.
-    play_during_release: bool,
+    /// it settles, deciding at the highest category requested (#96).
+    play_during_release: Option<u32>,
     reconnecting: bool,
     retry_at: Instant,
     retry_delay: Duration,
@@ -385,7 +385,7 @@ impl Handoff {
             },
             case_closed: false,
             stop_during_take: false,
-            play_during_release: false,
+            play_during_release: None,
             reconnecting: false,
             retry_at: now,
             retry_delay: FIRST_RETRY,
@@ -629,7 +629,7 @@ impl Handoff {
                     if self.requested_take {
                         self.route_away(out);
                     }
-                    self.play_during_release = false;
+                    self.play_during_release = None;
                     self.last_owner_linux = false;
                     self.say("REMOTE requested ownership; release already pending");
                     self.hold_for_remote(out);
@@ -875,9 +875,10 @@ impl Handoff {
                 if fresh_play && self.ear_resumed(sampled_at) {
                     self.say(EAR_RESUMED);
                 } else if fresh_play {
-                    self.play_during_release = true;
+                    let requested = Some(behind.unwrap_or(category));
+                    self.play_during_release = self.play_during_release.max(requested);
                 } else if stopped {
-                    self.play_during_release = false;
+                    self.play_during_release = None;
                 }
             }
             Some(_) => {}
@@ -1032,7 +1033,7 @@ impl Handoff {
         self.requested_take = false;
         self.last_owner_linux = false;
         self.stop_during_take = false;
-        self.play_during_release = false;
+        self.play_during_release = None;
         self.resume_deferred = false;
         if self.automatic {
             out.push(Command::PauseMedia);
@@ -1115,11 +1116,10 @@ impl Handoff {
             // its A2DP resume to the next play edge (#205).
             self.resume_deferred = true;
             self.say("AUTO playback stopped during the take; keeping ownership");
-        } else if play && self.was_playing == Some(true) {
+        } else if let Some(category) = play.filter(|_| self.was_playing == Some(true)) {
             // The stopped-to-playing edge was seen while the release was in
             // flight; decide on it now.
-            if self.decide_poll(Some(false), true, self.category).action == TakeoverAction::TakeOver
-            {
+            if self.decide_poll(Some(false), true, category).action == TakeoverAction::TakeOver {
                 if !self.auto_take_allowed() {
                     self.say(CONNECT_MODE_SKIP);
                     return;
@@ -1155,7 +1155,7 @@ impl Handoff {
         self.was_playing = None;
         self.take_assumes_playing = false;
         self.stop_during_take = false;
-        self.play_during_release = false;
+        self.play_during_release = None;
         self.resume_deferred = false;
         self.hosts.clear();
         self.snapshot_hosts.clear();
@@ -1293,7 +1293,7 @@ impl Handoff {
             cause,
         });
         self.stop_during_take = false;
-        self.play_during_release = false;
+        self.play_during_release = None;
         self.reconnect_take_pending = false;
         self.timed_out_release = None;
         self.resume_deferred = false;
@@ -5012,6 +5012,42 @@ mod tests {
         );
     }
 
+    /// #96: a new stream behind MPRIS during Auto's pending release is
+    /// decided at 201 once the release settles, not at Linux's 301.
+    #[test]
+    fn fresh_source_during_release() {
+        let run = |owner| {
+            let mut p = Probe::new(false, true);
+            p.routing(SessionFacts {
+                owner: Some(vec![1]),
+                ..ready_facts()
+            });
+            assert_eq!(
+                p.feed(100, Input::Auto),
+                [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+            );
+            assert_eq!(p.feed(150, remote_media()), []);
+            assert_eq!(p.feed(160, relay(REMOTE, owner)), []);
+            assert_eq!(p.play_category(200, MEDIA), []);
+            assert_eq!(p.play_source(500, MEDIA, Some(STREAM)), []);
+            p.core.take_lines();
+            let ack = p.feed(600, Input::Ownership(vec![0]));
+            (ack, p.core.take_lines())
+        };
+        let (ack, lines) = run(MEDIA);
+        assert_eq!(ack, []);
+        assert_eq!(count_lines(&lines, "AUTO takeover blocked"), 1);
+        let (ack, lines) = run(IDLE);
+        assert_eq!(ack, [SendOwnership(true)]);
+        assert_eq!(
+            count_lines(
+                &lines,
+                "AUTO playback restarted during the release; requested Linux ownership"
+            ),
+            1
+        );
+    }
+
     #[test]
     fn category_rise_while_holding_the_take_sends_nothing() {
         let mut p = Probe::ready();
@@ -5488,7 +5524,7 @@ mod tests {
                 }
                 all.extend(p.play_category(500, IDLE));
                 all.extend(p.play_category(1000, MEDIA));
-                assert!(p.core.play_during_release, "{name}");
+                assert!(p.core.play_during_release.is_some(), "{name}");
                 all.extend(p.feed(ms, settle.clone()));
                 let lines = p.core.take_lines();
                 assert!(!lines.contains(&EAR_RESUMED.to_string()), "{name}");

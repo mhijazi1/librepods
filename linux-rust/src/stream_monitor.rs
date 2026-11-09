@@ -181,8 +181,9 @@ pub(crate) trait PeakSource: Send {
 enum Gate {
     /// Audible in every sample since this one, its first audible sample.
     Debounce(Instant),
-    /// Counts; this was its last audible sample.
-    Counting(Instant),
+    /// Counts; this was its last audible sample, and this its start number
+    /// (`PlaybackTracker::started`).
+    Counting(Instant, u64),
 }
 
 /// Debounces takeover-worthy playback streams that carry sound into a
@@ -224,7 +225,7 @@ pub(crate) struct PlaybackTracker {
     playing: bool,
     /// How many times a stream started counting (#96): a stream that stops
     /// counting and counts again is a new start.
-    pub(crate) starts: u64,
+    starts: u64,
 }
 
 /// The worthy, uncorked, unmuted streams of a listing.
@@ -280,12 +281,12 @@ impl PlaybackTracker {
                 (None, true) => Some(Gate::Debounce(now)),
                 (Some(Gate::Debounce(start)), true) if since(start) >= self.min => {
                     self.starts += 1;
-                    Some(Gate::Counting(now))
+                    Some(Gate::Counting(now, self.starts))
                 }
                 (debounce @ Some(Gate::Debounce(_)), true) => debounce,
-                (Some(Gate::Counting(_)), true) => Some(Gate::Counting(now)),
-                (Some(Gate::Counting(last)), false) if since(last) < SILENCE_HOLD => {
-                    Some(Gate::Counting(last))
+                (Some(Gate::Counting(_, start)), true) => Some(Gate::Counting(now, start)),
+                (Some(Gate::Counting(last, start)), false) if since(last) < SILENCE_HOLD => {
+                    Some(Gate::Counting(last, start))
                 }
                 (_, false) => None,
             };
@@ -297,12 +298,30 @@ impl PlaybackTracker {
         let playing = self
             .gates
             .values()
-            .any(|gate| matches!(gate, Gate::Counting(_)));
+            .any(|gate| matches!(gate, Gate::Counting(..)));
         if playing == self.playing {
             return None;
         }
         self.playing = playing;
         Some(playing)
+    }
+
+    /// Each counting stream's start number (`starts` when it started), in
+    /// order, with its owner PIDs in `owners` (`stream_owners`; none when
+    /// unresolved) (#96).
+    pub(crate) fn started(&self, owners: &HashMap<u32, HashSet<u32>>) -> Starts {
+        let mut started: Starts = self
+            .gates
+            .iter()
+            .filter_map(|(index, gate)| match gate {
+                Gate::Counting(_, start) => {
+                    Some((*start, owners.get(index).cloned().unwrap_or_default()))
+                }
+                Gate::Debounce(_) => None,
+            })
+            .collect();
+        started.sort_unstable_by_key(|&(start, _)| start);
+        started
     }
 
     /// The handoff core reset its playback baseline at `at` (#90): streams
@@ -322,7 +341,7 @@ impl PlaybackTracker {
                 preexisting.insert(index);
                 false
             }
-            Gate::Debounce(_) | Gate::Counting(_) => true,
+            Gate::Debounce(_) | Gate::Counting(..) => true,
         });
     }
 
@@ -371,6 +390,10 @@ impl PlaybackTracker {
 /// A playback listing with its candidates' peak levels.
 pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 
+/// The counting streams' starts the monitor publishes beside
+/// `PlaybackState` (`PlaybackTracker::started`, #96).
+pub(crate) type Starts = Vec<(u64, HashSet<u32>)>;
+
 /// What the stream monitor publishes.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PlaybackState {
@@ -413,7 +436,18 @@ pub(crate) fn live_stream_pids(
     streams: &[StreamProps],
     ppid: impl Fn(u32) -> Option<u32>,
 ) -> HashSet<u32> {
-    let mut pids = HashSet::new();
+    stream_owners(streams, ppid)
+        .into_values()
+        .flatten()
+        .collect()
+}
+
+/// `live_stream_pids` by stream index (#96).
+pub(crate) fn stream_owners(
+    streams: &[StreamProps],
+    ppid: impl Fn(u32) -> Option<u32>,
+) -> HashMap<u32, HashSet<u32>> {
+    let mut owners = HashMap::new();
     for stream in streams
         .iter()
         .filter(|s| !s.corked && is_takeover_worthy(s))
@@ -426,9 +460,9 @@ pub(crate) fn live_stream_pids(
                 _ => break,
             }
         }
-        pids.extend(walked);
+        owners.insert(stream.index, walked);
     }
-    pids
+    owners
 }
 
 /// The process a sink input plays for: its own `PROCESS_ID`, else its
@@ -470,7 +504,7 @@ fn proc_ppid(pid: u32) -> Option<u32> {
 /// and publish the stream-playing state (initially not counted; streams
 /// already playing in the first listing never count, see
 /// `PlaybackTracker`) with the live presence of each successful listing,
-/// beside the tracker's `starts` (#96) in the same send.
+/// beside the tracker's `started` (#96) in the same send.
 /// Each sample is timed when the listing and levels return. Sampling runs on
 /// the blocking pool in its own task, so a sound server that never answers
 /// stalls only this state, never the caller, and only until its connect or
@@ -498,7 +532,7 @@ pub(crate) fn spawn_stream_playback<S, P>(
     interval: Duration,
     rebaseline: Arc<Mutex<Option<Instant>>>,
     observed: impl Fn(Instant) + Send + Sync + 'static,
-) -> watch::Receiver<(PlaybackState, u64)>
+) -> watch::Receiver<(PlaybackState, Starts)>
 where
     S: PlaybackSource + 'static,
     P: PeakSource + 'static,
@@ -516,7 +550,8 @@ where
             let sampled = tokio::task::spawn_blocking(move || {
                 if let Some(sample) = tracker.sample(&mut source, &mut peaks) {
                     // Read from /proc before the lock, which a step may wait on.
-                    let live = live_stream_pids(&sample.0, proc_ppid);
+                    let owners = stream_owners(&sample.0, proc_ppid);
+                    let live = owners.values().flatten().copied().collect();
                     let mut request = rebaseline.lock().unwrap_or_else(PoisonError::into_inner);
                     let now = Instant::now();
                     tracker.observe_sample(now, request.take(), &sample);
@@ -526,7 +561,7 @@ where
                             counted: tracker.playing,
                             live: (!source.dead()).then_some(live),
                         },
-                        tracker.starts,
+                        tracker.started(&owners),
                     );
                     if *publish.borrow() != state {
                         publish.send_replace(state);
