@@ -3938,7 +3938,7 @@ mod tests {
         let (manager, mut rx, _tx) = ready_session().await;
         let streams = LiveStreams::default();
         let h =
-            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+            Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
         expect_startup(&h, &mut rx).await;
         h.emit_queued(owns(0)).await;
         h.emit_queued(AACPEvent::AudioSource(AudioSource {
