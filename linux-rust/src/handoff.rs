@@ -529,8 +529,9 @@ impl Handoff {
                 // The other host left: nothing to hold A2DP for (#264).
                 if self.only_local_listed() {
                     self.remote_owns = false;
-                    self.sync_hold(false, out);
                 }
+                // A remote edge seen before its host was listed holds now (#296).
+                self.sync_hold(false, out);
             }
             Input::Ownership(value) => self.ownership(now, value, out),
             Input::RemoteOwnershipRequest => {
@@ -582,6 +583,7 @@ impl Handoff {
                     // [0] is acknowledged like the first one, without a pause.
                     self.say("REMOTE requested ownership; re-sending the timed-out release");
                     self.request(now, false, Cause::Remote, out);
+                    self.hold_for_remote(out);
                     return;
                 }
                 // Linux holds or is taking the AirPods for a call: keep them
@@ -1046,6 +1048,10 @@ impl Handoff {
     /// so the start also restores a card an earlier run left `off`.
     fn sync_hold(&mut self, start: bool, out: &mut Vec<Command>) {
         let want = self.remote_owns && !self.quitting && !self.only_local_listed();
+        // No new hold after SessionLost (#287); Disconnected releases an earlier one.
+        if want && !self.live() {
+            return;
+        }
         if self.a2dp_hold && (start || self.held.is_some()) && self.held != Some(want) {
             self.held = Some(want);
             out.push(Command::HoldA2dp(want));
@@ -1302,11 +1308,13 @@ impl Handoff {
 
     /// Announce Linux to the remote hosts. The announcement carries the idle
     /// media information, so during a call the call is advertised again
-    /// after it (#11).
+    /// after it (#11), and otherwise a relayed category is re-sent (#299).
     fn announce(&self, out: &mut Vec<Command>) {
         out.push(Command::Announce);
         if self.local_call {
             out.push(Command::AdvertiseCall(true));
+        } else if self.category_relay && self.category != AUDIO_CATEGORY_IDLE {
+            out.push(Command::RelayCategory(self.category));
         }
     }
 
@@ -4592,6 +4600,41 @@ mod tests {
     }
 
     #[test]
+    fn hold_not_after_session_lost_audio_source() {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(100, Input::SessionLost), []);
+        assert_eq!(holds(&p.feed(200, remote_media())), []);
+        assert_eq!(p.feed(300, Input::Disconnected), [DropSession]);
+    }
+
+    #[test]
+    fn hold_not_after_session_lost_unsolicited_zero() {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(150, Input::SessionLost), []);
+        assert_eq!(holds(&p.feed(200, Input::Ownership(vec![0]))), []);
+        assert_eq!(p.feed(300, Input::Disconnected), [DropSession]);
+    }
+
+    #[test]
+    fn hold_session_lost_keeps_emitted_hold_until_disconnect() {
+        // A yield after SessionLost emits no hold.
+        let mut p = hold_take();
+        assert_eq!(p.feed(700, Input::SessionLost), []);
+        assert_eq!(holds(&p.feed(1100, Input::Ownership(vec![0]))), []);
+
+        // A hold emitted before SessionLost stays until Disconnected.
+        let mut p = held();
+        assert_eq!(p.feed(150, Input::SessionLost), []);
+        assert_eq!(holds(&p.feed(200, remote_media())), []);
+        assert_eq!(holds(&p.feed(300, Input::RemoteOwnershipRequest)), []);
+        assert_eq!(
+            p.feed(400, Input::Disconnected),
+            [HoldA2dp(false), DropSession]
+        );
+    }
+
+    #[test]
     fn hold_take_ack_releases_before_route_and_resume() {
         let mut p = held();
         assert_eq!(p.feed(200, idle_transport()), []);
@@ -4732,6 +4775,88 @@ mod tests {
             all.extend(q.feed(ms, Input::Tick));
         }
         assert_eq!(holds(&all), []);
+    }
+
+    fn hosts_now(new: Vec<ConnectedDevice>) -> Input {
+        Input::ConnectedDevices {
+            old: two_hosts(),
+            new,
+        }
+    }
+
+    /// `hold_ready(true)` with the AirPods listing only Linux: released.
+    fn listed_alone() -> Probe {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(50, hosts_now(vec![host(LOCAL)])), []);
+        p
+    }
+
+    /// A remote edge from 200 ms, while only Linux is listed, holds once
+    /// the other host is listed, and only once (#296).
+    fn assert_holds_once_listed(mut p: Probe, edge: &[Input]) {
+        for (i, input) in edge.iter().enumerate() {
+            assert_eq!(holds(&p.feed(200 + 100 * i as u64, input.clone())), []);
+        }
+        assert_eq!(
+            holds(&p.feed(1000, hosts_now(two_hosts()))),
+            [HoldA2dp(true)]
+        );
+        assert_eq!(holds(&p.feed(1100, hosts_now(two_hosts()))), []);
+    }
+
+    #[test]
+    fn hold_remote_edge_before_host_listed_audio_source() {
+        assert_holds_once_listed(listed_alone(), &[remote_media()]);
+        // The same from a hold the host list released.
+        let mut p = held();
+        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
+        assert_holds_once_listed(p, &[remote_media()]);
+    }
+
+    #[test]
+    fn hold_remote_edge_before_host_listed_unsolicited_loss() {
+        let edge = [Input::Ownership(vec![1]), Input::Ownership(vec![0])];
+        assert_holds_once_listed(listed_alone(), &edge);
+    }
+
+    #[test]
+    fn hold_remote_edge_before_host_listed_remote_request() {
+        assert_holds_once_listed(listed_alone(), &[Input::RemoteOwnershipRequest]);
+    }
+
+    #[test]
+    fn hold_remote_request_retry_after_host_left_and_returned() {
+        let mut p = hold_take();
+        assert_eq!(
+            holds(&p.feed(1100, Input::RemoteOwnershipRequest)),
+            [HoldA2dp(true)]
+        );
+        assert_eq!(
+            p.feed(1200, hosts_now(vec![host(LOCAL)])),
+            [HoldA2dp(false)]
+        );
+        assert_eq!(holds(&p.feed(1100 + 5001, Input::Tick)), []);
+        assert!(matches!(p.core.timed_out_release, Some((Cause::Remote, _))));
+        assert_eq!(holds(&p.feed(6200, hosts_now(two_hosts()))), []);
+        assert_eq!(
+            p.feed(6300, Input::RemoteOwnershipRequest),
+            [SendOwnership(false), HoldA2dp(true)]
+        );
+    }
+
+    #[test]
+    fn hold_host_list_alone_adds_no_hold() {
+        let mut p = held();
+        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
+        let mut all = p.feed(200, hosts_now(two_hosts()));
+        for ms in (300..10_000).step_by(500) {
+            all.extend(p.feed(ms, Input::Tick));
+        }
+        assert_eq!(holds(&all), []);
+        // An empty list after only Linux was listed holds nothing either.
+        let mut p = held();
+        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
+        assert_eq!(holds(&p.feed(200, hosts_now(vec![]))), []);
     }
 
     /// The c1/c2 sequences of the tests above; every command, in order.
@@ -5016,6 +5141,137 @@ mod tests {
         assert_eq!(
             p.feed(1000, Input::LocalCall(false)),
             [AdvertiseCall(false)]
+        );
+    }
+
+    #[test]
+    fn category_held_takeover_command_lists() {
+        // The production setup: A2DP hold and category relay on.
+        let mut p = hold_ready(true);
+        p.core.category_relay = true;
+        p.core.take_lines();
+        assert_eq!(p.feed(100, remote_media()), [HoldA2dp(true)]);
+        assert_eq!(p.play_category(500, STREAM), [RelayCategory(STREAM)]);
+        assert_eq!(
+            p.core.take_lines(),
+            ["AUTO takeover skipped: the audio source's category 301 is above Linux's 201"]
+        );
+        assert_eq!(
+            p.play_category(1000, MEDIA),
+            [RelayCategory(MEDIA), SendOwnership(true)]
+        );
+        // The ack releases the hold before it routes.
+        assert_eq!(
+            p.feed(1100, Input::Ownership(vec![1])),
+            [HoldA2dp(false), RouteToAirPods]
+        );
+    }
+
+    // #299: an announcement carries category 100; Linux's own follows it.
+    #[test]
+    fn category_relay_after_auto_toggle_at_301() {
+        let mut p = relaying();
+        p.feed(100, Input::Manual);
+        assert_eq!(p.play_category(500, MEDIA), []);
+        assert_eq!(
+            p.feed(1000, Input::Auto),
+            [
+                ConnectA2dp,
+                SendOwnership(false),
+                Announce,
+                RelayCategory(MEDIA),
+                DrainPlayback
+            ]
+        );
+        assert_eq!(p.play_category(1500, MEDIA), []);
+    }
+
+    #[test]
+    fn category_relay_after_new_host_at_201() {
+        let mut p = relaying();
+        assert_eq!(
+            p.play_category(500, STREAM),
+            [RelayCategory(STREAM), SendOwnership(true)]
+        );
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        let three = vec![host(LOCAL), host(REMOTE), host(REMOTE_2)];
+        assert_eq!(
+            p.feed(
+                1000,
+                Input::ConnectedDevices {
+                    old: two_hosts(),
+                    new: three,
+                },
+            ),
+            [Announce, RelayCategory(STREAM)]
+        );
+    }
+
+    #[test]
+    fn category_relay_after_reconnect_adoption() {
+        // 301 set before the disconnect.
+        let mut p = relaying();
+        assert_eq!(
+            p.play_category(500, MEDIA),
+            [RelayCategory(MEDIA), SendOwnership(true)]
+        );
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(1100, Input::Disconnected), [PauseMedia, DropSession]);
+        assert_eq!(p.feed(2200, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(2300, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, RelayCategory(MEDIA), DrainPlayback]
+        );
+        assert_eq!(p.play_category(2500, MEDIA), []);
+        // 301 set while disconnected.
+        let mut p = relaying();
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        assert_eq!(p.play_category(500, MEDIA), []);
+        assert_eq!(p.feed(1200, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(1300, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, RelayCategory(MEDIA), DrainPlayback]
+        );
+        assert_eq!(p.play_category(1500, MEDIA), []);
+    }
+
+    #[test]
+    fn category_relay_after_announce_none_when_idle() {
+        let mut p = relaying();
+        p.feed(100, Input::Manual);
+        assert_eq!(
+            p.feed(1000, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+        );
+    }
+
+    #[test]
+    fn category_relay_after_announce_none_when_disabled() {
+        let mut p = Probe::ready();
+        p.feed(100, Input::Manual);
+        assert_eq!(p.play_category(500, MEDIA), []);
+        assert_eq!(
+            p.feed(1000, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+        );
+    }
+
+    #[test]
+    fn category_relay_after_announce_none_during_call() {
+        let mut p = relaying();
+        assert_eq!(p.feed(100, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play_category(500, MEDIA), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        let three = vec![host(LOCAL), host(REMOTE), host(REMOTE_2)];
+        assert_eq!(
+            p.feed(
+                1000,
+                Input::ConnectedDevices {
+                    old: two_hosts(),
+                    new: three,
+                },
+            ),
+            [Announce, AdvertiseCall(true)]
         );
     }
 

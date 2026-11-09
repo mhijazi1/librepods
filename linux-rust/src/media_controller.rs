@@ -143,7 +143,10 @@ pub(crate) fn routing_snapshot(
         audio: audio.map(|a| a.r#type),
         audio_from_local: audio.is_some_and(|a| a.mac == local),
         local_category,
-        remote_category: audio.and_then(|a| relays.get(&a.mac)).copied(),
+        remote_category: audio
+            .filter(|a| a.mac != local)
+            .and_then(|a| relays.get(&a.mac))
+            .copied(),
     }
 }
 
@@ -646,7 +649,7 @@ fn select_a2dp_profile(
 }
 
 /// Longest the A2DP hold's release waits for the AirPods sink (#264).
-pub(crate) const HOLD_RELEASE_WAIT: Duration = Duration::from_secs(3);
+const HOLD_RELEASE_WAIT: Duration = Duration::from_secs(3);
 
 /// The A2DP hold's write (#264): `off`, only from an active A2DP profile, so
 /// a call, a card already off or an unknown profile is left alone.
@@ -2879,7 +2882,7 @@ mod tests {
         // H = REMOTE is the audio source; G = REMOTE_2 is another host.
         let h = REMOTE;
         let g = REMOTE_2;
-        let table: [(u32, Option<(&str, AudioSourceType)>, &[(&str, u32)], _); 15] = [
+        let table: [(u32, Option<(&str, AudioSourceType)>, &[(&str, u32)], _); 16] = [
             (MEDIA, Some((h, Media)), &[], take),
             (STREAM, Some((h, Media)), &[], higher(STREAM, MEDIA)),
             (STREAM, Some((h, none)), &[], take),
@@ -2902,6 +2905,8 @@ mod tests {
                 &[(g, IDLE)],
                 higher(STREAM, MEDIA),
             ),
+            // A relay stored under Linux's own address is not remote.
+            (STREAM, Some((LOCAL, none)), &[(LOCAL, MEDIA)], take),
         ];
         for (local, audio, relays, expected) in table {
             let routing = category_routing(local, audio, relays);

@@ -3930,6 +3930,35 @@ mod tests {
         stop_handoff_task(mac);
     }
 
+    /// The owner's media report is stale: its inbound relay of 100 reaches
+    /// the core, so a counted stream (201) takes once.
+    #[tokio::test]
+    async fn category_stream_against_relayed_idle_takes() {
+        let mac = "5A:00:00:00:02:73";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let streams = LiveStreams::default();
+        let h =
+            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+        expect_startup(&h, &mut rx).await;
+        h.emit_queued(owns(0)).await;
+        h.emit_queued(AACPEvent::AudioSource(AudioSource {
+            mac: REMOTE.to_string(),
+            r#type: AudioSourceType::Media,
+        }))
+        .await;
+        h.emit_queued(AACPEvent::MediaInformation {
+            host: REMOTE.to_string(),
+            category: AUDIO_CATEGORY_IDLE,
+        })
+        .await;
+        streams.settle().await;
+
+        streams.set(vec![music(73)]);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        stop_handoff_task(mac);
+    }
+
     #[tokio::test]
     async fn category_relay_reaches_each_remote_host() {
         let (manager, mut rx, _tx) = ready_session().await;
