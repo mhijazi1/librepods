@@ -1701,7 +1701,7 @@ pub(crate) fn parse_media_information(payload: &[u8]) -> Option<MediaInformation
 enum Opack<'a> {
     Str(&'a str),
     Uint(u32),
-    /// A bool, a back-reference or a non-UTF-8 string.
+    /// A bool, a back-reference, a non-UTF-8 string, or an int that is negative or above u32::MAX.
     Other,
 }
 
