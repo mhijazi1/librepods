@@ -4,8 +4,9 @@
 //! `Chain` is the pure step machine: after a settle, read the transport
 //! fresh, again while it stays idle, and, only if every read was idle, nudge
 //! the AirPods sink (suspend, then resume), then kick the players that were
-//! playing at the take (MPRIS Pause, then Play), then, as a last resort, cycle the card profile once and play
-//! them again. Any audible check stops it. `run` drives it on injected I/O
+//! playing at the take (MPRIS Pause, then Play), then, as a last resort,
+//! cycle the card profile once and play them again. Any audible check stops
+//! it. `run` drives it on injected I/O
 //! (`A2dpResumeIo`); the production I/O is `MediaController`'s. The transport
 //! state the core needs comes from `spawn_transport_poller`, which only reads
 //! BlueZ's `MediaTransport1.State` (never `Acquire`: the fd would go to
@@ -156,17 +157,16 @@ impl Chain {
 
     /// Run the step due at `now`: its actions, or None once the chain is
     /// over. `transport` (the fresh read: active, idle or unknown) matters
-    /// only when `reads_transport()`: active ends the chain; idle reads again
-    /// `TRANSPORT_REREAD` later while that read still gets `TRANSPORT_REREAD`
-    /// before `read_end`, and otherwise suspends the sink; unknown goes
-    /// straight to the audible check, never stopping a transport that may
-    /// carry audio. `audible` matters only
-    /// when `senses()`, and ends the chain there; `playing` only when
-    /// `reads_players()`. Once the sink is suspended or the players paused,
-    /// the next step always undoes it. The kick and the cycle are skipped,
-    /// ending the chain, when the Play after them can't be due
-    /// `PLAY_EDGE_MARGIN` before `until`: the core would release on the stop
-    /// they cause.
+    /// only when `reads_transport()`: active ends the chain; idle before
+    /// `read_end` - `TRANSPORT_REREAD` reads again `TRANSPORT_REREAD` later,
+    /// or at that time if sooner, and otherwise suspends the sink; unknown
+    /// goes straight to the audible check, never stopping a transport that
+    /// may carry audio. `audible` matters only when `senses()`, and ends the
+    /// chain there; `playing` only when `reads_players()`. Once the sink is
+    /// suspended or the players paused, the next step always undoes it. The
+    /// kick and the cycle are skipped, ending the chain, when the Play after
+    /// them can't be due `PLAY_EDGE_MARGIN` before `until`: the core would
+    /// release on the stop they cause.
     fn step(
         &mut self,
         now: Instant,
@@ -194,9 +194,11 @@ impl Chain {
         let (actions, next, wait) = match std::mem::replace(&mut self.stage, Stage::Done) {
             Stage::Start => match transport {
                 Some(true) => return None,
-                // The re-read still gets `TRANSPORT_REREAD` before `read_end`.
-                Some(false) if now + TRANSPORT_REREAD * 2 <= self.read_end => {
-                    (Vec::new(), Stage::Start, TRANSPORT_REREAD)
+                // Read latency must not pull the nudge earlier: the last read
+                // starts `TRANSPORT_REREAD` before `read_end`, never before.
+                Some(false) if now + TRANSPORT_REREAD < self.read_end => {
+                    let last = self.read_end - TRANSPORT_REREAD;
+                    (Vec::new(), Stage::Start, TRANSPORT_REREAD.min(last - now))
                 }
                 Some(false) => (vec![Action::SuspendSink(true)], Stage::Suspended, NUDGE_GAP),
                 None => (Vec::new(), Stage::Nudged, NUDGE_GAP + AUDIBLE_WAIT),
@@ -381,7 +383,8 @@ static FRESH_BUS: Mutex<Option<Connection>> = Mutex::new(None);
 /// the shared `FRESH_BUS` connection. None for no MAC (never idle: "/dev_/"
 /// matches no transport), when another read holds the connection (a stuck
 /// open or call), or when BlueZ can't be read in `TRANSPORT_READ_TIMEOUT`:
-/// the chain stops waiting then, and this blocking read can't be aborted.
+/// the chain stops waiting by its read window's end, and this blocking read
+/// can't be aborted.
 pub(crate) fn read_transport_once(airpods_mac: &str) -> Option<bool> {
     // The budget counts the connection's opening too.
     let deadline = Instant::now() + TRANSPORT_READ_TIMEOUT;
@@ -616,33 +619,38 @@ mod tests {
         steps.iter().flat_map(|(_, a)| a.clone()).collect()
     }
 
-    /// A chain started at `t0`, stepped through its idle re-reads: its next
-    /// step is its last transport read.
+    /// A chain started at `t0`, stepped through its instant idle re-reads:
+    /// its next step is its last transport read.
     fn at_last_read(t0: Instant, until: Instant, playing: Vec<String>) -> Chain {
         let mut chain = Chain::new(t0, until, playing);
-        while chain.due() + TRANSPORT_REREAD * 2 <= t0 + RESUME_SETTLE + TRANSPORT_READ_TIMEOUT {
+        let last = t0 + RESUME_SETTLE + TRANSPORT_READ_TIMEOUT - TRANSPORT_REREAD;
+        while chain.due() < last {
             let due = chain.due();
             assert_eq!(chain.step(due, Some(false), false, &[]), Some(vec![]));
-            assert_eq!(chain.due(), due + TRANSPORT_REREAD);
+            assert_eq!(chain.due(), (due + TRANSPORT_REREAD).min(last));
         }
         assert!(chain.reads_transport());
         chain
     }
 
     #[test]
-    fn idle_read_rereads_only_if_the_reread_gets_a_full_gap() {
-        // A slow idle read ending here still leaves its re-read
-        // TRANSPORT_REREAD before the read window's end; 1 ms later, it
-        // nudges instead of starting a read that would time out as unknown.
+    fn idle_read_nudges_only_from_the_last_read_time() {
+        // The last read starts TRANSPORT_REREAD before the read window's end,
+        // however long the reads before it took.
         let t0 = Instant::now();
-        let latest = t0 + RESUME_SETTLE + TRANSPORT_READ_TIMEOUT - TRANSPORT_REREAD * 2;
-        let chain = || Chain::new(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
-        assert_eq!(chain().step(latest, Some(false), false, &[]), Some(vec![]));
-        let after = latest + Duration::from_millis(1);
-        assert_eq!(
-            chain().step(after, Some(false), false, &[]),
-            Some(vec![SuspendSink(true)])
-        );
+        let last = t0 + RESUME_SETTLE + TRANSPORT_READ_TIMEOUT - TRANSPORT_REREAD;
+        let idle_at = |now| {
+            let mut chain = Chain::new(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
+            (chain.step(now, Some(false), false, &[]), chain.due())
+        };
+        // A slow first read ending 99 ms before `last`: the re-read at `last`.
+        let early = last - TRANSPORT_REREAD + Duration::from_millis(1);
+        assert_eq!(idle_at(early), (Some(vec![]), last));
+        // 1 ms before `last`: still a re-read, at `last`.
+        let just_before = last - Duration::from_millis(1);
+        assert_eq!(idle_at(just_before), (Some(vec![]), last));
+        // From `last` on: the nudge.
+        assert_eq!(idle_at(last).0, Some(vec![SuspendSink(true)]));
     }
 
     #[test]
@@ -895,8 +903,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn profile_cycle_that_would_end_past_the_window_is_skipped() {
-        // 1 s reads: the kick is at 4 s, the cycle would be at 7 s and its
-        // Play at 9 s.
+        // 1 s reads: the kick is at 4.9 s, the cycle would be at 7.9 s and
+        // its Play at 9.9 s.
         let (acted, _) = run_with_reads_of(|_| Duration::from_secs(1)).await;
         assert_eq!(
             acted,
@@ -1094,9 +1102,41 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn settle_idle_through_read_window_nudges() {
+        assert_nudges_in_read_window(|_| Box::pin(async { Some(false) })).await;
+    }
+
+    /// A transport read that takes `ms`, then reads `active`.
+    fn read_after(ms: u64, active: bool) -> BoxFuture<'static, Option<bool>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Some(active)
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settle_slow_idle_reads_never_nudge_early() {
+        // Read latency must not pull the nudge before the last read's time.
+        assert_nudges_in_read_window(|_| read_after(50, false)).await;
+        assert_nudges_in_read_window(|n| read_after(if n == 0 { 301 } else { 0 }, false)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settle_slow_reads_then_active_late_in_read_window_acts_nothing() {
+        // 50 ms reads at 500, 650, 800 and 900 ms; the transport is active
+        // by the last (about 880 ms).
         let (_cancel, cancelled) = oneshot::channel();
-        let (acted, n, chain) =
-            spawn_with_transport(|_| Box::pin(async { Some(false) }), cancelled);
+        let (acted, n, chain) = spawn_with_transport(|n| read_after(50, n >= 3), cancelled);
+        chain.await.unwrap();
+        assert_eq!(*acted.lock().unwrap(), []);
+        assert_eq!(reads(&n), 4);
+    }
+
+    /// Run the chain on transport reads `read` that stay idle: nothing acts
+    /// before the last read's time, the nudge comes by the read window's end,
+    /// after more than one read.
+    async fn assert_nudges_in_read_window(read: fn(usize) -> BoxFuture<'static, Option<bool>>) {
+        let (_cancel, cancelled) = oneshot::channel();
+        let (acted, n, chain) = spawn_with_transport(read, cancelled);
         let lower = RESUME_SETTLE + TRANSPORT_READ_TIMEOUT - TRANSPORT_REREAD;
         tokio::time::sleep(lower - Duration::from_millis(1)).await;
         assert_eq!(*acted.lock().unwrap(), []);
