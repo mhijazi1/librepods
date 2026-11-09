@@ -1196,7 +1196,10 @@ mod tests {
     }
 
     fn has_entry(mac: &str) -> bool {
-        ENTRIES.lock().unwrap().contains_key(mac)
+        ENTRIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(mac)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1214,7 +1217,7 @@ mod tests {
         let mac = "7E:00:00:00:04:09";
         device_connected_if_dropped(mac);
         assert!(!has_entry(mac));
-        // A reason alone (any device gets one) has no drop recorded.
+        // A reason with no drop (any device gets reasons) is left alone.
         let mac = "7E:00:00:00:04:0A";
         device_connected(mac);
         disconnect_reason(mac, Some(REMOTE));
