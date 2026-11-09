@@ -162,9 +162,19 @@ struct Entry {
     dropped_at: Option<Instant>,
     up_since: Option<Instant>,
     backoff: Backoff,
-    /// When the watcher's connect for playback succeeded.
-    marker: Option<Instant>,
+    marker: Option<Marker>,
     watcher: Option<AbortHandle>,
+}
+
+/// The watcher's connect for playback, for the next handoff task to take.
+#[derive(Clone, Copy)]
+struct Marker {
+    /// Linux's audio category at the play edge, for the take's category
+    /// check.
+    category: u32,
+    /// None while the connect is in flight: BlueZ's Connected=true starts
+    /// the task before `bluetoothctl connect` returns.
+    connected_at: Option<Instant>,
 }
 
 static ENTRIES: LazyLock<Mutex<HashMap<String, Entry>>> = LazyLock::new(Default::default);
@@ -242,25 +252,46 @@ fn record_drop(mac: &str, now: Instant) {
     });
 }
 
-/// The watcher's connect for playback succeeded now.
-pub(crate) fn set_marker(mac: &str) {
+/// A connect for playback at `category` succeeded now.
+#[cfg(test)]
+pub(crate) fn set_marker(mac: &str, category: u32) {
+    let connected_at = Some(now());
+    with_entry(mac, |e| {
+        e.marker = Some(Marker {
+            category,
+            connected_at,
+        })
+    });
+}
+
+/// The marker's category while it is in flight or within
+/// `RECONNECT_TAKE_WINDOW` of its connect.
+fn live(marker: Option<Marker>) -> Option<u32> {
     let now = now();
-    with_entry(mac, |e| e.marker = Some(now));
+    marker
+        .filter(|m| {
+            m.connected_at
+                .is_none_or(|at| now.saturating_duration_since(at) <= RECONNECT_TAKE_WINDOW)
+        })
+        .map(|m| m.category)
 }
 
-/// The marker set at `at` is still within `RECONNECT_TAKE_WINDOW`.
-fn in_window(at: Option<Instant>) -> bool {
-    at.is_some_and(|at| now().saturating_duration_since(at) <= RECONNECT_TAKE_WINDOW)
+/// The live marker's category, left in place: the watcher can still clear
+/// it on a playback stop.
+pub(crate) fn peek_marker(mac: &str) -> Option<u32> {
+    live(with_entry(mac, |e| e.marker))
 }
 
-fn marker_live(mac: &str) -> bool {
-    in_window(with_entry(mac, |e| e.marker))
+/// Consume the marker: Linux's audio category at the play edge, if the
+/// watcher's connect for that playback is still live.
+pub(crate) fn take_marker(mac: &str) -> Option<u32> {
+    live(with_entry(mac, |e| e.marker.take()))
 }
 
-/// Consume the marker: whether the watcher's connect for playback happened
-/// within `RECONNECT_TAKE_WINDOW`.
-pub(crate) fn take_marker(mac: &str) -> bool {
-    in_window(with_entry(mac, |e| e.marker.take()))
+/// Linux's playback stopped: no task takes for it. Whether a marker was
+/// cleared.
+pub(crate) fn playback_stopped(mac: &str) -> bool {
+    with_entry(mac, |e| e.marker.take()).is_some()
 }
 
 /// Whether the session reports hosts, ears and an audio source within
@@ -388,16 +419,19 @@ impl Connector for Bluez {
 pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Connector) {
     let mut previous = None;
     let mut connected_for_playback = false;
+    // The marker is for playback that still plays.
+    let stopped = |playing: bool| {
+        if !playing && playback_stopped(&mac) {
+            io.log(&mac, "playback stopped before the handoff task took");
+        }
+    };
     while let Some(category) = samples.next().await {
         let playing = category > AUDIO_CATEGORY_IDLE;
         let edge = previous == Some(false) && playing;
         let last = previous.replace(playing);
         if connected_for_playback {
-            // The marker is for playback that still plays.
-            if !playing && with_entry(&mac, |e| e.marker.take()).is_some() {
-                io.log(&mac, "playback stopped before the handoff task took");
-            }
-            if !playing || !marker_live(&mac) {
+            stopped(playing);
+            if !playing || peek_marker(&mac).is_none() {
                 return;
             }
             continue;
@@ -439,24 +473,55 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
             io.log(&mac, "le.rs is already connecting; skipping");
             continue;
         };
-        with_entry(&mac, |e| e.backoff.attempted(now));
+        with_entry(&mac, |e| {
+            e.backoff.attempted(now);
+            // Before the connect: its Connected=true starts the task.
+            e.marker = Some(Marker {
+                category,
+                connected_at: None,
+            });
+        });
         io.log(
             &mac,
             "new Linux playback after a host-driven drop; reconnecting",
         );
-        let result = if io.connected(&mac).await {
-            Ok(())
-        } else {
-            io.connect(&mac).await
+        let attempt = async {
+            if io.connected(&mac).await {
+                Ok(())
+            } else {
+                io.connect(&mac).await
+            }
+        };
+        tokio::pin!(attempt);
+        // Sample while connecting: a stop clears the marker, and no edge
+        // waits in the poller's channel past the attempt.
+        let result = loop {
+            tokio::select! {
+                result = &mut attempt => break result,
+                Some(category) = samples.next() => {
+                    let playing = category > AUDIO_CATEGORY_IDLE;
+                    previous = Some(playing);
+                    stopped(playing);
+                }
+            }
         };
         match result {
             Ok(()) => {
-                set_marker(&mac);
+                // A task that already took it, or a stop, leaves it cleared.
+                let now = self::now();
+                with_entry(&mac, |e| {
+                    if let Some(m) = e.marker.as_mut() {
+                        m.connected_at = Some(now);
+                    }
+                });
                 connected_for_playback = true;
                 io.log(&mac, "reconnected for new playback");
             }
             Err(e) => {
-                with_entry(&mac, |entry| entry.backoff.failed());
+                with_entry(&mac, |entry| {
+                    entry.backoff.failed();
+                    entry.marker = None;
+                });
                 io.log(&mac, &format!("reconnect failed: {e}"));
             }
         }
@@ -708,6 +773,8 @@ mod tests {
         guarded: Mutex<Vec<bool>>,
         lines: Mutex<Vec<String>>,
         settings: Mutex<Option<Settings>>,
+        /// How long each `connect` takes.
+        delay: Mutex<Duration>,
     }
 
     impl Connector for Arc<Fake> {
@@ -719,6 +786,8 @@ mod tests {
             self.connects.lock().unwrap().push(now());
             let guarded = ConnectGuard::try_new(mac).is_none();
             self.guarded.lock().unwrap().push(guarded);
+            let delay = *self.delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
             self.results.lock().unwrap().pop_front().unwrap_or(Ok(()))
         }
 
@@ -813,7 +882,7 @@ mod tests {
         assert!(fake.connects.lock().unwrap()[1] >= t0 + RECONNECT_BACKOFF_MIN * 2);
         rig.sample(false).await;
         assert!(rig.task.is_finished());
-        assert!(!take_marker(mac));
+        assert_eq!(take_marker(mac), None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -924,7 +993,7 @@ mod tests {
         assert!(rig.task.is_finished());
         rig.play_edge().await;
         assert_eq!(fake.connects(), 0);
-        assert!(!take_marker(mac));
+        assert_eq!(take_marker(mac), None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -957,9 +1026,9 @@ mod tests {
         device_connected(mac);
         rig.sample(true).await;
         assert!(!rig.task.is_finished());
-        assert!(take_marker(mac));
+        assert_eq!(take_marker(mac), Some(AUDIO_CATEGORY_MEDIA));
         // Consumed once.
-        assert!(!take_marker(mac));
+        assert_eq!(take_marker(mac), None);
         rig.sample(true).await;
         assert!(rig.task.is_finished());
 
@@ -970,7 +1039,7 @@ mod tests {
         rig.play_edge().await;
         rig.sample(false).await;
         assert!(rig.task.is_finished());
-        assert!(!take_marker(mac));
+        assert_eq!(take_marker(mac), None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1019,6 +1088,54 @@ mod tests {
         rig.play_edge().await;
         assert!(rig.task.is_finished());
         assert_eq!(fake.connects(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_watcher_slow_failure_drops_plays_while_connecting() {
+        let mac = "7E:00:00:00:00:0F";
+        host_driven_drop(mac);
+        let fake = Arc::new(Fake::default());
+        *fake.delay.lock().unwrap() = CONNECT_TIMEOUT;
+        fake.results
+            .lock()
+            .unwrap()
+            .push_back(Err("timed out".to_string()));
+        let rig = Rig::start(mac, fake.clone());
+        rig.play_edge().await;
+        assert_eq!(fake.connects(), 1);
+        // A stop and a play while the connect hangs, then it fails.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        rig.play_edge().await;
+        tokio::time::sleep(CONNECT_TIMEOUT).await;
+        assert_eq!(fake.lines("reconnect failed"), 1);
+        assert_eq!(take_marker(mac), None);
+        // That play is no edge after the attempt: still playing starts none.
+        rig.sample(true).await;
+        tokio::time::sleep(RECONNECT_BACKOFF_MAX).await;
+        rig.sample(true).await;
+        assert_eq!(fake.connects(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_watcher_stop_while_connecting_clears_marker() {
+        let mac = "7E:00:00:00:00:10";
+        host_driven_drop(mac);
+        let fake = Arc::new(Fake::default());
+        *fake.delay.lock().unwrap() = Duration::from_secs(5);
+        let rig = Rig::start(mac, fake.clone());
+        rig.play_edge().await;
+        // The handoff task may start before the connect returns.
+        assert_eq!(peek_marker(mac), Some(AUDIO_CATEGORY_MEDIA));
+        rig.sample(false).await;
+        assert_eq!(
+            fake.lines("playback stopped before the handoff task took"),
+            1
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(fake.lines("reconnected for new playback"), 1);
+        assert_eq!(take_marker(mac), None);
+        rig.sample(true).await;
+        assert!(rig.task.is_finished());
     }
 
     /// Ten minutes after a host-driven drop with no new play edge.

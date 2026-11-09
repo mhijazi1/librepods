@@ -450,6 +450,13 @@ impl Handoff {
         self
     }
 
+    /// Start with Linux's audio category sampled before this core, for the
+    /// reconnect take's category check (#307).
+    pub(crate) fn with_category(mut self, category: u32) -> Self {
+        self.category = category;
+        self
+    }
+
     /// Both buds were last reported in the case (#307).
     pub(crate) fn case_closed(&self) -> bool {
         self.case_closed
@@ -1836,6 +1843,30 @@ mod tests {
         assert_eq!(
             p.feed(100, Input::Reconnected(ready_facts())),
             [CancelReconnect]
+        );
+    }
+
+    #[test]
+    fn with_category_takes_over_remote_media_on_reconnected() {
+        let remote_media = || SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Media)),
+            ..ready_facts()
+        };
+        let mut p = Probe::new(true, false);
+        p.core = p
+            .core
+            .with_playback_requested()
+            .with_category(crate::media_controller::AUDIO_CATEGORY_MEDIA);
+        assert_eq!(
+            p.feed(100, Input::Reconnected(remote_media())),
+            [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
+        );
+        // Without it, Linux's idle category is below the remote media's.
+        let mut p = Probe::new(true, false);
+        p.core = p.core.with_playback_requested();
+        assert!(
+            !p.feed(100, Input::Reconnected(remote_media()))
+                .contains(&SendOwnership(true))
         );
     }
 
