@@ -192,11 +192,17 @@ fn now() -> Instant {
 
 /// BlueZ's `Device1.Disconnected(reason, message)`, before or after the
 /// Connected=false it explains.
+/// BlueZ may send one per bearer: a drop counts once.
 pub(crate) fn disconnect_reason(mac: &str, reason: Option<&str>) {
+    info!("Reconnect {mac}: disconnect reason {reason:?}");
     let host_driven = drop_cause(reason);
     with_entry(mac, |e| {
+        let counted = e.host_driven == Some(true);
         e.host_driven = Some(host_driven);
-        if host_driven && let Some(at) = e.dropped_at {
+        if host_driven
+            && !counted
+            && let Some(at) = e.dropped_at
+        {
             e.backoff.dropped(at);
         }
     });
@@ -240,8 +246,13 @@ pub(crate) fn device_disconnected(mac: &str) {
     }
 }
 
+/// Once per Connected cycle: a repeated Connected=false neither counts again
+/// nor clears a marker whose connect is still running.
 fn record_drop(mac: &str, now: Instant) {
     with_entry(mac, |e| {
+        if e.dropped_at.is_some() {
+            return;
+        }
         if let Some(up) = e.up_since.take() {
             e.backoff.session_ended(now.saturating_duration_since(up));
         }
@@ -266,10 +277,11 @@ pub(crate) fn set_marker(mac: &str, category: u32) {
 }
 
 /// The marker's category while it is in flight or within
-/// `RECONNECT_TAKE_WINDOW` of its connect.
-fn live(marker: Option<Marker>) -> Option<u32> {
+/// `RECONNECT_TAKE_WINDOW` of its connect, left in place: the watcher can
+/// still clear it on a playback stop.
+pub(crate) fn peek_marker(mac: &str) -> Option<u32> {
     let now = now();
-    marker
+    with_entry(mac, |e| e.marker)
         .filter(|m| {
             m.connected_at
                 .is_none_or(|at| now.saturating_duration_since(at) <= RECONNECT_TAKE_WINDOW)
@@ -277,16 +289,11 @@ fn live(marker: Option<Marker>) -> Option<u32> {
         .map(|m| m.category)
 }
 
-/// The live marker's category, left in place: the watcher can still clear
-/// it on a playback stop.
-pub(crate) fn peek_marker(mac: &str) -> Option<u32> {
-    live(with_entry(mac, |e| e.marker))
-}
-
-/// Consume the marker: Linux's audio category at the play edge, if the
-/// watcher's connect for that playback is still live.
+/// Consume the marker: Linux's audio category at the play edge. Its age is
+/// judged at `peek_marker`, before the routing wait; only a stop or a
+/// failure removes it after that.
 pub(crate) fn take_marker(mac: &str) -> Option<u32> {
-    live(with_entry(mac, |e| e.marker.take()))
+    with_entry(mac, |e| e.marker.take()).map(|m| m.category)
 }
 
 /// Linux's playback stopped: no task takes for it. Whether a marker was
@@ -442,12 +449,21 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
         });
         // These hold until the next Connected=true.
         if up || host_driven == Some(false) || case_closed {
+            if host_driven == Some(false) {
+                io.log(&mac, "not reconnecting: the drop was not host-driven");
+            } else if case_closed {
+                io.log(&mac, "not reconnecting: the case was closed at the drop");
+            }
+            return;
+        }
+        let settings = io.settings(&mac);
+        if settings.mode != SwitchingMode::Handoff {
+            io.log(&mac, "not reconnecting: switching mode is not handoff");
             return;
         }
         if !edge {
             continue;
         }
-        let settings = io.settings(&mac);
         let facts = Facts {
             host_driven: host_driven == Some(true),
             case_closed,
@@ -457,9 +473,6 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
         };
         if let Decision::Wait(reason) = decide(&facts) {
             io.log(&mac, &format!("not reconnecting: {reason}"));
-            if settings.mode != SwitchingMode::Handoff {
-                return;
-            }
             continue;
         }
         let now = now();
@@ -487,10 +500,11 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
             "new Linux playback after a host-driven drop; reconnecting",
         );
         let attempt = async {
+            // Already connected: no Connected=true starts a task to take.
             if io.connected(&mac).await {
-                Ok(())
+                Ok(true)
             } else {
-                io.connect(&mac).await
+                io.connect(&mac).await.map(|()| false)
             }
         };
         tokio::pin!(attempt);
@@ -507,11 +521,13 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
             }
         };
         match result {
-            Ok(()) => {
+            Ok(already) => {
                 // A task that already took it, or a stop, leaves it cleared.
                 let now = self::now();
                 with_entry(&mac, |e| {
-                    if let Some(m) = e.marker.as_mut() {
+                    if already {
+                        e.marker = None;
+                    } else if let Some(m) = e.marker.as_mut() {
                         m.connected_at = Some(now);
                     }
                 });
@@ -988,6 +1004,8 @@ mod tests {
         rig.play_edge().await;
         assert_eq!(fake.connects(), 0);
         assert_eq!(fake.lines("reconnected for new playback"), 1);
+        // No Connected=true follows to start a task: no marker is left.
+        assert_eq!(take_marker(mac), None);
         // No further attempt, however many plays follow.
         tokio::time::sleep(RECONNECT_BACKOFF_MAX).await;
         rig.sample(true).await;
@@ -1068,6 +1086,56 @@ mod tests {
             assert!(rig.task.is_finished(), "{mac}");
         }
         assert_eq!(fake.connects(), 0);
+        // One line per ruled-out drop; none for Connected=true.
+        assert_eq!(fake.lines("not reconnecting"), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_watcher_stops_when_mode_leaves_handoff() {
+        for (mac, mode) in [
+            ("7E:00:00:00:00:11", SwitchingMode::Off),
+            ("7E:00:00:00:00:12", SwitchingMode::Legacy),
+        ] {
+            host_driven_drop(mac);
+            let fake = Arc::new(Fake::default());
+            let rig = Rig::start(mac, fake.clone());
+            rig.sample(true).await;
+            assert!(!rig.task.is_finished(), "{mac}");
+            *fake.settings.lock().unwrap() = Some(Settings { mode, ..settings() });
+            // The same playback goes on: no edge, yet the watcher ends.
+            rig.sample(true).await;
+            assert!(rig.task.is_finished(), "{mac}");
+            assert_eq!(
+                fake.lines("not reconnecting: switching mode is not handoff"),
+                1
+            );
+            assert_eq!(fake.connects(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_duplicate_drop_signals_count_once() {
+        let mac = "7E:00:00:00:00:13";
+        let delay = || with_entry(mac, |e| e.backoff.delay);
+        // Reason first, then the drop, each signalled twice.
+        with_entry(mac, |e| e.backoff.attempted(now()));
+        device_connected(mac);
+        disconnect_reason(mac, Some(REMOTE));
+        disconnect_reason(mac, Some(REMOTE));
+        record_drop(mac, now());
+        record_drop(mac, now());
+        assert_eq!(delay(), RECONNECT_BACKOFF_MIN * 2);
+        // The drop first: a repeat neither counts nor clears the marker of a
+        // connect still running.
+        with_entry(mac, |e| e.backoff.attempted(now()));
+        device_connected(mac);
+        record_drop(mac, now());
+        set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        disconnect_reason(mac, Some(REMOTE));
+        record_drop(mac, now());
+        disconnect_reason(mac, Some(REMOTE));
+        assert_eq!(delay(), RECONNECT_BACKOFF_MIN * 4);
+        assert_eq!(take_marker(mac), Some(AUDIO_CATEGORY_MEDIA));
     }
 
     #[tokio::test(start_paused = true)]

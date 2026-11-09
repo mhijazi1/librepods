@@ -782,7 +782,8 @@ async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
 async fn run_handoff(mut shell: Shell) {
     // A reconnect the watcher made for new playback takes for it once the
     // session reports its routing (#307); otherwise the normal start. Peeked
-    // first, so a stop during the wait still clears it.
+    // first, so a stop during the wait still clears it; its age is judged
+    // there only, so the wait can't expire it.
     let marked = reconnect::peek_marker(&shell.mac).is_some();
     let ready = marked && reconnect::routing_ready(&shell.manager).await;
     if marked && !ready {
@@ -2721,6 +2722,30 @@ mod tests {
         // A fresh [1] acknowledges it.
         h.emit_queued(owns(1)).await;
         wait_until("the ACK", acked).await;
+        stop_handoff_task(mac);
+    }
+
+    /// The marker's age is judged once, at task start (#307 round 2).
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_marker_fresh_at_start_survives_routing_wait() {
+        let mac = "5A:00:00:00:07:12";
+        let (manager, mut rx, _tx) = injected_manager().await;
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        tokio::time::advance(Duration::from_secs(12)).await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        // Routing at +4 s: past RECONNECT_TAKE_WINDOW since the connect.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        {
+            let mut state = manager.state.lock().await;
+            state.connected_devices = vec![host(LOCAL), host(REMOTE)];
+            state.ear_detection_status = vec![EarDetectionStatus::InEar; 2];
+            state.audio_source = Some(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            });
+        }
+        h.play(true).await;
+        expect_reconnect_take(mac, &mut rx).await;
         stop_handoff_task(mac);
     }
 
