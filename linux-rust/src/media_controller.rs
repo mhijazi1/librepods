@@ -1415,7 +1415,11 @@ impl MediaController {
                         move || started_before(deadline, available),
                     )
                 },
-                move || async move { before_deadline(deadline, restart).await.unwrap_or(false) },
+                // A held card must stay off: no WirePlumber restart (#264).
+                move || async move {
+                    !self.a2dp_hold_skips()
+                        && before_deadline(deadline, restart).await.unwrap_or(false)
+                },
                 tokio::time::sleep,
             )
         })
@@ -1470,7 +1474,6 @@ impl MediaController {
             }
         }
 
-        // shortcut: no hold check before `recover` (WirePlumber restart) (#288).
         if !before_deadline(deadline, recover).await? {
             if Instant::now() >= deadline {
                 return Err(DeadlineExceeded);
@@ -2183,24 +2186,61 @@ impl MediaController {
             // One card lookup and one choice for both sets, made before the
             // card goes off. Set directly: no WirePlumber restart or wait.
             Action::ProfileCycle => {
-                let Some(index) = find_card_index(mac).await else {
-                    return false;
+                let read = move || async move {
+                    let index = find_card_index(mac).await?;
+                    let (available, active) = self.get_card_profiles(index).await;
+                    let cached = self.state.lock().await.cached_a2dp_profile.clone();
+                    let profiles = resume_profiles(
+                        &available,
+                        active.as_deref(),
+                        &cached,
+                        crate::utils::load_preferred_codec(),
+                    );
+                    if profiles.is_empty() {
+                        info!("A2DP resume: no profile cycle from {active:?}");
+                    }
+                    Some((index, profiles))
                 };
-                let (available, active) = self.get_card_profiles(index).await;
-                let cached = self.state.lock().await.cached_a2dp_profile.clone();
-                let profiles = resume_profiles(
-                    &available,
-                    active.as_deref(),
-                    &cached,
-                    crate::utils::load_preferred_codec(),
-                );
-                if profiles.is_empty() {
-                    info!("A2DP resume: no profile cycle from {active:?}");
-                }
-                blocking(move || run_profile_cycle(&profiles, |p| set_card_profile_sync(index, p)))
-                    .await
+                self.profile_cycle_with(read, set_card_profile_sync).await
             }
         }
+    }
+
+    /// The profile cycle (#200) under `profile_write`, with the card read
+    /// (index and profiles to set) and the write injected. Never waits for
+    /// the lock, so the chain stays inside its window: the holder is already
+    /// moving the card. Under the A2DP hold (#264) only `off` is written.
+    async fn profile_cycle_with<R, RFut, S>(&self, read: R, set: S) -> bool
+    where
+        R: FnOnce() -> RFut,
+        RFut: Future<Output = Option<(u32, Vec<String>)>>,
+        S: Fn(u32, &str) -> bool + Send + 'static,
+    {
+        let Ok(write) = Arc::clone(&self.profile_write).try_lock_owned() else {
+            info!("A2DP resume: profile cycle skipped, another profile write is running");
+            return false;
+        };
+        if self.a2dp_held.load(Ordering::SeqCst) {
+            info!("A2DP resume: profile cycle skipped, A2DP hold");
+            return false;
+        }
+        let Some((index, profiles)) = read().await else {
+            return false;
+        };
+        let held = Arc::clone(&self.a2dp_held);
+        // The guard lives in the job: a dropped chain can't free the lock
+        // before the last write lands.
+        blocking(move || {
+            let _write = write;
+            run_profile_cycle(&profiles, |p| {
+                if p != "off" && held.load(Ordering::SeqCst) {
+                    info!("A2DP resume: {p} write skipped, A2DP hold");
+                    return false;
+                }
+                set(index, p)
+            })
+        })
+        .await
     }
 }
 
@@ -3967,6 +4007,36 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn recovery_skips_wireplumber_restart_once_held() {
+        // A hold set by the first availability check, after the activation's
+        // entry check, stops the restart; without it, recovery restarts once.
+        for (hold, expected_restarts) in [(true, 0), (false, 1)] {
+            let controller = MediaController::new(String::new(), String::new());
+            controller.state.lock().await.device_index = Some(3);
+            let first = std::cell::Cell::new(true);
+            let restarts = std::cell::Cell::new(0);
+            let recovered = controller
+                .recover_a2dp_availability_by(
+                    Instant::now() + A2DP_ACTIVATION_DEADLINE,
+                    || async { Some(3) },
+                    || {
+                        if first.replace(false) && hold {
+                            controller.set_a2dp_held(true);
+                        }
+                        async { false }
+                    },
+                    || {
+                        restarts.set(restarts.get() + 1);
+                        async { true }
+                    },
+                )
+                .await;
+            assert!(!recovered);
+            assert_eq!(restarts.get(), expected_restarts);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a2dp_activation_deadline_no_step_starts_at_deadline() {
         let controller = MediaController::new(String::new(), String::new());
         controller.state.lock().await.device_index = Some(3);
@@ -4248,6 +4318,71 @@ mod tests {
         assert_eq!(run_cycle(&both, &[]), (true, profiles(&both)));
         assert_eq!(run_cycle(&both, &["a2dp-sink"]), (false, profiles(&both)));
         assert_eq!(run_cycle(&[], &[]), (true, Vec::new()));
+    }
+
+    /// The profile cycle seam on card 3 reading `off, a2dp-sink`, with a
+    /// recording write that then runs `after`. Returns (result, reads, writes).
+    async fn cycle_seam(
+        controller: &MediaController,
+        after: impl Fn(&str) + Send + 'static,
+    ) -> (bool, u32, Vec<String>) {
+        let reads = std::cell::Cell::new(0);
+        let writes = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = Arc::clone(&writes);
+        let read = || {
+            reads.set(reads.get() + 1);
+            async { Some((3, profiles(&["off", "a2dp-sink"]))) }
+        };
+        let ok = controller
+            .profile_cycle_with(read, move |_, p: &str| {
+                recorded.lock().unwrap().push(p.to_string());
+                after(p);
+                true
+            })
+            .await;
+        let writes = writes.lock().unwrap().clone();
+        (ok, reads.get(), writes)
+    }
+
+    #[tokio::test]
+    async fn profile_cycle_runs_every_write_under_profile_write() {
+        let controller = MediaController::new(String::new(), String::new());
+        let both = profiles(&["off", "a2dp-sink"]);
+        assert_eq!(cycle_seam(&controller, |_| {}).await, (true, 1, both));
+        assert!(controller.profile_write.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn profile_cycle_skips_without_waiting_while_profile_write_busy() {
+        let controller = MediaController::new(String::new(), String::new());
+        let _write = controller.profile_write.lock().await;
+        let run = cycle_seam(&controller, |_| {});
+        let outcome = tokio::time::timeout(Duration::from_millis(100), run).await;
+        assert_eq!(
+            outcome.expect("waited for profile_write"),
+            (false, 0, vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_cycle_writes_nothing_while_held() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        assert_eq!(cycle_seam(&controller, |_| {}).await, (false, 0, vec![]));
+    }
+
+    #[tokio::test]
+    async fn profile_cycle_leaves_card_off_once_held_after_off() {
+        let controller = MediaController::new(String::new(), String::new());
+        let holder = controller.clone();
+        let hold_on_off = move |p: &str| {
+            if p == "off" {
+                holder.set_a2dp_held(true);
+            }
+        };
+        let off = profiles(&["off"]);
+        assert_eq!(cycle_seam(&controller, hold_on_off).await, (false, 1, off));
+        assert!(controller.profile_write.try_lock().is_ok());
     }
 
     const TEST_INTERVAL: Duration = Duration::from_millis(1);
