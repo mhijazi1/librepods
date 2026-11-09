@@ -1302,11 +1302,13 @@ impl Handoff {
 
     /// Announce Linux to the remote hosts. The announcement carries the idle
     /// media information, so during a call the call is advertised again
-    /// after it (#11).
+    /// after it (#11), and otherwise a relayed category is re-sent (#299).
     fn announce(&self, out: &mut Vec<Command>) {
         out.push(Command::Announce);
         if self.local_call {
             out.push(Command::AdvertiseCall(true));
+        } else if self.category_relay && self.category != AUDIO_CATEGORY_IDLE {
+            out.push(Command::RelayCategory(self.category));
         }
     }
 
@@ -5016,6 +5018,114 @@ mod tests {
         assert_eq!(
             p.feed(1000, Input::LocalCall(false)),
             [AdvertiseCall(false)]
+        );
+    }
+
+    // #299: an announcement carries category 100; Linux's own follows it.
+    #[test]
+    fn category_relay_after_auto_toggle_at_301() {
+        let mut p = relaying();
+        p.feed(100, Input::Manual);
+        assert_eq!(p.play_category(500, MEDIA), []);
+        assert_eq!(
+            p.feed(1000, Input::Auto),
+            [
+                ConnectA2dp,
+                SendOwnership(false),
+                Announce,
+                RelayCategory(MEDIA),
+                DrainPlayback
+            ]
+        );
+        assert_eq!(p.play_category(1500, MEDIA), []);
+    }
+
+    #[test]
+    fn category_relay_after_new_host_at_201() {
+        let mut p = relaying();
+        assert_eq!(
+            p.play_category(500, STREAM),
+            [RelayCategory(STREAM), SendOwnership(true)]
+        );
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        let three = vec![host(LOCAL), host(REMOTE), host(REMOTE_2)];
+        assert_eq!(
+            p.feed(
+                1000,
+                Input::ConnectedDevices {
+                    old: two_hosts(),
+                    new: three,
+                },
+            ),
+            [Announce, RelayCategory(STREAM)]
+        );
+    }
+
+    #[test]
+    fn category_relay_after_reconnect_adoption() {
+        // 301 set before the disconnect.
+        let mut p = relaying();
+        assert_eq!(
+            p.play_category(500, MEDIA),
+            [RelayCategory(MEDIA), SendOwnership(true)]
+        );
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(1100, Input::Disconnected), [PauseMedia, DropSession]);
+        assert_eq!(p.feed(2200, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(2300, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, RelayCategory(MEDIA), DrainPlayback]
+        );
+        assert_eq!(p.play_category(2500, MEDIA), []);
+        // 301 set while disconnected.
+        let mut p = relaying();
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        assert_eq!(p.play_category(500, MEDIA), []);
+        assert_eq!(p.feed(1200, Input::Tick), [Reconnect { audio: true }]);
+        assert_eq!(
+            p.feed(1300, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, RelayCategory(MEDIA), DrainPlayback]
+        );
+        assert_eq!(p.play_category(1500, MEDIA), []);
+    }
+
+    #[test]
+    fn category_relay_after_announce_none_when_idle() {
+        let mut p = relaying();
+        p.feed(100, Input::Manual);
+        assert_eq!(
+            p.feed(1000, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+        );
+    }
+
+    #[test]
+    fn category_relay_after_announce_none_when_disabled() {
+        let mut p = Probe::ready();
+        p.feed(100, Input::Manual);
+        assert_eq!(p.play_category(500, MEDIA), []);
+        assert_eq!(
+            p.feed(1000, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+        );
+    }
+
+    #[test]
+    fn category_relay_after_announce_none_during_call() {
+        let mut p = relaying();
+        assert_eq!(p.feed(100, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play_category(500, MEDIA), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        let three = vec![host(LOCAL), host(REMOTE), host(REMOTE_2)];
+        assert_eq!(
+            p.feed(
+                1000,
+                Input::ConnectedDevices {
+                    old: two_hosts(),
+                    new: three,
+                },
+            ),
+            [Announce, AdvertiseCall(true)]
         );
     }
 
