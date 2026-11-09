@@ -891,7 +891,7 @@ impl Shell {
 /// when the task should end.
 async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     let case_closed = core.case_closed();
-    core.set_baseline_playing(shell.play_rx.streams().baseline);
+    core.set_baseline_playing(shell.play_rx.streams.borrow().0.baseline);
     let (now, commands) = shell.play_rx.handle(|now| core.handle(now, input));
     if commands.contains(&Command::DropSession) {
         // A case close also drops as Remote: no reconnect for it (#307).
