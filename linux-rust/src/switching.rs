@@ -42,7 +42,7 @@ use crate::stream_monitor::{
 use crate::utils::{self, ConnectMode, SwitchingMode};
 use futures::future::BoxFuture;
 use log::{error, info};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -63,18 +63,24 @@ type EventTx = mpsc::UnboundedSender<AACPEvent>;
 /// queue; answered once it has.
 type FlushRequest = oneshot::Sender<()>;
 /// Playback samples: Linux's audio category at the instant (#272), from
-/// `local_category`.
+/// `local_category`, and a new source's category (`Input::Playback`, #96).
 pub(crate) struct PlaybackSamples {
-    rx: mpsc::Receiver<(Instant, u32)>,
+    rx: mpsc::Receiver<(Instant, u32, Option<u32>)>,
     /// Asks the stream monitor to re-baseline at the core's reset (#90).
     rebaseline: Arc<StdMutex<Option<Instant>>>,
     /// The stream monitor's state, read at `Command::PauseMedia` (#302) and
-    /// `Command::ResumeA2dp` (#330).
-    streams: watch::Receiver<PlaybackState>,
+    /// `Command::ResumeA2dp` (#330), with its count of stream starts (#96).
+    streams: watch::Receiver<(PlaybackState, u64)>,
 }
 
 impl PlaybackSamples {
     pub(crate) async fn recv(&mut self) -> Option<(Instant, u32)> {
+        let (sampled_at, category, _) = self.sample().await?;
+        Some((sampled_at, category))
+    }
+
+    /// `recv` with the category of a source new since the previous sample.
+    pub(crate) async fn sample(&mut self) -> Option<(Instant, u32, Option<u32>)> {
         self.rx.recv().await
     }
 
@@ -116,7 +122,7 @@ impl PlaybackSamples {
     /// The stream monitor's state now, for `Command::PauseMedia` (#302) and
     /// `Command::ResumeA2dp` (#330).
     pub(crate) fn streams(&self) -> PlaybackState {
-        self.streams.borrow().clone()
+        self.streams.borrow().0.clone()
     }
 }
 
@@ -321,6 +327,7 @@ where
     let mpris = Arc::new(mpris);
     let samples = streams.clone();
     tokio::spawn(async move {
+        let mut last = None;
         loop {
             // Stamped before the stream state is read: a sample
             // stamped at or after a step's reset reads every state the
@@ -330,12 +337,12 @@ where
             let owners = tokio::task::spawn_blocking(move || mpris())
                 .await
                 .unwrap_or_default();
-            let category = {
-                let state = samples.borrow();
-                let live = owners.iter().any(|&owner| state.live_or_unknown(owner));
-                local_category(!owners.is_empty(), live, state.counted)
-            };
-            if play_tx.send((sampled_at, category)).await.is_err() {
+            let (category, new_source) = sample_sources(&owners, &samples.borrow(), &mut last);
+            if play_tx
+                .send((sampled_at, category, new_source))
+                .await
+                .is_err()
+            {
                 break;
             }
             tokio::time::sleep(interval).await;
@@ -346,6 +353,38 @@ where
         rebaseline,
         streams,
     }
+}
+
+/// The players with a live local stream and the stream starts one poller
+/// sample saw (#96).
+type Sources = (HashSet<Option<u32>>, u64);
+
+/// One poller sample over the Playing players' bus `owners` and the stream
+/// monitor's state and stream starts: Linux's `local_category` and, against
+/// the previous sample's sources in `last` (none before the first sample),
+/// the category of a source new since then (#96): a player with a live local
+/// stream whose owner had none (301), else a stream that started counting
+/// (201).
+fn sample_sources(
+    owners: &[Option<u32>],
+    (state, starts): &(PlaybackState, u64),
+    last: &mut Option<Sources>,
+) -> (u32, Option<u32>) {
+    let live: HashSet<_> = owners
+        .iter()
+        .copied()
+        .filter(|&owner| state.live_or_unknown(owner))
+        .collect();
+    let category = local_category(!owners.is_empty(), !live.is_empty(), state.counted);
+    let new_source = last.as_ref().and_then(|(was_live, was_starts)| {
+        if !live.is_subset(was_live) {
+            Some(AUDIO_CATEGORY_MEDIA)
+        } else {
+            (starts > was_starts).then_some(AUDIO_CATEGORY_STREAM)
+        }
+    });
+    *last = Some((live, *starts));
+    (category, new_source)
 }
 
 /// Linux's audio category (#272): an MPRIS player playing with a live local
@@ -879,9 +918,9 @@ async fn run_handoff(mut shell: Shell) {
             Some(resumed) = shell.ear_rx.recv() => {
                 on_ear_resume(&mut core, &mut shell, resumed).await
             }
-            Some((sampled_at, category)) = shell.play_rx.recv() => {
+            Some((sampled_at, category, new_source)) = shell.play_rx.sample() => {
                 sync_session(&mut core, &mut shell).await
-                    || step(&mut core, &mut shell, Input::Playback { sampled_at, category }).await
+                    || step(&mut core, &mut shell, Input::Playback { sampled_at, category, new_source }).await
             }
             Some((_, in_call)) = shell.call_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
@@ -1574,7 +1613,7 @@ mod tests {
     /// then fed through `dispatch_events` from the manager's event channel.
     struct Harness {
         records: Arc<Records>,
-        play_tx: mpsc::Sender<(Instant, u32)>,
+        play_tx: mpsc::Sender<(Instant, u32, Option<u32>)>,
         playback_started: Arc<AtomicBool>,
         /// The injected call monitor's sender (no sound server in tests).
         call_tx: mpsc::Sender<(Instant, bool)>,
@@ -1607,14 +1646,14 @@ mod tests {
 
         /// The sender `play` uses and the playback samples it feeds.
         fn play_channel() -> (
-            mpsc::Sender<(Instant, u32)>,
+            mpsc::Sender<(Instant, u32, Option<u32>)>,
             impl FnOnce() -> PlaybackSamples,
         ) {
             let (play_tx, play_rx) = mpsc::channel(8);
             (play_tx, move || PlaybackSamples {
                 rx: play_rx,
                 rebaseline: Default::default(),
-                streams: watch::channel(PlaybackState::default()).1,
+                streams: watch::channel(Default::default()).1,
             })
         }
 
@@ -1727,7 +1766,7 @@ mod tests {
             records: Arc<Records>,
             handler: Arc<DeviceHandler>,
             (play_tx, playback): (
-                mpsc::Sender<(Instant, u32)>,
+                mpsc::Sender<(Instant, u32, Option<u32>)>,
                 impl FnOnce() -> PlaybackSamples,
             ),
             connect_mode: ConnectMode,
@@ -1832,7 +1871,7 @@ mod tests {
 
         async fn play_category(&self, category: u32) {
             // A closed channel (no handoff task) drops the sample.
-            let _ = self.play_tx.send((Instant::now(), category)).await;
+            let _ = self.play_tx.send((Instant::now(), category, None)).await;
         }
 
         fn pauses(&self) -> usize {
@@ -2213,7 +2252,7 @@ mod tests {
             move || PlaybackSamples {
                 rx: play_rx,
                 rebaseline: Default::default(),
-                streams: watch::channel(PlaybackState::default()).1,
+                streams: watch::channel(Default::default()).1,
             },
             move |_: &str| call_rx,
         )
@@ -2232,11 +2271,11 @@ mod tests {
         wait_until("the automatic start", || logged().contains("AUTO enabled")).await;
 
         play_tx
-            .send((Instant::now(), AUDIO_CATEGORY_IDLE))
+            .send((Instant::now(), AUDIO_CATEGORY_IDLE, None))
             .await
             .unwrap();
         play_tx
-            .send((Instant::now(), AUDIO_CATEGORY_MEDIA))
+            .send((Instant::now(), AUDIO_CATEGORY_MEDIA, None))
             .await
             .unwrap();
         wait_until("the take", || {
@@ -2673,7 +2712,10 @@ mod tests {
             },
         ));
         for category in [AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_MEDIA] {
-            play_tx.send((Instant::now(), category)).await.unwrap();
+            play_tx
+                .send((Instant::now(), category, None))
+                .await
+                .unwrap();
         }
         expect_reconnect_take(mac, &mut rx).await;
         wait_until("the connect to return", || {
@@ -2739,7 +2781,7 @@ mod tests {
         reconnect::disconnect_reason(mac, Some("org.bluez.Reason.Remote"));
         let (play_tx, samples) = Harness::play_channel();
         let watcher = tokio::spawn(reconnect::watch(mac.to_string(), samples(), Connects));
-        let sample = |category| play_tx.send((Instant::now(), category));
+        let sample = |category| play_tx.send((Instant::now(), category, None));
         // Connected for new playback at t=0.
         sample(AUDIO_CATEGORY_IDLE).await.unwrap();
         sample(AUDIO_CATEGORY_MEDIA).await.unwrap();
@@ -2940,6 +2982,7 @@ mod tests {
             Input::Playback {
                 sampled_at: Instant::now(),
                 category: AUDIO_CATEGORY_IDLE,
+                new_source: None,
             },
             Input::AudioSource(AudioSource {
                 mac: REMOTE.to_string(),
@@ -2967,6 +3010,7 @@ mod tests {
         let play = Input::Playback {
             sampled_at: Instant::now(),
             category: AUDIO_CATEGORY_MEDIA,
+            new_source: None,
         };
         assert!(!step(&mut core, &mut shell, play).await);
         let mut packets = Vec::new();
@@ -3131,10 +3175,13 @@ mod tests {
         controller.set_playing(is_playing).await;
         let (outer, media) = share_media(controller.clone(), pause_players);
         let (play_tx, play_rx) = mpsc::channel(8);
-        let streams = watch::channel(PlaybackState {
-            counted: false,
-            live: live.map(|pids| pids.iter().copied().collect()),
-        })
+        let streams = watch::channel((
+            PlaybackState {
+                counted: false,
+                live: live.map(|pids| pids.iter().copied().collect()),
+            },
+            0,
+        ))
         .1;
         let h = Harness::start_playback(
             SwitchingMode::Handoff,
@@ -4709,14 +4756,15 @@ mod tests {
         }
 
         /// The core fed as the default path feeds it: each playback sample
-        /// is `local_category` of MPRIS (the test player Playing or not),
-        /// whether it owns one of the listing's live streams and the
-        /// real `PlaybackTracker`'s state, as `spawn_playback_poller_with`
-        /// combines them.
+        /// combines the MPRIS owners, the listing's live streams and the
+        /// real `PlaybackTracker`'s state with `sample_sources`, as
+        /// `spawn_playback_poller_with` does.
         struct Pipeline {
             core: Handoff,
             tracker: PlaybackTracker,
             streams_playing: bool,
+            /// The poller's sources of the previous sample (#96).
+            last: Option<Sources>,
             t0: Instant,
             /// Every command list the core returned, in order.
             log: Vec<Vec<Command>>,
@@ -4732,6 +4780,7 @@ mod tests {
                     core: Handoff::new(LOCAL.to_string(), t0, true, true),
                     tracker: PlaybackTracker::new(MIN_STREAM_PLAYBACK),
                     streams_playing: false,
+                    last: None,
                     t0,
                     log: Vec::new(),
                 };
@@ -4767,18 +4816,35 @@ mod tests {
                 streams: &[StreamProps],
                 level: f32,
             ) -> Vec<Command> {
+                self.sample(ms, &player(mpris), streams, |_| level)
+            }
+
+            /// One playback sample at `ms`: the stream listing with each
+            /// candidate's peak `level`, the Playing players' bus `owners`,
+            /// combined by `sample_sources`, then the core.
+            fn sample(
+                &mut self,
+                ms: u64,
+                owners: &[Option<u32>],
+                streams: &[StreamProps],
+                level: impl Fn(u32) -> f32,
+            ) -> Vec<Command> {
                 let now = self.t0 + Duration::from_millis(ms);
-                if let Some(playing) = self.tracker.observe_levels(now, streams, |_| level) {
+                if let Some(playing) = self.tracker.observe_levels(now, streams, level) {
                     self.streams_playing = playing;
                 }
-                let live =
-                    stream_monitor::live_stream_pids(streams, |_| None).contains(&PLAYER_PID);
-                let category = local_category(mpris, live, self.streams_playing);
+                let state = PlaybackState {
+                    counted: self.streams_playing,
+                    live: Some(stream_monitor::live_stream_pids(streams, |_| None)),
+                };
+                let (category, new_source) =
+                    sample_sources(owners, &(state, self.tracker.starts), &mut self.last);
                 self.feed(
                     ms,
                     Input::Playback {
                         sampled_at: now,
                         category,
+                        new_source,
                     },
                 )
             }
@@ -5229,6 +5295,336 @@ mod tests {
             };
             assert_eq!(run(PLAYER_PID + 1), NO_TAKE);
             assert_eq!(run(PLAYER_PID), [vec![SendOwnership(true)]]);
+        }
+
+        // #96: a new local source behind playback already above idle.
+        const SECOND_PID: u32 = PLAYER_PID + 1;
+        const SKIP_201: &str =
+            "AUTO takeover skipped: the audio source's category 301 is above Linux's 201";
+        const IDLE: u32 = AUDIO_CATEGORY_IDLE;
+        const STREAM: u32 = AUDIO_CATEGORY_STREAM;
+        const MEDIA: u32 = AUDIO_CATEGORY_MEDIA;
+
+        /// `stream` played by process `pid`.
+        fn owned_by(pid: u32, mut stream: StreamProps) -> StreamProps {
+            stream
+                .props
+                .insert("application.process.id".to_string(), pid.to_string());
+            stream
+        }
+
+        impl Pipeline {
+            /// Every command of the samples every `PLAYBACK_POLL` from
+            /// `from` through `to` ms.
+            fn samples(
+                &mut self,
+                from: u64,
+                to: u64,
+                owners: &[Option<u32>],
+                streams: &[StreamProps],
+                level: impl Fn(u32) -> f32,
+            ) -> Vec<Command> {
+                (from..=to)
+                    .step_by(POLL_MS as usize)
+                    .flat_map(|ms| self.sample(ms, owners, streams, &level))
+                    .collect()
+            }
+        }
+
+        /// Linux plays `owners` over `streams` (all audible) from
+        /// `EVENT_MS`, takes for it and holds the AirPods once every stream
+        /// counts; then the iPhone takes (a genuine [0]: Linux yields) and
+        /// relays `owner`. Returns the next sample's ms.
+        fn yielded(owners: &[Option<u32>], streams: &[StreamProps], owner: u32) -> (Pipeline, u64) {
+            let mut p = Pipeline::ready();
+            let end = EVENT_MS + MIN_MS + POLL_MS;
+            let all = p.samples(EVENT_MS, end, owners, streams, |_| LOUD);
+            assert_eq!(all, [SendOwnership(true)]);
+            assert_eq!(p.feed(end, Input::Ownership(vec![1])), []);
+            let source = AudioSource {
+                mac: REMOTE.to_string(),
+                r#type: AudioSourceType::Media,
+            };
+            assert_eq!(p.feed(end, Input::AudioSource(source)), []);
+            let relay = Input::MediaInformation {
+                host: REMOTE.to_string(),
+                category: owner,
+            };
+            assert_eq!(p.feed(end, relay), []);
+            assert_eq!(p.feed(end, Input::Ownership(vec![0])), [PauseMedia]);
+            p.core.take_lines();
+            (p, end + POLL_MS)
+        }
+
+        /// The samples from `from` until a stream started then has counted
+        /// for a poll.
+        fn past_min(from: u64) -> u64 {
+            from + MIN_MS + POLL_MS
+        }
+
+        /// Stream B passes the minimum behind stream A, which still counts
+        /// (Linux stays at 201), after a yield to an owner relaying `owner`.
+        fn stream_behind_counted(owner: u32) -> (Vec<Command>, Vec<String>) {
+            let (mut p, ms) = yielded(&[], &[music(1)], owner);
+            let both = [music(1), music(2)];
+            let all = p.samples(ms, past_min(ms), &[], &both, |_| LOUD);
+            (all, p.core.take_lines())
+        }
+
+        #[test]
+        fn fresh_source_stream_behind_counted_takes_from_idle_owner() {
+            assert_eq!(stream_behind_counted(IDLE).0, [SendOwnership(true)]);
+        }
+
+        #[test]
+        fn fresh_source_stream_behind_counted_skips_playing_owner() {
+            let (all, lines) = stream_behind_counted(MEDIA);
+            assert_eq!(all, []);
+            assert_eq!(lines, [SKIP_201]);
+        }
+
+        /// #96 Q5: stream B counted beside A, falls silent past
+        /// `SILENCE_HOLD` (A keeps Linux at 201) and counts again: a new
+        /// source.
+        #[test]
+        fn fresh_source_stream_recount_after_silence_hold_is_new() {
+            let both = [music(1), music(2)];
+            let (mut p, ms) = yielded(&[], &both, IDLE);
+            let hold_ms = stream_monitor::SILENCE_HOLD.as_millis() as u64;
+            let silent_b = |index| if index == 2 { SILENT } else { LOUD };
+            let loud_again = ms + hold_ms + POLL_MS;
+            assert_eq!(
+                p.samples(ms, loud_again - POLL_MS, &[], &both, silent_b),
+                []
+            );
+            assert!(p.streams_playing);
+            let all = p.samples(loud_again, past_min(loud_again), &[], &both, |_| LOUD);
+            assert_eq!(all, [SendOwnership(true)]);
+        }
+
+        /// The player of `SECOND_PID` starts behind the test player, which
+        /// keeps Linux at 301, after a yield to a 301 owner; `pid` is the
+        /// second player's bus owner.
+        fn second_player(pid: u32) -> Vec<Command> {
+            let first = [Some(PLAYER_PID)];
+            let (mut p, ms) = yielded(&first, &[music(1)], MEDIA);
+            let both = [Some(PLAYER_PID), Some(pid)];
+            let streams = [music(1), owned_by(pid, music(2))];
+            p.samples(ms, past_min(ms), &both, &streams, |_| LOUD)
+        }
+
+        #[test]
+        fn fresh_source_mpris_new_owner_pid_takes() {
+            assert_eq!(second_player(SECOND_PID), [SendOwnership(true)]);
+        }
+
+        /// #96 Q4: a second player of the same process is no new source; its
+        /// stream counts at 201, below the owner's 301.
+        #[test]
+        fn fresh_source_mpris_same_pid_no_take() {
+            assert_eq!(second_player(PLAYER_PID), []);
+        }
+
+        /// #96 Q3: MPRIS keeps Linux at 301 and a new stream counts behind
+        /// it: a request at 201, not 301.
+        #[test]
+        fn fresh_source_request_uses_source_category() {
+            let run = |owner| {
+                let player = [Some(PLAYER_PID)];
+                let (mut p, ms) = yielded(&player, &[music(1)], owner);
+                let streams = [music(1), owned_by(SECOND_PID, music(2))];
+                let all = p.samples(ms, past_min(ms), &player, &streams, |_| LOUD);
+                (all, p.core.take_lines())
+            };
+            assert_eq!(run(MEDIA), (vec![], vec![SKIP_201.to_string()]));
+            assert_eq!(run(IDLE).0, [SendOwnership(true)]);
+        }
+
+        /// The second player (its own new stream) starts at `ms`: a new
+        /// source at 301, then one at 201.
+        fn new_player(p: &mut Pipeline, ms: u64) -> Vec<Command> {
+            let both = [Some(PLAYER_PID), Some(SECOND_PID)];
+            let streams = [music(1), owned_by(SECOND_PID, music(2))];
+            p.samples(ms, past_min(ms), &both, &streams, |_| LOUD)
+        }
+
+        #[test]
+        fn fresh_source_non_event_steady_sources() {
+            let player = [Some(PLAYER_PID)];
+            let (mut p, ms) = yielded(&player, &[music(1)], IDLE);
+            let end = ms + 2 * MIN_MS + POLL_MS;
+            assert_eq!(p.samples(ms, end, &player, &[music(1)], |_| LOUD), []);
+        }
+
+        #[test]
+        fn fresh_source_non_event_while_owning() {
+            let mut p = Pipeline::ready();
+            let player = [Some(PLAYER_PID)];
+            let first = p.samples(EVENT_MS, EVENT_MS, &player, &[music(1)], |_| LOUD);
+            assert_eq!(first, [SendOwnership(true)]);
+            assert_eq!(p.feed(EVENT_MS, Input::Ownership(vec![1])), []);
+            assert_eq!(new_player(&mut p, EVENT_MS + POLL_MS), []);
+        }
+
+        #[test]
+        fn fresh_source_non_event_while_pending() {
+            let mut p = Pipeline::ready();
+            let player = [Some(PLAYER_PID)];
+            let first = p.samples(EVENT_MS, EVENT_MS, &player, &[music(1)], |_| LOUD);
+            assert_eq!(first, [SendOwnership(true)]);
+            assert_eq!(new_player(&mut p, EVENT_MS + POLL_MS), []);
+        }
+
+        #[test]
+        fn fresh_source_non_event_remote_call() {
+            let (mut p, ms) = yielded(&[Some(PLAYER_PID)], &[music(1)], IDLE);
+            let call = AudioSource {
+                mac: REMOTE.to_string(),
+                r#type: AudioSourceType::Call,
+            };
+            assert_eq!(p.feed(ms, Input::AudioSource(call)), []);
+            assert_eq!(new_player(&mut p, ms), []);
+        }
+
+        #[test]
+        fn fresh_source_non_event_bud_out() {
+            let (mut p, ms) = yielded(&[Some(PLAYER_PID)], &[music(1)], IDLE);
+            assert_eq!(p.feed(ms, Input::EarState(vec![OutOfEar, OutOfEar])), []);
+            assert_eq!(new_player(&mut p, ms), []);
+        }
+
+        /// The core fed by the real poller through `PlaybackSamples::handle`,
+        /// until a sample has `category`, then `more` samples; every command.
+        async fn feed_until(
+            rx: &mut PlaybackSamples,
+            core: &mut Handoff,
+            category: u32,
+            more: usize,
+        ) -> Vec<Command> {
+            let mut all = Vec::new();
+            let mut left = None;
+            while left != Some(0) {
+                let (sampled_at, sampled, new_source) =
+                    tokio::time::timeout(Duration::from_secs(3), rx.sample())
+                        .await
+                        .expect("a playback sample")
+                        .expect("poller running");
+                let input = Input::Playback {
+                    sampled_at,
+                    category: sampled,
+                    new_source,
+                };
+                all.extend(rx.handle(|now| core.handle(now, input)).1);
+                left = match left {
+                    Some(n) => Some(n - 1),
+                    None => (sampled == category).then_some(more),
+                };
+            }
+            all
+        }
+
+        /// #96 c1 (#272's rise) through the poller: a counted audible
+        /// stream, Linux owns and yields, then a live MPRIS player starts:
+        /// one take while the owner's category is at most 301.
+        #[tokio::test]
+        async fn fresh_source_mpris_behind_counted_stream_takes() {
+            for owner in [IDLE, MEDIA] {
+                let mut core = Handoff::new(LOCAL.to_string(), Instant::now(), true, true);
+                for input in seed_inputs(facts()) {
+                    core.handle(Instant::now(), input);
+                }
+                let mpris = Arc::new(AtomicBool::new(false));
+                let reads = mpris.clone();
+                let streams = LiveStreams::default();
+                let mut rx = spawn_playback_poller_with(
+                    move || player(reads.load(Ordering::SeqCst)),
+                    streams.clone(),
+                    AllAudible,
+                    STREAM_TEST_MIN,
+                    STREAM_TEST_POLL,
+                    |_| (),
+                );
+                streams.settle().await;
+                assert_eq!(feed_until(&mut rx, &mut core, IDLE, 0).await, []);
+                streams.set(vec![music(1)]);
+                let take = feed_until(&mut rx, &mut core, STREAM, 0).await;
+                assert_eq!(take, [SendOwnership(true)]);
+                assert_eq!(core.handle(Instant::now(), Input::Ownership(vec![1])), []);
+                let source = AudioSource {
+                    mac: REMOTE.to_string(),
+                    r#type: AudioSourceType::Media,
+                };
+                assert_eq!(core.handle(Instant::now(), Input::AudioSource(source)), []);
+                let relay = Input::MediaInformation {
+                    host: REMOTE.to_string(),
+                    category: owner,
+                };
+                assert_eq!(core.handle(Instant::now(), relay), []);
+                let lost = core.handle(Instant::now(), Input::Ownership(vec![0]));
+                assert_eq!(lost, [PauseMedia]);
+                core.take_lines();
+                assert_eq!(feed_until(&mut rx, &mut core, STREAM, 5).await, []);
+                mpris.store(true, Ordering::SeqCst);
+                let all = feed_until(&mut rx, &mut core, MEDIA, 5).await;
+                assert_eq!(all, [SendOwnership(true)], "{owner}");
+                assert_eq!(
+                    core.take_lines(),
+                    ["AUTO playback started; requested Linux ownership"]
+                );
+            }
+        }
+
+        /// #301: a bud back in while the iPhone owns; the second player's
+        /// 301 and its stream's 201 both come within the grace.
+        #[test]
+        fn fresh_source_non_event_ear_resume_grace() {
+            let (mut p, ms) = yielded(&[Some(PLAYER_PID)], &[music(1)], IDLE);
+            assert_eq!(p.feed(ms, Input::EarState(vec![InEar, OutOfEar])), []);
+            assert_eq!(p.feed(ms, Input::EarState(vec![InEar, InEar])), []);
+            assert_eq!(new_player(&mut p, ms), []);
+            let resumed =
+                "AUTO playback resumed by ear detection while another host owns; not taking";
+            assert_eq!(p.core.take_lines(), [resumed, resumed]);
+        }
+
+        /// The second player (on stream A, which counts already) starts at
+        /// the reset's first sample, or its second when `later`.
+        fn after_reset(later: bool) -> Vec<Command> {
+            let a = owned_by(SECOND_PID, music(1));
+            let (mut p, ms) = yielded(&[], &[a.clone()], IDLE);
+            assert_eq!(
+                p.feed(ms, Input::Auto),
+                [
+                    Command::ConnectA2dp,
+                    SendOwnership(false),
+                    Command::Announce,
+                    Command::DrainPlayback
+                ]
+            );
+            assert_eq!(p.feed(ms, Input::Ownership(vec![0])), []);
+            let start = if later {
+                ms + 2 * POLL_MS
+            } else {
+                ms + POLL_MS
+            };
+            let mut all = p.samples(ms + POLL_MS, start - POLL_MS, &[], &[a.clone()], |_| LOUD);
+            let second = [Some(SECOND_PID)];
+            all.extend(p.samples(start, past_min(start), &second, &[a], |_| LOUD));
+            all
+        }
+
+        /// The core's first sample after a reset and the poller's first
+        /// sample are baselines, whatever source they report.
+        #[test]
+        fn fresh_source_non_event_after_baseline_reset() {
+            assert_eq!(after_reset(false), []);
+            // The twin: a second sample takes at 301.
+            assert_eq!(after_reset(true), [SendOwnership(true)]);
+            let state = (PlaybackState::default(), 1);
+            assert_eq!(
+                sample_sources(&player(true), &state, &mut None),
+                (MEDIA, None)
+            );
         }
     }
 
