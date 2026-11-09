@@ -35,6 +35,8 @@ pub(crate) const RELEASE_HOLD: Duration = Duration::from_secs(5);
 /// sampled within this long is ear detection's resume and takes nothing, as
 /// on macOS (#301, #304). Covers one playback poll plus a stream's debounce.
 pub(crate) const EAR_RESUME_GRACE: Duration = Duration::from_secs(3);
+const EAR_RESUMED: &str =
+    "AUTO playback resumed by ear detection while another host owns; not taking";
 /// First reconnect delay after a disconnect or a successful reconnect.
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 /// Reconnect backoff cap.
@@ -770,13 +772,7 @@ impl Handoff {
                 TakeoverAction::TakeOver if !self.auto_take_allowed() => {
                     self.say(CONNECT_MODE_SKIP)
                 }
-                TakeoverAction::TakeOver
-                    if self.ear_resume_until.is_some_and(|end| sampled_at < end) =>
-                {
-                    self.say(
-                        "AUTO playback resumed by ear detection while another host owns; not taking",
-                    )
-                }
+                TakeoverAction::TakeOver if self.ear_resumed(sampled_at) => self.say(EAR_RESUMED),
                 TakeoverAction::TakeOver => {
                     self.request(now, true, Cause::Playback, out);
                     self.say("AUTO playback started; requested Linux ownership");
@@ -820,7 +816,10 @@ impl Handoff {
                 }
             }
             Some(p) if p.cause == Cause::Playback => {
-                if fresh_play {
+                // The settled release must not retake for it either.
+                if fresh_play && self.ear_resumed(sampled_at) {
+                    self.say(EAR_RESUMED);
+                } else if fresh_play {
                     self.play_during_release = true;
                 } else if stopped {
                     self.play_during_release = false;
@@ -1057,6 +1056,12 @@ impl Handoff {
     /// list is no evidence of that.
     fn only_local_listed(&self) -> bool {
         !self.hosts.is_empty() && self.hosts.iter().all(|d| d.mac == self.local)
+    }
+
+    /// A play sampled at `sampled_at` is ear detection's resume while another
+    /// host still owns (#301).
+    fn ear_resumed(&self, sampled_at: Instant) -> bool {
+        self.remote_owns && self.ear_resume_until.is_some_and(|end| sampled_at < end)
     }
 
     /// The pending request settled (acknowledged or timed out): act on a
@@ -5015,8 +5020,6 @@ mod tests {
     }
 
     // #301: ear detection's resume while another host owns.
-    const EAR_RESUMED: &str =
-        "AUTO playback resumed by ear detection while another host owns; not taking";
     const GRACE_MS: u64 = EAR_RESUME_GRACE.as_millis() as u64;
 
     /// `remote_playing(Some(relayed))`: another host owns, Linux holds no
@@ -5151,5 +5154,54 @@ mod tests {
             end(&mut p);
             assert_eq!(p.core.ear_resume_until, None, "{name}");
         }
+    }
+
+    #[test]
+    fn ear_resume_during_auto_release_does_not_take() {
+        let timed_out = 100 + ACK_TIMEOUT.as_millis() as u64 + 100;
+        for (name, ms, settle) in [
+            ("ack", 1100, Input::Ownership(vec![0])),
+            ("timeout", timed_out, Input::Tick),
+        ] {
+            // Auto releases the AirPods Linux owned while the iPhone plays.
+            let mut p = Probe::new(false, true);
+            p.routing(SessionFacts {
+                owner: Some(vec![1]),
+                ..ready_facts()
+            });
+            let mut all = p.feed(100, Input::Auto);
+            assert_eq!(takes(&all), 0, "{name}: {all:?}");
+            all.extend(p.feed(150, remote_media()));
+            all.extend(p.feed(160, relay(REMOTE, MEDIA)));
+            all.extend(p.play_category(200, MEDIA));
+            all.extend(p.feed(300, Input::EarState(vec![InEar, OutOfEar])));
+            all.extend(p.feed(400, Input::EarState(vec![InEar, InEar])));
+            all.extend(p.play_category(500, IDLE));
+            all.extend(p.play_category(1000, MEDIA));
+            all.extend(p.feed(ms, settle));
+            assert!(p.core.pending.is_none(), "{name}");
+            assert_eq!(takes(&all), 0, "{name}: {all:?}");
+            assert!(
+                p.core.take_lines().contains(&EAR_RESUMED.to_string()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ear_resume_grace_needs_remote_owner() {
+        let mut p = bud_out(IDLE, true);
+        // The iPhone stopped, left (only Linux listed) and came back idle:
+        // nobody else owns the AirPods.
+        p.feed(240, Input::AudioSource(idle()));
+        for (ms, new) in [(250, vec![host(LOCAL)]), (260, two_hosts())] {
+            let old = p.core.hosts.clone();
+            p.feed(ms, Input::ConnectedDevices { old, new });
+        }
+        assert!(!p.core.remote_owns && p.core.ear_resume_until.is_some());
+        p.core.take_lines();
+        // A play within the grace is not ear detection's resume.
+        assert_eq!(p.play_category(700, MEDIA), [SendOwnership(true)]);
+        assert!(!p.core.take_lines().contains(&EAR_RESUMED.to_string()));
     }
 }
