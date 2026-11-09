@@ -404,12 +404,23 @@ const fn card_lookup_max_wait(attempts: u32) -> Duration {
     CARD_LOOKUP_INTERVAL.saturating_mul(attempts.saturating_sub(1))
 }
 
+/// BlueZ's A2DP Sink profile, asked for when BlueZ never connected it (#310).
+const A2DP_SINK: uuid::Uuid = uuid::Uuid::from_u128(0x0000110b_0000_1000_8000_00805f9b34fb);
+
+/// Longest the A2DP profile connect may take (the handoff probe's value).
+const A2DP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Card lookups after the A2DP profile connect: the card can trail BlueZ's
+/// reply. 1.75 s of sleeps keeps `a2dp_activation_worst_case_wait` <= 15 s.
+const A2DP_CONNECT_LOOKUP_ATTEMPTS: u32 = 8;
+
 /// Worst-case waiting in `activate_a2dp_profile`, from the production
-/// constants: the initial full card lookup finds the card on its last try,
-/// then the card is missing at every enumeration check, so both waits run all
-/// their checks (each a `CARD_LOOKUP_ATTEMPTS_PER_CHECK` lookup) and
-/// WirePlumber is restarted once in between. The run time of the lookups
-/// themselves and of `systemctl` is not counted.
+/// constants: the initial full card lookup misses, the A2DP profile connect's
+/// re-lookup finds the card on its last try, then the card is missing at
+/// every enumeration check, so both waits run all their checks (each a
+/// `CARD_LOOKUP_ATTEMPTS_PER_CHECK` lookup) and WirePlumber is restarted once
+/// in between. The run time of the lookups themselves, of the connect and of
+/// `systemctl` is not counted.
 const fn a2dp_activation_worst_case_wait() -> Duration {
     let wait = MediaController::A2DP_ENUMERATION_INTERVAL
         .saturating_mul(MediaController::A2DP_ENUMERATION_ATTEMPTS.saturating_sub(1))
@@ -418,6 +429,7 @@ const fn a2dp_activation_worst_case_wait() -> Duration {
                 .saturating_mul(MediaController::A2DP_ENUMERATION_ATTEMPTS),
         );
     card_lookup_max_wait(CARD_LOOKUP_ATTEMPTS)
+        .saturating_add(card_lookup_max_wait(A2DP_CONNECT_LOOKUP_ATTEMPTS))
         .saturating_add(wait)
         .saturating_add(WIREPLUMBER_SETTLE)
         .saturating_add(wait)
@@ -439,6 +451,15 @@ const _: () = assert!(
     A2DP_ACTIVATION_DEADLINE.as_millis() >= a2dp_activation_worst_case_wait().as_millis()
         && A2DP_ACTIVATION_DEADLINE.as_millis() >= A2DP_RECOVERY_BOUND.as_millis(),
     "A2DP_ACTIVATION_DEADLINE is shorter than the activation's sleeps"
+);
+
+// Nor do the sleeps plus a connect that runs to its timeout.
+const _: () = assert!(
+    A2DP_ACTIVATION_DEADLINE.as_millis()
+        >= a2dp_activation_worst_case_wait()
+            .saturating_add(A2DP_CONNECT_TIMEOUT)
+            .as_millis(),
+    "A2DP_ACTIVATION_DEADLINE is shorter than the sleeps and the A2DP connect"
 );
 
 /// A2DP activation ran out of `A2DP_ACTIVATION_DEADLINE`.
@@ -484,15 +505,16 @@ where
 }
 
 /// `retry_card_lookup` with the sleep injected, so tests can count sleeps.
-async fn retry_card_lookup_with<F, Fut, S, SFut>(
+/// Generic so the hold's connect can re-read the whole card.
+async fn retry_card_lookup_with<T, F, Fut, S, SFut>(
     attempts: u32,
     interval: Duration,
     mut lookup: F,
     mut sleep: S,
-) -> Option<u32>
+) -> Option<T>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<u32>>,
+    Fut: std::future::Future<Output = Option<T>>,
     S: FnMut(Duration) -> SFut,
     SFut: std::future::Future<Output = ()>,
 {
@@ -510,7 +532,78 @@ where
     None
 }
 
-/// What `activate_a2dp_profile` should do with the card's profile.
+/// Ask BlueZ for the A2DP profile once, cut at `A2DP_CONNECT_TIMEOUT`, then
+/// look for the card it brings with `A2DP_CONNECT_LOOKUP_ATTEMPTS` tries of
+/// `find`. `None` after one `warn!` naming the cause (#310).
+async fn connect_a2dp_then_find<T, C, CFut, F, FFut, S, SFut>(
+    connect: C,
+    find: F,
+    sleep: S,
+) -> Option<T>
+where
+    C: FnOnce() -> CFut,
+    CFut: Future<Output = Result<(), String>>,
+    F: FnMut() -> FFut,
+    FFut: Future<Output = Option<T>>,
+    S: FnMut(Duration) -> SFut,
+    SFut: Future<Output = ()>,
+{
+    info!("No AirPods card: asking BlueZ to ConnectProfile A2DP Sink");
+    // shortcut: a ConnectProfile cut here can still finish in BlueZ after
+    // `profile_write` is released, so a later hold may miss its card (#TBD).
+    let cause = match tokio::time::timeout(A2DP_CONNECT_TIMEOUT, connect()).await {
+        Ok(Ok(())) => {
+            let interval = CARD_LOOKUP_INTERVAL;
+            let found =
+                retry_card_lookup_with(A2DP_CONNECT_LOOKUP_ATTEMPTS, interval, find, sleep).await;
+            if found.is_some() {
+                return found;
+            }
+            "still no AirPods card".to_string()
+        }
+        Ok(Err(e)) => e,
+        Err(_) => format!("no reply within {A2DP_CONNECT_TIMEOUT:?}"),
+    };
+    warn!("A2DP profile connect gave up: {cause}");
+    None
+}
+
+/// BlueZ `Device1.ConnectProfile(A2DP_SINK)` on the AirPods `mac`, only while
+/// BlueZ reports them connected. Unbounded: callers cut it.
+async fn connect_a2dp_profile(mac: &str) -> Result<(), String> {
+    let address = mac.parse::<bluer::Address>().map_err(|e| e.to_string())?;
+    let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
+    let device = session
+        .default_adapter()
+        .await
+        .and_then(|adapter| adapter.device(address))
+        .map_err(|e| e.to_string())?;
+    connect_if_connected(
+        || async { device.is_connected().await.unwrap_or(false) },
+        || async {
+            device
+                .connect_profile(&A2DP_SINK)
+                .await
+                .map_err(|e| e.to_string())
+        },
+    )
+    .await
+}
+
+/// Connect only while connected, so a hold released on a disconnect never
+/// pages AirPods that left (#310 Q5).
+async fn connect_if_connected<I, IFut, C, CFut>(is_connected: I, connect: C) -> Result<(), String>
+where
+    I: FnOnce() -> IFut,
+    IFut: Future<Output = bool>,
+    C: FnOnce() -> CFut,
+    CFut: Future<Output = Result<(), String>>,
+{
+    if !is_connected().await {
+        return Err("AirPods not connected".to_string());
+    }
+    connect().await
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProfileChoice {
     /// An A2DP variant is already active. Switching would recreate the sink
@@ -603,7 +696,8 @@ where
 /// so each wait is at most 4 × 1 s sleeps ≈ 4 s whether or not the card is
 /// there. With the initial full lookup in `activate_a2dp_profile` (11 × 250 ms
 /// ≈ 2.75 s) and the restart (systemctl + `WIREPLUMBER_SETTLE` 2 s) the whole
-/// activation waits ≈ 12.75 s plus lookup and systemctl run time, within
+/// activation waits ≈ 12.75 s plus lookup and systemctl run time (≈ 14.5 s
+/// when the A2DP profile connect's re-lookup runs too), within
 /// `A2DP_RECOVERY_BOUND` (15 s); see `a2dp_activation_worst_case_wait`.
 async fn recover_a2dp_availability<C, CFut, R, RFut, S, SFut>(
     attempts: u32,
@@ -1163,6 +1257,13 @@ impl MediaController {
                 deadline,
                 || self.get_audio_device_index(&mac),
                 || {
+                    connect_a2dp_then_find(
+                        || connect_a2dp_profile(&mac),
+                        || find_card_index(mac.clone()),
+                        tokio::time::sleep,
+                    )
+                },
+                || {
                     self.recover_a2dp_availability_by(
                         deadline,
                         || find_card_index(mac.clone()),
@@ -1226,13 +1327,16 @@ impl MediaController {
     }
 
     /// The activation after the MAC check, every step bounded by `deadline`:
-    /// `lookup` is the initial full card lookup, `recover` makes sure A2DP is
-    /// offered, `choose` picks the profile and `set` switches to it. State is
-    /// written only after a step returns, so a step cut off writes nothing.
-    async fn activate_a2dp_profile_with<L, LFut, V, VFut, C, CFut, P, PFut>(
+    /// `lookup` is the initial full card lookup, `connect` asks BlueZ for the
+    /// A2DP profile and finds the card again when the lookup found none,
+    /// `recover` makes sure A2DP is offered, `choose` picks the profile and
+    /// `set` switches to it. State is written only after a step returns, so a
+    /// step cut off writes nothing.
+    async fn activate_a2dp_profile_with<L, LFut, K, KFut, V, VFut, C, CFut, P, PFut>(
         &self,
         deadline: Instant,
         lookup: L,
+        connect: K,
         recover: V,
         choose: C,
         set: P,
@@ -1240,6 +1344,8 @@ impl MediaController {
     where
         L: FnOnce() -> LFut,
         LFut: Future<Output = Option<u32>>,
+        K: FnOnce() -> KFut,
+        KFut: Future<Output = Option<u32>>,
         V: FnOnce() -> VFut,
         VFut: Future<Output = bool>,
         C: FnOnce(u32) -> CFut,
@@ -1254,8 +1360,17 @@ impl MediaController {
         let index = before_deadline(deadline, lookup).await?;
         self.state.lock().await.device_index = index;
         if index.is_none() {
-            warn!("Could not get device index. Cannot activate A2DP profile.");
-            return Ok(());
+            // BlueZ never connected A2DP (inbound connect). Under the write
+            // lock, so a hold that starts now wins (#264).
+            let _write = before_deadline(deadline, || self.profile_write.lock()).await?;
+            if self.a2dp_hold_skips() {
+                return Ok(());
+            }
+            let index = before_deadline(deadline, connect).await?;
+            self.state.lock().await.device_index = index;
+            if index.is_none() {
+                return Ok(());
+            }
         }
 
         // shortcut: no hold check before `recover` (WirePlumber restart) (#288).
@@ -1619,41 +1734,49 @@ impl MediaController {
             debug!("A2DP hold({hold}): no connected device MAC");
             return;
         }
-        let card_mac = mac.clone();
-        let read = || async move {
-            tokio::task::spawn_blocking(move || {
-                get_card_info_list_sync().into_iter().find(|card| {
-                    card.device_string
-                        .as_deref()
-                        .is_some_and(|d| d.contains(&card_mac))
+        let read = || {
+            let card_mac = mac.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    get_card_info_list_sync().into_iter().find(|card| {
+                        card.device_string
+                            .as_deref()
+                            .is_some_and(|d| d.contains(&card_mac))
+                    })
                 })
-            })
-            .await
-            .ok()
-            .flatten()
+                .await
+                .ok()
+                .flatten()
+            }
         };
+        let connect =
+            || connect_a2dp_then_find(|| connect_a2dp_profile(&mac), read, tokio::time::sleep);
         let write =
             |index, profile: String| blocking(move || set_card_profile_sync(index, &profile));
         let preferred = crate::utils::load_preferred_codec();
-        self.apply_a2dp_hold_with(hold, &cached, preferred, read, write, || {
+        self.apply_a2dp_hold_with(hold, &cached, preferred, read, connect, write, || {
             get_sink_name_by_mac(&mac)
         })
         .await;
     }
 
-    /// `apply_a2dp_hold` with the card read, the profile write and the sink
-    /// lookup injected.
-    async fn apply_a2dp_hold_with<R, RFut, W, WFut, S, SFut>(
+    /// `apply_a2dp_hold` with the card read, the A2DP profile connect (with
+    /// its card re-read), the profile write and the sink lookup injected.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_a2dp_hold_with<R, RFut, K, KFut, W, WFut, S, SFut>(
         &self,
         hold: bool,
         cached: &str,
         preferred: crate::utils::PreferredCodec,
         read: R,
+        connect: K,
         write: W,
         sink: S,
     ) where
         R: FnOnce() -> RFut,
         RFut: Future<Output = Option<pulse::Card>>,
+        K: FnOnce() -> KFut,
+        KFut: Future<Output = Option<pulse::Card>>,
         W: FnOnce(u32, String) -> WFut,
         WFut: Future<Output = bool>,
         S: FnMut() -> SFut,
@@ -1661,9 +1784,17 @@ impl MediaController {
     {
         // Held from the read through the write, not during the sink wait.
         let write_lock = self.profile_write.lock().await;
-        let Some(card) = read().await else {
-            debug!("A2DP hold({hold}): no AirPods card");
-            return;
+        let card = match read().await {
+            Some(card) => card,
+            // A release with no card: BlueZ never connected A2DP (#310).
+            None if !hold && !self.a2dp_held.load(Ordering::SeqCst) => {
+                let Some(card) = connect().await else { return };
+                card
+            }
+            None => {
+                debug!("A2DP hold({hold}): no AirPods card");
+                return;
+            }
         };
         let active = card.active_profile.as_deref();
         let profile = if hold {
@@ -3244,7 +3375,7 @@ mod tests {
             CARD_LOOKUP_INTERVAL,
             || {
                 calls.set(calls.get() + 1);
-                async { None }
+                async { None::<u32> }
             },
             |interval| {
                 sleeps.set(sleeps.get() + 1);
@@ -3292,21 +3423,25 @@ mod tests {
         let attempts = MediaController::A2DP_ENUMERATION_ATTEMPTS;
         let interval = MediaController::A2DP_ENUMERATION_INTERVAL;
         let initial_lookup = CARD_LOOKUP_INTERVAL * (CARD_LOOKUP_ATTEMPTS - 1);
+        let connect_lookup = CARD_LOOKUP_INTERVAL * (A2DP_CONNECT_LOOKUP_ATTEMPTS - 1);
         let per_check_lookup = CARD_LOOKUP_INTERVAL * (CARD_LOOKUP_ATTEMPTS_PER_CHECK - 1);
         let wait = interval * (attempts - 1) + per_check_lookup * attempts;
-        let expected = initial_lookup + wait + WIREPLUMBER_SETTLE + wait;
+        let expected = initial_lookup + connect_lookup + wait + WIREPLUMBER_SETTLE + wait;
         assert_eq!(a2dp_activation_worst_case_wait(), expected);
         assert!(expected <= A2DP_RECOVERY_BOUND, "{expected:?} > 15 s");
-        // Still within the bound when the initial lookup is charged its
-        // nominal CARD_LOOKUP_ATTEMPTS × CARD_LOOKUP_INTERVAL (~3 s).
-        let nominal =
-            CARD_LOOKUP_INTERVAL * CARD_LOOKUP_ATTEMPTS + wait + WIREPLUMBER_SETTLE + wait;
+        assert!(expected + A2DP_CONNECT_TIMEOUT <= A2DP_ACTIVATION_DEADLINE);
+        // Still within the bound when both lookups are charged their nominal
+        // attempts × CARD_LOOKUP_INTERVAL (~3 s and 2 s).
+        let nominal = CARD_LOOKUP_INTERVAL * (CARD_LOOKUP_ATTEMPTS + A2DP_CONNECT_LOOKUP_ATTEMPTS)
+            + wait
+            + WIREPLUMBER_SETTLE
+            + wait;
         assert!(nominal <= A2DP_RECOVERY_BOUND, "{nominal:?} > 15 s");
 
         // Replay the production sequence on a virtual clock: the initial full
-        // lookup finds the card on its last try, then the card is missing at
-        // every enumeration check (single-shot re-lookups) and the restart
-        // succeeds.
+        // lookup misses, the A2DP profile connect succeeds and its re-lookup
+        // finds the card on its last try, then the card is missing at every
+        // enumeration check (single-shot re-lookups) and the restart succeeds.
         let clock = std::cell::Cell::new(Duration::ZERO);
         let lookups = std::cell::Cell::new(0u32);
         let tick = |d: Duration| {
@@ -3318,13 +3453,24 @@ mod tests {
             CARD_LOOKUP_INTERVAL,
             || {
                 lookups.set(lookups.get() + 1);
-                let n = lookups.get();
-                async move { (n == CARD_LOOKUP_ATTEMPTS).then_some(3) }
+                async { None::<u32> }
             },
             tick,
         )
         .await;
-        assert_eq!(initial, Some(3));
+        assert_eq!((initial, lookups.get()), (None, CARD_LOOKUP_ATTEMPTS));
+        lookups.set(0);
+        let found = connect_a2dp_then_find(
+            || async { Ok(()) },
+            || {
+                lookups.set(lookups.get() + 1);
+                let n = lookups.get();
+                async move { (n == A2DP_CONNECT_LOOKUP_ATTEMPTS).then_some(3) }
+            },
+            tick,
+        )
+        .await;
+        assert_eq!(found, Some(3));
 
         let controller = MediaController::new(String::new(), String::new());
         let checks = std::cell::Cell::new(0u32);
@@ -3482,6 +3628,7 @@ mod tests {
                         steps.step("lookup", slow_query(), None)
                     })
                 },
+                || steps.step("connect", Duration::ZERO, None),
                 || steps.step("recover", Duration::ZERO, true),
                 |_| steps.step("choose", Duration::ZERO, ProfileChoice::Unavailable),
                 |_, _| steps.step("set", Duration::ZERO, true),
@@ -3518,6 +3665,7 @@ mod tests {
                         steps.step("lookup", Duration::from_millis(3750), None)
                     })
                 },
+                || steps.step("connect", Duration::ZERO, None),
                 || steps.step("recover", Duration::ZERO, true),
                 |_| steps.step("choose", Duration::ZERO, ProfileChoice::Unavailable),
                 |_, _| steps.step("set", Duration::ZERO, true),
@@ -3545,6 +3693,7 @@ mod tests {
             .activate_a2dp_profile_with(
                 deadline,
                 || steps.step("lookup", slow_query(), Some(10)),
+                || steps.step("connect", Duration::ZERO, None),
                 || {
                     controller.recover_a2dp_availability_by(
                         deadline,
@@ -3644,6 +3793,7 @@ mod tests {
                 .activate_a2dp_profile_with(
                     deadline,
                     || steps.step("lookup", Duration::ZERO, Some(3)),
+                    || steps.step("connect", Duration::ZERO, None),
                     || {
                         controller.recover_a2dp_availability_by(
                             deadline,
@@ -4044,6 +4194,7 @@ mod tests {
             .activate_a2dp_profile_with(
                 deadline,
                 || async { Some(3) },
+                || async { None },
                 || async { true },
                 |_| {
                     during(&controller);
@@ -4098,7 +4249,15 @@ mod tests {
         };
         let sink = || async { Some("bluez_output.AA".to_string()) };
         controller
-            .apply_a2dp_hold_with(hold, "", PreferredCodec::Aac, read, write, sink)
+            .apply_a2dp_hold_with(
+                hold,
+                "",
+                PreferredCodec::Aac,
+                read,
+                || async { None },
+                write,
+                sink,
+            )
             .await;
         sets.into_inner()
     }
@@ -4147,6 +4306,7 @@ mod tests {
                 "",
                 PreferredCodec::Aac,
                 || async { Some(card) },
+                || async { None },
                 write,
                 sink,
             )
@@ -4193,6 +4353,7 @@ mod tests {
         let activation = controller.activate_a2dp_profile_with(
             Instant::now() + A2DP_ACTIVATION_DEADLINE,
             || async { Some(3) },
+            || async { None },
             || async { true },
             |_| async { ProfileChoice::Activate("a2dp-sink".to_string()) },
             // Like `spawn_blocking`: dropping the wait doesn't stop the write.
@@ -4224,6 +4385,7 @@ mod tests {
                 "",
                 PreferredCodec::Aac,
                 read,
+                || async { None },
                 |_, profile| async { set_card(profile) },
                 || async { None },
             );
@@ -4261,5 +4423,287 @@ mod tests {
     async fn hold_wins_over_activation_write_past_the_deadline() {
         let past = A2DP_ACTIVATION_DEADLINE + Duration::from_secs(1);
         assert_eq!(hold_during_activation_write(past).await, hold_won());
+    }
+
+    /// An activation whose initial lookup runs `during` and finds `first`,
+    /// whose BlueZ connect answers `connected` after `took`, whose re-lookups
+    /// find `again` and whose `choose` asks for `a2dp-sink`. Returns the
+    /// outcome, the steps and the writes.
+    async fn activate_connecting(
+        controller: &MediaController,
+        first: Option<u32>,
+        (took, connected): (Duration, Result<(), String>),
+        again: Option<u32>,
+        during: impl FnOnce(&MediaController),
+    ) -> (Result<(), DeadlineExceeded>, Steps, Vec<(u32, String)>) {
+        let steps = Steps::default();
+        let sets = std::cell::RefCell::new(Vec::new());
+        let outcome = controller
+            .activate_a2dp_profile_with(
+                Instant::now() + A2DP_ACTIVATION_DEADLINE,
+                || {
+                    during(controller);
+                    steps.step("lookup", Duration::ZERO, first)
+                },
+                || {
+                    connect_a2dp_then_find(
+                        || steps.step("connect", took, connected),
+                        || steps.step("find", Duration::ZERO, again),
+                        tokio::time::sleep,
+                    )
+                },
+                || steps.step("recover", Duration::ZERO, true),
+                |_| {
+                    let choice = ProfileChoice::Activate("a2dp-sink".to_string());
+                    steps.step("choose", Duration::ZERO, choice)
+                },
+                |idx, profile| {
+                    sets.borrow_mut().push((idx, profile));
+                    steps.step("set", Duration::ZERO, true)
+                },
+            )
+            .await;
+        (outcome, steps, sets.into_inner())
+    }
+
+    /// No recover, choose or set step started.
+    fn activation_stopped(steps: &Steps) -> bool {
+        ["recover", "choose", "set"]
+            .iter()
+            .all(|step| steps.started(step) == 0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_without_card_connects_a2dp_profile_then_activates() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (outcome, steps, sets) =
+            activate_connecting(&controller, None, (Duration::ZERO, Ok(())), Some(7), |_| {}).await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!((steps.started("connect"), steps.started("find")), (1, 1));
+        for step in ["recover", "choose", "set"] {
+            assert_eq!(steps.started(step), 1, "{step}");
+        }
+        assert_eq!(sets, [(7, "a2dp-sink".to_string())]);
+        assert_eq!(controller.state.lock().await.device_index, Some(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_with_card_never_connects() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (outcome, steps, sets) = activate_connecting(
+            &controller,
+            Some(3),
+            (Duration::ZERO, Ok(())),
+            Some(7),
+            |_| {},
+        )
+        .await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!((steps.started("connect"), steps.started("find")), (0, 0));
+        assert_eq!(sets, [(3, "a2dp-sink".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_connect_profile_failure_gives_up_once() {
+        let controller = MediaController::new(String::new(), String::new());
+        let failed = Err("org.bluez.Error.Failed".to_string());
+        let start = Instant::now();
+        let (outcome, steps, sets) =
+            activate_connecting(&controller, None, (Duration::ZERO, failed), Some(7), |_| {}).await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!((steps.started("connect"), steps.started("find")), (1, 0));
+        assert!(activation_stopped(&steps));
+        assert!(sets.is_empty());
+        assert_eq!(controller.state.lock().await.device_index, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_connect_profile_timeout_is_bounded() {
+        let controller = MediaController::new(String::new(), String::new());
+        let never = (Duration::from_secs(3600), Ok(()));
+        let start = Instant::now();
+        let (outcome, steps, sets) =
+            activate_connecting(&controller, None, never, Some(7), |_| {}).await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(start.elapsed(), A2DP_CONNECT_TIMEOUT);
+        assert!(start.elapsed() <= A2DP_ACTIVATION_DEADLINE);
+        assert_eq!((steps.started("connect"), steps.started("find")), (1, 0));
+        assert!(activation_stopped(&steps));
+        assert!(sets.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_connect_then_card_still_missing_gives_up() {
+        let controller = MediaController::new(String::new(), String::new());
+        let start = Instant::now();
+        let (outcome, steps, sets) =
+            activate_connecting(&controller, None, (Duration::ZERO, Ok(())), None, |_| {}).await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            start.elapsed(),
+            card_lookup_max_wait(A2DP_CONNECT_LOOKUP_ATTEMPTS)
+        );
+        assert_eq!(
+            (steps.started("connect"), steps.started("find")),
+            (1, A2DP_CONNECT_LOOKUP_ATTEMPTS as usize)
+        );
+        assert!(activation_stopped(&steps));
+        assert!(sets.is_empty());
+        assert_eq!(controller.state.lock().await.device_index, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_while_held_never_connects_a2dp_profile() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let (outcome, steps, sets) =
+            activate_connecting(&controller, None, (Duration::ZERO, Ok(())), Some(7), |_| {}).await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!((steps.started("lookup"), steps.started("connect")), (0, 0));
+        assert!(sets.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_hold_set_during_lookup_skips_connect() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (outcome, steps, sets) =
+            activate_connecting(&controller, None, (Duration::ZERO, Ok(())), Some(7), |c| {
+                c.set_a2dp_held(true)
+            })
+            .await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!((steps.started("lookup"), steps.started("connect")), (1, 0));
+        assert!(activation_stopped(&steps));
+        assert!(sets.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_connect_waits_for_profile_write() {
+        let controller = MediaController::new(String::new(), String::new());
+        let held_for = Duration::from_secs(1);
+        let start = Instant::now();
+        let write = controller.profile_write.lock().await;
+        let release = async move {
+            tokio::time::sleep(held_for).await;
+            drop(write);
+        };
+        let activation =
+            activate_connecting(&controller, None, (Duration::ZERO, Ok(())), Some(7), |_| {});
+        let ((outcome, steps, sets), ()) = tokio::join!(activation, release);
+        assert_eq!(outcome, Ok(()));
+        let connects: Vec<Instant> = steps
+            .0
+            .borrow()
+            .iter()
+            .filter(|(n, _)| *n == "connect")
+            .map(|(_, t)| *t)
+            .collect();
+        assert_eq!(connects, [start + held_for]);
+        assert_eq!(sets, [(7, "a2dp-sink".to_string())]);
+    }
+
+    fn card_on(active: &str) -> pulse::Card {
+        pulse::Card {
+            index: 3,
+            name: None,
+            device_string: None,
+            profiles: profiles(&["off", "a2dp-sink"]),
+            active_profile: Some(active.into()),
+        }
+    }
+
+    /// A `hold` with the flag at `held`, whose card read finds a card on
+    /// `found` and whose A2DP profile connect re-reads one on `again`; the
+    /// sink is there. Returns the connects and the writes.
+    async fn hold_connecting(
+        hold: bool,
+        held: bool,
+        found: Option<&str>,
+        again: Option<&str>,
+    ) -> (usize, Vec<String>) {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(held);
+        let steps = Steps::default();
+        let sets = std::cell::RefCell::new(Vec::new());
+        controller
+            .apply_a2dp_hold_with(
+                hold,
+                "",
+                PreferredCodec::Aac,
+                || async { found.map(card_on) },
+                || {
+                    connect_a2dp_then_find(
+                        || steps.step("connect", Duration::ZERO, Ok(())),
+                        || async { again.map(card_on) },
+                        tokio::time::sleep,
+                    )
+                },
+                |_, profile| {
+                    sets.borrow_mut().push(profile);
+                    async { true }
+                },
+                || async { Some("bluez_output.AA".to_string()) },
+            )
+            .await;
+        (steps.started("connect"), sets.into_inner())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_release_without_card_connects_a2dp_profile() {
+        let none = Vec::<String>::new();
+        // The new card is off: the A2DP choice is written.
+        assert_eq!(
+            hold_connecting(false, false, None, Some("off")).await,
+            (1, vec!["a2dp-sink".to_string()])
+        );
+        // Already on A2DP: no write, the sink wait as today.
+        assert_eq!(
+            hold_connecting(false, false, None, Some("a2dp-sink")).await,
+            (1, none.clone())
+        );
+        // Still no card after the connect.
+        assert_eq!(hold_connecting(false, false, None, None).await, (1, none));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_release_with_card_unchanged() {
+        assert_eq!(
+            hold_connecting(false, false, Some("off"), None).await,
+            (0, vec!["a2dp-sink".to_string()])
+        );
+        assert_eq!(
+            hold_connecting(false, false, Some("a2dp-sink"), None).await,
+            (0, vec![])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_on_without_card_never_connects() {
+        let off = Some("off");
+        assert_eq!(hold_connecting(true, true, None, off).await, (0, vec![]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_release_superseded_never_connects() {
+        let off = Some("off");
+        assert_eq!(hold_connecting(false, true, None, off).await, (0, vec![]));
+    }
+
+    #[tokio::test]
+    async fn connect_a2dp_profile_skips_disconnected_device() {
+        for connected in [false, true] {
+            let calls = std::cell::Cell::new(0);
+            let result = connect_if_connected(
+                || async move { connected },
+                || {
+                    calls.set(calls.get() + 1);
+                    async { Ok(()) }
+                },
+            )
+            .await;
+            assert_eq!(calls.get(), usize::from(connected));
+            assert_eq!(result.is_ok(), connected);
+        }
     }
 }
