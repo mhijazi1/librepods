@@ -549,8 +549,8 @@ struct HandoffTask {
     released: Released,
 }
 
-/// A stopped task's A2DP hold release (#294): its settle, sent by the task's
-/// `Shell` as it drops; dropped unsent when the task held nothing.
+/// A stopped task's queued sink work (#294, #311): its settle, sent by the
+/// task's `Shell` as it drops.
 type Released = oneshot::Receiver<BoxFuture<'static, ()>>;
 
 /// Stopped tasks' releases, each bounded by `SHUTDOWN_RELEASE_WAIT` from its
@@ -660,8 +660,10 @@ pub(crate) fn handoff_task(mac: &str) -> Option<AbortHandle> {
         .map(|task| task.handle.clone())
 }
 
-/// Removes a finished task's registry entry, unless a replacement already
-/// took the MAC. Runs on return, abort and panic alike.
+/// Ends a finished task's registry entry, unless a replacement already
+/// took the MAC, as `Registry::stop` does, so a task that ended by itself
+/// (a Disconnected or Quit step) still hands its release's settle on. Runs
+/// on return, abort and panic alike.
 struct Unregister {
     registry: &'static StdMutex<Registry>,
     mac: String,
@@ -676,7 +678,7 @@ impl Drop for Unregister {
             .get(&self.mac)
             .is_some_and(|task| task.id == self.id)
         {
-            registry.tasks.remove(&self.mac);
+            registry.stop(&self.mac);
         }
     }
 }
@@ -753,17 +755,18 @@ struct Shell {
 /// after its last poll, so no hold of its own can follow this release.
 impl Drop for Shell {
     fn drop(&mut self) {
-        if self.held {
-            self.media.hold_a2dp(false);
-        }
-        // After the release, so the default never stays the park sink.
+        // Ahead of the release, which may wait seconds for the AirPods sink,
+        // so the default never stays the park sink (#311).
         if self.parked {
             self.media
                 .route_default_sink(SinkEvent::Unpark(UnparkTo::Local));
         }
-        if (self.held || self.parked)
-            && let Some(released) = self.released.take()
-        {
+        if self.held {
+            self.media.hold_a2dp(false);
+        }
+        // Whatever this task queued, a natural end's release and unpark
+        // included: the registry waits for it.
+        if let Some(released) = self.released.take() {
             let _ = released.send(self.media.hold_settled());
         }
     }
@@ -888,6 +891,7 @@ impl Shell {
 /// when the task should end.
 async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     let case_closed = core.case_closed();
+    core.set_baseline_playing(shell.play_rx.streams().baseline);
     let (now, commands) = shell.play_rx.handle(|now| core.handle(now, input));
     if commands.contains(&Command::DropSession) {
         // A case close also drops as Remote: no reconnect for it (#307).
@@ -897,17 +901,25 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     for line in core.take_lines() {
         shell.log(&line);
     }
-    let end = shell.execute(now, commands).await;
-    // After the step's commands, on the same queue, so a park follows its
-    // hold and an unpark follows the ACK's release and route (#311).
+    // On the commands' queue (#311): an unpark to the local sink ahead of
+    // the step's hold release, which may wait seconds for the AirPods sink;
+    // a park after its hold, an unpark to the AirPods after the ACK's route.
     let park = core.park();
-    if (park == Park::Parked) != shell.parked {
+    let route = ((park == Park::Parked) != shell.parked).then(|| {
         shell.parked = park == Park::Parked;
-        shell.media.route_default_sink(match park {
+        match park {
             Park::Parked => SinkEvent::Park,
             Park::AirPods => SinkEvent::Unpark(UnparkTo::AirPods),
             Park::Local | Park::FallenBack => SinkEvent::Unpark(UnparkTo::Local),
-        });
+        }
+    });
+    let local = SinkEvent::Unpark(UnparkTo::Local);
+    if route == Some(local) {
+        shell.media.route_default_sink(local);
+    }
+    let end = shell.execute(now, commands).await;
+    if let Some(route) = route.filter(|&route| route != local) {
+        shell.media.route_default_sink(route);
     }
     end
 }
@@ -1478,6 +1490,8 @@ mod tests {
         encode_media_information_call,
     };
     use crate::call_detect::{StreamDirection, StreamProps};
+    use crate::default_sink::{DefaultSinkIo, PARK_SINK, ParkWatch};
+    use crate::media_controller::HOLD_RELEASE_WAIT;
     use crate::stream_monitor::AllAudible;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -3481,6 +3495,7 @@ mod tests {
         let streams = watch::channel((
             PlaybackState {
                 counted: false,
+                baseline: false,
                 live: live.map(|pids| pids.iter().copied().collect()),
             },
             Vec::new(),
@@ -3657,6 +3672,7 @@ mod tests {
                 }),
                 PlaybackState {
                     counted: false,
+                    baseline: false,
                     live: live.map(|pids| pids.iter().copied().collect()),
                 },
             )
@@ -5168,6 +5184,7 @@ mod tests {
                 let owned = stream_monitor::stream_owners(streams, |_| None);
                 let state = PlaybackState {
                     counted: self.streams_playing,
+                    baseline: false,
                     live: (!self.monitor_dead).then(|| owned.values().flatten().copied().collect()),
                 };
                 let started = self.tracker.started(&owned);
@@ -5981,6 +5998,7 @@ mod tests {
             let sample = |live| {
                 let state = PlaybackState {
                     counted: false,
+                    baseline: false,
                     live,
                 };
                 (state, Vec::new())
@@ -6017,6 +6035,7 @@ mod tests {
             let sample = |live| {
                 let state = PlaybackState {
                     counted: false,
+                    baseline: false,
                     live,
                 };
                 (state, Vec::new())
@@ -6145,6 +6164,7 @@ mod tests {
                 ),
                 PlaybackState {
                     counted: false,
+                    baseline: false,
                     live: Some(live),
                 },
             )
@@ -6574,7 +6594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn park_task_stop_while_parked_unparks_after_the_release() {
+    async fn park_task_stop_while_parked_unparks_before_the_release() {
         let mac = "5A:00:00:00:11:03";
         let (manager, mut rx, _tx) = no_source_session().await;
         let h = park_task(mac, &mut rx, &manager).await;
@@ -6583,7 +6603,7 @@ mod tests {
         stop_handoff_task(mac);
         let events = after_stop(&h, task).await;
         assert!(
-            events.ends_with(&[SinkEvent::Hold(false), SinkEvent::Unpark(UnparkTo::Local)]),
+            events.ends_with(&[SinkEvent::Unpark(UnparkTo::Local), SinkEvent::Hold(false)]),
             "{events:?}"
         );
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
@@ -6591,7 +6611,10 @@ mod tests {
 
     /// #88 on the park sink: a worthy stream with no MPRIS player, which
     /// follows the default to the park sink, passes the peak gate and gets
-    /// its 201 take request after the minimum.
+    /// its 201 take request after the minimum. The fake `StreamProps` carry
+    /// no sink: production `peak_stream` measures the monitor of whatever
+    /// sink the stream plays to, and mo's Wine game check covers the real
+    /// null sink.
     #[tokio::test]
     async fn park_peak_stream_on_the_park_sink_takes() {
         let mac = "5A:00:00:00:11:04";
@@ -6615,6 +6638,248 @@ mod tests {
             "{:?}",
             h.sink_events()
         );
+        stop_handoff_task(mac);
+    }
+
+    /// The default sink the park replaces in `ParkSinks`.
+    const LOCAL_SINK: &str = "alsa_output.local";
+
+    /// A sound server for a real `DefaultSinkRouter` (#311): the local sink
+    /// is default and the AirPods sink never shows up, so once `stuck` a
+    /// hold release waits its full `HOLD_RELEASE_WAIT`, or until `found`.
+    #[derive(Clone)]
+    struct ParkSinks {
+        calls: Arc<StdMutex<Vec<String>>>,
+        default: Arc<StdMutex<String>>,
+        stuck: Arc<AtomicBool>,
+        found: Arc<Notify>,
+    }
+
+    impl ParkSinks {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn default(&self) -> String {
+            self.default.lock().unwrap().clone()
+        }
+
+        fn call(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl DefaultSinkIo for ParkSinks {
+        fn current_default(&self) -> BoxFuture<'static, Option<String>> {
+            Box::pin(std::future::ready(Some(self.default())))
+        }
+
+        fn airpods_sink(&self) -> BoxFuture<'static, Option<String>> {
+            Box::pin(std::future::ready(None))
+        }
+
+        fn set_default(&self, name: String) -> BoxFuture<'static, bool> {
+            self.call(format!("set {name}"));
+            *self.default.lock().unwrap() = name;
+            Box::pin(std::future::ready(true))
+        }
+
+        fn hold_a2dp(&self, hold: bool) -> BoxFuture<'static, ()> {
+            self.call(format!("Hold({hold})"));
+            let stuck = !hold && self.stuck.load(Ordering::SeqCst);
+            let found = self.found.clone();
+            Box::pin(async move {
+                if stuck {
+                    let _ = tokio::time::timeout(HOLD_RELEASE_WAIT, found.notified()).await;
+                }
+            })
+        }
+
+        fn load_park_sink(&self) -> BoxFuture<'static, Option<u32>> {
+            self.call("load".to_string());
+            Box::pin(std::future::ready(Some(7)))
+        }
+
+        fn unload_module(&self, module: u32) -> BoxFuture<'static, bool> {
+            self.call(format!("unload {module}"));
+            Box::pin(std::future::ready(true))
+        }
+
+        fn park_module(&self) -> BoxFuture<'static, Option<u32>> {
+            Box::pin(std::future::ready(None))
+        }
+
+        fn watch_park(&self, local: String) -> ParkWatch {
+            let none = || Err::<crate::pulse::ParkConnection, _>(io::Error::other("test"));
+            ParkWatch::spawn(none, local)
+        }
+    }
+
+    /// `FakeMedia` whose routes and holds also go to a real router.
+    struct RouterMedia {
+        fake: FakeMedia,
+        sinks: DefaultSinkRouter,
+    }
+
+    impl MediaActions for RouterMedia {
+        fn pause(&self, streams: PlaybackState) -> BoxFuture<'static, bool> {
+            self.fake.pause(streams)
+        }
+
+        fn activate_a2dp(&self) -> BoxFuture<'static, ()> {
+            self.fake.activate_a2dp()
+        }
+
+        fn resume_a2dp(
+            &self,
+            streams: PlaybackState,
+            until: Instant,
+            cancel: oneshot::Receiver<()>,
+        ) -> BoxFuture<'static, ()> {
+            self.fake.resume_a2dp(streams, until, cancel)
+        }
+
+        fn route_default_sink(&self, event: SinkEvent) {
+            self.fake.route_default_sink(event);
+            self.sinks.route(event);
+        }
+
+        fn hold_a2dp(&self, hold: bool) {
+            self.fake.hold_a2dp(hold);
+            self.sinks.route(SinkEvent::Hold(hold));
+        }
+
+        fn hold_settled(&self) -> BoxFuture<'static, ()> {
+            Box::pin(self.sinks.settled())
+        }
+    }
+
+    /// `park_task` on a real router over `ParkSinks`, parked by another
+    /// host's request.
+    async fn router_parked_task(
+        mac: &str,
+        rx: &mut mpsc::Receiver<Vec<u8>>,
+        manager: &AACPManager,
+    ) -> (Harness, ParkSinks) {
+        let sinks = ParkSinks {
+            calls: Arc::default(),
+            default: Arc::new(StdMutex::new(LOCAL_SINK.to_string())),
+            stuck: Arc::default(),
+            found: Arc::default(),
+        };
+        let records = Arc::new(Records::default());
+        records.parks.store(true, Ordering::SeqCst);
+        let fake = FakeMedia {
+            records: records.clone(),
+            mac: mac.to_string(),
+        };
+        let media: Arc<dyn MediaActions> = Arc::new(RouterMedia {
+            fake,
+            sinks: DefaultSinkRouter::spawn(sinks.clone()),
+        });
+        let controller = MediaController::new(mac.to_string(), LOCAL.to_string());
+        let media = (Arc::new(Mutex::new(controller)), media);
+        let handler = Arc::new(DeviceHandler::default());
+        let h = Harness::start_wired(
+            SwitchingMode::Handoff,
+            mac,
+            manager,
+            media,
+            records,
+            handler,
+        )
+        .await;
+        expect_startup(&h, rx).await;
+        park_after_remote_request(&h, rx).await;
+        wait_until("the park sink", || sinks.default() == PARK_SINK).await;
+        sinks.stuck.store(true, Ordering::SeqCst);
+        (h, sinks)
+    }
+
+    /// The exit path while parked: the unpark runs ahead of the release,
+    /// which outlasts `SHUTDOWN_RELEASE_WAIT`.
+    #[tokio::test(start_paused = true)]
+    async fn park_shutdown_unparks_before_a_slow_release() {
+        let mac = "5A:00:00:00:11:05";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let (_h, sinks) = router_parked_task(mac, &mut rx, &manager).await;
+        let registry = private_registry(&[mac]);
+        let stopped = tokio::time::Instant::now();
+        shutdown(registry).await;
+        assert!(stopped.elapsed() <= SHUTDOWN_RELEASE_WAIT);
+        let calls = sinks.calls();
+        assert!(
+            calls.ends_with(&[
+                format!("set {LOCAL_SINK}"),
+                "unload 7".to_string(),
+                "Hold(false)".to_string()
+            ]),
+            "{calls:?}"
+        );
+        assert_eq!(sinks.default(), LOCAL_SINK);
+    }
+
+    /// A task that ends by itself while parked hands its unpark and release
+    /// on: a replacement for the MAC waits for them.
+    #[tokio::test]
+    async fn park_disconnected_while_parked_replacement_waits_for_the_unpark() {
+        let mac = "5A:00:00:00:11:06";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let (h, sinks) = router_parked_task(mac, &mut rx, &manager).await;
+        let task = handoff_task(mac).expect("task");
+        manager.disconnect().await;
+        wait_until("the task to end", || task.is_finished()).await;
+        let events = h.sink_events();
+        assert!(
+            events.ends_with(&[SinkEvent::Unpark(UnparkTo::Local), SinkEvent::Hold(false)]),
+            "{events:?}"
+        );
+
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let replacement = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        wait_until("the unload", || sinks.calls().contains(&"unload 7".into())).await;
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(replacement.sink_events(), []);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sinks.default(), LOCAL_SINK);
+
+        sinks.found.notify_one();
+        expect_startup(&replacement, &mut rx).await;
+        assert_eq!(replacement.sink_events(), [SinkEvent::Hold(false)]);
+        stop_handoff_task(mac);
+    }
+
+    /// A non-MPRIS stream playing since the baseline never takes (#90), so
+    /// it keeps the hold from parking; once it corks, the park follows.
+    #[tokio::test]
+    async fn park_baseline_stream_holds_off_the_park_until_it_corks() {
+        let mac = "5A:00:00:00:11:07";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let streams = LiveStreams::default();
+        streams.set(vec![music(52)]);
+        let h =
+            Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
+        h.records.parks.store(true, Ordering::SeqCst);
+        expect_startup(&h, &mut rx).await;
+        streams.settle().await;
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        h.emit_queued(owns(0)).await;
+        use SinkEvent::{Hold, Park};
+        wait_until("the hold", || h.sink_events().contains(&Hold(true))).await;
+
+        // Playing past twice the minimum: no park, no take.
+        tokio::time::sleep(STREAM_TEST_MIN * 2).await;
+        assert_eq!(h.sink_events(), [Hold(false), Hold(true)]);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+        streams.set(vec![StreamProps {
+            corked: true,
+            ..music(52)
+        }]);
+        wait_until("the park", || h.sink_events().ends_with(&[Park])).await;
+        assert_eq!(h.sink_events(), [Hold(false), Hold(true), Park]);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         stop_handoff_task(mac);
     }
 }

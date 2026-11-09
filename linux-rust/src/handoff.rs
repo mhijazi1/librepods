@@ -374,6 +374,9 @@ pub(crate) struct Handoff {
     park: Park,
     /// While parked: `PARK_TIMEOUT` after the last play edge.
     park_until: Option<Instant>,
+    /// A worthy stream of the stream monitor's baseline is live (#311):
+    /// playing for the park, never for a take.
+    baseline_playing: bool,
     /// Linux's audio category in the last playback sample since the
     /// baseline (#272). A local fact: a reset keeps it.
     category: u32,
@@ -441,6 +444,7 @@ impl Handoff {
             park_sink: false,
             park: Park::Local,
             park_until: None,
+            baseline_playing: false,
             category: AUDIO_CATEGORY_IDLE,
             relays: HashMap::new(),
             category_relay: false,
@@ -475,6 +479,13 @@ impl Handoff {
     /// `with_park_sink`.
     pub(crate) fn park(&self) -> Park {
         self.park
+    }
+
+    /// Whether a baseline stream is live (#311), which the takeover signal
+    /// leaves out (#90): the stream monitor's state, which the shell sets
+    /// before each step.
+    pub(crate) fn set_baseline_playing(&mut self, playing: bool) {
+        self.baseline_playing = playing;
     }
 
     /// Route the default sink to the AirPods on a take's ACK and away on
@@ -576,13 +587,20 @@ impl Handoff {
 
     /// Park once the hold is on, Linux plays nothing and has no call; end a
     /// park or a fallback when the hold ends (#311). A take's ACK has
-    /// already unparked to the AirPods.
+    /// already unparked to the AirPods. A baseline stream, which can't take,
+    /// falls a park back to the local output.
     fn update_park(&mut self) {
         let held = self.held == Some(true);
         let idle = self.category <= AUDIO_CATEGORY_IDLE && !self.local_call;
         self.park = match self.park {
             Park::Parked | Park::FallenBack if !held => Park::Local,
-            Park::Local | Park::AirPods if self.park_sink && held && idle => {
+            Park::Parked if self.baseline_playing => {
+                self.say("PARK a stream playing since the baseline; new playback goes to the local output");
+                Park::FallenBack
+            }
+            Park::Local | Park::AirPods
+                if self.park_sink && held && idle && !self.baseline_playing =>
+            {
                 self.say("PARK new playback waits on the silent park sink while another host owns");
                 Park::Parked
             }
@@ -6616,5 +6634,24 @@ mod tests {
         };
         assert_eq!(p.feed(200, only_linux), [HoldA2dp(false)]);
         assert_eq!(p.core.park(), Park::Local);
+    }
+
+    #[test]
+    fn park_baseline_stream_falls_back_without_a_take() {
+        let mut p = parked();
+        p.core.set_baseline_playing(true);
+        assert_eq!(p.play(1000, false), []);
+        assert_eq!(p.core.park(), Park::FallenBack);
+    }
+
+    #[test]
+    fn park_baseline_stream_keeps_the_hold_from_parking() {
+        let mut p = park_ready();
+        p.core.set_baseline_playing(true);
+        assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+        assert_eq!(p.core.park(), Park::Local);
+        p.core.set_baseline_playing(false);
+        assert_eq!(p.play(500, false), []);
+        assert_eq!(p.core.park(), Park::Parked);
     }
 }

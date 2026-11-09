@@ -403,6 +403,9 @@ pub(crate) struct PlaybackState {
     /// listing (`stream_owners`); None before the first one (#302) and
     /// once the source is dead (`PlaybackSource::dead`, #318).
     pub(crate) live: Option<HashSet<u32>>,
+    /// A worthy stream of the baseline (`PlaybackTracker`, which never
+    /// counts it) is live: playing for the park sink (#311).
+    pub(crate) baseline: bool,
 }
 
 impl PlaybackState {
@@ -562,6 +565,7 @@ where
                         PlaybackState {
                             counted: tracker.playing,
                             live: (!source.dead()).then_some(live),
+                            baseline: tracker.preexisting.as_ref().is_some_and(|b| !b.is_empty()),
                         },
                         tracker.started(&owners),
                     );
@@ -2104,6 +2108,7 @@ mod tests {
             rx.borrow().0,
             PlaybackState {
                 counted: false,
+                baseline: true,
                 live: owned
             }
         );
@@ -2120,6 +2125,7 @@ mod tests {
         .expect("corked stream not live")
         .expect("monitor running");
         assert!(!rx.borrow().0.counted);
+        assert!(!rx.borrow().0.baseline);
     }
 
     /// `stream` with `PROCESS_ID` set to `pid`.
@@ -2157,6 +2163,7 @@ mod tests {
         let ppid = |pid| ppids.iter().find(|&&(c, _)| c == pid).map(|&(_, p)| p);
         let state = PlaybackState {
             counted: false,
+            baseline: false,
             live: Some(live_stream_pids(&streams, ppid)),
         };
         state.live_or_unknown(owner)
@@ -3018,6 +3025,7 @@ mod tests {
             rx.borrow().0,
             PlaybackState {
                 counted: false,
+                baseline: false,
                 live: None
             }
         );

@@ -205,7 +205,8 @@ async fn apply_park(
             };
             if !io.set_default(PARK_SINK.to_string()).await {
                 warn!("Default sink: Park failed to set {PARK_SINK}");
-                unload_park(io, module, false).await;
+                // A set that timed out may still have been applied.
+                unload_park(io, module, true).await;
                 return None;
             }
             info!("Default sink: Park set {PARK_SINK}, replacing {local:?}");
@@ -407,7 +408,7 @@ pub(crate) struct ParkWatch {
 impl ParkWatch {
     /// Run the event path on the sound server `connect` gives, moving to
     /// the sink named `local`.
-    fn spawn<I: ParkIo>(
+    pub(crate) fn spawn<I: ParkIo>(
         connect: impl FnOnce() -> io::Result<I> + Send + 'static,
         local: String,
     ) -> Self {
@@ -503,10 +504,14 @@ fn watch_events(io: &mut impl ParkIo, local: &str, stopped: &Receiver<()>) {
         local,
         moves: HashMap::new(),
     };
+    let running = || matches!(stopped.try_recv(), Err(TryRecvError::Empty));
+    // A watch stopped while it connected moves nothing.
+    if !running() {
+        return;
+    }
     for input in io.sink_inputs(None) {
         mover.input(io, input);
     }
-    let running = || matches!(stopped.try_recv(), Err(TryRecvError::Empty));
     while running() {
         let events = match io.next(PARK_POLL) {
             Ok(events) => events,
@@ -733,6 +738,9 @@ mod tests {
         default: Arc<Mutex<String>>,
         sets: Arc<Mutex<Vec<String>>>,
         fail: Arc<AtomicBool>,
+        /// Each `set_default` applies but reports a failure, as one that
+        /// timed out (#311).
+        lost_reply: Arc<AtomicBool>,
         /// When set, each `set_default` finishes only on one of its permits.
         gate: Option<Arc<Notify>>,
         /// The AirPods sink is gone (#311).
@@ -749,6 +757,7 @@ mod tests {
                 default: Arc::new(Mutex::new(DAC.to_string())),
                 sets: Arc::default(),
                 fail: Arc::new(AtomicBool::new(fail)),
+                lost_reply: Arc::default(),
                 gate: None,
                 no_airpods: Arc::default(),
                 leftover: None,
@@ -778,6 +787,7 @@ mod tests {
             if ok {
                 *self.default.lock().unwrap() = name;
             }
+            let ok = ok && !self.lost_reply.load(Ordering::SeqCst);
             let gate = self.gate.clone();
             Box::pin(async move {
                 if let Some(gate) = gate {
@@ -1331,6 +1341,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn park_lifecycle_failed_park_set_pins_the_servers_pick() {
+        // The set timed out after the server applied it.
+        let sinks = FakeSinks::new(false);
+        sinks.lost_reply.store(true, Ordering::SeqCst);
+        route_all(&sinks, &[Park]).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, "unload 7", PICK]);
+        assert_eq!(*sinks.default.lock().unwrap(), PICK);
+    }
+
+    #[tokio::test]
     async fn park_lifecycle_startup_unloads_a_leftover() {
         // The leftover was the default: the server's pick is made explicit.
         let sinks = FakeSinks {
@@ -1546,6 +1566,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(sinks.calls(), moved_and_reset("media.role=phone"));
         drop(router);
+    }
+
+    #[test]
+    fn park_event_watch_stopped_before_its_listing_moves_nothing() {
+        let pulse = Arc::<Mutex<FakePulse>>::default();
+        pulse.lock().unwrap().put(event_on(5, PARK_INDEX), 0);
+        let (connect, connected) = std::sync::mpsc::channel::<()>();
+        let io = FakePulseIo(pulse.clone());
+        let ParkWatch { stop, done } = ParkWatch::spawn(
+            move || {
+                let _ = connected.recv();
+                Ok(io)
+            },
+            DAC.to_string(),
+        );
+        // `ParkWatch::stop` gave up while it connected.
+        drop(stop);
+        connect.send(()).unwrap();
+        let ended = done.recv_timeout(Duration::from_secs(3));
+        assert_eq!(ended, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+        assert_eq!(pulse.lock().unwrap().calls, Vec::<String>::new());
     }
 
     #[tokio::test]
