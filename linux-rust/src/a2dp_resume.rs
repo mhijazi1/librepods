@@ -88,6 +88,10 @@ const _: () = assert!(
 const SELF_PAUSE_GUARD: Duration = Duration::from_secs(3);
 /// The most between the starts of the self-pause watch's Paused reads.
 const SELF_PAUSE_READ: Duration = Duration::from_millis(250);
+/// The most each player's PlaybackStatus read for a Paused read takes; a
+/// slower player counts as not Paused, so one hung player can't stall it.
+pub(crate) const PAUSED_STATUS_TIMEOUT: Duration = Duration::from_millis(200);
+const _: () = assert!(PAUSED_STATUS_TIMEOUT.as_millis() <= SELF_PAUSE_READ.as_millis());
 const _: () = assert!(
     SELF_PAUSE_GUARD
         .saturating_add(SELF_PAUSE_READ)
@@ -305,6 +309,18 @@ pub(crate) trait A2dpResumeIo: Send + Sync {
     fn self_pauses(&self) -> usize {
         0
     }
+    /// How many of `self_pauses` have finished. The default (all of them)
+    /// is a test seam for fakes; the production I/O must override it.
+    fn self_pauses_done(&self) -> usize {
+        self.self_pauses()
+    }
+}
+
+/// LibrePods' (started, finished) pause counts. Finished is read first, so
+/// a pause that ends between the reads still shows as in flight.
+fn pause_counts(io: &impl A2dpResumeIo) -> (usize, usize) {
+    let done = io.self_pauses_done();
+    (io.self_pauses(), done)
 }
 
 /// Run the chain on `io` once `routed` resolves (the default sink route
@@ -323,7 +339,7 @@ pub(crate) async fn run(
     routed: impl Future<Output = ()>,
 ) {
     let mut cancel = cancel.shared();
-    let pauses = io.self_pauses();
+    let pauses = pause_counts(&io);
     let routed = async {
         routed.await;
         clock()
@@ -441,20 +457,29 @@ fn clock() -> Instant {
 /// from `routed_at` (one due during a slower read starts right after it),
 /// and each is cut off `SELF_PAUSE_READ` after the guard's end. The Plays
 /// go out in turn beside the reads, so a slow one holds up no read.
-/// `cancel`, or a LibrePods pause since `pauses` was counted (at the take),
-/// ends it with no further Play; both are checked before each Play.
+/// `cancel`, a LibrePods pause in flight at the take or counted since
+/// `pauses` (its (started, finished) counts at the take), or reaching the
+/// `PLAY_EDGE_MARGIN` ends it with no further Play or read; all are checked
+/// before each Play, and all but `cancel` (which ends a read at once) before
+/// each read.
 async fn replay_self_pauses(
     io: &impl A2dpResumeIo,
     replayable: &Mutex<Vec<String>>,
     routed_at: Instant,
     until: Instant,
-    pauses: usize,
+    pauses: (usize, usize),
     cancel: impl Future + Clone + Unpin,
 ) {
     let guard_end = routed_at + SELF_PAUSE_GUARD;
     // A read due by the guard's end may run into the next interval, and see
     // a pause made after the guard.
     let read_end = guard_end + SELF_PAUSE_READ;
+    // LibrePods counts a pause before making it, so the counts are read
+    // after the Paused read that might see it.
+    let cannot_play = || {
+        let (started, done) = pause_counts(io);
+        started != done || (started, done) != pauses || clock() + PLAY_EDGE_MARGIN >= until
+    };
     let (queue, mut queued) = mpsc::unbounded_channel();
     let mut read_cancel = cancel.clone();
     let reads = async move {
@@ -467,7 +492,7 @@ async fn replay_self_pauses(
                 _ = &mut read_cancel => return,
                 read_at = due.tick() => read_at.into_std(),
             };
-            if read_at > guard_end || replayable.lock().unwrap().is_empty() {
+            if read_at > guard_end || replayable.lock().unwrap().is_empty() || cannot_play() {
                 return;
             }
             let paused = tokio::select! {
@@ -495,15 +520,11 @@ async fn replay_self_pauses(
     let plays = async move {
         let mut cancel = cancel;
         while let Some(player) = queued.recv().await {
-            // A Play can be slow: re-check before each. LibrePods counts a
-            // pause before making it, so the count is read after the Paused read.
-            let now = clock();
-            if (&mut cancel).now_or_never().is_some()
-                || io.self_pauses() != pauses
-                || now + PLAY_EDGE_MARGIN >= until
-            {
+            // A Play can be slow: re-check before each.
+            if (&mut cancel).now_or_never().is_some() || cannot_play() {
                 return;
             }
+            let now = clock();
             let ms = (now - routed_at).as_millis();
             info!("A2DP resume: {player} paused itself {ms} ms after the route; Play");
             io.act(Action::Play(player)).await;
@@ -1585,8 +1606,10 @@ mod tests {
     /// ProfileCycle pauses it; a Play plays it again. It leaves MPRIS `gone`
     /// after the route. The route ends `route` after the take; the transport
     /// reads `transport`; audio is silent for `AUDIBLE_SAMPLE`; a Paused read
-    /// takes `read` and reads `Q` at its end. LibrePods' pause count is
-    /// `count`, plus one from `bump` after the route.
+    /// takes `read` and reads `Q` at its end; each Paused read's call is
+    /// logged in `paused_calls` (ms after the route). LibrePods' pause count
+    /// is `count`, plus one from `bump` after the route; one of them is
+    /// unfinished until `unfinished` after the route.
     #[derive(Default)]
     struct Take {
         route: Duration,
@@ -1597,6 +1620,8 @@ mod tests {
         read: Duration,
         count: usize,
         bump: Option<Duration>,
+        unfinished: Option<Duration>,
+        paused_calls: Arc<StdMutex<Vec<u128>>>,
     }
 
     /// `Take`'s I/O; records each action with its time since the route.
@@ -1661,6 +1686,8 @@ mod tests {
         }
 
         fn paused(&self) -> BoxFuture<'static, Vec<String>> {
+            let at = tokio::time::Instant::now().duration_since(self.routed_at);
+            self.take.paused_calls.lock().unwrap().push(at.as_millis());
             let io = self.clone();
             Box::pin(async move {
                 tokio::time::sleep(io.take.read).await;
@@ -1674,6 +1701,11 @@ mod tests {
 
         fn self_pauses(&self) -> usize {
             self.take.count + usize::from(self.take.bump.is_some_and(|at| self.past(at)))
+        }
+
+        fn self_pauses_done(&self) -> usize {
+            let unfinished = self.take.unfinished.is_some_and(|at| !self.past(at));
+            self.self_pauses() - usize::from(unfinished)
         }
     }
 
@@ -1998,6 +2030,52 @@ mod tests {
         })
         .await;
         assert_eq!(acted, [(250, Play(Q.into()))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_librepods_pause_at_the_take_is_never_undone() {
+        // Q pauses at 100 ms, the 250 ms read sees it; the ear-removal pause
+        // in flight at the take finishes at 200 ms (a), or never (b).
+        for unfinished in [ms(200), Duration::MAX] {
+            let acted = take(Take {
+                count: 1,
+                unfinished: Some(unfinished),
+                ..self_paused(&[100])
+            })
+            .await;
+            assert!(
+                !acted.iter().any(|(_, a)| matches!(a, Play(_))),
+                "{unfinished:?}: {acted:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn self_pause_reads_stop_after_a_librepods_pause() {
+        // Q is still Playing at the 0 ms read; a LibrePods pause at 100 ms.
+        let calls = Arc::default();
+        let acted = take(Take {
+            bump: Some(ms(100)),
+            paused_calls: Arc::clone(&calls),
+            ..self_paused(&[1000])
+        })
+        .await;
+        assert_eq!(acted, []);
+        assert_eq!(*calls.lock().unwrap(), [0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn self_pause_reads_stop_at_the_play_edge() {
+        // The edge margin is reached 1500 ms after the route, mid-guard.
+        let calls = Arc::default();
+        let acted = take(Take {
+            route: A2DP_RESUME_WINDOW - PLAY_EDGE_MARGIN - ms(1500),
+            paused_calls: Arc::clone(&calls),
+            ..self_paused(&[2000])
+        })
+        .await;
+        assert_eq!(acted, []);
+        assert_eq!(*calls.lock().unwrap(), [0, 250, 500, 750, 1000, 1250]);
     }
 
     /// R's bus owner lookup fails.
