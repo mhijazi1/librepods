@@ -181,8 +181,9 @@ pub(crate) trait PeakSource: Send {
 enum Gate {
     /// Audible in every sample since this one, its first audible sample.
     Debounce(Instant),
-    /// Counts; this was its last audible sample.
-    Counting(Instant),
+    /// Counts; this was its last audible sample, and this its start number
+    /// (`PlaybackTracker::started`).
+    Counting(Instant, u64),
 }
 
 /// Debounces takeover-worthy playback streams that carry sound into a
@@ -222,6 +223,9 @@ pub(crate) struct PlaybackTracker {
     preexisting: Option<HashSet<u32>>,
     /// Whether a stream counts as playing (false before any change).
     playing: bool,
+    /// How many times a stream started counting (#96): a stream that stops
+    /// counting and counts again is a new start.
+    starts: u64,
 }
 
 /// The worthy, uncorked, unmuted streams of a listing.
@@ -240,6 +244,7 @@ impl PlaybackTracker {
             gates: HashMap::new(),
             preexisting: None,
             playing: false,
+            starts: 0,
         }
     }
 
@@ -275,12 +280,13 @@ impl PlaybackTracker {
             let gate = match (self.gates.get(&index).copied(), audible) {
                 (None, true) => Some(Gate::Debounce(now)),
                 (Some(Gate::Debounce(start)), true) if since(start) >= self.min => {
-                    Some(Gate::Counting(now))
+                    self.starts += 1;
+                    Some(Gate::Counting(now, self.starts))
                 }
                 (debounce @ Some(Gate::Debounce(_)), true) => debounce,
-                (Some(Gate::Counting(_)), true) => Some(Gate::Counting(now)),
-                (Some(Gate::Counting(last)), false) if since(last) < SILENCE_HOLD => {
-                    Some(Gate::Counting(last))
+                (Some(Gate::Counting(_, start)), true) => Some(Gate::Counting(now, start)),
+                (Some(Gate::Counting(last, start)), false) if since(last) < SILENCE_HOLD => {
+                    Some(Gate::Counting(last, start))
                 }
                 (_, false) => None,
             };
@@ -292,12 +298,30 @@ impl PlaybackTracker {
         let playing = self
             .gates
             .values()
-            .any(|gate| matches!(gate, Gate::Counting(_)));
+            .any(|gate| matches!(gate, Gate::Counting(..)));
         if playing == self.playing {
             return None;
         }
         self.playing = playing;
         Some(playing)
+    }
+
+    /// Each counting stream's start number (`starts` when it started), in
+    /// order, with its owner PIDs in `owners` (`stream_owners`; none when
+    /// unresolved) (#96).
+    pub(crate) fn started(&self, owners: &HashMap<u32, HashSet<u32>>) -> Starts {
+        let mut started: Starts = self
+            .gates
+            .iter()
+            .filter_map(|(index, gate)| match gate {
+                Gate::Counting(_, start) => {
+                    Some((*start, owners.get(index).cloned().unwrap_or_default()))
+                }
+                Gate::Debounce(_) => None,
+            })
+            .collect();
+        started.sort_unstable_by_key(|&(start, _)| start);
+        started
     }
 
     /// The handoff core reset its playback baseline at `at` (#90): streams
@@ -317,7 +341,7 @@ impl PlaybackTracker {
                 preexisting.insert(index);
                 false
             }
-            Gate::Debounce(_) | Gate::Counting(_) => true,
+            Gate::Debounce(_) | Gate::Counting(..) => true,
         });
     }
 
@@ -366,6 +390,10 @@ impl PlaybackTracker {
 /// A playback listing with its candidates' peak levels.
 pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 
+/// The counting streams' starts the monitor publishes beside
+/// `PlaybackState` (`PlaybackTracker::started`, #96).
+pub(crate) type Starts = Vec<(u64, HashSet<u32>)>;
+
 /// What the stream monitor publishes.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PlaybackState {
@@ -408,7 +436,18 @@ pub(crate) fn live_stream_pids(
     streams: &[StreamProps],
     ppid: impl Fn(u32) -> Option<u32>,
 ) -> HashSet<u32> {
-    let mut pids = HashSet::new();
+    stream_owners(streams, ppid)
+        .into_values()
+        .flatten()
+        .collect()
+}
+
+/// `live_stream_pids` by stream index (#96).
+pub(crate) fn stream_owners(
+    streams: &[StreamProps],
+    ppid: impl Fn(u32) -> Option<u32>,
+) -> HashMap<u32, HashSet<u32>> {
+    let mut owners = HashMap::new();
     for stream in streams
         .iter()
         .filter(|s| !s.corked && is_takeover_worthy(s))
@@ -421,9 +460,9 @@ pub(crate) fn live_stream_pids(
                 _ => break,
             }
         }
-        pids.extend(walked);
+        owners.insert(stream.index, walked);
     }
-    pids
+    owners
 }
 
 /// The process a sink input plays for: its own `PROCESS_ID`, else its
@@ -464,7 +503,8 @@ fn proc_ppid(pid: u32) -> Option<u32> {
 /// Sample `source` and `peaks` every `interval` with a `PlaybackTracker`
 /// and publish the stream-playing state (initially not counted; streams
 /// already playing in the first listing never count, see
-/// `PlaybackTracker`) with the live presence of each successful listing.
+/// `PlaybackTracker`) with the live presence of each successful listing,
+/// beside the tracker's `started` (#96) in the same send.
 /// Each sample is timed when the listing and levels return. Sampling runs on
 /// the blocking pool in its own task, so a sound server that never answers
 /// stalls only this state, never the caller, and only until its connect or
@@ -492,12 +532,12 @@ pub(crate) fn spawn_stream_playback<S, P>(
     interval: Duration,
     rebaseline: Arc<Mutex<Option<Instant>>>,
     observed: impl Fn(Instant) + Send + Sync + 'static,
-) -> watch::Receiver<PlaybackState>
+) -> watch::Receiver<(PlaybackState, Starts)>
 where
     S: PlaybackSource + 'static,
     P: PeakSource + 'static,
 {
-    let (tx, rx) = watch::channel(PlaybackState::default());
+    let (tx, rx) = watch::channel(Default::default());
     let observed = Arc::new(observed);
     tokio::spawn(async move {
         let mut state = Some((PlaybackTracker::new(min), source, peaks));
@@ -510,15 +550,19 @@ where
             let sampled = tokio::task::spawn_blocking(move || {
                 if let Some(sample) = tracker.sample(&mut source, &mut peaks) {
                     // Read from /proc before the lock, which a step may wait on.
-                    let live = live_stream_pids(&sample.0, proc_ppid);
+                    let owners = stream_owners(&sample.0, proc_ppid);
+                    let live = owners.values().flatten().copied().collect();
                     let mut request = rebaseline.lock().unwrap_or_else(PoisonError::into_inner);
                     let now = Instant::now();
                     tracker.observe_sample(now, request.take(), &sample);
                     observed(now);
-                    let state = PlaybackState {
-                        counted: tracker.playing,
-                        live: (!source.dead()).then_some(live),
-                    };
+                    let state = (
+                        PlaybackState {
+                            counted: tracker.playing,
+                            live: (!source.dead()).then_some(live),
+                        },
+                        tracker.started(&owners),
+                    );
                     if *publish.borrow() != state {
                         publish.send_replace(state);
                     }
@@ -528,7 +572,7 @@ where
             .await;
             let Ok(sampled) = sampled else {
                 log::error!("Stream playback monitor stopped: sampling panicked");
-                tx.send_replace(PlaybackState::default());
+                tx.send_replace(Default::default());
                 break;
             };
             state = Some(sampled);
@@ -1966,13 +2010,13 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        assert!(!rx.borrow().counted);
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| s.counted))
+        assert!(!rx.borrow().0.counted);
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|(s, _)| s.counted))
             .await
             .expect("stream playback")
             .expect("monitor running");
         script.lock().unwrap().push_back(Ok(vec![]));
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| !s.counted))
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|(s, _)| !s.counted))
             .await
             .expect("stream playback ended")
             .expect("monitor running");
@@ -1996,7 +2040,7 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| s.counted))
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|(s, _)| s.counted))
             .await
             .expect("stream playback after a timeout")
             .expect("monitor running");
@@ -2006,8 +2050,8 @@ mod tests {
             .unwrap()
             .extend([timed_out(), timed_out(), Ok(vec![])]);
         tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(rx.borrow().counted);
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| !s.counted))
+        assert!(rx.borrow().0.counted);
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|(s, _)| !s.counted))
             .await
             .expect("stream playback ended")
             .expect("monitor running");
@@ -2037,12 +2081,15 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        assert_eq!(rx.borrow().live, None);
+        assert_eq!(rx.borrow().0.live, None);
         let owned = Some(HashSet::from([PID]));
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| s.live == owned))
-            .await
-            .expect("live baseline stream")
-            .expect("monitor running");
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            rx.wait_for(|(s, _)| s.live == owned),
+        )
+        .await
+        .expect("live baseline stream")
+        .expect("monitor running");
         script
             .lock()
             .unwrap()
@@ -2052,7 +2099,7 @@ mod tests {
         assert!(script.lock().unwrap().is_empty());
         assert!(!rx.has_changed().unwrap());
         assert_eq!(
-            *rx.borrow(),
+            rx.borrow().0,
             PlaybackState {
                 counted: false,
                 live: owned
@@ -2065,12 +2112,12 @@ mod tests {
         script.lock().unwrap().push_back(Ok(vec![corked]));
         tokio::time::timeout(
             Duration::from_secs(3),
-            rx.wait_for(|s| s.live == Some(HashSet::new())),
+            rx.wait_for(|(s, _)| s.live == Some(HashSet::new())),
         )
         .await
         .expect("corked stream not live")
         .expect("monitor running");
-        assert!(!rx.borrow().counted);
+        assert!(!rx.borrow().0.counted);
     }
 
     /// `stream` with `PROCESS_ID` set to `pid`.
@@ -2303,7 +2350,7 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| s.counted))
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|(s, _)| s.counted))
             .await
             .expect("stream playback")
             .expect("monitor running");
@@ -2908,12 +2955,12 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| s.counted))
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|(s, _)| s.counted))
             .await
             .expect("stream playback")
             .expect("monitor running");
         die.store(true, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| !s.counted))
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|(s, _)| !s.counted))
             .await
             .expect("stream playback off once the thread died")
             .expect("monitor running");
@@ -2950,7 +2997,7 @@ mod tests {
         );
         tokio::time::timeout(
             Duration::from_secs(3),
-            rx.wait_for(|s| s.counted && s.live == Some(HashSet::from([PID]))),
+            rx.wait_for(|(s, _)| s.counted && s.live == Some(HashSet::from([PID]))),
         )
         .await
         .expect("stream playback")
@@ -2958,7 +3005,7 @@ mod tests {
         die.store(true, std::sync::atomic::Ordering::SeqCst);
         tokio::time::timeout(
             Duration::from_secs(3),
-            rx.wait_for(|s| s.live.is_none() && !s.counted),
+            rx.wait_for(|(s, _)| s.live.is_none() && !s.counted),
         )
         .await
         .expect("live unknown once the thread died")
@@ -2966,7 +3013,7 @@ mod tests {
         // It stays so over later polls.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
-            *rx.borrow(),
+            rx.borrow().0,
             PlaybackState {
                 counted: false,
                 live: None
@@ -2974,7 +3021,7 @@ mod tests {
         );
         // Unknown again: every Playing player counts, even one whose owner
         // lookup failed (#83, #329).
-        assert!(rx.borrow().live_or_unknown(None));
+        assert!(rx.borrow().0.live_or_unknown(None));
     }
 
     #[test]

@@ -505,9 +505,9 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
                     break;
                 }
             }
-            Some((sampled_at, category)) = io.play_rx.recv() => {
+            Some((sampled_at, category, new_source)) = io.play_rx.sample() => {
                 if sync_session(&mut core, &mut io).await?
-                    || step(&mut core, &mut io, Input::Playback { sampled_at, category }).await?
+                    || step(&mut core, &mut io, Input::Playback { sampled_at, category, new_source }).await?
                 {
                     break;
                 }
@@ -1158,6 +1158,7 @@ mod tests {
         let play = |ms: u64, category: u32| Input::Playback {
             sampled_at: at(ms),
             category,
+            new_source: None,
         };
         let mut core = Handoff::new(CORE_LOCAL.to_string(), t0, true, true);
         feed_worn_idle_session(&mut core, t0);
