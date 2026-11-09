@@ -9,6 +9,7 @@ mod handoff_log;
 mod handoff_probe;
 mod media_controller;
 mod pulse;
+mod reconnect;
 mod settings_file;
 mod stream_monitor;
 mod switching;
@@ -344,6 +345,8 @@ async fn async_main(
             return true;
         };
         let proxy = conn.with_proxy("org.bluez", path, std::time::Duration::from_millis(5000));
+        // shortcut: a failed UUIDs/Address read skips reconnect::device_connected (#408)
+        // and the next drop's record_drop is then a no-op.
         let Ok(uuids) = proxy.get::<Vec<String>>("org.bluez.Device1", "UUIDs") else {
             return true;
         };
@@ -355,9 +358,13 @@ async fn async_main(
         let Ok(addr) = addr_str.parse::<Address>() else {
             return true;
         };
+        let airpods = uuids.iter().any(|u| u.to_lowercase() == target_uuid);
         if is_connected == 0 {
             if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceDisconnected(addr_str.clone())) {
                 warn!("Failed to send DeviceConnected UI message: {:?}", e);
+            }
+            if airpods {
+                reconnect::device_disconnected(&addr_str);
             }
             return true;
         }
@@ -386,9 +393,10 @@ async fn async_main(
             return true;
         }
 
-        if !uuids.iter().any(|u| u.to_lowercase() == target_uuid) {
+        if !airpods {
             return true;
         }
+        reconnect::device_connected(&addr_str);
         let name = proxy
             .get::<String>("org.bluez.Device1", "Name")
             .unwrap_or_else(|_| "Unknown".to_string());
@@ -419,6 +427,19 @@ async fn async_main(
                 warn!("Failed to send DeviceConnected UI message: {:?}", e);
             }
         });
+        true
+    })?;
+
+    // Why a device dropped, before or after its Connected=false (#307).
+    // Older BlueZ never sends it, and a drop with no reason never reconnects.
+    let reasons = MatchRule::new_signal("org.bluez.Device1", "Disconnected");
+    conn.add_match(reasons, |_: (), _, msg| {
+        if let Some(mac) = msg.path().and_then(|path| {
+            path.rsplit_once("/dev_")
+                .map(|(_, dev)| dev.replace('_', ":"))
+        }) {
+            reconnect::disconnect_reason(&mac, msg.get1::<String>().as_deref());
+        }
         true
     })?;
 

@@ -199,7 +199,13 @@ pub async fn start_le_monitor(
                                                 matched_airpods_mac.as_ref().unwrap(),
                                                 auto_connect
                                             );
-                                            if auto_connect {
+                                            // One connect at a time with the playback reconnect (#307).
+                                            if auto_connect
+                                                && let Some(_connect_guard) =
+                                                    crate::reconnect::ConnectGuard::try_new(
+                                                        matched_airpods_mac.as_ref().unwrap(),
+                                                    )
+                                            {
                                                 let real_address =
                                                     Address::from_str(&addr_str).unwrap();
                                                 let mut cm = connecting_macs_clone.lock().await;
@@ -260,6 +266,11 @@ pub async fn start_le_monitor(
                                                         );
                                                     }
                                                 }
+                                            } else if auto_connect {
+                                                info!(
+                                                    "A connect to {} is already in flight, skipping.",
+                                                    matched_airpods_mac.as_ref().unwrap()
+                                                );
                                             } else {
                                                 info!(
                                                     "Auto-connect is disabled for {}, not attempting to connect.",

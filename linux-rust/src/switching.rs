@@ -34,6 +34,7 @@ use crate::handoff_log;
 use crate::media_controller::{
     self, AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_STREAM, MediaController,
 };
+use crate::reconnect;
 use crate::stream_monitor::{
     self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PlaybackState, PulsePeaks,
     PulsePlaybackStreams,
@@ -489,7 +490,7 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 static LAST_OWNER_LINUX: LazyLock<StdMutex<HashMap<String, bool>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-fn last_owner_linux(mac: &str) -> bool {
+pub(crate) fn last_owner_linux(mac: &str) -> bool {
     LAST_OWNER_LINUX.lock().unwrap().get(mac) == Some(&true)
 }
 
@@ -683,7 +684,8 @@ impl Shell {
                 Command::Reconnect { audio } => {
                     info!("Handoff: reconnect (audio={audio}) left to the app lifecycle")
                 }
-                Command::AdoptSession => info!("Handoff: no reconnect session to adopt"),
+                // Only a reconnect-for-playback start feeds Reconnected (#307).
+                Command::AdoptSession => info!("Handoff: adopted the reconnected session"),
                 Command::CancelReconnect => info!("Handoff: no reconnect to cancel"),
                 Command::DrainPlayback => self.play_rx.drain(),
                 Command::Exit => return true,
@@ -700,7 +702,12 @@ impl Shell {
 /// Feed one input to the core, log its lines and execute its commands. True
 /// when the task should end.
 async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
+    let case_closed = core.case_closed();
     let (now, commands) = shell.play_rx.handle(|now| core.handle(now, input));
+    if commands.contains(&Command::DropSession) {
+        // A case close also drops as Remote: no reconnect for it (#307).
+        reconnect::case_closed_at_drop(&shell.mac, case_closed);
+    }
     remember_last_owner_linux(&shell.mac, core.last_owner_linux());
     for line in core.take_lines() {
         shell.log(&line);
@@ -773,6 +780,17 @@ async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
 }
 
 async fn run_handoff(mut shell: Shell) {
+    // A reconnect the watcher made for new playback takes for it once the
+    // session reports its routing (#307); otherwise the normal start. Claimed
+    // first, so the watcher still clears it on a stop during the wait; its
+    // age is judged there only, so the wait can't expire it.
+    let marked = reconnect::claim_marker(&shell.mac);
+    let ready = marked && reconnect::routing_ready(&shell.manager).await;
+    if marked && !ready {
+        shell.log("RECONNECT host state not ready in 5 s; starting without a take");
+    }
+    let take_category = reconnect::take_marker(&shell.mac).filter(|_| ready);
+    let for_playback = take_category.is_some();
     // The event channel is set after connect and handshake, so the earlier
     // reports exist only in the state. The manager emits under the state
     // lock it updates, and the router never takes that lock: flushing the
@@ -794,13 +812,24 @@ async fn run_handoff(mut shell: Shell) {
         }
         (session_facts(&state), backlog)
     };
-    let mut core = Handoff::new(shell.local.clone(), Instant::now(), false, true)
-        .with_connect_mode(shell.connect_mode)
-        .with_last_owner_linux(last_owner_linux(&shell.mac))
-        .with_default_sink_routing(true)
-        .with_a2dp_hold(true)
-        .with_category_relay(shell.relay_category);
-    for input in seed_inputs(facts) {
+    let mut core = Handoff::new(
+        shell.local.clone(),
+        Instant::now(),
+        for_playback,
+        !for_playback,
+    )
+    .with_connect_mode(shell.connect_mode)
+    .with_last_owner_linux(last_owner_linux(&shell.mac))
+    .with_default_sink_routing(true)
+    .with_a2dp_hold(true)
+    .with_category_relay(shell.relay_category);
+    let start = if let Some(category) = take_category {
+        core = core.with_playback_requested().with_category(category);
+        vec![Input::Reconnected(facts)]
+    } else {
+        seed_inputs(facts)
+    };
+    for input in start {
         if step(&mut core, &mut shell, input).await {
             return;
         }
@@ -808,6 +837,13 @@ async fn run_handoff(mut shell: Shell) {
     // Replayed before Auto, so a stale [0] in it cannot pass for the reply
     // to Auto's "not owning" (#54).
     for event in backlog {
+        // The facts already hold the last OwnsConnection, and a stale [1]
+        // would ack the reconnect take early (#360).
+        if core.reconnect_take_pending()
+            && matches!(&event, AACPEvent::ControlCommand(s) if s.identifier == Control::OwnsConnection)
+        {
+            continue;
+        }
         if mark_session_lost(&mut core, &mut shell).await
             || on_event(&mut core, &mut shell, event).await
         {
@@ -815,7 +851,7 @@ async fn run_handoff(mut shell: Shell) {
         }
     }
     // The core's own automatic startup: A2DP, "not owning", announce.
-    if step(&mut core, &mut shell, Input::Auto).await {
+    if !for_playback && step(&mut core, &mut shell, Input::Auto).await {
         return;
     }
     if step(&mut core, &mut shell, Input::InitBacklogDrained).await {
@@ -2447,6 +2483,358 @@ mod tests {
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert!(rx.try_recv().is_err());
         assert_eq!(h.pauses(), 1);
+    }
+
+    /// The reconnect-for-playback take's packets: the announcement, then
+    /// OwnsConnection [1], with no "not owning" first.
+    async fn expect_reconnect_take(mac: &str, rx: &mut mpsc::Receiver<Vec<u8>>) {
+        assert_eq!(next_packet(rx).await, expected_new_device(REMOTE).await);
+        assert_eq!(next_packet(rx).await, expected_tipi(REMOTE).await);
+        assert_eq!(next_packet(rx).await, expected_owns(1).await);
+        wait_until("the reconnect take", || {
+            traced(mac)
+                .iter()
+                .any(|l| l == "AUTO reconnected for new playback; requested Linux ownership")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_for_playback_start_takes() {
+        let mac = "5A:00:00:00:07:07";
+        let (manager, mut rx, _tx) = ready_session().await;
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        h.play(true).await;
+        expect_reconnect_take(mac, &mut rx).await;
+        // Acknowledged; the playback goes on: nothing more is sent.
+        h.emit_queued(owns(1)).await;
+        h.play(true).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        // The marker was used once.
+        assert_eq!(reconnect::take_marker(mac), None);
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn normal_start_keeps_running_playback_as_baseline() {
+        let mac = "5A:00:00:00:07:08";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        h.play(true).await;
+        expect_startup(&h, &mut rx).await;
+        h.emit_queued(owns(0)).await;
+        h.play(true).await;
+        h.play(true).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert!(
+            !traced(mac)
+                .iter()
+                .any(|l| l.starts_with("AUTO reconnected"))
+        );
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn reconnect_marker_expires() {
+        let mac = "5A:00:00:00:07:09";
+        tokio::time::pause();
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        tokio::time::advance(reconnect::RECONNECT_TAKE_WINDOW + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        h.play(true).await;
+        expect_startup(&h, &mut rx).await;
+        assert!(
+            !traced(mac)
+                .iter()
+                .any(|l| l.starts_with("AUTO reconnected"))
+        );
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_start_waits_for_routing_ready() {
+        const NOT_READY: &str = "RECONNECT host state not ready in 5 s; starting without a take";
+        // Reports arriving after the task starts, within 5 s, still take.
+        let mac = "5A:00:00:00:07:0A";
+        let (manager, mut rx, _tx) = injected_manager().await;
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(rx.try_recv().is_err());
+        {
+            let mut state = manager.state.lock().await;
+            state.connected_devices = vec![host(LOCAL), host(REMOTE)];
+            state.ear_detection_status = vec![EarDetectionStatus::InEar; 2];
+            state.audio_source = Some(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            });
+        }
+        h.play(true).await;
+        expect_reconnect_take(mac, &mut rx).await;
+        assert!(!traced(mac).iter().any(|l| l == NOT_READY));
+        stop_handoff_task(mac);
+
+        // None within 5 s: one line, then the normal start.
+        let mac = "5A:00:00:00:07:0B";
+        let (manager, mut rx, _tx) = injected_manager().await;
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        tokio::time::sleep(reconnect::ROUTING_READY_WAIT).await;
+        wait_until("the normal start", || {
+            traced(mac).iter().any(|l| l.starts_with("AUTO enabled"))
+        })
+        .await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        h.play(true).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        let trace = traced(mac);
+        assert_eq!(trace.iter().filter(|l| *l == NOT_READY).count(), 1);
+        assert!(!trace.iter().any(|l| l.starts_with("AUTO reconnected")));
+        stop_handoff_task(mac);
+    }
+
+    /// Connects as BlueZ does: its Connected=true starts the handoff task
+    /// before `bluetoothctl connect` returns (#307).
+    struct StartsTask {
+        manager: AACPManager,
+        harness: Arc<StdMutex<Option<Harness>>>,
+    }
+
+    impl reconnect::Connector for StartsTask {
+        async fn connected(&self, _: &str) -> bool {
+            false
+        }
+
+        async fn connect(&self, mac: &str) -> Result<(), String> {
+            let h = Harness::start(SwitchingMode::Handoff, mac, &self.manager).await;
+            wait_until("the take", || {
+                traced(mac)
+                    .iter()
+                    .any(|l| l.starts_with("AUTO reconnected for new playback"))
+            })
+            .await;
+            *self.harness.lock().unwrap() = Some(h);
+            Ok(())
+        }
+
+        fn settings(&self, _: &str) -> reconnect::Settings {
+            handoff_settings()
+        }
+
+        fn log(&self, _: &str, _: &str) {}
+    }
+
+    fn handoff_settings() -> reconnect::Settings {
+        reconnect::Settings {
+            mode: SwitchingMode::Handoff,
+            auto_connect: true,
+            connect_mode: ConnectMode::Automatically,
+            last_owner_linux: false,
+        }
+    }
+
+    /// Connects at once; the test starts the handoff task itself.
+    struct Connects;
+
+    impl reconnect::Connector for Connects {
+        async fn connected(&self, _: &str) -> bool {
+            false
+        }
+
+        async fn connect(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn settings(&self, _: &str) -> reconnect::Settings {
+            handoff_settings()
+        }
+
+        fn log(&self, _: &str, _: &str) {}
+    }
+
+    #[tokio::test]
+    async fn reconnect_take_before_connect_returns() {
+        let mac = "5A:00:00:00:07:0E";
+        let (manager, mut rx, _tx) = ready_session().await;
+        reconnect::disconnect_reason(mac, Some("org.bluez.Reason.Remote"));
+        let harness = Arc::new(StdMutex::new(None));
+        let (play_tx, samples) = Harness::play_channel();
+        let watcher = tokio::spawn(reconnect::watch(
+            mac.to_string(),
+            samples(),
+            StartsTask {
+                manager: manager.clone(),
+                harness: harness.clone(),
+            },
+        ));
+        for category in [AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_MEDIA] {
+            play_tx.send((Instant::now(), category)).await.unwrap();
+        }
+        expect_reconnect_take(mac, &mut rx).await;
+        wait_until("the connect to return", || {
+            harness.lock().unwrap().is_some()
+        })
+        .await;
+        // The task used it; the connect's return doesn't set it again.
+        assert_eq!(reconnect::take_marker(mac), None);
+        watcher.abort();
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn reconnect_for_playback_takes_over_remote_media() {
+        let mac = "5A:00:00:00:07:0F";
+        let (manager, mut rx, _tx) = ready_session().await;
+        manager.state.lock().await.audio_source = Some(AudioSource {
+            mac: REMOTE.to_string(),
+            r#type: AudioSourceType::Media,
+        });
+        // Linux's media at 301 is not below the remote media's 301.
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        let _h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        expect_reconnect_take(mac, &mut rx).await;
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_stop_during_routing_wait_starts_normally() {
+        let mac = "5A:00:00:00:07:10";
+        let (manager, mut rx, _tx) = injected_manager().await;
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The watcher saw the playback stop.
+        assert!(reconnect::playback_stopped(mac));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        {
+            let mut state = manager.state.lock().await;
+            state.connected_devices = vec![host(LOCAL), host(REMOTE)];
+            state.ear_detection_status = vec![EarDetectionStatus::InEar; 2];
+            state.audio_source = Some(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            });
+        }
+        h.play(true).await;
+        expect_startup(&h, &mut rx).await;
+        assert!(
+            !traced(mac)
+                .iter()
+                .any(|l| l.starts_with("AUTO reconnected"))
+        );
+        stop_handoff_task(mac);
+    }
+
+    /// A claimed marker outlives RECONNECT_TAKE_WINDOW only while the
+    /// watcher still watches for its stop (#307 round 3).
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_stop_during_routing_wait_after_expiry_does_not_take() {
+        let mac = "5A:00:00:00:07:13";
+        let (manager, mut rx, _tx) = injected_manager().await;
+        reconnect::disconnect_reason(mac, Some("org.bluez.Reason.Remote"));
+        let (play_tx, samples) = Harness::play_channel();
+        let watcher = tokio::spawn(reconnect::watch(mac.to_string(), samples(), Connects));
+        let sample = |category| play_tx.send((Instant::now(), category));
+        // Connected for new playback at t=0.
+        sample(AUDIO_CATEGORY_IDLE).await.unwrap();
+        sample(AUDIO_CATEGORY_MEDIA).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        // The task starts at t=12 and waits for its routing.
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        // Still playing at t=15.5, past the window; stopped at t=16.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        sample(AUDIO_CATEGORY_MEDIA).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sample(AUDIO_CATEGORY_IDLE).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(watcher.is_finished());
+        // Routing at t=16.5, inside the task's 5 s wait.
+        {
+            let mut state = manager.state.lock().await;
+            state.connected_devices = vec![host(LOCAL), host(REMOTE)];
+            state.ear_detection_status = vec![EarDetectionStatus::InEar; 2];
+            state.audio_source = Some(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            });
+        }
+        wait_until("the normal start", || {
+            traced(mac).iter().any(|l| l.starts_with("AUTO enabled"))
+        })
+        .await;
+        expect_startup(&h, &mut rx).await;
+        assert!(
+            !traced(mac)
+                .iter()
+                .any(|l| l.starts_with("AUTO reconnected"))
+        );
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn reconnect_take_ignores_stale_backlog_ownership() {
+        let mac = "5A:00:00:00:07:11";
+        let (manager, mut rx, _tx) = ready_session().await;
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        // Before the first await: in the init backlog.
+        h.emit(owns(1));
+        expect_reconnect_take(mac, &mut rx).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        let acked = || traced(mac).iter().any(|l| l.starts_with("ACK owner=linux"));
+        assert!(!acked());
+        // A fresh [1] acknowledges it.
+        h.emit_queued(owns(1)).await;
+        wait_until("the ACK", acked).await;
+        stop_handoff_task(mac);
+    }
+
+    /// The marker's age is judged once, at task start (#307 round 2).
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_marker_fresh_at_start_survives_routing_wait() {
+        let mac = "5A:00:00:00:07:12";
+        let (manager, mut rx, _tx) = injected_manager().await;
+        reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
+        tokio::time::advance(Duration::from_secs(12)).await;
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        // Routing at +4 s: past RECONNECT_TAKE_WINDOW since the connect.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        {
+            let mut state = manager.state.lock().await;
+            state.connected_devices = vec![host(LOCAL), host(REMOTE)];
+            state.ear_detection_status = vec![EarDetectionStatus::InEar; 2];
+            state.audio_source = Some(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            });
+        }
+        h.play(true).await;
+        expect_reconnect_take(mac, &mut rx).await;
+        stop_handoff_task(mac);
+    }
+
+    /// The task's DropSession reports whether the case was closed (#307).
+    #[tokio::test]
+    async fn drop_session_reports_case_closed() {
+        for (mac, ears, closed) in [
+            ("5A:00:00:00:07:0C", EarDetectionStatus::InCase, true),
+            ("5A:00:00:00:07:0D", EarDetectionStatus::OutOfEar, false),
+        ] {
+            reconnect::case_closed_at_drop(mac, !closed);
+            let (manager, mut rx, _tx) = ready_session().await;
+            let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+            let task = handoff_task(mac).expect("handoff task");
+            expect_startup(&h, &mut rx).await;
+            h.emit_queued(wear(ears)).await;
+            manager.disconnect().await;
+            wait_until("the task to end", || task.is_finished()).await;
+            assert_eq!(reconnect::closed_at_drop(mac), closed, "{mac}");
+        }
     }
 
     #[tokio::test]
