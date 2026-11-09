@@ -1120,8 +1120,10 @@ impl MediaController {
         old_statuses: Vec<EarDetectionStatus>,
         new_statuses: Vec<EarDetectionStatus>,
     ) {
-        self.handle_ear_detection_with(old_statuses, new_statuses, Self::pause_mpris_players)
-            .await;
+        self.handle_ear_detection_with(old_statuses, new_statuses, || {
+            Self::pause_mpris_players_owned(&|_| true)
+        })
+        .await;
     }
 
     /// `handle_ear_detection` with the blocking MPRIS pause injected, so the
@@ -1584,12 +1586,6 @@ impl MediaController {
     /// a blocking thread.
     pub(crate) fn pause_playing_mpris_players(own: &dyn Fn(Option<u32>) -> bool) -> PauseOutcome {
         Self::pause_mpris_players_owned(own).1
-    }
-
-    /// Pause every MPRIS player that reports `Playing`, also returning the
-    /// paused services.
-    fn pause_mpris_players() -> (Vec<String>, PauseOutcome) {
-        Self::pause_mpris_players_owned(&|_| true)
     }
 
     /// `pause_playing_mpris_players`, also returning the paused services.
