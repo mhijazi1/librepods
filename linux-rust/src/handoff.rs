@@ -476,6 +476,13 @@ impl Handoff {
         self
     }
 
+    /// Start with the category the reconnect's play asked at (#422), for
+    /// `Input::Reconnected`'s take.
+    pub(crate) fn with_requested_category(mut self, category: u32) -> Self {
+        self.requested_category = Some(category);
+        self
+    }
+
     /// Both buds were last reported in the case (#307).
     pub(crate) fn case_closed(&self) -> bool {
         self.case_closed
@@ -6281,5 +6288,36 @@ mod tests {
             [PauseMedia, RouteAway, HoldA2dp(true)]
         );
         assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
+    }
+
+    /// A #307 reconnect at the aggregate 301 for a play that asked at
+    /// `requested`, the remote playing media (301).
+    fn reconnect_requested(requested: u32) -> (Probe, Vec<Command>) {
+        use crate::media_controller::AUDIO_CATEGORY_MEDIA;
+        let remote_media_facts = SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Media)),
+            ..ready_facts()
+        };
+        let mut p = Probe::new(true, false);
+        p.core = p
+            .core
+            .with_playback_requested()
+            .with_category(AUDIO_CATEGORY_MEDIA)
+            .with_requested_category(requested);
+        let out = p.feed(100, Input::Reconnected(remote_media_facts));
+        (p, out)
+    }
+
+    #[test]
+    fn with_requested_category_takes_at_the_request() {
+        use crate::media_controller::{AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_STREAM};
+        let (_, out) = reconnect_requested(AUDIO_CATEGORY_MEDIA);
+        assert!(out.contains(&SendOwnership(true)), "{out:?}");
+        // A source behind playback asked at 201, below the remote's media.
+        let (mut p, out) = reconnect_requested(AUDIO_CATEGORY_STREAM);
+        assert!(!out.contains(&SendOwnership(true)), "{out:?}");
+        // The core's own category is the aggregate: 301 is no rise.
+        let out = p.play_source(200, AUDIO_CATEGORY_MEDIA, None);
+        assert!(!out.contains(&SendOwnership(true)), "{out:?}");
     }
 }

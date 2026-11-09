@@ -1002,8 +1002,11 @@ async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     .with_default_sink_routing(true)
     .with_a2dp_hold(true)
     .with_category_relay(shell.relay_category);
-    let start = if let Some(category) = take_category {
-        core = core.with_playback_requested().with_category(category);
+    let start = if let Some((category, requested)) = take_category {
+        core = core
+            .with_playback_requested()
+            .with_category(category)
+            .with_requested_category(requested);
         vec![Input::Reconnected(facts)]
     } else {
         seed_inputs(facts)
@@ -2952,6 +2955,34 @@ mod tests {
         reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
         let _h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         expect_reconnect_take(mac, &mut rx).await;
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn reconnect_for_new_source_takes_at_its_request() {
+        let mac = "5A:00:00:00:04:22";
+        let (manager, mut rx, _tx) = ready_session().await;
+        manager.state.lock().await.audio_source = Some(AudioSource {
+            mac: REMOTE.to_string(),
+            r#type: AudioSourceType::Media,
+        });
+        // Linux plays media, but the reconnect's new source asked at 201.
+        reconnect::set_requested_marker(mac, AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_STREAM);
+        let _h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        wait_until("the blocked take", || {
+            traced(mac)
+                .iter()
+                .any(|l| l.starts_with("AUTO reconnected; takeover blocked"))
+        })
+        .await;
+        let owns_one = expected_owns(1).await;
+        assert!(!rest(&mut rx).await.contains(&owns_one));
+        assert!(
+            !traced(mac)
+                .iter()
+                .any(|l| l == "AUTO reconnected for new playback; requested Linux ownership")
+        );
+        assert_eq!(reconnect::take_marker(mac), None);
         stop_handoff_task(mac);
     }
 
