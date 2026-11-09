@@ -18,7 +18,7 @@ use libpulse_sys as sys;
 use log::{info, warn};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -354,6 +354,12 @@ impl DefaultSinkIo for MediaController {
     }
 
     fn park_module(&self) -> BoxFuture<'static, Option<u32>> {
+        // Once per process: a later router (another device, a reconnect)
+        // would unload a park still in place.
+        static CHECKED: AtomicBool = AtomicBool::new(false);
+        if CHECKED.swap(true, Ordering::SeqCst) {
+            return Box::pin(async { None });
+        }
         Box::pin(blocking(|| {
             let modules = pulse::modules("LibrePods").map_err(|e| warn!("Default sink: {e}"));
             modules.ok()?.into_iter().find_map(|m| {
