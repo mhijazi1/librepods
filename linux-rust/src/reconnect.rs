@@ -83,7 +83,7 @@ pub(crate) struct Facts {
 /// The category a sample's play edge asks at, as handoff.rs's
 /// `Input::Playback`: a start or a rise (#272) at the aggregate, a new
 /// source behind playback (#96) at its own; None for no edge or the baseline.
-pub(crate) fn play_request(
+fn play_request(
     previous: Option<u32>,
     category: u32,
     new_source: Option<u32>,
@@ -370,9 +370,9 @@ fn marker_done(mac: &str) -> bool {
 }
 
 /// Consume the marker: Linux's aggregate audio category at the play edge
-/// and the category the edge asked at. Its age is
-/// judged at `claim_marker`, before the routing wait; only a stop or a
-/// failure removes a claimed one after that.
+/// and the category the edge asked at. Its age is judged at
+/// `claim_marker`, before the routing wait; only a stop or a failure
+/// removes a claimed one after that.
 pub(crate) fn take_marker(mac: &str) -> Option<(u32, u32)> {
     with_entry(mac, |e| e.marker.take()).map(|m| (m.category, m.requested))
 }
