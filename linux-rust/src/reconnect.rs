@@ -276,6 +276,26 @@ fn record_drop(mac: &str, now: Instant) -> bool {
     })
 }
 
+/// The MAC in a BlueZ Device1 object path (`/org/bluez/hci0/dev_AA_BB_...`).
+pub(crate) fn mac_from_path(path: &str) -> Option<String> {
+    path.rsplit_once("/dev_")
+        .map(|(_, dev)| dev.replace('_', ":"))
+}
+
+/// Connected=true whose UUIDs or Address read failed: `device_connected`,
+/// but only for a recorded drop, which only an AirPods MAC has.
+pub(crate) fn device_connected_if_dropped(mac: &str) {
+    // Only `device_connected` clears `dropped_at`, so the check stays true.
+    let dropped = ENTRIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mac.to_ascii_uppercase())
+        .is_some_and(|e| e.dropped_at.is_some());
+    if dropped {
+        device_connected(mac);
+    }
+}
+
 /// A connect for playback at `category` succeeded now.
 #[cfg(test)]
 pub(crate) fn set_marker(mac: &str, category: u32) {
@@ -1164,6 +1184,49 @@ mod tests {
         disconnect_reason(mac, Some(REMOTE));
         assert_eq!(delay(), RECONNECT_BACKOFF_MIN * 4);
         assert_eq!(take_marker(mac), Some(AUDIO_CATEGORY_MEDIA));
+    }
+
+    #[test]
+    fn reconnect_mac_from_path_device_and_adapter() {
+        assert_eq!(
+            mac_from_path("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").as_deref(),
+            Some("AA:BB:CC:DD:EE:FF")
+        );
+        assert_eq!(mac_from_path("/org/bluez/hci0"), None);
+    }
+
+    fn has_entry(mac: &str) -> bool {
+        ENTRIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(mac)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_connected_if_dropped_resets_a_drop() {
+        let mac = "7E:00:00:00:04:08";
+        assert!(record_drop(mac, now()));
+        assert!(!record_drop(mac, now()));
+        device_connected_if_dropped(mac);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(record_drop(mac, now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_connected_if_dropped_leaves_others_alone() {
+        let mac = "7E:00:00:00:04:09";
+        device_connected_if_dropped(mac);
+        assert!(!has_entry(mac));
+        // A reason with no drop (any device gets reasons) is left alone.
+        let mac = "7E:00:00:00:04:0A";
+        device_connected(mac);
+        disconnect_reason(mac, Some(REMOTE));
+        let state = || with_entry(mac, |e| (e.up_since, e.dropped_at, e.host_driven));
+        let before = state();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        device_connected_if_dropped(mac);
+        assert_eq!(state(), before);
+        assert_eq!(before.1, None);
     }
 
     #[tokio::test(start_paused = true)]
