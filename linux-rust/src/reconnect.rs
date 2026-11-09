@@ -5,11 +5,12 @@
 //! playback start, never on a timer: a timer would ping-pong with the Mac's
 //! ~45 s heal. A per-MAC watcher runs while the AirPods are disconnected in
 //! the handoff mode. It owns its own playback poller (first sample =
-//! baseline), decides at each play edge with the pure `decide`, spaces its
-//! attempts with the pure `Backoff`, and shares a per-MAC in-flight guard
-//! with le.rs. Each attempt leaves a marker (its play edge's category) the
-//! next handoff task consumes to take for that playback (switching.rs); a
-//! failure or a playback stop clears it.
+//! baseline), decides at each play edge (a start, a rise or a new source
+//! behind playback) with the pure `decide`, spaces its attempts with the
+//! pure `Backoff`, and shares a per-MAC in-flight guard with le.rs. Each
+//! attempt leaves a marker (its edge's aggregate and requested categories)
+//! the next handoff task consumes to take for that playback (switching.rs);
+//! a failure or a playback stop clears it.
 
 use crate::bluetooth::aacp::AACPManager;
 use crate::media_controller::AUDIO_CATEGORY_IDLE;
@@ -70,10 +71,32 @@ impl Settings {
 pub(crate) struct Facts {
     pub(crate) host_driven: bool,
     pub(crate) case_closed: bool,
-    /// The previous playback sample since the drop; None at the baseline.
-    pub(crate) previous: Option<bool>,
-    pub(crate) playing: bool,
+    /// The previous sample's aggregate category since the drop; None at the
+    /// baseline.
+    pub(crate) previous: Option<u32>,
+    pub(crate) category: u32,
+    /// A source new since the previous sample: its own category (#96).
+    pub(crate) new_source: Option<u32>,
     pub(crate) settings: Settings,
+}
+
+/// The category a sample's play edge asks at, as handoff.rs's
+/// `Input::Playback`: a start or a rise (#272) at the aggregate, a new
+/// source behind playback (#96) at its own; None for no edge or the baseline.
+pub(crate) fn play_request(
+    previous: Option<u32>,
+    category: u32,
+    new_source: Option<u32>,
+) -> Option<u32> {
+    let previous = previous?;
+    if category <= AUDIO_CATEGORY_IDLE {
+        None
+    } else if category > previous {
+        Some(category)
+    } else {
+        // Still playing, no higher than before: only a new source asks.
+        new_source
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +106,7 @@ pub(crate) enum Decision {
 }
 
 /// Reconnect only for a host-driven drop with the case open, on a new Linux
-/// playback start, in the handoff mode with autoConnect on and a connect
+/// play request, in the handoff mode with autoConnect on and a connect
 /// mode that allows the take. Pushing an Apple host off is no reason to wait
 /// (the AirPods keep 2 hosts, #308).
 pub(crate) fn decide(f: &Facts) -> Decision {
@@ -94,8 +117,8 @@ pub(crate) fn decide(f: &Facts) -> Decision {
         Decision::Wait("the drop was not host-driven")
     } else if f.case_closed {
         Decision::Wait("the case was closed at the drop")
-    } else if !(f.previous == Some(false) && f.playing) {
-        Decision::Wait("no new Linux playback start")
+    } else if play_request(f.previous, f.category, f.new_source).is_none() {
+        Decision::Wait("no new Linux play request")
     } else if !s.auto_connect {
         Decision::Wait("autoConnect is off")
     } else if s.connect_mode == ConnectMode::WhenLastConnected && !s.last_owner_linux {
@@ -170,9 +193,12 @@ struct Entry {
 /// The watcher's connect for playback, for the next handoff task to take.
 #[derive(Clone, Copy)]
 struct Marker {
-    /// Linux's audio category at the play edge, for the take's category
-    /// check.
+    /// Linux's aggregate audio category at the play edge: the take core's
+    /// category.
     category: u32,
+    /// The category the edge asked at (`play_request`), for the take's
+    /// category check.
+    requested: u32,
     /// None while the connect is in flight: BlueZ's Connected=true starts
     /// the task before `bluetoothctl connect` returns.
     connected_at: Option<Instant>,
@@ -299,10 +325,17 @@ pub(crate) fn device_connected_if_dropped(mac: &str) {
 /// A connect for playback at `category` succeeded now.
 #[cfg(test)]
 pub(crate) fn set_marker(mac: &str, category: u32) {
+    set_requested_marker(mac, category, category);
+}
+
+/// `set_marker` for an edge that asked at `requested`.
+#[cfg(test)]
+pub(crate) fn set_requested_marker(mac: &str, category: u32, requested: u32) {
     let connected_at = Some(now());
     with_entry(mac, |e| {
         e.marker = Some(Marker {
             category,
+            requested,
             connected_at,
             claimed: false,
         })
@@ -336,11 +369,12 @@ fn marker_done(mac: &str) -> bool {
     })
 }
 
-/// Consume the marker: Linux's audio category at the play edge. Its age is
+/// Consume the marker: Linux's aggregate audio category at the play edge
+/// and the category the edge asked at. Its age is
 /// judged at `claim_marker`, before the routing wait; only a stop or a
 /// failure removes a claimed one after that.
-pub(crate) fn take_marker(mac: &str) -> Option<u32> {
-    with_entry(mac, |e| e.marker.take()).map(|m| m.category)
+pub(crate) fn take_marker(mac: &str) -> Option<(u32, u32)> {
+    with_entry(mac, |e| e.marker.take()).map(|m| (m.category, m.requested))
 }
 
 /// Linux's playback stopped: no task takes for it. Whether a marker was
@@ -437,14 +471,17 @@ fn bluetoothctl_result(outcome: Bluetoothctl) -> Result<(), String> {
     }
 }
 
-/// The watcher's playback samples: Linux's audio category.
+/// The watcher's playback samples: Linux's aggregate audio category and a
+/// new source's own (#96).
 pub(crate) trait Samples: Send + 'static {
-    fn next(&mut self) -> impl Future<Output = Option<u32>> + Send;
+    fn next(&mut self) -> impl Future<Output = Option<(u32, Option<u32>)>> + Send;
 }
 
 impl Samples for PlaybackSamples {
-    async fn next(&mut self) -> Option<u32> {
-        self.recv().await.map(|(_, category)| category)
+    async fn next(&mut self) -> Option<(u32, Option<u32>)> {
+        self.sample()
+            .await
+            .map(|(_, category, new_source)| (category, new_source))
     }
 }
 
@@ -500,9 +537,9 @@ impl Connector for Bluez {
 }
 
 /// Watch one disconnected AirPods MAC until it connects, the drop rules a
-/// reconnect out, or the mode isn't handoff. Only a play edge (stopped then
-/// playing, after the first sample) can start an attempt; a play the backoff
-/// or le.rs's connect blocks isn't queued.
+/// reconnect out, or the mode isn't handoff. Only a play edge (a start, a
+/// rise or a new source behind playback, after the first sample) can start
+/// an attempt; a play the backoff or le.rs's connect blocks isn't queued.
 pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Connector) {
     let mut previous = None;
     let mut connected_for_playback = false;
@@ -512,10 +549,9 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
             io.log(&mac, "playback stopped before the handoff task took");
         }
     };
-    while let Some(category) = samples.next().await {
+    while let Some((category, new_source)) = samples.next().await {
         let playing = category > AUDIO_CATEGORY_IDLE;
-        let edge = previous == Some(false) && playing;
-        let last = previous.replace(playing);
+        let last = previous.replace(category);
         if connected_for_playback {
             stopped(playing);
             if !playing || marker_done(&mac) {
@@ -539,15 +575,16 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
             io.log(&mac, "not reconnecting: switching mode is not handoff");
             return;
         }
-        if !edge {
+        let Some(requested) = play_request(last, category, new_source) else {
             continue;
-        }
+        };
         let settings = io.settings(&mac);
         let facts = Facts {
             host_driven: host_driven == Some(true),
             case_closed,
             previous: last,
-            playing,
+            category,
+            new_source,
             settings,
         };
         if let Decision::Wait(reason) = decide(&facts) {
@@ -571,6 +608,7 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
             // Before the connect: its Connected=true starts the task.
             e.marker = Some(Marker {
                 category,
+                requested,
                 connected_at: None,
                 claimed: false,
             });
@@ -593,10 +631,9 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
         let result = loop {
             tokio::select! {
                 result = &mut attempt => break result,
-                Some(category) = samples.next() => {
-                    let playing = category > AUDIO_CATEGORY_IDLE;
-                    previous = Some(playing);
-                    stopped(playing);
+                Some((category, _)) = samples.next() => {
+                    previous = Some(category);
+                    stopped(category > AUDIO_CATEGORY_IDLE);
                 }
             }
         };
@@ -650,8 +687,9 @@ mod tests {
         Facts {
             host_driven: true,
             case_closed: false,
-            previous: Some(false),
-            playing: true,
+            previous: Some(AUDIO_CATEGORY_IDLE),
+            category: AUDIO_CATEGORY_MEDIA,
+            new_source: None,
             settings: settings(),
         }
     }
@@ -801,14 +839,14 @@ mod tests {
 
     #[test]
     fn reconnect_policy_waits_without_new_play_edge() {
-        for (previous, playing) in [
-            (Some(true), true),
-            (Some(false), false),
-            (Some(true), false),
+        for (previous, category) in [
+            (Some(AUDIO_CATEGORY_MEDIA), AUDIO_CATEGORY_MEDIA),
+            (Some(AUDIO_CATEGORY_IDLE), AUDIO_CATEGORY_IDLE),
+            (Some(AUDIO_CATEGORY_MEDIA), AUDIO_CATEGORY_IDLE),
         ] {
             assert!(waits(Facts {
                 previous,
-                playing,
+                category,
                 ..connect_facts()
             }));
         }
@@ -969,15 +1007,15 @@ mod tests {
         }
     }
 
-    impl Samples for mpsc::Receiver<u32> {
-        async fn next(&mut self) -> Option<u32> {
+    impl Samples for mpsc::Receiver<(u32, Option<u32>)> {
+        async fn next(&mut self) -> Option<(u32, Option<u32>)> {
             self.recv().await
         }
     }
 
     /// A watcher for `mac` after a drop with `reason`, fed by `sample`.
     struct Rig {
-        tx: mpsc::Sender<u32>,
+        tx: mpsc::Sender<(u32, Option<u32>)>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -995,7 +1033,13 @@ mod tests {
             } else {
                 AUDIO_CATEGORY_IDLE
             };
-            let _ = self.tx.send(category).await;
+            self.source(category, None).await;
+        }
+
+        /// One sample of `category` and a new source's, processed before
+        /// this returns.
+        async fn source(&self, category: u32, new_source: Option<u32>) {
+            let _ = self.tx.send((category, new_source)).await;
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
@@ -1186,7 +1230,10 @@ mod tests {
         device_connected(mac);
         rig.sample(true).await;
         assert!(!rig.task.is_finished());
-        assert_eq!(take_marker(mac), Some(AUDIO_CATEGORY_MEDIA));
+        assert_eq!(
+            take_marker(mac),
+            Some((AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_MEDIA))
+        );
         // Consumed once.
         assert_eq!(take_marker(mac), None);
         rig.sample(true).await;
@@ -1276,7 +1323,10 @@ mod tests {
         assert!(!record_drop(mac, now()));
         disconnect_reason(mac, Some(REMOTE));
         assert_eq!(delay(), RECONNECT_BACKOFF_MIN * 4);
-        assert_eq!(take_marker(mac), Some(AUDIO_CATEGORY_MEDIA));
+        assert_eq!(
+            take_marker(mac),
+            Some((AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_MEDIA))
+        );
     }
 
     #[test]
@@ -1437,5 +1487,141 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reconnect_watcher_no_timer_playing_from_drop() {
         no_timer("7E:00:00:00:00:0E", true).await;
+    }
+
+    const STREAM: u32 = crate::media_controller::AUDIO_CATEGORY_STREAM;
+
+    /// A watcher after a host-driven drop, fed `(category, new_source)`
+    /// samples: its connects and the marker it leaves (aggregate, request).
+    async fn edge_marker(mac: &str, samples: &[(u32, Option<u32>)]) -> (usize, Option<(u32, u32)>) {
+        host_driven_drop(mac);
+        let fake = Arc::new(Fake::default());
+        let rig = Rig::start(mac, fake.clone());
+        for &(category, new_source) in samples {
+            rig.source(category, new_source).await;
+        }
+        (fake.connects(), take_marker(mac))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_watcher_new_source_behind_playback_reconnects() {
+        assert_eq!(
+            edge_marker(
+                "7E:00:00:04:22:01",
+                &[(STREAM, None), (STREAM, Some(STREAM))]
+            )
+            .await,
+            (1, Some((STREAM, STREAM)))
+        );
+        // Asked at the source's own category, under the aggregate.
+        assert_eq!(
+            edge_marker(
+                "7E:00:00:04:22:02",
+                &[
+                    (AUDIO_CATEGORY_MEDIA, None),
+                    (AUDIO_CATEGORY_MEDIA, Some(STREAM))
+                ]
+            )
+            .await,
+            (1, Some((AUDIO_CATEGORY_MEDIA, STREAM)))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_watcher_rise_reconnects_at_aggregate() {
+        assert_eq!(
+            edge_marker(
+                "7E:00:00:04:22:03",
+                &[(STREAM, None), (AUDIO_CATEGORY_MEDIA, None)]
+            )
+            .await,
+            (1, Some((AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_MEDIA)))
+        );
+        // A rise with a new source asks at the aggregate.
+        assert_eq!(
+            edge_marker(
+                "7E:00:00:04:22:04",
+                &[(STREAM, None), (AUDIO_CATEGORY_MEDIA, Some(STREAM))]
+            )
+            .await,
+            (1, Some((AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_MEDIA)))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_watcher_baseline_steady_fall_and_stop_are_no_edges() {
+        let samples = [
+            (AUDIO_CATEGORY_MEDIA, Some(STREAM)),
+            (AUDIO_CATEGORY_MEDIA, None),
+            (AUDIO_CATEGORY_MEDIA, None),
+            (STREAM, None),
+            (AUDIO_CATEGORY_IDLE, None),
+        ];
+        assert_eq!(edge_marker("7E:00:00:04:22:05", &samples).await, (0, None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_watcher_stop_after_new_source_edge_clears_marker() {
+        let mac = "7E:00:00:04:22:06";
+        host_driven_drop(mac);
+        let fake = Arc::new(Fake::default());
+        let rig = Rig::start(mac, fake.clone());
+        rig.source(STREAM, None).await;
+        rig.source(STREAM, Some(STREAM)).await;
+        assert_eq!(fake.connects(), 1);
+        rig.source(AUDIO_CATEGORY_IDLE, None).await;
+        assert!(rig.task.is_finished());
+        assert_eq!(take_marker(mac), None);
+    }
+
+    #[test]
+    fn reconnect_policy_rise_and_new_source_edges_keep_the_other_rules() {
+        let rise = Facts {
+            previous: Some(STREAM),
+            category: AUDIO_CATEGORY_MEDIA,
+            ..connect_facts()
+        };
+        let behind = Facts {
+            previous: Some(AUDIO_CATEGORY_MEDIA),
+            new_source: Some(STREAM),
+            ..connect_facts()
+        };
+        for edge in [rise, behind] {
+            assert_eq!(decide(&edge), Decision::Connect);
+            for facts in [
+                Facts {
+                    host_driven: false,
+                    ..edge
+                },
+                Facts {
+                    case_closed: true,
+                    ..edge
+                },
+                Facts {
+                    settings: Settings {
+                        auto_connect: false,
+                        ..settings()
+                    },
+                    ..edge
+                },
+                Facts {
+                    settings: Settings {
+                        mode: SwitchingMode::Legacy,
+                        ..settings()
+                    },
+                    ..edge
+                },
+                Facts {
+                    settings: Settings {
+                        connect_mode: ConnectMode::WhenLastConnected,
+                        last_owner_linux: false,
+                        ..settings()
+                    },
+                    ..edge
+                },
+            ] {
+                assert!(waits(facts), "{facts:?}");
+            }
+        }
     }
 }
