@@ -390,7 +390,8 @@ const _: () = assert!(
 
 /// Wall-clock limit on `activate_a2dp_profile`, run time of every sound-server
 /// query (up to `pulse::CONNECT_TIMEOUT + OPERATION_TIMEOUT` each) and of the
-/// WirePlumber restart included (#123).
+/// WirePlumber restart included (#123). A profile write started before it
+/// runs to its end (#264).
 const A2DP_ACTIVATION_DEADLINE: Duration = Duration::from_secs(20);
 
 // The sleeps alone never trip the deadline.
@@ -1212,6 +1213,8 @@ impl MediaController {
             return Ok(());
         }
 
+        // shortcut: no hold check before `recover`, which can restart
+        // WirePlumber after a hold started (#288).
         if !before_deadline(deadline, recover).await? {
             if Instant::now() >= deadline {
                 return Err(DeadlineExceeded);
@@ -1251,7 +1254,10 @@ impl MediaController {
             return Ok(());
         }
         info!("Activating A2DP profile for AirPods: {}", preferred_profile);
-        if before_deadline(deadline, || set(idx, preferred_profile.clone())).await? {
+        // Awaited to its end, past the deadline too: a dropped wait would let
+        // the blocking write land after the lock is gone, under a hold (#264).
+        // Its own sound-server timeouts bound it.
+        if set(idx, preferred_profile.clone()).await {
             info!("Successfully activated A2DP profile: {}", preferred_profile);
         } else {
             warn!("Failed to activate A2DP profile: {}", preferred_profile);
@@ -3985,5 +3991,78 @@ mod tests {
         assert_eq!(outcome, Ok(()));
         assert_eq!(*card.borrow(), "off");
         assert_eq!(log.into_inner(), ["a2dp-sink", "off"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_wins_over_activation_write_past_the_deadline() {
+        use std::sync::Mutex as StdMutex;
+        let controller = MediaController::new(String::new(), String::new());
+        let card = Arc::new(StdMutex::new("off".to_string()));
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let deadline = Instant::now() + A2DP_ACTIVATION_DEADLINE;
+        let activation = controller.activate_a2dp_profile_with(
+            deadline,
+            || async { Some(3) },
+            || async { true },
+            |_| async { ProfileChoice::Activate("a2dp-sink".to_string()) },
+            // Like `spawn_blocking`: dropping the wait doesn't stop the write.
+            |_, profile| {
+                let (card, log) = (card.clone(), log.clone());
+                let (entered, gate) = (entered.clone(), gate.clone());
+                let write = tokio::spawn(async move {
+                    entered.notify_one();
+                    gate.notified().await;
+                    *card.lock().unwrap() = profile.clone();
+                    log.lock().unwrap().push(profile);
+                    true
+                });
+                async { write.await.unwrap() }
+            },
+        );
+        let hold = async {
+            entered.notified().await;
+            tokio::time::sleep_until(deadline + Duration::from_secs(1)).await;
+            controller.set_a2dp_held(true);
+            let read = || async {
+                Some(pulse::Card {
+                    index: 3,
+                    name: None,
+                    device_string: None,
+                    profiles: profiles(&["off", "a2dp-sink"]),
+                    active_profile: Some(card.lock().unwrap().clone()),
+                })
+            };
+            let write = |_, profile: String| async {
+                *card.lock().unwrap() = profile.clone();
+                log.lock().unwrap().push(profile);
+                true
+            };
+            let apply = controller.apply_a2dp_hold_with(
+                true,
+                "",
+                PreferredCodec::Aac,
+                read,
+                write,
+                || async { None },
+            );
+            let open_gate = async {
+                // Without the wait to the write's end the hold reads `off` here.
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                gate.notify_one();
+            };
+            tokio::join!(apply, open_gate);
+        };
+        let (outcome, ()) = tokio::join!(activation, hold);
+        // Let an orphaned write land.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*card.lock().unwrap(), "off");
+        assert_eq!(*log.lock().unwrap(), ["a2dp-sink", "off"]);
+        assert_eq!(outcome, Ok(()));
     }
 }
