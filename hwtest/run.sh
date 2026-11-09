@@ -74,7 +74,7 @@ verdict() { # verdict SCENARIO
   echo "# LibrePods hardware run $(basename "$OUT")"
   echo
   echo "- Build: \`$(sed -n 's/^src=//p' "$STAMP")\`"
-  echo "- macOS: $(mac_ssh sw_vers -productVersion 2>/dev/null || echo '?'); mode: ${UNATTENDED:+unattended}${UNATTENDED:-attended}; rounds: $ROUNDS"
+  echo "- macOS: $(mac_ssh sw_vers -productVersion 2>/dev/null || echo '?'); mode: $([ -n "$UNATTENDED" ] && echo unattended || echo attended); rounds: $ROUNDS"
   echo
   echo "| Scenario | Verdict | Notes |"
   echo "|---|---|---|"
