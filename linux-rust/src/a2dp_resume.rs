@@ -2,8 +2,9 @@
 //! idle (#200, DECISIONS 2026-11-08 option (b)).
 //!
 //! `Chain` is the pure step machine: after a settle, read the transport
-//! fresh, again while it stays idle, and, only if every read was idle, nudge
-//! the AirPods sink (suspend, then resume), then kick the players that were
+//! fresh, again while it stays idle, and, only if every read was idle up to
+//! one issued `TRANSPORT_START_WAIT` after the start, nudge the AirPods sink
+//! (suspend, then resume), then kick the players that were
 //! playing at the take (MPRIS Pause, then Play), then, as a last resort,
 //! cycle the card profile once and play them again. Any audible check stops
 //! it. `run` drives it on injected I/O (`A2dpResumeIo`); the production I/O
@@ -15,20 +16,25 @@ use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-/// From the chain's start to its transport read: PipeWire starts the
+/// From the chain's start to its first transport read: PipeWire starts the
 /// transport by itself about 0.3 s after a take (#267).
 const RESUME_SETTLE: Duration = Duration::from_millis(500);
-/// The longest the chain waits for its transport read; a slower read is
-/// unknown.
+/// From the chain's start to the first transport read whose idle may nudge:
+/// PipeWire's own start can still be in flight well after the settle, and a
+/// nudge then restarts the transport under Linux audio (#331, #267).
+const TRANSPORT_START_WAIT: Duration = Duration::from_secs(2);
+/// The most a fresh transport read takes, and how long after
+/// `TRANSPORT_START_WAIT` the chain waits for its reads: one still running
+/// then is unknown.
 const TRANSPORT_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// Between the chain's fresh transport reads while they read idle: after a
 /// take from a streaming iPhone, PipeWire starts the transport about 0.8 s
-/// after the ACK (#305). All reads end by `RESUME_SETTLE` +
+/// after the ACK (#305). All reads end by `TRANSPORT_START_WAIT` +
 /// `TRANSPORT_READ_TIMEOUT` from the chain's start.
 const TRANSPORT_REREAD: Duration = Duration::from_millis(100);
 /// From the sink's suspend to its resume.
@@ -50,8 +56,8 @@ pub(crate) const AUDIBLE_SAMPLE: Duration = Duration::from_millis(500);
 /// window-end Tick comes after its release.
 const PLAY_EDGE_MARGIN: Duration = crate::switching::PLAYBACK_POLL;
 /// The chain's sleeps when nothing ever plays: every step runs, with its
-/// transport read timing out and its three audibility reads.
-const CHAIN_WORST_CASE_SLEEP: Duration = RESUME_SETTLE
+/// transport reads timing out and its three audibility reads.
+const CHAIN_WORST_CASE_SLEEP: Duration = TRANSPORT_START_WAIT
     .saturating_add(TRANSPORT_READ_TIMEOUT)
     .saturating_add(NUDGE_GAP)
     .saturating_add(AUDIBLE_WAIT)
@@ -67,7 +73,7 @@ const CHAIN_WORST_CASE_SLEEP: Duration = RESUME_SETTLE
 const RESUME_MARGIN: Duration = Duration::from_millis(1500);
 /// How long after the take's acknowledgement the core holds playback-stop
 /// releases while the chain may pause and play the players.
-pub(crate) const A2DP_RESUME_WINDOW: Duration = Duration::from_secs(9);
+pub(crate) const A2DP_RESUME_WINDOW: Duration = Duration::from_millis(10_500);
 const _: () = assert!(
     CHAIN_WORST_CASE_SLEEP
         .saturating_add(PLAY_EDGE_MARGIN)
@@ -110,7 +116,8 @@ pub(crate) enum Action {
 
 enum Stage {
     /// Read the transport fresh, again every `TRANSPORT_REREAD` while it is
-    /// idle; nudge only if every read until `read_end` was idle.
+    /// idle; nudge only on an idle read issued from `nudge_at` on, and only
+    /// if every read before it was idle.
     Start,
     Suspended,
     Nudged,
@@ -130,6 +137,8 @@ struct Chain {
     due: Instant,
     /// The end of the core's hold window: a stop after it releases.
     until: Instant,
+    /// The earliest issue time of a transport read whose idle may nudge.
+    nudge_at: Instant,
     /// The end of the fresh transport reads: one still running then is
     /// unknown.
     read_end: Instant,
@@ -142,7 +151,8 @@ impl Chain {
             start: playing,
             due: now + RESUME_SETTLE,
             until,
-            read_end: now + RESUME_SETTLE + TRANSPORT_READ_TIMEOUT,
+            nudge_at: now + TRANSPORT_START_WAIT,
+            read_end: now + TRANSPORT_START_WAIT + TRANSPORT_READ_TIMEOUT,
         }
     }
 
@@ -168,19 +178,22 @@ impl Chain {
     }
 
     /// Run the step due at `now`: its actions, or None once the chain is
-    /// over. `transport` (the fresh read: active, idle or unknown) matters
-    /// only when `reads_transport()`: active ends the chain; idle before
-    /// `read_end` - `TRANSPORT_REREAD` reads again `TRANSPORT_REREAD` later,
-    /// or at that time if sooner, and otherwise suspends the sink; unknown
-    /// goes straight to the audible check, never stopping a transport that
-    /// may carry audio. `audible` matters only when `senses()`, and ends the
-    /// chain there; `playing` only when `reads_players()`. Once the sink is
-    /// suspended or the players paused, the next step always undoes it. The
-    /// kick and the cycle are skipped, ending the chain, when the Play after
-    /// them can't be due `PLAY_EDGE_MARGIN` before `until`: the core would
-    /// release on the stop they cause.
+    /// over. `transport` (the fresh read issued at `issued`: active, idle or
+    /// unknown) matters only when `reads_transport()`: active ends the chain;
+    /// idle issued from `nudge_at` on suspends the sink (`run` bounds each
+    /// read by `read_end`); idle issued earlier and back before `read_end`
+    /// reads again `TRANSPORT_REREAD` later, or at `nudge_at` if sooner;
+    /// anything else goes straight to the audible check, never stopping a
+    /// transport that may carry audio. `audible` matters only when
+    /// `senses()`, and ends the chain there; `playing` only when
+    /// `reads_players()`. Once the sink is suspended or the players paused,
+    /// the next step always undoes it. The kick and the cycle are skipped,
+    /// ending the chain, when the Play after them can't be due
+    /// `PLAY_EDGE_MARGIN` before `until`: the core would release on the stop
+    /// they cause.
     fn step(
         &mut self,
+        issued: Instant,
         now: Instant,
         transport: Option<bool>,
         audible: bool,
@@ -206,14 +219,16 @@ impl Chain {
         let (actions, next, wait) = match std::mem::replace(&mut self.stage, Stage::Done) {
             Stage::Start => match transport {
                 Some(true) => return None,
-                // Read latency must not pull the nudge earlier: the last read
-                // starts `TRANSPORT_REREAD` before `read_end`, never before.
-                Some(false) if now + TRANSPORT_REREAD < self.read_end => {
-                    let last = self.read_end - TRANSPORT_REREAD;
-                    (Vec::new(), Stage::Start, TRANSPORT_REREAD.min(last - now))
+                // Judged by its issue time: a read issued before `nudge_at`
+                // may have raced PipeWire's own start, however late it is back.
+                Some(false) if issued >= self.nudge_at => {
+                    (vec![Action::SuspendSink(true)], Stage::Suspended, NUDGE_GAP)
                 }
-                Some(false) => (vec![Action::SuspendSink(true)], Stage::Suspended, NUDGE_GAP),
-                None => (Vec::new(), Stage::Nudged, NUDGE_GAP + AUDIBLE_WAIT),
+                Some(false) if now < self.read_end => {
+                    let wait = TRANSPORT_REREAD.min(self.nudge_at.saturating_duration_since(now));
+                    (Vec::new(), Stage::Start, wait)
+                }
+                _ => (Vec::new(), Stage::Nudged, NUDGE_GAP + AUDIBLE_WAIT),
             },
             Stage::Suspended => (
                 vec![Action::SuspendSink(false)],
@@ -310,6 +325,13 @@ pub(crate) async fn run(
         info!("A2DP resume: the default sink route outlasted the window");
         return;
     }
+    let ms = |at: Instant| at.saturating_duration_since(routed_at).as_millis();
+    // routed_at - (until - A2DP_RESUME_WINDOW), the ACK, with no Instant underflow.
+    let after_ack = A2DP_RESUME_WINDOW.saturating_sub(until.saturating_duration_since(routed_at));
+    debug!(
+        "A2DP resume: chain start {} ms after the ACK",
+        after_ack.as_millis()
+    );
     let replayable = Mutex::new(start.clone());
     let watch = replay_self_pauses(&io, &replayable, routed_at, until, pauses, cancel.clone());
     let mut chain = Chain::new(routed_at, until, start);
@@ -323,11 +345,18 @@ pub(crate) async fn run(
             // so a yield during them stops the chain before the step they decide.
             let sensed = async {
                 tokio::time::sleep_until(due.into()).await;
+                let issued = clock();
                 let transport = if reads_transport {
-                    tokio::time::timeout_at(read_end.into(), io.transport_active())
+                    let read = tokio::time::timeout_at(read_end.into(), io.transport_active())
                         .await
                         .ok()
-                        .flatten()
+                        .flatten();
+                    let back = ms(clock());
+                    debug!(
+                        "A2DP resume: transport read issued {} ms, back {back} ms after the chain start: {read:?}",
+                        ms(issued)
+                    );
+                    read
                 } else {
                     None
                 };
@@ -337,9 +366,9 @@ pub(crate) async fn run(
                 } else {
                     Vec::new()
                 };
-                (transport, audible, playing)
+                (issued, transport, audible, playing)
             };
-            let (transport, audible, playing) = tokio::select! {
+            let (issued, transport, audible, playing) = tokio::select! {
                 biased;
                 _ = &mut cancel => {
                     info!("A2DP resume: cancelled");
@@ -349,7 +378,7 @@ pub(crate) async fn run(
                 sensed = sensed => sensed,
             };
             let now = clock();
-            let Some(actions) = chain.step(now, transport, audible, &playing) else {
+            let Some(actions) = chain.step(issued, now, transport, audible, &playing) else {
                 let left = until.saturating_duration_since(now);
                 info!(
                     "A2DP resume: done (transport: {transport:?}, transport reads: {reads}, audible: {audible}, window left: {left:?})"
@@ -731,7 +760,7 @@ mod tests {
             let now = chain.due();
             let ms = (now - first).as_millis();
             let (audible, playing) = sense(ms);
-            match chain.step(now, Some(false), audible, &playing) {
+            match chain.step(now, now, Some(false), audible, &playing) {
                 Some(actions) => steps.push((ms, actions)),
                 None => return steps,
             }
@@ -746,10 +775,10 @@ mod tests {
     /// its next step is its last transport read.
     fn at_last_read(t0: Instant, until: Instant, playing: Vec<String>) -> Chain {
         let mut chain = Chain::new(t0, until, playing);
-        let last = t0 + RESUME_SETTLE + TRANSPORT_READ_TIMEOUT - TRANSPORT_REREAD;
+        let last = t0 + TRANSPORT_START_WAIT;
         while chain.due() < last {
             let due = chain.due();
-            assert_eq!(chain.step(due, Some(false), false, &[]), Some(vec![]));
+            assert_eq!(chain.step(due, due, Some(false), false, &[]), Some(vec![]));
             assert_eq!(chain.due(), (due + TRANSPORT_REREAD).min(last));
         }
         assert!(chain.reads_transport());
@@ -758,13 +787,13 @@ mod tests {
 
     #[test]
     fn idle_read_nudges_only_from_the_last_read_time() {
-        // The last read starts TRANSPORT_REREAD before the read window's end,
-        // however long the reads before it took.
+        // The last read is issued at TRANSPORT_START_WAIT, however long the
+        // reads before it took.
         let t0 = Instant::now();
-        let last = t0 + RESUME_SETTLE + TRANSPORT_READ_TIMEOUT - TRANSPORT_REREAD;
+        let last = t0 + TRANSPORT_START_WAIT;
         let idle_at = |now| {
             let mut chain = Chain::new(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
-            (chain.step(now, Some(false), false, &[]), chain.due())
+            (chain.step(now, now, Some(false), false, &[]), chain.due())
         };
         // A slow first read ending 99 ms before `last`: the re-read at `last`.
         let early = last - TRANSPORT_REREAD + Duration::from_millis(1);
@@ -774,6 +803,85 @@ mod tests {
         assert_eq!(idle_at(just_before), (Some(vec![]), last));
         // From `last` on: the nudge.
         assert_eq!(idle_at(last).0, Some(vec![SuspendSink(true)]));
+    }
+
+    /// Run a chain started at `t0` to its end, silent with `P` playing: each
+    /// transport read is issued when due and back `read` later (unknown when
+    /// back at the read window's end, as `run` times it out), and active if
+    /// issued more than `idle_for` after `t0`. Returns each action with its
+    /// step time since `t0`.
+    fn run_reads(read: Duration, idle_for: Duration) -> Vec<(Duration, Action)> {
+        let t0 = Instant::now();
+        let mut chain = Chain::new(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
+        let mut acted = Vec::new();
+        loop {
+            let issued = chain.due();
+            let (now, transport) = if chain.reads_transport() {
+                let back = issued + read;
+                let value = (back < chain.read_end).then_some(issued - t0 > idle_for);
+                (back.min(chain.read_end), value)
+            } else {
+                (issued, None)
+            };
+            let Some(actions) = chain.step(issued, now, transport, false, &players(&[P])) else {
+                return acted;
+            };
+            acted.extend(actions.into_iter().map(|a| (now - t0, a)));
+        }
+    }
+
+    #[test]
+    fn transport_start_wait_outlasts_a_slow_natural_start() {
+        assert!(TRANSPORT_START_WAIT >= Duration::from_secs(2));
+        // Idle until 1.9 s, then active: no action at all.
+        for read in [Duration::ZERO, ms(50)] {
+            assert_eq!(run_reads(read, ms(1900)), [], "{read:?}");
+        }
+    }
+
+    #[test]
+    fn never_starting_transport_nudges_within_the_read_window() {
+        for read in [Duration::ZERO, ms(50), ms(150), ms(400)] {
+            let acted = run_reads(read, Duration::MAX);
+            let nudge = acted.iter().find(|(_, a)| *a == SuspendSink(true));
+            let at = nudge.expect("a nudge").0;
+            assert!(at >= TRANSPORT_START_WAIT, "{read:?}: {at:?}");
+            assert!(
+                at <= TRANSPORT_START_WAIT + TRANSPORT_READ_TIMEOUT,
+                "{read:?}: {at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_read_issued_before_nudge_time_never_nudges() {
+        let t0 = Instant::now();
+        let new = || Chain::new(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
+        let nudge_at = t0 + TRANSPORT_START_WAIT;
+        let issued = nudge_at - ms(100);
+        // Back idle 50 ms after the nudge time: read again at once.
+        let mut chain = new();
+        let back = nudge_at + ms(50);
+        assert_eq!(
+            chain.step(issued, back, Some(false), false, &[]),
+            Some(vec![])
+        );
+        assert!(chain.reads_transport());
+        assert_eq!(chain.due(), back);
+        // That read, issued after the nudge time, may nudge.
+        assert_eq!(
+            chain.step(back, back, Some(false), false, &[]),
+            Some(vec![SuspendSink(true)])
+        );
+        // Back at the read window's end: no time for another read, unknown.
+        let mut chain = new();
+        let read_end = chain.read_end;
+        assert_eq!(
+            chain.step(issued, read_end, Some(false), false, &[]),
+            Some(vec![])
+        );
+        assert!(!chain.reads_transport());
+        assert_eq!(chain.due(), read_end + NUDGE_GAP + AUDIBLE_WAIT);
     }
 
     #[test]
@@ -858,13 +966,18 @@ mod tests {
         let mut chain = Chain::new(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
         let mut all = Vec::new();
         // Far more steps than the chain has, all silent.
-        for _ in 0..20 {
-            if let Some(actions) = chain.step(chain.due(), Some(false), false, &players(&[P])) {
+        for _ in 0..40 {
+            if let Some(actions) =
+                chain.step(chain.due(), chain.due(), Some(false), false, &players(&[P]))
+            {
                 all.extend(actions);
             }
         }
         assert_eq!(all.iter().filter(|a| **a == ProfileCycle).count(), 1);
-        assert_eq!(chain.step(chain.due(), Some(false), false, &[]), None);
+        assert_eq!(
+            chain.step(chain.due(), chain.due(), Some(false), false, &[]),
+            None
+        );
     }
 
     #[test]
@@ -872,12 +985,12 @@ mod tests {
         let t0 = Instant::now();
         let mut chain = at_last_read(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
         assert_eq!(
-            chain.step(chain.due(), Some(false), false, &[]),
+            chain.step(chain.due(), chain.due(), Some(false), false, &[]),
             Some(vec![SuspendSink(true)])
         );
         assert_eq!(chain.cancel(), [SuspendSink(false)]);
         assert_eq!(
-            chain.step(chain.due(), Some(false), false, &players(&[P])),
+            chain.step(chain.due(), chain.due(), Some(false), false, &players(&[P])),
             None
         );
         assert_eq!(chain.cancel(), []);
@@ -885,11 +998,11 @@ mod tests {
         // Cancelled after the kick's Pause: nothing more, no Play.
         let mut chain = at_last_read(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
         for _ in 0..3 {
-            chain.step(chain.due(), Some(false), false, &players(&[P]));
+            chain.step(chain.due(), chain.due(), Some(false), false, &players(&[P]));
         }
         assert_eq!(chain.cancel(), []);
         assert_eq!(
-            chain.step(chain.due(), Some(false), false, &players(&[P])),
+            chain.step(chain.due(), chain.due(), Some(false), false, &players(&[P])),
             None
         );
     }
@@ -902,23 +1015,30 @@ mod tests {
         // production ones do. A read still running at the read window's end
         // is unknown, so the nudge (or the unknown read) is by then.
         assert_eq!(
-            RESUME_SETTLE + TRANSPORT_READ_TIMEOUT + last + AUDIBLE_SAMPLE * 3,
+            TRANSPORT_START_WAIT + TRANSPORT_READ_TIMEOUT + last + AUDIBLE_SAMPLE * 3,
             CHAIN_WORST_CASE_SLEEP
         );
-        assert!(A2DP_RESUME_WINDOW >= CHAIN_WORST_CASE_SLEEP + PLAY_EDGE_MARGIN + RESUME_MARGIN);
+        // Tight: the window grows only with the chain (#331).
+        assert_eq!(
+            CHAIN_WORST_CASE_SLEEP + PLAY_EDGE_MARGIN + RESUME_MARGIN,
+            A2DP_RESUME_WINDOW
+        );
         // An unknown transport read leaves the later steps on the same times.
         let t0 = Instant::now();
         let until = t0 + A2DP_RESUME_WINDOW;
         let mut idle = at_last_read(t0, until, players(&[P]));
-        idle.step(idle.due(), Some(false), false, &[]);
-        idle.step(idle.due(), Some(false), false, &[]);
+        idle.step(idle.due(), idle.due(), Some(false), false, &[]);
+        idle.step(idle.due(), idle.due(), Some(false), false, &[]);
         let mut unknown = at_last_read(t0, until, players(&[P]));
-        assert_eq!(unknown.step(unknown.due(), None, false, &[]), Some(vec![]));
+        assert_eq!(
+            unknown.step(unknown.due(), unknown.due(), None, false, &[]),
+            Some(vec![])
+        );
         assert_eq!(unknown.due(), idle.due());
         // The same for an unknown first read.
         let mut unknown = Chain::new(t0, until, players(&[P]));
         let first = unknown.due();
-        assert_eq!(unknown.step(first, None, false, &[]), Some(vec![]));
+        assert_eq!(unknown.step(first, first, None, false, &[]), Some(vec![]));
         assert_eq!(unknown.due(), first + NUDGE_GAP + AUDIBLE_WAIT);
     }
 
@@ -928,37 +1048,40 @@ mod tests {
         let until = t0 + A2DP_RESUME_WINDOW;
         let nudged = || {
             let mut chain = at_last_read(t0, until, players(&[P]));
-            chain.step(chain.due(), Some(false), false, &[]);
-            chain.step(chain.due(), Some(false), false, &[]);
+            chain.step(chain.due(), chain.due(), Some(false), false, &[]);
+            chain.step(chain.due(), chain.due(), Some(false), false, &[]);
             chain
         };
         // The kick's Play would be due just PLAY_EDGE_MARGIN before the
         // window's end: no Pause. 1 ms earlier, the kick runs.
         let edge = until - KICK_GAP - PLAY_EDGE_MARGIN;
         let mut chain = nudged();
-        assert_eq!(chain.step(edge, Some(false), false, &players(&[P])), None);
+        assert_eq!(
+            chain.step(edge, edge, Some(false), false, &players(&[P])),
+            None
+        );
         assert_eq!(chain.cancel(), []);
         let before = edge - Duration::from_millis(1);
         assert_eq!(
-            nudged().step(before, Some(false), false, &players(&[P])),
+            nudged().step(before, before, Some(false), false, &players(&[P])),
             Some(vec![Pause(P.into())])
         );
 
         // The same for the cycle's replay Play.
         let kicked = || {
             let mut chain = nudged();
-            chain.step(chain.due(), Some(false), false, &players(&[P]));
-            chain.step(chain.due(), Some(false), false, &[]);
+            chain.step(chain.due(), chain.due(), Some(false), false, &players(&[P]));
+            chain.step(chain.due(), chain.due(), Some(false), false, &[]);
             chain
         };
         let edge = until - CYCLE_SETTLE - AUDIBLE_SAMPLE - PLAY_EDGE_MARGIN;
         assert_eq!(
-            kicked().step(edge, Some(false), false, &players(&[P])),
+            kicked().step(edge, edge, Some(false), false, &players(&[P])),
             None
         );
         let before = edge - Duration::from_millis(1);
         assert_eq!(
-            kicked().step(before, Some(false), false, &players(&[P])),
+            kicked().step(before, before, Some(false), false, &players(&[P])),
             Some(vec![ProfileCycle])
         );
     }
@@ -1026,8 +1149,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn profile_cycle_that_would_end_past_the_window_is_skipped() {
-        // 1 s reads: the kick is at 4.9 s, the cycle would be at 7.9 s and
-        // its Play at 9.9 s.
+        // 1 s reads: the kick is at 5 s, the cycle would be at 8 s and its
+        // Play at 10 s, PLAY_EDGE_MARGIN before the window's end.
         let (acted, _) = run_with_reads_of(|_| Duration::from_secs(1)).await;
         assert_eq!(
             acted,
@@ -1038,8 +1161,8 @@ mod tests {
                 Play(P.into())
             ]
         );
-        // Instant reads: the nudge at the read window's last read, 0.9 s; the
-        // cycle at 4.9 s, its Play at 6.9 s.
+        // Instant reads: the nudge at TRANSPORT_START_WAIT, 2 s; the cycle at
+        // 6 s, its Play at 7.5 s.
         let (acted, _) = run_with_reads_of(|_| Duration::ZERO).await;
         assert_eq!(acted[4..], [ProfileCycle, Play(P.into())]);
     }
@@ -1053,7 +1176,7 @@ mod tests {
         })
         .await;
         assert_eq!(acted[4..], [ProfileCycle, Play(P.into())]);
-        // The replay Play ends the run, at 6.9 s, in time for the poll.
+        // The replay Play ends the run, at 7.5 s, in time for the poll.
         assert!(ran + PLAY_EDGE_MARGIN < A2DP_RESUME_WINDOW, "{ran:?}");
     }
 
@@ -1245,25 +1368,80 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn settle_slow_reads_then_active_late_in_read_window_acts_nothing() {
-        // 50 ms reads at 500, 650, 800 and 900 ms; the transport is active
-        // by the last (about 880 ms).
+        // 50 ms reads issued every 150 ms from 500 ms to 1850 ms, then at
+        // 2000 ms; the transport is active by the last.
         let (_cancel, cancelled) = oneshot::channel();
-        let (acted, n, chain) = spawn_with_transport(|n| read_after(50, n >= 3), cancelled);
+        let (acted, n, chain) = spawn_with_transport(|n| read_after(50, n >= 10), cancelled);
         chain.await.unwrap();
         assert_eq!(*acted.lock().unwrap(), []);
-        assert_eq!(reads(&n), 4);
+        assert_eq!(reads(&n), 11);
+    }
+
+    /// Resume I/O on tokio's clock: silent, `P` Playing, each transport read
+    /// back idle 170 ms (more than `TRANSPORT_REREAD`) after its issue;
+    /// records each read's issue and each action, in ms since `start`.
+    struct SlowTransportIo {
+        start: tokio::time::Instant,
+        issued: Arc<StdMutex<Vec<u128>>>,
+        acted: Arc<StdMutex<Vec<(u128, Action)>>>,
+    }
+
+    impl A2dpResumeIo for SlowTransportIo {
+        fn act(&self, action: Action) -> BoxFuture<'static, ()> {
+            let at = self.start.elapsed().as_millis();
+            self.acted.lock().unwrap().push((at, action));
+            Box::pin(async {})
+        }
+
+        fn audible(&self) -> BoxFuture<'static, bool> {
+            Box::pin(async { false })
+        }
+
+        fn playing(&self) -> BoxFuture<'static, Vec<String>> {
+            Box::pin(async { players(&[P]) })
+        }
+
+        fn transport_active(&self) -> BoxFuture<'static, Option<bool>> {
+            self.issued
+                .lock()
+                .unwrap()
+                .push(self.start.elapsed().as_millis());
+            read_after(170, false)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_idle_read_back_after_nudge_time_never_nudges() {
+        let start = tokio::time::Instant::now();
+        let io = SlowTransportIo {
+            start,
+            issued: Arc::default(),
+            acted: Arc::default(),
+        };
+        let (issued, acted) = (Arc::clone(&io.issued), Arc::clone(&io.acted));
+        let (_cancel, cancelled) = oneshot::channel();
+        let until = start.into_std() + A2DP_RESUME_WINDOW;
+        run(io, until, cancelled, std::future::ready(())).await;
+        // The read issued at 1850 ms is back idle at 2020 ms, after the
+        // nudge time: it reads again at once, and only that read nudges.
+        assert_eq!(
+            *issued.lock().unwrap(),
+            [500, 770, 1040, 1310, 1580, 1850, 2020]
+        );
+        assert_eq!(TRANSPORT_START_WAIT, ms(2000));
+        assert_eq!(acted.lock().unwrap()[0], (2190, SuspendSink(true)));
     }
 
     /// Run the chain on transport reads `read` that stay idle: nothing acts
-    /// before the last read's time, the nudge comes by the read window's end,
-    /// after more than one read.
+    /// before a read issued at `TRANSPORT_START_WAIT`, the nudge comes by the
+    /// read window's end, after more than one read.
     async fn assert_nudges_in_read_window(read: fn(usize) -> BoxFuture<'static, Option<bool>>) {
         let (_cancel, cancelled) = oneshot::channel();
         let (acted, n, chain) = spawn_with_transport(read, cancelled);
-        let lower = RESUME_SETTLE + TRANSPORT_READ_TIMEOUT - TRANSPORT_REREAD;
+        let lower = TRANSPORT_START_WAIT;
         tokio::time::sleep(lower - Duration::from_millis(1)).await;
         assert_eq!(*acted.lock().unwrap(), []);
-        tokio::time::sleep(RESUME_SETTLE + TRANSPORT_READ_TIMEOUT - lower).await;
+        tokio::time::sleep(TRANSPORT_START_WAIT + TRANSPORT_READ_TIMEOUT - lower).await;
         assert_eq!(*acted.lock().unwrap(), [SuspendSink(true)]);
         chain.await.unwrap();
         assert_eq!(
@@ -1682,17 +1860,17 @@ mod tests {
             ..Take::default()
         };
         let fast = take(idle(Duration::ZERO)).await;
-        assert_eq!(fast[0], (900, SuspendSink(true)));
+        assert_eq!(fast[0], (2000, SuspendSink(true)));
         assert_eq!(take(idle(Duration::from_secs(1))).await, fast);
     }
 
     #[tokio::test(start_paused = true)]
     async fn kick_and_cycle_plays_are_the_only_plays_for_players_they_pause() {
-        // The kick pauses Q at 2.9 s; a Paused read sees it at 3 s, or,
-        // slow, is still running from 2.5 s when the watch ends at 3.25 s.
-        for read in [Duration::ZERO, ms(2500)] {
+        // An unknown transport read (an idle one nudges first and kicks
+        // after the watch, #331): the kick pauses Q at 2.5 s; a Paused read
+        // sees it at 2.75 s, or, slow, is back from 0 s at 2.6 s.
+        for read in [Duration::ZERO, ms(2600)] {
             let acted = take(Take {
-                transport: Some(false),
                 read,
                 ..Take::default()
             })
@@ -1701,8 +1879,6 @@ mod tests {
             assert_eq!(
                 acted,
                 [
-                    SuspendSink(true),
-                    SuspendSink(false),
                     Pause(Q.into()),
                     Play(Q.into()),
                     ProfileCycle,
@@ -1715,22 +1891,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn self_pause_before_the_kick_is_played_once_then_cycled() {
-        // Paused at the kick's check, so not kicked; played again at 3 s,
-        // so the cycle's Play is the only one after it.
+        // After an unknown transport read (#331), paused at the kick's check,
+        // so not kicked; played again at 2.52 s, so the cycle's Play is the
+        // only one after it.
         let acted = take(Take {
-            pauses: vec![ms(2800)],
-            transport: Some(false),
+            pauses: vec![ms(2400)],
+            read: ms(20),
             ..Take::default()
         })
         .await;
         assert_eq!(
             acted,
             [
-                (900, SuspendSink(true)),
-                (1400, SuspendSink(false)),
-                (3000, Play(Q.into())),
-                (4900, ProfileCycle),
-                (6900, Play(Q.into())),
+                (2520, Play(Q.into())),
+                (4500, ProfileCycle),
+                (6500, Play(Q.into())),
             ]
         );
     }
