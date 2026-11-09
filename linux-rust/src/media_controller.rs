@@ -550,6 +550,8 @@ trait CardFound {
     fn card_found(self);
 }
 
+/// Tests' plain connects.
+#[cfg(test)]
 impl CardFound for () {
     fn card_found(self) {}
 }
