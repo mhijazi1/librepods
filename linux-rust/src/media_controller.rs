@@ -873,6 +873,9 @@ pub struct MediaController {
     /// Ear-removal and ownership-loss pauses started, so the A2DP resume
     /// never undoes one (#327).
     self_pauses: Arc<AtomicUsize>,
+    /// Of `self_pauses`, those whose blocking pause has returned or unwound
+    /// (#356).
+    self_pauses_done: Arc<AtomicUsize>,
     /// The handoff's A2DP hold is on (#264): `activate_a2dp_profile` writes
     /// nothing. Set synchronously by the shell, in emit order.
     a2dp_held: Arc<AtomicBool>,
@@ -893,6 +896,7 @@ impl MediaController {
             state: Arc::new(Mutex::new(state)),
             ownership_pauses: Arc::new(AtomicUsize::new(0)),
             self_pauses: Arc::default(),
+            self_pauses_done: Arc::default(),
             a2dp_held: Arc::default(),
             profile_write: Arc::default(),
             ear_resumes: Arc::default(),
@@ -1104,7 +1108,7 @@ impl MediaController {
     /// The MPRIS players (KDE Connect's excluded) that report Playing.
     /// Blocking.
     fn playing_mpris_players() -> Vec<String> {
-        Self::mpris_players_with_status("Playing")
+        Self::mpris_players_with_status("Playing", Duration::from_secs(5))
     }
 
     /// `playing_mpris_players` whose bus owner PID (None when the bus can't
@@ -1154,28 +1158,29 @@ impl MediaController {
     /// The MPRIS players (KDE Connect's excluded) that report Paused.
     /// Blocking.
     fn paused_mpris_players() -> Vec<String> {
-        Self::mpris_players_with_status("Paused")
+        Self::mpris_players_with_status("Paused", crate::a2dp_resume::PAUSED_STATUS_TIMEOUT)
     }
 
     fn mpris_playing(conn: &Connection, service: &str) -> bool {
-        Self::mpris_status_is(conn, service, "Playing")
+        Self::mpris_status_is(conn, service, "Playing", Duration::from_secs(5))
     }
 
-    /// The MPRIS players (KDE Connect's excluded) that report `status`;
-    /// empty without a session bus. Blocking.
-    fn mpris_players_with_status(status: &str) -> Vec<String> {
+    /// The MPRIS players (KDE Connect's excluded) that report `status`, each
+    /// read within `timeout`; empty without a session bus. Blocking.
+    fn mpris_players_with_status(status: &str, timeout: Duration) -> Vec<String> {
         let Ok(conn) = Connection::new_session() else {
             return Vec::new();
         };
         Self::list_mpris_services(&conn)
             .into_iter()
-            .filter(|service| Self::mpris_status_is(&conn, service, status))
+            .filter(|service| Self::mpris_status_is(&conn, service, status, timeout))
             .collect()
     }
 
-    /// Whether `service` reports `status`; a failed read is false.
-    fn mpris_status_is(conn: &Connection, service: &str, status: &str) -> bool {
-        conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5))
+    /// Whether `service` reports `status` within `timeout`; a failed read
+    /// is false.
+    fn mpris_status_is(conn: &Connection, service: &str, status: &str, timeout: Duration) -> bool {
+        conn.with_proxy(service, "/org/mpris/MediaPlayer2", timeout)
             .get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
             .is_ok_and(|s| s == status)
     }
@@ -1601,15 +1606,35 @@ impl MediaController {
         Ok(())
     }
 
+    /// Run `pause_players`, a self-pause, on a blocking thread. Counted
+    /// started before, so the A2DP resume never sees it uncounted, and
+    /// finished once it returns or unwinds (#327, #356).
+    async fn self_pause<T: Send + 'static>(
+        &self,
+        pause_players: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        struct Done(Arc<AtomicUsize>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        self.self_pauses.fetch_add(1, Ordering::SeqCst);
+        let done = Done(self.self_pauses_done.clone());
+        tokio::task::spawn_blocking(move || {
+            let _done = done;
+            pause_players()
+        })
+        .await
+        .unwrap()
+    }
+
     async fn pause_with<F>(&self, pause_players: F) -> PauseOutcome
     where
         F: FnOnce() -> (Vec<String>, PauseOutcome) + Send + 'static,
     {
         debug!("Pausing playback");
-        // Counted before the pause, so the A2DP resume never sees it uncounted.
-        self.self_pauses.fetch_add(1, Ordering::SeqCst);
-
-        let (paused_services, outcome) = tokio::task::spawn_blocking(pause_players).await.unwrap();
+        let (paused_services, outcome) = self.self_pause(pause_players).await;
 
         if !paused_services.is_empty() {
             info!("Paused {} media player(s) via DBus", paused_services.len());
@@ -1637,9 +1662,7 @@ impl MediaController {
 
         let pending = OwnershipPause::start(&self.ownership_pauses);
         let was_playing = self.state.lock().await.is_playing;
-        // Counted before the pause, so the A2DP resume never sees it uncounted.
-        self.self_pauses.fetch_add(1, Ordering::SeqCst);
-        let outcome = tokio::task::spawn_blocking(pause_players).await.unwrap();
+        let outcome = self.self_pause(pause_players).await;
 
         let mut state = self.state.lock().await;
         // Remember that the pause came from us, so the playback listener does
@@ -2507,6 +2530,10 @@ impl A2dpResumeIo for MediaController {
 
     fn self_pauses(&self) -> usize {
         self.self_pauses.load(Ordering::SeqCst)
+    }
+
+    fn self_pauses_done(&self) -> usize {
+        self.self_pauses_done.load(Ordering::SeqCst)
     }
 
     fn transport_active(&self) -> BoxFuture<'static, Option<bool>> {
@@ -3464,6 +3491,48 @@ mod tests {
             .await;
         // Both buds out pauses twice; each pause sees itself counted.
         assert_eq!(*counts.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn self_pauses_count_finished_once_the_pause_returns() {
+        use EarDetectionStatus::*;
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.disconnect_when_not_wearing = false;
+        let (started, done) = (
+            controller.self_pauses.clone(),
+            controller.self_pauses_done.clone(),
+        );
+        let counts = move || (started.load(Ordering::SeqCst), done.load(Ordering::SeqCst));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let (log, read) = (seen.clone(), counts.clone());
+        let pauser = move || {
+            log.lock().unwrap().push(read());
+            (vec![], PauseOutcome::default())
+        };
+        controller
+            .handle_ear_detection_with(vec![InEar, InEar], vec![OutOfEar, OutOfEar], pauser)
+            .await;
+        assert_eq!(counts(), (2, 2));
+        let (log, read) = (seen.clone(), counts.clone());
+        controller
+            .pause_all_media_with(move || {
+                log.lock().unwrap().push(read());
+                PauseOutcome::default()
+            })
+            .await;
+        assert_eq!(counts(), (3, 3));
+        // Inside each pause (ear removal twice, then ownership loss), it is
+        // started but not finished.
+        assert_eq!(*seen.lock().unwrap(), [(1, 0), (2, 1), (3, 2)]);
+        // A pause that unwinds counts as finished too.
+        let pausing = controller.clone();
+        let unwound = tokio::spawn(async move {
+            pausing
+                .pause_all_media_with(|| -> PauseOutcome { panic!("pause unwinds") })
+                .await
+        });
+        assert!(unwound.await.is_err());
+        assert_eq!(counts(), (4, 4));
     }
 
     #[tokio::test]
