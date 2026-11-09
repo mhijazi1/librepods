@@ -772,6 +772,13 @@ async fn run_handoff(mut shell: Shell) {
                     true
                 }
             },
+            // After events, so a reinsertion's EarState comes first, and
+            // before samples, so a queued `false` beats a ready play (#313).
+            Some(resumed) = shell.ear_rx.recv() => {
+                info!("Handoff {}: ear detection resumed a player: {resumed}", shell.mac);
+                sync_session(&mut core, &mut shell).await
+                    || step(&mut core, &mut shell, Input::EarResume { resumed }).await
+            }
             Some((sampled_at, category)) = shell.play_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::Playback { sampled_at, category }).await
@@ -783,11 +790,6 @@ async fn run_handoff(mut shell: Shell) {
             Some(active) = shell.a2dp_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::A2dpTransport { active }).await
-            }
-            Some(resumed) = shell.ear_rx.recv() => {
-                info!("Handoff {}: ear detection resumed a player: {resumed}", shell.mac);
-                sync_session(&mut core, &mut shell).await
-                    || step(&mut core, &mut shell, Input::EarResume { resumed }).await
             }
             _ = tick.tick() => {
                 sync_session(&mut core, &mut shell).await

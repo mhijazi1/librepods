@@ -72,7 +72,8 @@ pub(crate) enum Input {
     EarState(Vec<EarDetectionStatus>),
     /// The shell's ear-detection resume for one reinsertion: whether it
     /// played any player (#313). A `false` answering the last reinsertion
-    /// still due a report ends the ear-resume grace; a `true` keeps it.
+    /// still due a report ends the ear-resume grace, unless a `true` came in
+    /// for that grace.
     EarResume { resumed: bool },
     /// Audio source report.
     AudioSource(AudioSource),
@@ -349,6 +350,9 @@ pub(crate) struct Handoff {
     ear_resume_until: Option<Instant>,
     /// Reinsertions not yet answered by an `EarResume` report (#313).
     ear_reports_due: u32,
+    /// A `true` report came in for the live grace, so no `false` ends it
+    /// (#313); a reinsertion with no live grace resets it.
+    ear_resume_confirmed: bool,
 }
 
 impl Handoff {
@@ -402,6 +406,7 @@ impl Handoff {
             category_relay: false,
             ear_resume_until: None,
             ear_reports_due: 0,
+            ear_resume_confirmed: false,
         }
     }
 
@@ -495,6 +500,10 @@ impl Handoff {
                 };
                 // A bud put back; an empty list is a first reading, not one.
                 let reinserted = !self.ears.is_empty() && in_ear(&ears) > in_ear(&self.ears);
+                // A fresh grace has no `true` report yet (#313).
+                if reinserted && !self.ear_resume_until.is_some_and(|end| now < end) {
+                    self.ear_resume_confirmed = false;
+                }
                 if reinserted && self.remote_owns && !self.requested_take {
                     self.ear_resume_until = Some(now + EAR_RESUME_GRACE);
                 }
@@ -504,9 +513,13 @@ impl Handoff {
                 self.ears = ears;
             }
             Input::EarResume { resumed } => {
-                self.ear_reports_due = self.ear_reports_due.saturating_sub(1);
-                if !resumed && self.ear_reports_due == 0 {
-                    self.ear_resume_until = None;
+                // A report with no reinsertion due is stray: it changes nothing.
+                if self.ear_reports_due > 0 {
+                    self.ear_reports_due -= 1;
+                    self.ear_resume_confirmed |= resumed;
+                    if self.ear_reports_due == 0 && !self.ear_resume_confirmed {
+                        self.ear_resume_until = None;
+                    }
                 }
             }
             Input::AudioSource(source) => {
@@ -5568,5 +5581,36 @@ mod tests {
         resumed(&mut p, 100, false);
         assert_eq!(p.core.ear_resume_until, None);
         assert_eq!(p.core.ear_reports_due, 0);
+    }
+
+    #[test]
+    fn ear_resume_stray_report_after_true_keeps_grace() {
+        let mut p = bud_out(MEDIA, true);
+        resumed(&mut p, 250, true);
+        resumed(&mut p, 300, false);
+        assert!(p.core.ear_resume_until.is_some());
+        assert_eq!(p.play_category(700, MEDIA), []);
+        assert_eq!(p.core.take_lines(), [EAR_RESUMED]);
+    }
+
+    #[test]
+    fn ear_resume_two_step_reinsertion_does_not_take() {
+        let mut p = remote_playing(Some(MEDIA));
+        p.feed(100, Input::EarState(vec![OutOfEar, OutOfEar]));
+        // The first bud resumes the paused player; the second finds none.
+        p.feed(200, Input::EarState(vec![InEar, OutOfEar]));
+        resumed(&mut p, 250, true);
+        p.feed(300, Input::EarState(vec![InEar, InEar]));
+        resumed(&mut p, 350, false);
+        assert_eq!(p.play_category(700, MEDIA), []);
+        assert_eq!(p.core.take_lines(), [EAR_RESUMED]);
+
+        // Past that grace, a fresh one ends on its own `false` report.
+        let after = 300 + GRACE_MS + 100;
+        assert_eq!(p.play_category(after, IDLE), []);
+        p.feed(after + 100, Input::EarState(vec![InEar, OutOfEar]));
+        p.feed(after + 200, Input::EarState(vec![InEar, InEar]));
+        resumed(&mut p, after + 250, false);
+        assert_eq!(p.play_category(after + 300, MEDIA), [SendOwnership(true)]);
     }
 }
