@@ -215,6 +215,7 @@ async fn async_main(
             battery_c_status: None,
             case_owner: None,
             device: None,
+            devices: Vec::new(),
             connected: false,
             listening_mode: None,
             allow_off_option: None,
@@ -397,6 +398,13 @@ async fn async_main(
             }
             if airpods {
                 reconnect::device_disconnected(&addr_str);
+                if let Some(handle) = tray_handle.clone() {
+                    tokio::spawn(async move {
+                        handle
+                            .update(|tray: &mut MyTray| tray.device_disconnected(&addr_str))
+                            .await;
+                    });
+                }
             }
             return true;
         }

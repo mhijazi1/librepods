@@ -62,9 +62,12 @@ impl AirPodsDevice {
         // let mut att_manager = ATTManager::new();
         // att_manager.connect(mac_address).await.expect("Failed to connect ATT");
 
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(handle) = &tray_handle {
             handle
-                .update(|tray: &mut MyTray| tray.connect_reset(&mac_address.to_string()))
+                .update(|tray: &mut MyTray| {
+                    tray.connect_device(&mac_address.to_string(), command_tx.clone())
+                })
                 .await;
         }
 
@@ -134,13 +137,6 @@ impl AirPodsDevice {
         let (media_controller, handoff_media) =
             device_media(mac_address.to_string(), local_mac.clone());
         let mc_clone = media_controller.clone();
-        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        if let Some(handle) = &tray_handle {
-            handle
-                .update(|tray: &mut MyTray| tray.command_tx = Some(command_tx.clone()))
-                .await;
-        }
 
         // The channel is attached before initialize() sends any request, but
         // a BATTERY_INFO that arrives between connect() and the attach is
@@ -227,7 +223,7 @@ impl AirPodsDevice {
                 if let Some(handle) = &tray_handle_clone {
                     handle
                         .update(|tray: &mut MyTray| {
-                            tray.listening_mode = Some(value[0]);
+                            tray.apply_listening_mode(&mac_address.to_string(), value[0]);
                         })
                         .await;
                 }
@@ -244,7 +240,7 @@ impl AirPodsDevice {
                 if let Some(handle) = &tray_handle_clone {
                     handle
                         .update(|tray: &mut MyTray| {
-                            tray.allow_off_option = Some(value[0]);
+                            tray.apply_allow_off(&mac_address.to_string(), value[0]);
                         })
                         .await;
                 }
@@ -265,7 +261,10 @@ impl AirPodsDevice {
                 if let Some(handle) = &tray_handle_clone {
                     handle
                         .update(|tray: &mut MyTray| {
-                            tray.conversation_detect_enabled = Some(value[0] == 0x01);
+                            tray.apply_conversation_detect(
+                                &mac_address.to_string(),
+                                value[0] == 0x01,
+                            );
                         })
                         .await;
                 }
