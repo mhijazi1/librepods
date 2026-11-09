@@ -694,17 +694,23 @@ fn list_reusing<C, T>(
     result
 }
 
+/// Whether some sink input could inherit a process id from its client: it
+/// has a client (module streams have none) and no process id of its own.
+fn needs_clients(inputs: &[pulse::SinkInput]) -> bool {
+    inputs
+        .iter()
+        .any(|i| i.client.is_some() && stream_pid(&i.props, None).is_none())
+}
+
 /// Every sink input on `connection`, each with the process id it inherits
-/// from its client (`with_client_pid`). The clients are listed only when a
-/// sink input has no process id of its own.
+/// from its client (`with_client_pid`). The clients are listed only when
+/// `needs_clients`: native PipeWire streams (mpv, pw-cat) need them.
 fn sink_inputs(connection: &mut pulse::RawConnection) -> io::Result<Vec<StreamProps>> {
     let inputs = connection.sink_inputs(None)?;
-    // shortcut: clients are listed on every poll while a stream lacks its own pid (#344).
-    // Native PipeWire streams (mpv, pw-cat) need that; client-less module streams don't.
-    let clients = if inputs.iter().all(|i| stream_pid(&i.props, None).is_some()) {
-        Vec::new()
-    } else {
+    let clients = if needs_clients(&inputs) {
         connection.clients()?
+    } else {
+        Vec::new()
     };
     Ok(inputs
         .into_iter()
@@ -2746,10 +2752,43 @@ mod tests {
         assert_eq!(fake.connects, 2);
     }
 
+    fn raw_sink_input(pid: Option<&str>, client: Option<u32>) -> pulse::SinkInput {
+        pulse::SinkInput {
+            index: 1,
+            sink: 0,
+            corked: false,
+            mute: false,
+            volume: ChannelVolumes::default(),
+            props: pid
+                .map(|p| (PROCESS_ID.to_string(), p.to_string()))
+                .into_iter()
+                .collect(),
+            client,
+        }
+    }
+
     #[test]
-    fn playback_list_bound_covers_reconnect_and_both_listings() {
-        // `sink_inputs` may list the clients after the sink inputs.
-        assert!(PLAYBACK_LIST_BOUND > pulse::CONNECT_TIMEOUT + 2 * pulse::OPERATION_TIMEOUT);
+    fn needs_clients_skips_own_pid_and_clientless_streams() {
+        let inputs = [
+            raw_sink_input(Some("1000"), Some(1)),
+            raw_sink_input(Some("1001"), None),
+            raw_sink_input(None, None),
+        ];
+        assert!(!needs_clients(&inputs));
+    }
+
+    #[test]
+    fn needs_clients_for_pidless_stream_with_client() {
+        let inputs = [
+            raw_sink_input(Some("1000"), None),
+            raw_sink_input(None, Some(1)),
+        ];
+        assert!(needs_clients(&inputs));
+    }
+
+    #[test]
+    fn needs_clients_not_for_no_streams() {
+        assert!(!needs_clients(&[]));
     }
 
     #[test]

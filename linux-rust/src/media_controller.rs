@@ -1120,8 +1120,10 @@ impl MediaController {
         old_statuses: Vec<EarDetectionStatus>,
         new_statuses: Vec<EarDetectionStatus>,
     ) {
-        self.handle_ear_detection_with(old_statuses, new_statuses, Self::pause_mpris_players)
-            .await;
+        self.handle_ear_detection_with(old_statuses, new_statuses, || {
+            Self::pause_mpris_players_owned(&|_| true)
+        })
+        .await;
     }
 
     /// `handle_ear_detection` with the blocking MPRIS pause injected, so the
@@ -1586,12 +1588,6 @@ impl MediaController {
         Self::pause_mpris_players_owned(own).1
     }
 
-    /// Pause every MPRIS player that reports `Playing`, also returning the
-    /// paused services.
-    fn pause_mpris_players() -> (Vec<String>, PauseOutcome) {
-        Self::pause_mpris_players_owned(&|_| true)
-    }
-
     /// `pause_playing_mpris_players`, also returning the paused services.
     fn pause_mpris_players_owned(own: &dyn Fn(Option<u32>) -> bool) -> (Vec<String>, PauseOutcome) {
         let mut paused_services = Vec::new();
@@ -1824,6 +1820,11 @@ impl MediaController {
     #[cfg(test)]
     pub(crate) async fn i_paused_the_media(&self) -> bool {
         self.state.lock().await.i_paused_the_media
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_playing(&self, playing: bool) {
+        self.state.lock().await.is_playing = playing;
     }
 
     /// The A2DP hold is on, so an activation must not write (#264).
