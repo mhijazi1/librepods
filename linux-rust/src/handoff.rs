@@ -125,7 +125,7 @@ pub(crate) enum Input {
     ReconnectFailed(String),
     /// Queue boundary from the shell (#49): every event queued before the
     /// session's snapshot has been fed (the reconnect's init backlog up to
-    /// the probe's facts cut (#143), extended through the echo of its last
+    /// the probe's facts cut (#143), which waits for the echo of its last
     /// "not owning" only when the cached owner was [1], a real release
     /// (#290); the pre-snapshot queue on the default path); later events are
     /// fresh. It ends the reconnect take's stale-report window, so a later 0
