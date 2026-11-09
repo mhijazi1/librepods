@@ -2145,8 +2145,8 @@ mod tests {
         .await
         .with_line_sink(log.sink(mac.to_string()))
         .dispatch_events(events_rx, Arc::new(DeviceHandler::default()).handle());
-        wait_until("the automatic start", || logged().contains("AUTO enabled")).await;
-
+        // Before the first await, so both are in the init backlog and the
+        // core steps the [0] before any playback sample (#381).
         events
             .send(AACPEvent::ProximityKeys(vec![
                 (0x01, IRK.to_vec()),
@@ -2154,6 +2154,8 @@ mod tests {
             ]))
             .unwrap();
         events.send(owns(0)).unwrap();
+        wait_until("the automatic start", || logged().contains("AUTO enabled")).await;
+
         play_tx
             .send((Instant::now(), AUDIO_CATEGORY_IDLE))
             .await
