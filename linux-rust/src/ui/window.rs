@@ -544,7 +544,10 @@ impl App {
                                 });
                             let devices_list: HashMap<String, DeviceData> =
                                 serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                                    error!("Deserialization failed: {}", e);
+                                    error!(
+                                        "Could not parse devices.json: {}",
+                                        crate::settings_file::devices_error_log(&e.into())
+                                    );
                                     HashMap::new()
                                 });
                             devices_list.get(&mac).map(|d| d.type_.clone())
@@ -565,7 +568,10 @@ impl App {
                                         });
                                     let devices_list: HashMap<String, DeviceData> =
                                         serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                                            error!("Deserialization failed: {}", e);
+                                            error!(
+                                                "Could not parse devices.json: {}",
+                                                crate::settings_file::devices_error_log(&e.into())
+                                            );
                                             HashMap::new()
                                         });
                                     devices_list
@@ -801,7 +807,11 @@ impl App {
                     if let Err(e) = rewrite_devices_file(&devices_path, |existing| {
                         devices_with_added(existing, &addr.to_string(), data)
                     }) {
-                        error!("Not adding device to {}: {}", devices_path.display(), e);
+                        error!(
+                            "Not adding device to {}: {}",
+                            devices_path.display(),
+                            crate::settings_file::devices_error_log(&e)
+                        );
                     }
                     self.selected_tab = Tab::Device(addr.to_string());
                 }
@@ -823,7 +833,10 @@ impl App {
                         });
                     let devices_list: HashMap<String, DeviceData> =
                         serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                            error!("Deserialization failed: {}", e);
+                            error!(
+                                "Could not parse devices.json: {}",
+                                crate::settings_file::devices_error_log(&e.into())
+                            );
                             HashMap::new()
                         });
                     devices_list.get(&mac).map(|d| d.type_.clone())
@@ -914,7 +927,10 @@ impl App {
         });
         let devices_list: HashMap<String, DeviceData> = serde_json::from_str(&devices_json)
             .unwrap_or_else(|e| {
-                error!("Deserialization failed: {}", e);
+                error!(
+                    "Could not parse devices.json: {}",
+                    crate::settings_file::devices_error_log(&e.into())
+                );
                 HashMap::new()
             });
         let pane_grid = pane_grid::PaneGrid::new(&self.panes, |_pane_id, pane, _is_maximized| {

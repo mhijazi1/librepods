@@ -1,6 +1,6 @@
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::settings_file::{parse_devices, rewrite_devices_file};
+use crate::settings_file::{devices_error_log, parse_devices, rewrite_devices_file};
 use crate::utils::get_devices_path;
 use bluer::{
     Address, AddressType, Error, Result,
@@ -1618,7 +1618,11 @@ fn update_devices_file(
         Ok(serde_json::to_string(&devices)?)
     });
     if let Err(e) = result {
-        error!("Not saving devices to {}: {}", path.display(), e);
+        error!(
+            "Not saving devices to {}: {}",
+            path.display(),
+            devices_error_log(&e)
+        );
         return false;
     }
     true
