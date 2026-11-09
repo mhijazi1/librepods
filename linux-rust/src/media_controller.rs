@@ -405,7 +405,11 @@ const fn card_lookup_max_wait(attempts: u32) -> Duration {
 }
 
 /// BlueZ's A2DP Sink profile, asked for when BlueZ never connected it (#310).
-const A2DP_SINK: uuid::Uuid = uuid::Uuid::from_u128(0x0000110b_0000_1000_8000_00805f9b34fb);
+pub(crate) const A2DP_SINK: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000110b_0000_1000_8000_00805f9b34fb);
+
+/// `connect_if_connected`'s refusal: no ConnectProfile was sent (#320).
+const NOT_CONNECTED: &str = "AirPods not connected";
 
 /// Longest the A2DP profile connect may take (the handoff probe's value).
 const A2DP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -534,7 +538,8 @@ where
 
 /// Ask BlueZ for the A2DP profile once, cut at `A2DP_CONNECT_TIMEOUT`, then
 /// look for the card it brings with `A2DP_CONNECT_LOOKUP_ATTEMPTS` tries of
-/// `find`. `None` after one `warn!` naming the cause (#310).
+/// `find`. `None` after one `warn!` naming the cause (#310), or one `debug!`
+/// when the AirPods were not connected, so nothing was asked (#320).
 async fn connect_a2dp_then_find<T, C, CFut, F, FFut, S, SFut>(
     connect: C,
     find: F,
@@ -548,7 +553,6 @@ where
     S: FnMut(Duration) -> SFut,
     SFut: Future<Output = ()>,
 {
-    info!("No AirPods card: asking BlueZ to ConnectProfile A2DP Sink");
     // shortcut: a ConnectProfile cut here can outlive `profile_write` (#316):
     // it can still finish in BlueZ after the lock is released, so a later
     // hold may miss its card.
@@ -560,6 +564,10 @@ where
                 return found;
             }
             "still no AirPods card".to_string()
+        }
+        Ok(Err(e)) if e == NOT_CONNECTED => {
+            debug!("A2DP profile connect skipped: {e}");
+            return None;
         }
         Ok(Err(e)) => e,
         Err(_) => format!("no reply within {A2DP_CONNECT_TIMEOUT:?}"),
@@ -600,8 +608,9 @@ where
     CFut: Future<Output = Result<(), String>>,
 {
     if !is_connected().await {
-        return Err("AirPods not connected".to_string());
+        return Err(NOT_CONNECTED.to_string());
     }
+    info!("No AirPods card: asking BlueZ to ConnectProfile A2DP Sink");
     connect().await
 }
 
@@ -4710,7 +4719,8 @@ mod tests {
             )
             .await;
             assert_eq!(calls.get(), usize::from(connected));
-            assert_eq!(result.is_ok(), connected);
+            let refused = Err(NOT_CONNECTED.to_string());
+            assert_eq!(result, if connected { Ok(()) } else { refused });
         }
     }
 }
