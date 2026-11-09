@@ -230,14 +230,14 @@ async fn apply_park(
     }
 }
 
-/// Signal the event path to stop, set an explicit default while the park
-/// sink is still the default (the user's own change wins), then unload it:
+/// Stop the event path, set an explicit default while the park sink is
+/// still the default (the user's own change wins), then unload it:
 /// WirePlumber would keep naming the gone sink as the configured default,
-/// and a re-loaded park sink would win it back (spike #314). Only then wait
-/// for the event path, so a slow one never holds the park sink past an
-/// exit's `SHUTDOWN_RELEASE_WAIT`.
+/// and a re-loaded park sink would win it back (spike #314). Never waits
+/// for the event path, so a slow one never holds the queue (an exit's hold
+/// release) past `SHUTDOWN_RELEASE_WAIT` (#470).
 async fn unpark(io: &impl DefaultSinkIo, parked: Parked, to: UnparkTo) {
-    let stopped = parked.watch.stop();
+    drop(parked.watch);
     let park_default = io.current_default().await.as_deref() == Some(PARK_SINK);
     let sink = match to {
         UnparkTo::AirPods => io.airpods_sink().await.unwrap_or(parked.local),
@@ -250,7 +250,6 @@ async fn unpark(io: &impl DefaultSinkIo, parked: Parked, to: UnparkTo) {
         warn!("Default sink: Unpark({to:?}) failed to set {sink}");
     }
     unload_park(io, parked.module, park_default && !set).await;
-    stopped.await;
 }
 
 /// Unload the park sink's `module`; with `pin`, make the default the server
@@ -391,18 +390,14 @@ fn set_default_sink_sync(name: &str) -> bool {
 /// How long the event path waits for sink input events before it checks
 /// for a stop.
 const PARK_POLL: Duration = Duration::from_millis(100);
-/// How long `ParkWatch::stop` waits for the event path to stop: its poll
-/// plus an operation in flight.
-const PARK_STOP_WAIT: Duration = PARK_POLL.saturating_add(pulse::OPERATION_TIMEOUT);
 
-/// The park event path (#311), on its own thread while parked. It moves the
-/// non-worthy streams on the park sink to the local sink: those already
-/// there when it starts, then each one a sink input event shows there.
+/// The park event path (#311), on its own thread while parked, which stops
+/// once this drops. It moves the non-worthy streams on the park sink to the
+/// local sink: those already there when it starts, then each one a sink
+/// input event shows there.
 pub(crate) struct ParkWatch {
     /// Dropped to stop the thread.
-    stop: Sender<()>,
-    /// Disconnected once the thread handles no more events.
-    done: Receiver<()>,
+    _stop: Sender<()>,
 }
 
 impl ParkWatch {
@@ -413,32 +408,16 @@ impl ParkWatch {
         local: String,
     ) -> Self {
         let (stop, stopped) = std::sync::mpsc::channel();
-        let (finished, done) = std::sync::mpsc::channel::<()>();
         let spawned = std::thread::Builder::new()
             .name("librepods-park".to_string())
-            .spawn(move || {
-                let mut io = match connect() {
-                    Ok(io) => io,
-                    Err(e) => return warn!("Park: no event path: {e}"),
-                };
-                watch_events(&mut io, &local, stopped);
-                // Before `io` drops: its clearers may still linger.
-                drop(finished);
+            .spawn(move || match connect() {
+                Ok(mut io) => watch_events(&mut io, &local, stopped),
+                Err(e) => warn!("Park: no event path: {e}"),
             });
         if let Err(e) = spawned {
             warn!("Park: no event path thread: {e}");
         }
-        ParkWatch { stop, done }
-    }
-
-    /// Stop the event path now; the future resolves once it handles no more
-    /// events, or after `PARK_STOP_WAIT`.
-    fn stop(self) -> impl Future<Output = ()> {
-        drop(self.stop);
-        let done = self.done;
-        async move {
-            let _ = tokio::task::spawn_blocking(move || done.recv_timeout(PARK_STOP_WAIT)).await;
-        }
+        ParkWatch { _stop: stop }
     }
 }
 
@@ -537,7 +516,7 @@ struct ParkMover {
     local: u32,
     /// The moves made so far, by sink input.
     moves: HashMap<u32, u8>,
-    /// Disconnected once the park ends: no move or reset follows.
+    /// Disconnected once the park ends: no new input or move follows.
     stopped: Receiver<()>,
 }
 
@@ -560,8 +539,8 @@ impl ParkMover {
     }
 
     /// Move a non-worthy stream on the park sink to the local sink, then
-    /// reset the target that move stored for its key. Each step first checks
-    /// the park still runs.
+    /// reset the target that move stored for its key. A stop ends new
+    /// inputs and moves only: a move made always gets its reset.
     fn input(&mut self, io: &mut impl ParkIo, input: pulse::SinkInput) {
         // A stream not linked yet has no sink: moved now, none of it plays
         // on the park sink (spike #314).
@@ -613,13 +592,10 @@ impl ParkMover {
             }
             return;
         };
-        if !self.running() {
-            return;
-        }
         let Some(own) = io.open_corked(key, value) else {
             return;
         };
-        if self.running() && !io.move_to_default(own) {
+        if !io.move_to_default(own) {
             warn!("Park: failed to reset the target of {key}={value}");
         }
         io.close(own);
@@ -659,7 +635,7 @@ fn is_true(props: &BTreeMap<String, String>, key: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::SinkAction::SetDefault;
     use super::SinkEvent::{Take, Yield};
     use super::*;
@@ -669,7 +645,8 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Notify;
 
-    const DAC: &str = "alsa_output.dac";
+    /// The local default sink `FakeSinks` starts with.
+    pub(crate) const DAC: &str = "alsa_output.dac";
     const AIRPODS: &str = "bluez_output.AA";
 
     fn set(sink: &str) -> Vec<SinkAction> {
@@ -756,10 +733,11 @@ mod tests {
     }
 
     /// A sound server with the AirPods sink present; records each
-    /// `set_default` call, and each park sink load and unload.
+    /// `set_default` call, each hold, and each park sink load and unload.
+    /// The switching tests share it (#311).
     #[derive(Clone)]
-    struct FakeSinks {
-        default: Arc<Mutex<String>>,
+    pub(crate) struct FakeSinks {
+        pub(crate) default: Arc<Mutex<String>>,
         sets: Arc<Mutex<Vec<String>>>,
         fail: Arc<AtomicBool>,
         /// Each `set_default` applies but reports a failure, as one that
@@ -773,10 +751,17 @@ mod tests {
         leftover: Option<u32>,
         /// The park event path's sound server (#311).
         pulse: Arc<Mutex<FakePulse>>,
+        /// Once set, a hold release waits its full `HOLD_RELEASE_WAIT` for
+        /// an AirPods sink that never shows up, or until `found` (#311).
+        pub(crate) stuck: Arc<AtomicBool>,
+        pub(crate) found: Arc<Notify>,
+        /// When set, the park's watch connects only once the gate's sender
+        /// drops (#311).
+        pub(crate) connect: Arc<Mutex<Option<Receiver<()>>>>,
     }
 
     impl FakeSinks {
-        fn new(fail: bool) -> Self {
+        pub(crate) fn new(fail: bool) -> Self {
             FakeSinks {
                 default: Arc::new(Mutex::new(DAC.to_string())),
                 sets: Arc::default(),
@@ -786,10 +771,13 @@ mod tests {
                 no_airpods: Arc::default(),
                 leftover: None,
                 pulse: Arc::default(),
+                stuck: Arc::default(),
+                found: Arc::default(),
+                connect: Arc::default(),
             }
         }
 
-        fn sets(&self) -> Vec<String> {
+        pub(crate) fn sets(&self) -> Vec<String> {
             self.sets.lock().unwrap().clone()
         }
     }
@@ -826,9 +814,15 @@ mod tests {
         fn hold_a2dp(&self, hold: bool) -> BoxFuture<'static, ()> {
             self.sets.lock().unwrap().push(format!("Hold({hold})"));
             let gate = self.gate.clone();
+            let stuck = !hold && self.stuck.load(Ordering::SeqCst);
+            let found = self.found.clone();
             Box::pin(async move {
                 if let Some(gate) = gate {
                     gate.notified().await;
+                }
+                if stuck {
+                    let wait = crate::media_controller::HOLD_RELEASE_WAIT;
+                    let _ = tokio::time::timeout(wait, found.notified()).await;
                 }
             })
         }
@@ -856,8 +850,12 @@ mod tests {
 
         fn watch_park(&self, local: String) -> ParkWatch {
             let pulse = self.pulse.clone();
+            let gate = self.connect.lock().unwrap().take();
             ParkWatch::spawn(
                 move || {
+                    if let Some(gate) = gate {
+                        let _ = gate.recv();
+                    }
                     pulse.lock().unwrap().watching = true;
                     Ok(FakePulseIo(pulse))
                 },
@@ -1641,38 +1639,43 @@ mod tests {
         drop(router);
     }
 
+    /// Wait up to 3 s for the watch on `pulse` to end: its `FakePulseIo`,
+    /// made while `watching`, dropped.
+    fn wait_for_end(pulse: &Arc<Mutex<FakePulse>>) {
+        let waiting = std::time::Instant::now();
+        while pulse.lock().unwrap().watching {
+            assert!(waiting.elapsed() < Duration::from_secs(3), "still watching");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn park_event_watch_stopped_before_its_listing_moves_nothing() {
         let pulse = Arc::<Mutex<FakePulse>>::default();
         pulse.lock().unwrap().put(event_on(5, PARK_INDEX), 0);
+        pulse.lock().unwrap().watching = true;
         let (connect, connected) = std::sync::mpsc::channel::<()>();
         let io = FakePulseIo(pulse.clone());
-        let ParkWatch { stop, done } = ParkWatch::spawn(
+        let watch = ParkWatch::spawn(
             move || {
                 let _ = connected.recv();
                 Ok(io)
             },
             DAC.to_string(),
         );
-        // `ParkWatch::stop` gave up while it connected.
-        drop(stop);
+        // Unparked while it connected.
+        drop(watch);
         connect.send(()).unwrap();
-        let ended = done.recv_timeout(Duration::from_secs(3));
-        assert_eq!(ended, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+        wait_for_end(&pulse);
         assert_eq!(pulse.lock().unwrap().calls, Vec::<String>::new());
     }
 
-    /// A watch stopped during a move or a reset finishes only the call in
-    /// flight: no further move, clearer or reset move, and the listing's
-    /// next stream stays.
+    /// A watch stopped during a move or a reset still resets the stream it
+    /// moved (#311 r3), but moves nothing more: the listing's next stream
+    /// stays.
     #[test]
     fn park_event_watch_stopped_during_a_reset_moves_nothing_more() {
-        let moved = format!("move 5 -> {DAC_INDEX}");
-        let opened = "open media.role=event -> 101".to_string();
-        for (at, expected) in [
-            ("move", vec![moved.clone()]),
-            ("open", vec![moved.clone(), opened, "close 101".to_string()]),
-        ] {
+        for at in ["move", "open"] {
             let pulse = Arc::<Mutex<FakePulse>>::default();
             let (release, gate) = std::sync::mpsc::channel();
             {
@@ -1680,19 +1683,20 @@ mod tests {
                 pulse.put(event_on(5, PARK_INDEX), 0);
                 pulse.put(event_on(6, PARK_INDEX), 0);
                 pulse.gate = Some((at, gate));
+                pulse.watching = true;
             }
             let io = FakePulseIo(pulse.clone());
-            let ParkWatch { stop, done } = ParkWatch::spawn(move || Ok(io), DAC.to_string());
+            let watch = ParkWatch::spawn(move || Ok(io), DAC.to_string());
             let waiting = std::time::Instant::now();
             while pulse.lock().unwrap().gate.is_some() {
                 assert!(waiting.elapsed() < Duration::from_secs(3), "no {at}");
                 std::thread::sleep(Duration::from_millis(5));
             }
-            drop(stop);
+            drop(watch);
             drop(release);
-            let ended = done.recv_timeout(Duration::from_secs(3));
-            assert_eq!(ended, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
-            assert_eq!(pulse.lock().unwrap().calls, expected, "{at}");
+            wait_for_end(&pulse);
+            let calls = pulse.lock().unwrap().calls.clone();
+            assert_eq!(calls, moved_and_reset("media.role=event"), "{at}");
         }
     }
 

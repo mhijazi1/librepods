@@ -377,6 +377,11 @@ pub(crate) struct Handoff {
     /// A worthy stream of the stream monitor's baseline is live (#311):
     /// playing for the park, never for a take.
     baseline_playing: bool,
+    /// The stream monitor has a successful listing and runs (#311).
+    streams_known: bool,
+    /// The last playback sample was handled while `streams_known`: until
+    /// then an idle `category` is a default, not a fact (#311).
+    sampled_known: bool,
     /// Linux's audio category in the last playback sample since the
     /// baseline (#272). A local fact: a reset keeps it.
     category: u32,
@@ -445,6 +450,8 @@ impl Handoff {
             park: Park::Local,
             park_until: None,
             baseline_playing: false,
+            streams_known: false,
+            sampled_known: false,
             category: AUDIO_CATEGORY_IDLE,
             relays: HashMap::new(),
             category_relay: false,
@@ -481,11 +488,13 @@ impl Handoff {
         self.park
     }
 
-    /// Whether a baseline stream is live (#311), which the takeover signal
-    /// leaves out (#90): the stream monitor's state, which the shell sets
-    /// before each step.
-    pub(crate) fn set_baseline_playing(&mut self, playing: bool) {
-        self.baseline_playing = playing;
+    /// The stream monitor's state, which the shell sets before each step
+    /// (#311): whether it has a successful listing and runs (`known`), and
+    /// whether a baseline stream is live (`baseline`), which the takeover
+    /// signal leaves out (#90).
+    pub(crate) fn set_streams(&mut self, known: bool, baseline: bool) {
+        self.streams_known = known;
+        self.baseline_playing = baseline;
     }
 
     /// Route the default sink to the AirPods on a take's ACK and away on
@@ -585,17 +594,19 @@ impl Handoff {
         out
     }
 
-    /// Park once the hold is on, Linux plays nothing and has no call; end a
-    /// park or a fallback when the hold ends (#311). A take's ACK has
-    /// already unparked to the AirPods. A baseline stream, which can't take,
-    /// falls a park back to the local output.
+    /// Park once the hold is on and a sample with the streams known shows
+    /// Linux plays nothing and has no call; end a park or a fallback when
+    /// the hold ends (#311). A take's ACK has already unparked to the
+    /// AirPods. A baseline stream, which can't take, or a dead stream
+    /// monitor, which can't see one, falls a park back to the local output.
     fn update_park(&mut self) {
         let held = self.held == Some(true);
-        let idle = self.category <= AUDIO_CATEGORY_IDLE && !self.local_call;
+        let known = self.streams_known && self.sampled_known;
+        let idle = known && self.category <= AUDIO_CATEGORY_IDLE && !self.local_call;
         self.park = match self.park {
             Park::Parked | Park::FallenBack if !held => Park::Local,
-            Park::Parked if self.baseline_playing => {
-                self.say("PARK a stream playing since the baseline; new playback goes to the local output");
+            Park::Parked if self.baseline_playing || !known => {
+                self.say("PARK a stream playing since the baseline, or no stream monitor; new playback goes to the local output");
                 Park::FallenBack
             }
             Park::Local | Park::AirPods
@@ -902,6 +913,7 @@ impl Handoff {
         let playing = category > AUDIO_CATEGORY_IDLE;
         let previous = self.was_playing.replace(playing);
         let last_category = std::mem::replace(&mut self.category, category);
+        self.sampled_known = self.streams_known;
         let assumed_playing = std::mem::take(&mut self.take_assumes_playing);
         // A rise while already playing (201 to 301) asks for a take like a
         // start (#272), unless Linux already holds one.
@@ -6446,10 +6458,13 @@ mod tests {
 
     // #311: the park sink.
 
-    /// `hold_ready(true)` with the park on.
+    /// `hold_ready(true)` with the park on, and an idle sample with the
+    /// streams known.
     fn park_ready() -> Probe {
         let mut p = hold_ready(true);
         p.core = p.core.with_park_sink(true);
+        p.core.set_streams(true, false);
+        assert_eq!(p.play(20, false), []);
         assert_eq!(p.core.park(), Park::Local);
         p
     }
@@ -6643,7 +6658,7 @@ mod tests {
     #[test]
     fn park_baseline_stream_falls_back_without_a_take() {
         let mut p = parked();
-        p.core.set_baseline_playing(true);
+        p.core.set_streams(true, true);
         assert_eq!(p.play(1000, false), []);
         assert_eq!(p.core.park(), Park::FallenBack);
     }
@@ -6651,11 +6666,42 @@ mod tests {
     #[test]
     fn park_baseline_stream_keeps_the_hold_from_parking() {
         let mut p = park_ready();
-        p.core.set_baseline_playing(true);
+        p.core.set_streams(true, true);
         assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
         assert_eq!(p.core.park(), Park::Local);
-        p.core.set_baseline_playing(false);
+        p.core.set_streams(true, false);
         assert_eq!(p.play(500, false), []);
         assert_eq!(p.core.park(), Park::Parked);
+    }
+
+    /// The seed's hold (#311 r3): stream presence unknown isn't idle. No
+    /// park before a sample taken with the streams known; never with a dead
+    /// stream monitor.
+    #[test]
+    fn park_waits_for_a_sample_with_the_streams_known() {
+        // `hold_ready`'s idle sample came before any listing.
+        let mut p = hold_ready(true);
+        p.core = p.core.with_park_sink(true);
+        assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+        assert_eq!(p.core.park(), Park::Local);
+        // Listed, but no sample since.
+        p.core.set_streams(true, false);
+        assert_eq!(p.feed(200, Input::Tick), []);
+        assert_eq!(p.core.park(), Park::Local);
+        assert_eq!(p.play(300, false), []);
+        assert_eq!(p.core.park(), Park::Parked);
+        // The stream monitor dies: back to the local output.
+        p.core.set_streams(false, false);
+        assert_eq!(p.play(400, false), []);
+        assert_eq!(p.core.park(), Park::FallenBack);
+
+        // A dead monitor from the start never parks.
+        let mut p = hold_ready(true);
+        p.core = p.core.with_park_sink(true);
+        assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+        for ms in (200..3000).step_by(100) {
+            assert_eq!(p.play(ms, false), []);
+            assert_eq!(p.core.park(), Park::Local, "{ms}");
+        }
     }
 }
