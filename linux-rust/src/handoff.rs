@@ -5144,6 +5144,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn category_held_takeover_command_lists() {
+        // The production setup: A2DP hold and category relay on.
+        let mut p = hold_ready(true);
+        p.core.category_relay = true;
+        p.core.take_lines();
+        assert_eq!(p.feed(100, remote_media()), [HoldA2dp(true)]);
+        assert_eq!(p.play_category(500, STREAM), [RelayCategory(STREAM)]);
+        assert_eq!(
+            p.core.take_lines(),
+            ["AUTO takeover skipped: the audio source's category 301 is above Linux's 201"]
+        );
+        assert_eq!(
+            p.play_category(1000, MEDIA),
+            [RelayCategory(MEDIA), SendOwnership(true)]
+        );
+        // The ack releases the hold before it routes.
+        assert_eq!(
+            p.feed(1100, Input::Ownership(vec![1])),
+            [HoldA2dp(false), RouteToAirPods]
+        );
+    }
+
     // #299: an announcement carries category 100; Linux's own follows it.
     #[test]
     fn category_relay_after_auto_toggle_at_301() {
