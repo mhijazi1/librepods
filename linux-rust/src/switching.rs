@@ -4425,17 +4425,7 @@ mod tests {
         #[test]
         fn non_event_ear_resume_while_remote_owns() {
             let run = |reinsert: bool| {
-                let mut p = Pipeline::ready();
-                let iphone = AudioSource {
-                    mac: REMOTE.to_string(),
-                    r#type: AudioSourceType::Media,
-                };
-                p.feed(20, Input::AudioSource(iphone));
-                let relay = Input::MediaInformation {
-                    host: REMOTE.to_string(),
-                    category: crate::media_controller::AUDIO_CATEGORY_MEDIA,
-                };
-                p.feed(20, relay);
+                let mut p = remote_owns();
                 // Already playing at the session start's baseline: no edge.
                 p.feed(30, Input::Auto);
                 p.step(40, true, &[music(1)]);
@@ -4473,24 +4463,19 @@ mod tests {
             p
         }
 
-        /// `remote_owns`, then an MPRIS player plays over `streams` from
-        /// the event on.
-        fn remote_owns_case(streams: &[StreamProps]) -> Pipeline {
-            let mut p = remote_owns();
-            p.event(true, streams);
-            p
-        }
-
         /// #302: a remote-control MPRIS player (Spotify Connect: Playing,
         /// no local stream) while the iPhone owns takes nothing. The twin
         /// with a live local music stream takes.
         #[test]
         fn non_event_remote_control_player() {
-            assert_eq!(remote_owns_case(&[]).takes(), NO_TAKE);
-            assert_eq!(
-                remote_owns_case(&[music(1)]).takes(),
-                [vec![SendOwnership(true)]]
-            );
+            // An MPRIS player plays over `s` from the event on.
+            let case = |s: &[StreamProps]| {
+                let mut p = remote_owns();
+                p.event(true, s);
+                p.takes()
+            };
+            assert_eq!(case(&[]), NO_TAKE);
+            assert_eq!(case(&[music(1)]), [vec![SendOwnership(true)]]);
         }
 
         /// #302: MPRIS with a live stream needs no peak debounce: the take
