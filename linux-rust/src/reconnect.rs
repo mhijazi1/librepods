@@ -7,8 +7,9 @@
 //! the handoff mode. It owns its own playback poller (first sample =
 //! baseline), decides at each play edge with the pure `decide`, spaces its
 //! attempts with the pure `Backoff`, and shares a per-MAC in-flight guard
-//! with le.rs. A successful connect leaves a marker the next handoff task
-//! consumes to take for that playback (switching.rs).
+//! with le.rs. Each attempt leaves a marker (its play edge's category) the
+//! next handoff task consumes to take for that playback (switching.rs); a
+//! failure or a playback stop clears it.
 
 use crate::bluetooth::aacp::AACPManager;
 use crate::media_controller::AUDIO_CATEGORY_IDLE;
