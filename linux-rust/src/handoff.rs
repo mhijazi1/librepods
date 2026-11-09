@@ -98,9 +98,9 @@ pub(crate) enum Input {
     /// Another host asked Linux to give up ownership. While any Linux release
     /// is pending (playback/auto, user, quit or remote) the request joins it
     /// and sends no second "not owning" (#61, #137). The join pauses at most
-    /// once, in automatic mode when Linux had taken: for a user/quit release
-    /// or a playback restart during the release. A repeat after Linux's
-    /// remote release timed out re-sends it without pausing again (#61).
+    /// once, in automatic mode when Linux had taken, for a user/quit release.
+    /// A repeat after Linux's remote release timed out re-sends it without
+    /// pausing again (#61).
     /// While a local call holds or is taking the AirPods, a pending or
     /// timed-out remote release still goes ahead (joined, or re-sent); any
     /// other request is refused (#11), and a release Linux already sent is
