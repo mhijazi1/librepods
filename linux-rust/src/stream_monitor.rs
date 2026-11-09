@@ -464,8 +464,8 @@ fn proc_ppid(pid: u32) -> Option<u32> {
 /// Each sample is timed when the listing and levels return. Sampling runs on
 /// the blocking pool in its own task, so a sound server that never answers
 /// stalls only this state, never the caller, and only until its connect or
-/// listing times out (`pulse::CONNECT_TIMEOUT`, `pulse::OPERATION_TIMEOUT`;
-/// the last state is kept). Putting the core's reset time in `rebaseline`
+/// listing times out (`pulse::CONNECT_TIMEOUT`, then `pulse::OPERATION_TIMEOUT`
+/// for the sink inputs and again for their clients; the last state is kept). Putting the core's reset time in `rebaseline`
 /// asks the tracker to re-baseline at it (`PlaybackTracker::rebaseline`)
 /// before it observes the next listing to return, even one already in
 /// flight (#90).
@@ -578,9 +578,10 @@ fn playback_stream_props(
 /// with their active profile.
 pub(crate) struct PulseStreams;
 
-/// How long `PulsePlaybackStreams` waits for one listing: a reconnect and a
-/// listing, plus a margin.
+/// How long `PulsePlaybackStreams` waits for one listing: a reconnect, the
+/// sink-input and client listings, plus a margin.
 const PLAYBACK_LIST_BOUND: Duration = pulse::CONNECT_TIMEOUT
+    .saturating_add(pulse::OPERATION_TIMEOUT)
     .saturating_add(pulse::OPERATION_TIMEOUT)
     .saturating_add(Duration::from_millis(500));
 
@@ -2742,6 +2743,12 @@ mod tests {
         assert_eq!(fake.list(Ok(())).unwrap(), 2);
         assert_eq!(fake.list(Ok(())).unwrap(), 2);
         assert_eq!(fake.connects, 2);
+    }
+
+    #[test]
+    fn playback_list_bound_covers_reconnect_and_both_listings() {
+        // `sink_inputs` may list the clients after the sink inputs.
+        assert!(PLAYBACK_LIST_BOUND > pulse::CONNECT_TIMEOUT + 2 * pulse::OPERATION_TIMEOUT);
     }
 
     #[test]

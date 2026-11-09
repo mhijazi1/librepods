@@ -3836,6 +3836,33 @@ mod tests {
         }
     }
 
+    /// #329: a playing MPRIS player with a live stream that another process
+    /// owns counts the stream only, never as the player's media.
+    #[tokio::test]
+    async fn playback_poller_mpris_with_other_process_stream_is_not_media() {
+        let streams = LiveStreams::default();
+        let mut rx = spawn_playback_poller_with(
+            || player(true),
+            streams.clone(),
+            AllAudible,
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+            |_| (),
+        );
+        streams.settle().await;
+        let mut other = music(71);
+        other.props.insert(
+            "application.process.id".to_string(),
+            (PLAYER_PID + 1).to_string(),
+        );
+        streams.set(vec![other]);
+        category_until(&mut rx, AUDIO_CATEGORY_STREAM).await;
+        for _ in 0..5 {
+            let category = rx.recv().await.expect("poller running").1;
+            assert_ne!(category, AUDIO_CATEGORY_MEDIA);
+        }
+    }
+
     /// #302: Linux's category over every (mpris, live, counted), the live
     /// input from the stream monitor's live filter over a music stream
     /// (live, baseline or not: the filter has none) or over a corked, a
