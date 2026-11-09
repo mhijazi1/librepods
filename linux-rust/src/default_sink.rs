@@ -880,8 +880,9 @@ mod tests {
         watching: bool,
         calls: Vec<String>,
         clearers: u32,
-        /// When set, the next `open_corked` waits for its sender to drop.
-        open_gate: Option<Receiver<()>>,
+        /// When set, the next call named so (`move` or `open`) waits for
+        /// the receiver's sender to drop.
+        gate: Option<(&'static str, Receiver<()>)>,
     }
 
     impl FakePulse {
@@ -900,6 +901,16 @@ mod tests {
     impl Drop for FakePulseIo {
         fn drop(&mut self) {
             self.0.lock().unwrap().watching = false;
+        }
+    }
+
+    impl FakePulseIo {
+        /// Wait at `call`'s gate, if it has one.
+        fn gate(&self, call: &str) {
+            let gate = self.0.lock().unwrap().gate.take_if(|(at, _)| *at == call);
+            if let Some((_, gate)) = gate {
+                let _ = gate.recv();
+            }
         }
     }
 
@@ -930,6 +941,7 @@ mod tests {
         }
 
         fn move_input(&mut self, input: u32, sink: u32) -> bool {
+            self.gate("move");
             let mut pulse = self.0.lock().unwrap();
             pulse.calls.push(format!("move {input} -> {sink}"));
             if let Some(i) = pulse.inputs.get_mut(&input) {
@@ -946,10 +958,7 @@ mod tests {
 
         /// A LibrePods stream on the park sink, announced like any other.
         fn open_corked(&mut self, key: &str, value: &str) -> Option<u32> {
-            let gate = self.0.lock().unwrap().open_gate.take();
-            if let Some(gate) = gate {
-                let _ = gate.recv();
-            }
+            self.gate("open");
             let mut pulse = self.0.lock().unwrap();
             pulse.clearers += 1;
             let index = 100 + pulse.clearers;
@@ -1651,33 +1660,38 @@ mod tests {
         assert_eq!(pulse.lock().unwrap().calls, Vec::<String>::new());
     }
 
-    /// A watch stopped during a reset finishes only the clearer it is
-    /// opening: no reset move, and the listing's next stream stays.
+    /// A watch stopped during a move or a reset finishes only the call in
+    /// flight: no further move, clearer or reset move, and the listing's
+    /// next stream stays.
     #[test]
     fn park_event_watch_stopped_during_a_reset_moves_nothing_more() {
-        let pulse = Arc::<Mutex<FakePulse>>::default();
-        let (release, gate) = std::sync::mpsc::channel();
-        {
-            let mut pulse = pulse.lock().unwrap();
-            pulse.put(event_on(5, PARK_INDEX), 0);
-            pulse.put(event_on(6, PARK_INDEX), 0);
-            pulse.open_gate = Some(gate);
-        }
-        let io = FakePulseIo(pulse.clone());
-        let ParkWatch { stop, done } = ParkWatch::spawn(move || Ok(io), DAC.to_string());
-        let opening = std::time::Instant::now();
-        while pulse.lock().unwrap().open_gate.is_some() {
-            assert!(opening.elapsed() < Duration::from_secs(3), "no open_corked");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        drop(stop);
-        drop(release);
-        let ended = done.recv_timeout(Duration::from_secs(3));
-        assert_eq!(ended, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
-        let calls = pulse.lock().unwrap().calls.clone();
+        let moved = format!("move 5 -> {DAC_INDEX}");
         let opened = "open media.role=event -> 101".to_string();
-        let expected = [format!("move 5 -> {DAC_INDEX}"), opened, "close 101".into()];
-        assert_eq!(calls, expected);
+        for (at, expected) in [
+            ("move", vec![moved.clone()]),
+            ("open", vec![moved.clone(), opened, "close 101".to_string()]),
+        ] {
+            let pulse = Arc::<Mutex<FakePulse>>::default();
+            let (release, gate) = std::sync::mpsc::channel();
+            {
+                let mut pulse = pulse.lock().unwrap();
+                pulse.put(event_on(5, PARK_INDEX), 0);
+                pulse.put(event_on(6, PARK_INDEX), 0);
+                pulse.gate = Some((at, gate));
+            }
+            let io = FakePulseIo(pulse.clone());
+            let ParkWatch { stop, done } = ParkWatch::spawn(move || Ok(io), DAC.to_string());
+            let waiting = std::time::Instant::now();
+            while pulse.lock().unwrap().gate.is_some() {
+                assert!(waiting.elapsed() < Duration::from_secs(3), "no {at}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(stop);
+            drop(release);
+            let ended = done.recv_timeout(Duration::from_secs(3));
+            assert_eq!(ended, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+            assert_eq!(pulse.lock().unwrap().calls, expected, "{at}");
+        }
     }
 
     #[tokio::test]
