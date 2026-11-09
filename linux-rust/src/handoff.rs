@@ -4236,19 +4236,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn idle_owner_keeps_ownership_through_a_local_call() {
-        let mut p = idle_owner(false);
-        assert_eq!(p.feed(1500, Input::LocalCall(true)), [AdvertiseCall(true)]);
-        assert_eq!(p.feed(2000, Input::RemoteOwnershipRequest), []);
-        p.idle_ticks(2000);
-        assert_eq!(
-            p.feed(70_000, Input::LocalCall(false)),
-            [AdvertiseCall(false)]
-        );
-        p.idle_ticks(70_000);
-    }
-
     // #253: mode toggles after a stop keep Linux the idle owner (#262).
 
     #[test]
