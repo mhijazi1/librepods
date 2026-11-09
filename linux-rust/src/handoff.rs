@@ -529,8 +529,9 @@ impl Handoff {
                 // The other host left: nothing to hold A2DP for (#264).
                 if self.only_local_listed() {
                     self.remote_owns = false;
-                    self.sync_hold(false, out);
                 }
+                // A remote edge seen before its host was listed holds now (#296).
+                self.sync_hold(false, out);
             }
             Input::Ownership(value) => self.ownership(now, value, out),
             Input::RemoteOwnershipRequest => {
@@ -582,6 +583,7 @@ impl Handoff {
                     // [0] is acknowledged like the first one, without a pause.
                     self.say("REMOTE requested ownership; re-sending the timed-out release");
                     self.request(now, false, Cause::Remote, out);
+                    self.hold_for_remote(out);
                     return;
                 }
                 // Linux holds or is taking the AirPods for a call: keep them
@@ -4773,6 +4775,88 @@ mod tests {
             all.extend(q.feed(ms, Input::Tick));
         }
         assert_eq!(holds(&all), []);
+    }
+
+    fn hosts_now(new: Vec<ConnectedDevice>) -> Input {
+        Input::ConnectedDevices {
+            old: two_hosts(),
+            new,
+        }
+    }
+
+    /// `hold_ready(true)` with the AirPods listing only Linux: released.
+    fn listed_alone() -> Probe {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(50, hosts_now(vec![host(LOCAL)])), []);
+        p
+    }
+
+    /// A remote edge from 200 ms, while only Linux is listed, holds once
+    /// the other host is listed, and only once (#296).
+    fn assert_holds_once_listed(mut p: Probe, edge: &[Input]) {
+        for (i, input) in edge.iter().enumerate() {
+            assert_eq!(holds(&p.feed(200 + 100 * i as u64, input.clone())), []);
+        }
+        assert_eq!(
+            holds(&p.feed(1000, hosts_now(two_hosts()))),
+            [HoldA2dp(true)]
+        );
+        assert_eq!(holds(&p.feed(1100, hosts_now(two_hosts()))), []);
+    }
+
+    #[test]
+    fn hold_remote_edge_before_host_listed_audio_source() {
+        assert_holds_once_listed(listed_alone(), &[remote_media()]);
+        // The same from a hold the host list released.
+        let mut p = held();
+        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
+        assert_holds_once_listed(p, &[remote_media()]);
+    }
+
+    #[test]
+    fn hold_remote_edge_before_host_listed_unsolicited_loss() {
+        let edge = [Input::Ownership(vec![1]), Input::Ownership(vec![0])];
+        assert_holds_once_listed(listed_alone(), &edge);
+    }
+
+    #[test]
+    fn hold_remote_edge_before_host_listed_remote_request() {
+        assert_holds_once_listed(listed_alone(), &[Input::RemoteOwnershipRequest]);
+    }
+
+    #[test]
+    fn hold_remote_request_retry_after_host_left_and_returned() {
+        let mut p = hold_take();
+        assert_eq!(
+            holds(&p.feed(1100, Input::RemoteOwnershipRequest)),
+            [HoldA2dp(true)]
+        );
+        assert_eq!(
+            p.feed(1200, hosts_now(vec![host(LOCAL)])),
+            [HoldA2dp(false)]
+        );
+        assert_eq!(holds(&p.feed(1100 + 5001, Input::Tick)), []);
+        assert!(matches!(p.core.timed_out_release, Some((Cause::Remote, _))));
+        assert_eq!(holds(&p.feed(6200, hosts_now(two_hosts()))), []);
+        assert_eq!(
+            p.feed(6300, Input::RemoteOwnershipRequest),
+            [SendOwnership(false), HoldA2dp(true)]
+        );
+    }
+
+    #[test]
+    fn hold_host_list_alone_adds_no_hold() {
+        let mut p = held();
+        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
+        let mut all = p.feed(200, hosts_now(two_hosts()));
+        for ms in (300..10_000).step_by(500) {
+            all.extend(p.feed(ms, Input::Tick));
+        }
+        assert_eq!(holds(&all), []);
+        // An empty list after only Linux was listed holds nothing either.
+        let mut p = held();
+        assert_eq!(p.feed(150, hosts_now(vec![host(LOCAL)])), [HoldA2dp(false)]);
+        assert_eq!(holds(&p.feed(200, hosts_now(vec![]))), []);
     }
 
     /// The c1/c2 sequences of the tests above; every command, in order.
