@@ -4348,8 +4348,32 @@ mod tests {
     async fn profile_cycle_runs_every_write_under_profile_write() {
         let controller = MediaController::new(String::new(), String::new());
         let both = profiles(&["off", "a2dp-sink"]);
-        assert_eq!(cycle_seam(&controller, |_| {}).await, (true, 1, both));
+        let lock = Arc::clone(&controller.profile_write);
+        let held = move |_: &str| assert!(lock.try_lock().is_err());
+        assert_eq!(cycle_seam(&controller, held).await, (true, 1, both));
         assert!(controller.profile_write.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn profile_cycle_keeps_profile_write_after_the_chain_is_dropped() {
+        let controller = MediaController::new(String::new(), String::new());
+        let lock = Arc::clone(&controller.profile_write);
+        let (dropped, wait) = std::sync::mpsc::channel::<()>();
+        let (report, locked) = std::sync::mpsc::channel();
+        // The `off` write waits until the chain is gone; the next one reports
+        // whether the job still holds the lock.
+        let after = move |p: &str| match p {
+            "off" => wait.recv().unwrap(),
+            _ => report.send(lock.try_lock().is_err()).unwrap(),
+        };
+        let run = cycle_seam(&controller, after);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), run)
+                .await
+                .is_err()
+        );
+        dropped.send(()).unwrap();
+        assert!(locked.recv_timeout(Duration::from_secs(5)).unwrap());
     }
 
     #[tokio::test]
