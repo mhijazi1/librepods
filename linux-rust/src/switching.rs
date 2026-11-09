@@ -116,7 +116,8 @@ impl PlaybackSamples {
 /// need no D-Bus or PipeWire.
 pub(crate) trait MediaActions: Send + Sync {
     /// Pause the local players `streams` says play locally
-    /// (`PlaybackState::live_or_unknown`); whether one matched.
+    /// (`PlaybackState::live_or_unknown`); whether one matched or the
+    /// session bus was unavailable.
     fn pause(&self, streams: PlaybackState) -> BoxFuture<'static, bool>;
     /// Activate the AirPods' A2DP profile.
     fn activate_a2dp(&self) -> BoxFuture<'static, ()>;
@@ -160,11 +161,19 @@ impl MediaActions for ControllerMedia {
         let controller = self.controller.clone();
         let pause_players = self.pause_players.clone();
         Box::pin(async move {
+            // No live local stream at all: nothing here to pause (#355).
+            if streams.live.as_ref().is_some_and(|pids| pids.is_empty()) {
+                return false;
+            }
             let outcome = controller
                 .pause_all_media_with(move || {
                     pause_players(&|owner| streams.live_or_unknown(owner))
                 })
                 .await;
+            if outcome.bus_unavailable {
+                error!("Handoff: session bus unavailable; could not pause local players");
+                return true;
+            }
             outcome.paused + outcome.failed > 0
         })
     }
@@ -2666,13 +2675,13 @@ mod tests {
         players: &[Option<u32>],
         live: Option<&[u32]>,
     ) -> (Vec<Option<u32>>, bool) {
-        let (manager, mut rx, _tx) = ready_session().await;
-        let records = Arc::new(Records::default());
         let paused_players = Arc::new(StdMutex::new(Vec::new()));
         let paused_for = paused_players.clone();
         let players = players.to_vec();
-        let (outer, media) = share_media(
-            MediaController::new(String::new(), LOCAL.to_string()),
+        let controller = yield_pause_with(
+            mac,
+            false,
+            live,
             Arc::new(move |own: &dyn Fn(Option<u32>) -> bool| {
                 let mut paused = paused_for.lock().unwrap();
                 paused.extend(players.iter().copied().filter(|&owner| own(owner)));
@@ -2681,7 +2690,26 @@ mod tests {
                     ..Default::default()
                 }
             }),
-        );
+        )
+        .await;
+        let paused = controller.i_paused_the_media().await;
+        let players = paused_players.lock().unwrap().clone();
+        (players, paused)
+    }
+
+    /// `yield_pause` with the pauser injected and `is_playing` as last seen
+    /// before it; returns the controller.
+    async fn yield_pause_with(
+        mac: &str,
+        is_playing: bool,
+        live: Option<&[u32]>,
+        pause_players: PausePlayers,
+    ) -> MediaController {
+        let (manager, mut rx, _tx) = ready_session().await;
+        let records = Arc::new(Records::default());
+        let controller = MediaController::new(String::new(), LOCAL.to_string());
+        controller.set_playing(is_playing).await;
+        let (outer, media) = share_media(controller.clone(), pause_players);
         let (play_tx, play_rx) = mpsc::channel(8);
         let streams = watch::channel(PlaybackState {
             counted: false,
@@ -2714,14 +2742,54 @@ mod tests {
         h.emit(AACPEvent::OwnershipToFalseRequest);
         assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
-        let paused = outer.lock().await.i_paused_the_media().await;
         stop_handoff_task(mac);
-        let players = paused_players.lock().unwrap().clone();
-        (players, paused)
+        controller
     }
 
     fn not_pausing(mac: &str) -> bool {
         traced(mac).iter().any(|l| l.contains("not pausing"))
+    }
+
+    /// A pauser that counts its calls and finds no session bus.
+    fn bus_unavailable(calls: &Arc<AtomicUsize>) -> PausePlayers {
+        let calls = calls.clone();
+        Arc::new(move |_: &dyn Fn(Option<u32>) -> bool| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            media_controller::PauseOutcome {
+                bus_unavailable: true,
+                ..Default::default()
+            }
+        })
+    }
+
+    /// #355: a known listing with no live local stream skips the pause
+    /// altogether, even while playback was last seen with no session bus.
+    #[tokio::test]
+    async fn yield_pause_known_empty_listing_skips_pause() {
+        let mac = "5A:00:00:00:03:07";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = yield_pause_with(mac, true, Some(&[]), bus_unavailable(&calls)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!controller.i_paused_the_media().await);
+        assert_eq!(a2dp_resume::A2dpResumeIo::self_pauses(&controller), 0);
+        assert!(not_pausing(mac), "{:#?}", traced(mac));
+    }
+
+    /// #355: with no session bus the pause is not reported as "not pausing";
+    /// the self-pause mark follows #27 (`marks_self_pause`).
+    #[tokio::test]
+    async fn yield_pause_bus_unavailable_is_not_not_pausing() {
+        for (mac, live, is_playing) in [
+            ("5A:00:00:00:03:08", Some(&[FIREFOX_PID][..]), true),
+            ("5A:00:00:00:03:09", Some(&[FIREFOX_PID][..]), false),
+            ("5A:00:00:00:03:0A", None, true),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let controller = yield_pause_with(mac, is_playing, live, bus_unavailable(&calls)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{mac}");
+            assert_eq!(controller.i_paused_the_media().await, is_playing, "{mac}");
+            assert!(!not_pausing(mac), "{:#?}", traced(mac));
+        }
     }
 
     #[tokio::test]
