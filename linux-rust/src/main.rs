@@ -180,12 +180,18 @@ async fn async_main(
 
     let devices_path = get_devices_path();
     let devices_json = std::fs::read_to_string(&devices_path).unwrap_or_else(|e| {
-        log::error!("Failed to read devices file: {}", e);
+        log::error!(
+            "Failed to read devices file: {}",
+            settings_file::devices_error_log(&e)
+        );
         "{}".to_string()
     });
     let devices_list: HashMap<String, DeviceData> = serde_json::from_str(&devices_json)
         .unwrap_or_else(|e| {
-            log::error!("Deserialization failed: {}", e);
+            log::error!(
+                "Could not parse devices.json: {}",
+                settings_file::devices_error_log(&e.into())
+            );
             HashMap::new()
         });
     for (mac, device_data) in devices_list.iter() {

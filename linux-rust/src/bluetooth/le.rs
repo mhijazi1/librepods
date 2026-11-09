@@ -138,11 +138,10 @@ fn rpa_lookup(
     })
 }
 
-/// Only the error's kind: a parse error's text quotes devices.json values, keys included.
 fn read_error_message(addr: &str, e: &std::io::Error) -> String {
     format!(
-        "Could not read devices.json to check {addr}: {:?}",
-        e.kind()
+        "Could not read devices.json to check {addr}: {}",
+        crate::settings_file::devices_error_log(e)
     )
 }
 
