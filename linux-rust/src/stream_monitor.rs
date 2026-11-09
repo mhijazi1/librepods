@@ -406,7 +406,8 @@ pub(crate) struct PlaybackState {
 }
 
 impl PlaybackState {
-    /// Whether the MPRIS player whose bus owner is `owner` plays locally:
+    /// Whether the MPRIS player whose resolved owner
+    /// (`media_controller::player_owner`, #349) is `owner` plays locally:
     /// it owns a live stream (#329), unknown counting as live: before the
     /// first successful listing (a stalled sound server, #83) or with a
     /// dead stream thread (#318), every player plays as before #302. A
@@ -430,7 +431,7 @@ const OWNER_DEPTH: usize = 16;
 /// (`PROCESS_ID`; a stream without one owns nothing) and its ancestors by
 /// `ppid`, at most `OWNER_DEPTH` of them, stopping at PID 1, an unknown
 /// parent or a repeat within that stream's walk. An MPRIS player owns a
-/// live stream iff its bus owner is in the set: the stream's process or a
+/// live stream iff its resolved owner is in the set: the stream's process or a
 /// bounded ancestor of it.
 #[cfg(test)]
 pub(crate) fn live_stream_pids(
@@ -494,7 +495,7 @@ fn with_client_pid(
 }
 
 /// `pid`'s parent from `/proc/<pid>/stat`; None if it is gone or unreadable.
-fn proc_ppid(pid: u32) -> Option<u32> {
+pub(crate) fn proc_ppid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name may hold spaces and parentheses: skip past its last ')'.
     let (_, fields) = stat.rsplit_once(')')?;

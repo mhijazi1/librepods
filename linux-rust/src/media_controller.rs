@@ -344,6 +344,60 @@ pub(crate) fn marks_self_pause(outcome: PauseOutcome, was_playing: bool) -> bool
     outcome.paused > 0 || outcome.failed > 0 || (outcome.bus_unavailable && was_playing)
 }
 
+/// Plasma Browser Integration's MPRIS bridge: a native-messaging host the
+/// browser starts, playing nothing itself (#349).
+const PBI_BUS: &str = "org.mpris.MediaPlayer2.plasma-browser-integration";
+/// mpDris2's and mpd-mpris's MPRIS bridge for MPD, with or without a `.`
+/// suffix (#349).
+const MPD_BUS: &str = "org.mpris.MediaPlayer2.mpd";
+
+/// The PID whose stream counts as MPRIS player `service`'s own, the
+/// resolved owner (#349): for the PBI bridge its bus owner's parent (the
+/// browser) by `ppid`, for the MPD bridge the local MPD process by `mpd`
+/// (called for that name only), else, or when that lookup fails, the bus
+/// owner as #329 has it (None when the bus can't tell).
+pub(crate) fn player_owner(
+    service: &str,
+    bus_owner: Option<u32>,
+    ppid: impl Fn(u32) -> Option<u32>,
+    mpd: impl FnOnce() -> Option<u32>,
+) -> Option<u32> {
+    let bridged = if service == PBI_BUS {
+        bus_owner.and_then(ppid)
+    } else if service
+        .strip_prefix(MPD_BUS)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    {
+        mpd()
+    } else {
+        None
+    };
+    bridged.or(bus_owner)
+}
+
+/// The lowest PID of `procs` (pid, `/proc/<pid>/comm`) that is MPD: `mpd`,
+/// or NixOS's `.mpd-wrapped`.
+pub(crate) fn mpd_pid(procs: impl IntoIterator<Item = (u32, impl AsRef<str>)>) -> Option<u32> {
+    procs
+        .into_iter()
+        .filter(|(_, comm)| matches!(comm.as_ref(), "mpd" | ".mpd-wrapped"))
+        .map(|(pid, _)| pid)
+        .min()
+}
+
+/// `mpd_pid` over every process in /proc.
+fn proc_mpd_pid() -> Option<u32> {
+    let procs = std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse().ok()?;
+            let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+            Some((pid, comm.trim_end().to_string()))
+        });
+    mpd_pid(procs)
+}
+
 /// The #841 guards, in order: case recovery, live session, Linux plus a
 /// remote host (this machine and at least one other device, so 2, 3, 4...
 /// hosts), audio source idle or local media. Automatic takes compare audio
@@ -1117,8 +1171,8 @@ impl MediaController {
         Self::mpris_players_with_status("Playing", Duration::from_secs(5))
     }
 
-    /// `playing_mpris_players` whose bus owner PID (None when the bus can't
-    /// tell) `own` accepts. Blocking.
+    /// `playing_mpris_players` whose resolved owner (`player_owner`, None
+    /// when the bus can't tell) `own` accepts. Blocking.
     fn playing_mpris_players_owned(own: &dyn Fn(Option<u32>) -> bool) -> Vec<String> {
         let Ok(conn) = Connection::new_session() else {
             return Vec::new();
@@ -1126,13 +1180,14 @@ impl MediaController {
         Self::list_mpris_services(&conn)
             .into_iter()
             .filter(|service| {
-                Self::mpris_playing(&conn, service) && own(Self::bus_owner_pid(&conn, service))
+                Self::mpris_playing(&conn, service) && own(Self::owner_pid(&conn, service))
             })
             .collect()
     }
 
-    /// The bus owner PID of each MPRIS player (KDE Connect's excluded) that
-    /// reports Playing; None where the bus can't tell. Blocking.
+    /// The resolved owner (`player_owner`) of each MPRIS player (KDE
+    /// Connect's excluded) that reports Playing; None where the bus can't
+    /// tell. Blocking.
     pub(crate) fn playing_mpris_owners() -> Vec<Option<u32>> {
         let Ok(conn) = Connection::new_session() else {
             return Vec::new();
@@ -1140,8 +1195,20 @@ impl MediaController {
         Self::list_mpris_services(&conn)
             .iter()
             .filter(|service| Self::mpris_playing(&conn, service))
-            .map(|service| Self::bus_owner_pid(&conn, service))
+            .map(|service| Self::owner_pid(&conn, service))
             .collect()
+    }
+
+    /// `player_owner` of the Playing player `service`, from the bus and
+    /// /proc. Blocking.
+    fn owner_pid(conn: &Connection, service: &str) -> Option<u32> {
+        let bus_owner = Self::bus_owner_pid(conn, service);
+        player_owner(
+            service,
+            bus_owner,
+            crate::stream_monitor::proc_ppid,
+            proc_mpd_pid,
+        )
     }
 
     /// The PID of the process owning bus name `service`; None when the bus
@@ -1688,9 +1755,9 @@ impl MediaController {
         outcome
     }
 
-    /// Pause every MPRIS player that reports `Playing` and whose bus owner
-    /// PID (None when the bus can't tell) `own` accepts. Blocking: run it on
-    /// a blocking thread.
+    /// Pause every MPRIS player that reports `Playing` and whose resolved
+    /// owner (`player_owner`, None when the bus can't tell) `own` accepts.
+    /// Blocking: run it on a blocking thread.
     pub(crate) fn pause_playing_mpris_players(own: &dyn Fn(Option<u32>) -> bool) -> PauseOutcome {
         Self::pause_mpris_players_owned(own).1
     }
@@ -1710,7 +1777,7 @@ impl MediaController {
             if let Ok(playback_status) =
                 proxy.get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
                 && playback_status == "Playing"
-                && own(Self::bus_owner_pid(&conn, &service))
+                && own(Self::owner_pid(&conn, &service))
             {
                 if proxy
                     .method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Pause", ())
@@ -5869,6 +5936,83 @@ mod tests {
         assert_eq!(
             (reads.load(Ordering::SeqCst), writes.lock().unwrap().len()),
             (0, 0)
+        );
+    }
+
+    // #349: MPRIS bridges resolve to the process that plays.
+    const BRIDGE_PID: u32 = 99_999_011;
+    const MPD_PID: u32 = 99_999_012;
+    const BROWSER_PID: u32 = 99_999_013;
+    const CHIME_PID: u32 = 99_999_014;
+
+    fn live(pids: &[u32]) -> crate::stream_monitor::PlaybackState {
+        crate::stream_monitor::PlaybackState {
+            counted: false,
+            live: Some(pids.iter().copied().collect()),
+        }
+    }
+
+    #[test]
+    fn bridge_owner_mpd_is_local_mpd_process() {
+        for service in [MPD_BUS, "org.mpris.MediaPlayer2.mpd.instance1234"] {
+            let owner = |procs: &[(u32, &str)]| {
+                player_owner(
+                    service,
+                    Some(BRIDGE_PID),
+                    |_| None,
+                    || mpd_pid(procs.iter().copied()),
+                )
+            };
+            let with_mpd = owner(&[(CHIME_PID, "pw-play"), (MPD_PID, "mpd")]);
+            assert_eq!(with_mpd, Some(MPD_PID), "{service}");
+            assert!(live(&[MPD_PID]).live_or_unknown(with_mpd), "{service}");
+            // No local MPD (a remote one): the bridge keeps its own PID.
+            let without = owner(&[(CHIME_PID, "pw-play")]);
+            assert_eq!(without, Some(BRIDGE_PID), "{service}");
+            assert!(!live(&[CHIME_PID]).live_or_unknown(without), "{service}");
+        }
+    }
+
+    #[test]
+    fn bridge_mpd_comm_names() {
+        assert_eq!(mpd_pid([(7, "mpd")]), Some(7));
+        assert_eq!(mpd_pid([(7, ".mpd-wrapped")]), Some(7));
+        for comm in ["mpdevil", "mpd-mpris", "mpDris2"] {
+            assert_eq!(mpd_pid([(7, comm)]), None, "{comm}");
+        }
+        assert_eq!(mpd_pid([(9, "mpd"), (3, "mpd"), (1, "mpDris2")]), Some(3));
+    }
+
+    #[test]
+    fn bridge_owner_pbi_is_hosts_parent() {
+        let parent = |pid| (pid == BRIDGE_PID).then_some(BROWSER_PID);
+        let owner = player_owner(PBI_BUS, Some(BRIDGE_PID), parent, || unreachable!());
+        assert_eq!(owner, Some(BROWSER_PID));
+        assert!(live(&[BROWSER_PID]).live_or_unknown(owner));
+        assert!(!live(&[CHIME_PID]).live_or_unknown(owner));
+        // A host whose parent is gone keeps its own PID.
+        let owner = player_owner(PBI_BUS, Some(BRIDGE_PID), |_| None, || unreachable!());
+        assert_eq!(owner, Some(BRIDGE_PID));
+    }
+
+    #[test]
+    fn bridge_owner_other_names_keep_bus_owner() {
+        for service in [
+            "org.mpris.MediaPlayer2.spotify",
+            "org.mpris.MediaPlayer2.firefox.instance_1_23",
+            "org.mpris.MediaPlayer2.mpdevil",
+        ] {
+            let owner = player_owner(
+                service,
+                Some(BRIDGE_PID),
+                |_| Some(1),
+                || panic!("mpd lookup for {service}"),
+            );
+            assert_eq!(owner, Some(BRIDGE_PID), "{service}");
+        }
+        assert_eq!(
+            player_owner(PBI_BUS, None, |_| Some(1), || unreachable!()),
+            None
         );
     }
 }
