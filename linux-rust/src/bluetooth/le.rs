@@ -66,7 +66,6 @@ fn try_start(
     lock(retry).ready(mac, now).then_some(guard)
 }
 
-// bluetoothctl, as bluer's connect doesn't work here.
 async fn le_connect(mac: &str) -> ConnectOutcome {
     use crate::reconnect::Bluetoothctl;
     match crate::reconnect::bluetoothctl_connect(mac).await {
