@@ -83,7 +83,8 @@ pub(crate) enum Input {
     /// session snapshot) and is not used for that decision (#58). Until
     /// `InitBacklogDrained`, `Auto` or a disconnect, a host in the
     /// `Reconnected` snapshot is known too, so stale replays never
-    /// re-announce (#79); only the probe's echo timeout keeps it longer.
+    /// re-announce (#79); only the probe's echo timeout (cached owner [1], a
+    /// real release, #290) keeps it longer.
     ConnectedDevices {
         old: Vec<ConnectedDevice>,
         new: Vec<ConnectedDevice>,
@@ -124,13 +125,14 @@ pub(crate) enum Input {
     ReconnectFailed(String),
     /// Queue boundary from the shell (#49): every event queued before the
     /// session's snapshot has been fed (the reconnect's init backlog up to
-    /// the echo of its last "not owning" in the probe, the pre-snapshot
-    /// queue on the default path); later events are fresh. It ends the
-    /// reconnect take's stale-report window, so a later 0 that acknowledges
-    /// nothing is a loss, and the snapshot hosts' announce exemption (#79),
-    /// which `Auto` or a disconnect also ends; only the probe's echo timeout
-    /// leaves it in place. Otherwise it changes nothing. Fed in queue order,
-    /// never on a timer.
+    /// the probe's facts cut (#143), which waits for the echo of its last
+    /// "not owning" only when the cached owner was [1], a real release
+    /// (#290); the pre-snapshot queue on the default path); later events are
+    /// fresh. It ends the reconnect take's stale-report window, so a later 0
+    /// that acknowledges nothing is a loss, and the snapshot hosts' announce
+    /// exemption (#79), which `Auto` or a disconnect also ends; only that
+    /// owner-[1] echo timing out leaves it in place. Otherwise it changes
+    /// nothing. Fed in queue order, never on a timer.
     InitBacklogDrained,
     /// Switch to automatic handoff (REPL `auto`). When the cached owner is
     /// Linux ([1]) its "not owning" is a pending release, so the reply is
@@ -314,9 +316,10 @@ pub(crate) struct Handoff {
     /// Hosts of the adopted `Reconnected` snapshot: replayed reports queued
     /// before it never announce them (#79). Cleared at `InitBacklogDrained`,
     /// `Auto` and on disconnect. Accepted limit: if the probe's echo timed
-    /// out (automatic already on, so no boundary and no `Auto`) they stay
-    /// exempt until the next disconnect, so a snapshot host that leaves and
-    /// rejoins in that session is not re-announced (#150).
+    /// out (cached owner [1], a real release, #290; automatic already on, so
+    /// no boundary and no `Auto`) they stay exempt until the next
+    /// disconnect, so a snapshot host that leaves and rejoins in that
+    /// session is not re-announced (#150).
     /// A host outside the snapshot is always announced.
     snapshot_hosts: Vec<ConnectedDevice>,
     ears: Vec<EarDetectionStatus>,
@@ -539,7 +542,7 @@ impl Handoff {
                 // and must not announce a second time (#58).
                 // Reconnected snapshot hosts count as known until the boundary,
                 // `Auto` or a disconnect (#79); only the probe's echo timeout
-                // leaves them known for the session.
+                // (cached owner [1], #290) leaves them known for the session.
                 if self.automatic
                     && self.live()
                     && new.iter().any(|d| {
