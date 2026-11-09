@@ -138,6 +138,14 @@ fn rpa_lookup(
     })
 }
 
+/// Only the error's kind: a parse error's text quotes devices.json values, keys included.
+fn read_error_message(addr: &str, e: &std::io::Error) -> String {
+    format!(
+        "Could not read devices.json to check {addr}: {:?}",
+        e.kind()
+    )
+}
+
 /// Addresses no stored IRK resolved, kept only while the stored IRKs stay the same.
 #[derive(Default)]
 struct UnmatchedRpas {
@@ -154,7 +162,7 @@ impl UnmatchedRpas {
         devices_json: std::io::Result<String>,
     ) -> Option<(String, Option<[u8; 16]>)> {
         let devices = crate::settings_file::parse_devices(devices_json)
-            .inspect_err(|e| warn!("Could not read devices.json to check {}: {}", addr, e))
+            .inspect_err(|e| warn!("{}", read_error_message(addr, e)))
             .ok()?;
         let irks = devices
             .values()
@@ -658,6 +666,21 @@ mod tests {
             unmatched.lookup(&addr, Ok(stored)),
             Some((MAC.to_string(), None))
         );
+    }
+
+    #[test]
+    fn read_error_message_hides_key_bytes() {
+        let irk = hex::encode(IRK);
+        let stored = devices_json(&irk, "");
+        let keys = format!(r#"{{"irk":"{irk}","enc_key":""}}"#);
+        assert!(stored.contains(&keys));
+        let bad = stored.replace(&keys, &format!("\"{irk}\""));
+        let err = crate::settings_file::parse_devices(Ok(bad)).unwrap_err();
+        // serde quotes the bad value, so the raw error would leak the IRK.
+        assert!(err.to_string().contains(&irk));
+        let msg = read_error_message(MAC, &err);
+        assert!(msg.contains(MAC), "{msg}");
+        assert!(!msg.to_lowercase().contains(&irk), "{msg}");
     }
 
     #[test]
