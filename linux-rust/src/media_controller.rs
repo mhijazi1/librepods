@@ -1104,7 +1104,6 @@ impl MediaController {
             let state = self.state.lock().await;
             if !state.ear_detection_enabled {
                 debug!("Ear detection disabled, skipping");
-                drop(state);
                 if reinserted {
                     self.report_ear_resume(false);
                 }
