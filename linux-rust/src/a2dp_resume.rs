@@ -795,7 +795,7 @@ mod tests {
             let mut chain = Chain::new(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
             (chain.step(now, now, Some(false), false, &[]), chain.due())
         };
-        // A slow first read ending 99 ms before `last`: the re-read at `last`.
+        // A read issued and back 99 ms before `last`: the re-read at `last`.
         let early = last - TRANSPORT_REREAD + Duration::from_millis(1);
         assert_eq!(idle_at(early), (Some(vec![]), last));
         // 1 ms before `last`: still a re-read, at `last`.
