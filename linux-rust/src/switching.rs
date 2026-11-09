@@ -355,9 +355,10 @@ where
     }
 }
 
-/// The players with a live local stream and the newest stream start one
-/// poller sample saw (#96).
-type Sources = (HashSet<Option<u32>>, u64);
+/// The players with a live local stream, the newest stream start and
+/// whether the live set was known (`PlaybackState::live`) one poller sample
+/// saw (#96).
+type Sources = (HashSet<Option<u32>>, u64, bool);
 
 /// One poller sample over the Playing players' bus `owners` and the stream
 /// monitor's state and stream starts: Linux's `local_category` and, against
@@ -366,6 +367,8 @@ type Sources = (HashSet<Option<u32>>, u64);
 /// stream whose owner had none (301), else a stream that started counting
 /// (201) and is no such player's own stream (#329: its process or a recorded
 /// ancestor is the player's owner; a stream with no resolved PID is new).
+/// A live set gone unknown since then (a dead monitor, #318) makes every
+/// player live: that sample re-baselines the players (#426).
 fn sample_sources(
     owners: &[Option<u32>],
     (state, started): &(PlaybackState, Starts),
@@ -377,10 +380,11 @@ fn sample_sources(
         .filter(|&owner| state.live_or_unknown(owner))
         .collect();
     let category = local_category(!owners.is_empty(), !live.is_empty(), state.counted);
-    let seen = last.as_ref().map_or(0, |&(_, seen)| seen);
+    let known = state.live.is_some();
+    let seen = last.as_ref().map_or(0, |&(_, seen, _)| seen);
     let own = |pids: &HashSet<u32>| live.iter().flatten().any(|pid| pids.contains(pid));
-    let new_source = last.as_ref().and_then(|(was_live, _)| {
-        if !live.is_subset(was_live) {
+    let new_source = last.as_ref().and_then(|(was_live, _, was_known)| {
+        if (known || !was_known) && !live.is_subset(was_live) {
             Some(AUDIO_CATEGORY_MEDIA)
         } else {
             started
@@ -390,7 +394,7 @@ fn sample_sources(
         }
     });
     let newest = started.last().map_or(seen, |&(start, _)| start.max(seen));
-    *last = Some((live, newest));
+    *last = Some((live, newest, known));
     (category, new_source)
 }
 
@@ -4772,6 +4776,8 @@ mod tests {
             streams_playing: bool,
             /// The poller's sources of the previous sample (#96).
             last: Option<Sources>,
+            /// The stream monitor is dead: samples' live set is unknown (#318).
+            monitor_dead: bool,
             t0: Instant,
             /// Every command list the core returned, in order.
             log: Vec<Vec<Command>>,
@@ -4788,6 +4794,7 @@ mod tests {
                     tracker: PlaybackTracker::new(MIN_STREAM_PLAYBACK),
                     streams_playing: false,
                     last: None,
+                    monitor_dead: false,
                     t0,
                     log: Vec::new(),
                 };
@@ -4843,7 +4850,7 @@ mod tests {
                 let owned = stream_monitor::stream_owners(streams, |_| None);
                 let state = PlaybackState {
                     counted: self.streams_playing,
-                    live: Some(owned.values().flatten().copied().collect()),
+                    live: (!self.monitor_dead).then(|| owned.values().flatten().copied().collect()),
                 };
                 let started = self.tracker.started(&owned);
                 let (category, new_source) =
@@ -5639,6 +5646,44 @@ mod tests {
                 sample_sources(&player(true), &state, &mut None),
                 (MEDIA, None)
             );
+        }
+
+        /// #426: player A plays its live stream (301) beside player B,
+        /// Playing with no stream. The monitor dies: the sample with the
+        /// live set gone unknown re-baselines, no new source; a player C
+        /// Playing in a later unknown sample is new.
+        #[test]
+        fn sample_sources_live_unknown_rebaselines_once() {
+            let (a, b, c) = (Some(PLAYER_PID), Some(SECOND_PID), Some(SECOND_PID + 1));
+            let sample = |live| {
+                let state = PlaybackState {
+                    counted: false,
+                    live,
+                };
+                (state, Vec::new())
+            };
+            let mut last = None;
+            let known = sample(Some(HashSet::from([PLAYER_PID])));
+            assert_eq!(sample_sources(&[a, b], &known, &mut last), (MEDIA, None));
+            let unknown = sample(None);
+            assert_eq!(sample_sources(&[a, b], &unknown, &mut last), (MEDIA, None));
+            assert_eq!(
+                sample_sources(&[a, b, c], &unknown, &mut last),
+                (MEDIA, Some(MEDIA))
+            );
+        }
+
+        /// #426 through the core: Linux plays at 301 with A's stream beside
+        /// B (Playing, no stream) while the iPhone owns relaying 301; the
+        /// monitor dies. That sample commands nothing.
+        #[test]
+        fn fresh_source_non_event_monitor_dead() {
+            let player = [Some(PLAYER_PID)];
+            let (mut p, ms) = yielded(&player, &[music(1)], MEDIA);
+            let both = [Some(PLAYER_PID), Some(SECOND_PID)];
+            assert_eq!(p.sample(ms, &both, &[music(1)], |_| LOUD), []);
+            p.monitor_dead = true;
+            assert_eq!(p.sample(ms + POLL_MS, &both, &[music(1)], |_| LOUD), []);
         }
 
         /// #96 with #301: a bud back in while the iPhone owns, relaying 100;

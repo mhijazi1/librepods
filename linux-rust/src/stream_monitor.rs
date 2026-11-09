@@ -400,7 +400,7 @@ pub(crate) struct PlaybackState {
     /// A stream counts as playing (`PlaybackTracker`).
     pub(crate) counted: bool,
     /// The PIDs owning a live stream, muted or not, in the last successful
-    /// listing (`live_stream_pids`); None before the first one (#302) and
+    /// listing (`stream_owners`); None before the first one (#302) and
     /// once the source is dead (`PlaybackSource::dead`, #318).
     pub(crate) live: Option<HashSet<u32>>,
 }
@@ -432,6 +432,7 @@ const OWNER_DEPTH: usize = 16;
 /// parent or a repeat within that stream's walk. An MPRIS player owns a
 /// live stream iff its bus owner is in the set: the stream's process or a
 /// bounded ancestor of it.
+#[cfg(test)]
 pub(crate) fn live_stream_pids(
     streams: &[StreamProps],
     ppid: impl Fn(u32) -> Option<u32>,
