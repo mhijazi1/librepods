@@ -369,10 +369,10 @@ where
     }
 }
 
-/// The players with a live local stream, the newest stream start and
-/// whether the live set was known (`PlaybackState::live`) one poller sample
-/// saw (#96).
-type Sources = (HashSet<Option<u32>>, u64, bool);
+/// The players with a live local stream, the newest stream start, whether
+/// the live set was known (`PlaybackState::live`) and the Playing players
+/// one poller sample saw (#96).
+type Sources = (HashSet<Option<u32>>, u64, bool, HashSet<Option<u32>>);
 
 /// One poller sample over the Playing players' bus `owners` and the stream
 /// monitor's state and stream starts: Linux's `local_category` and, against
@@ -382,7 +382,8 @@ type Sources = (HashSet<Option<u32>>, u64, bool);
 /// (201) and is no such player's own stream (#329: its process or a recorded
 /// ancestor is the player's owner; a stream with no resolved PID is new).
 /// A live set gone unknown since then (a dead monitor, #318) makes every
-/// player live: that sample re-baselines the players (#426).
+/// player live: that sample reports only players not Playing in the previous
+/// sample (#426, #429).
 fn sample_sources(
     owners: &[Option<u32>],
     (state, started): &(PlaybackState, Starts),
@@ -395,10 +396,12 @@ fn sample_sources(
         .collect();
     let category = local_category(!owners.is_empty(), !live.is_empty(), state.counted);
     let known = state.live.is_some();
-    let seen = last.as_ref().map_or(0, |&(_, seen, _)| seen);
+    let seen = last.as_ref().map_or(0, |&(_, seen, _, _)| seen);
     let own = |pids: &HashSet<u32>| live.iter().flatten().any(|pid| pids.contains(pid));
-    let new_source = last.as_ref().and_then(|(was_live, _, was_known)| {
-        if (known || !was_known) && !live.is_subset(was_live) {
+    let new_source = last.as_ref().and_then(|(was_live, _, was_known, were)| {
+        // Known -> unknown: `live` is every owner now, so compare owners.
+        let was = if *was_known && !known { were } else { was_live };
+        if !live.is_subset(was) {
             Some(AUDIO_CATEGORY_MEDIA)
         } else {
             started
@@ -408,7 +411,7 @@ fn sample_sources(
         }
     });
     let newest = started.last().map_or(seen, |&(start, _)| start.max(seen));
-    *last = Some((live, newest, known));
+    *last = Some((live, newest, known, owners.iter().copied().collect()));
     (category, new_source)
 }
 
@@ -5938,6 +5941,47 @@ mod tests {
             assert_eq!(p.sample(ms, &both, &[music(1)], |_| LOUD), []);
             p.monitor_dead = true;
             assert_eq!(p.sample(ms + POLL_MS, &both, &[music(1)], |_| LOUD), []);
+        }
+
+        /// #429: player C starts Playing in the sample the monitor dies.
+        /// C is new since the previous sample: one new source, once.
+        #[test]
+        fn sample_sources_live_unknown_new_player_reported_once() {
+            let (a, b, c) = (Some(PLAYER_PID), Some(SECOND_PID), Some(SECOND_PID + 1));
+            let sample = |live| {
+                let state = PlaybackState {
+                    counted: false,
+                    live,
+                };
+                (state, Vec::new())
+            };
+            let mut last = None;
+            let known = sample(Some(HashSet::from([PLAYER_PID])));
+            assert_eq!(sample_sources(&[a, b], &known, &mut last), (MEDIA, None));
+            let unknown = sample(None);
+            assert_eq!(
+                sample_sources(&[a, b, c], &unknown, &mut last),
+                (MEDIA, Some(MEDIA))
+            );
+            assert_eq!(
+                sample_sources(&[a, b, c], &unknown, &mut last),
+                (MEDIA, None)
+            );
+        }
+
+        /// #429 through the core: as `fresh_source_non_event_monitor_dead`,
+        /// but a new player starts in the sample the monitor dies: one take.
+        #[test]
+        fn fresh_source_monitor_dead_new_player_takes() {
+            let player = [Some(PLAYER_PID)];
+            let (mut p, ms) = yielded(&player, &[music(1)], MEDIA);
+            let both = [Some(PLAYER_PID), Some(SECOND_PID)];
+            assert_eq!(p.sample(ms, &both, &[music(1)], |_| LOUD), []);
+            p.monitor_dead = true;
+            let three = [Some(PLAYER_PID), Some(SECOND_PID), Some(SECOND_PID + 1)];
+            let from = ms + POLL_MS;
+            let all = p.samples(from, past_min(from), &three, &[music(1)], |_| LOUD);
+            assert_eq!(all, [SendOwnership(true)]);
         }
 
         /// #96 with #301: a bud back in while the iPhone owns, relaying 100;
