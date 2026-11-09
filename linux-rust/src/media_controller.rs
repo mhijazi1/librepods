@@ -553,9 +553,8 @@ where
     // `profile_write` is released, so a later hold may miss its card (#TBD).
     let cause = match tokio::time::timeout(A2DP_CONNECT_TIMEOUT, connect()).await {
         Ok(Ok(())) => {
-            let interval = CARD_LOOKUP_INTERVAL;
-            let found =
-                retry_card_lookup_with(A2DP_CONNECT_LOOKUP_ATTEMPTS, interval, find, sleep).await;
+            let attempts = A2DP_CONNECT_LOOKUP_ATTEMPTS;
+            let found = retry_card_lookup_with(attempts, CARD_LOOKUP_INTERVAL, find, sleep).await;
             if found.is_some() {
                 return found;
             }
@@ -604,6 +603,8 @@ where
     }
     connect().await
 }
+
+/// What `activate_a2dp_profile` should do with the card's profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProfileChoice {
     /// An A2DP variant is already active. Switching would recreate the sink
