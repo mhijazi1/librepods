@@ -83,11 +83,7 @@ pub(crate) struct Facts {
 /// The category a sample's play edge asks at, as handoff.rs's
 /// `Input::Playback`: a start or a rise (#272) at the aggregate, a new
 /// source behind playback (#96) at its own; None for no edge or the baseline.
-fn play_request(
-    previous: Option<u32>,
-    category: u32,
-    new_source: Option<u32>,
-) -> Option<u32> {
+fn play_request(previous: Option<u32>, category: u32, new_source: Option<u32>) -> Option<u32> {
     let previous = previous?;
     if category <= AUDIO_CATEGORY_IDLE {
         None
