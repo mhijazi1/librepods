@@ -781,10 +781,10 @@ async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
 
 async fn run_handoff(mut shell: Shell) {
     // A reconnect the watcher made for new playback takes for it once the
-    // session reports its routing (#307); otherwise the normal start. Peeked
-    // first, so a stop during the wait still clears it; its age is judged
-    // there only, so the wait can't expire it.
-    let marked = reconnect::peek_marker(&shell.mac).is_some();
+    // session reports its routing (#307); otherwise the normal start. Claimed
+    // first, so the watcher still clears it on a stop during the wait; its
+    // age is judged there only, so the wait can't expire it.
+    let marked = reconnect::claim_marker(&shell.mac);
     let ready = marked && reconnect::routing_ready(&shell.manager).await;
     if marked && !ready {
         shell.log("RECONNECT host state not ready in 5 s; starting without a take");
@@ -2623,12 +2623,35 @@ mod tests {
         }
 
         fn settings(&self, _: &str) -> reconnect::Settings {
-            reconnect::Settings {
-                mode: SwitchingMode::Handoff,
-                auto_connect: true,
-                connect_mode: ConnectMode::Automatically,
-                last_owner_linux: false,
-            }
+            handoff_settings()
+        }
+
+        fn log(&self, _: &str, _: &str) {}
+    }
+
+    fn handoff_settings() -> reconnect::Settings {
+        reconnect::Settings {
+            mode: SwitchingMode::Handoff,
+            auto_connect: true,
+            connect_mode: ConnectMode::Automatically,
+            last_owner_linux: false,
+        }
+    }
+
+    /// Connects at once; the test starts the handoff task itself.
+    struct Connects;
+
+    impl reconnect::Connector for Connects {
+        async fn connected(&self, _: &str) -> bool {
+            false
+        }
+
+        async fn connect(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn settings(&self, _: &str) -> reconnect::Settings {
+            handoff_settings()
         }
 
         fn log(&self, _: &str, _: &str) {}
@@ -2698,6 +2721,52 @@ mod tests {
             });
         }
         h.play(true).await;
+        expect_startup(&h, &mut rx).await;
+        assert!(
+            !traced(mac)
+                .iter()
+                .any(|l| l.starts_with("AUTO reconnected"))
+        );
+        stop_handoff_task(mac);
+    }
+
+    /// A claimed marker outlives RECONNECT_TAKE_WINDOW only while the
+    /// watcher still watches for its stop (#307 round 3).
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_stop_during_routing_wait_after_expiry_does_not_take() {
+        let mac = "5A:00:00:00:07:13";
+        let (manager, mut rx, _tx) = injected_manager().await;
+        reconnect::disconnect_reason(mac, Some("org.bluez.Reason.Remote"));
+        let (play_tx, samples) = Harness::play_channel();
+        let watcher = tokio::spawn(reconnect::watch(mac.to_string(), samples(), Connects));
+        let sample = |category| play_tx.send((Instant::now(), category));
+        // Connected for new playback at t=0.
+        sample(AUDIO_CATEGORY_IDLE).await.unwrap();
+        sample(AUDIO_CATEGORY_MEDIA).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        // The task starts at t=12 and waits for its routing.
+        let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+        // Still playing at t=15.5, past the window; stopped at t=16.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        sample(AUDIO_CATEGORY_MEDIA).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sample(AUDIO_CATEGORY_IDLE).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(watcher.is_finished());
+        // Routing at t=16.5, inside the task's 5 s wait.
+        {
+            let mut state = manager.state.lock().await;
+            state.connected_devices = vec![host(LOCAL), host(REMOTE)];
+            state.ear_detection_status = vec![EarDetectionStatus::InEar; 2];
+            state.audio_source = Some(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            });
+        }
+        wait_until("the normal start", || {
+            traced(mac).iter().any(|l| l.starts_with("AUTO enabled"))
+        })
+        .await;
         expect_startup(&h, &mut rx).await;
         assert!(
             !traced(mac)

@@ -176,6 +176,17 @@ struct Marker {
     /// None while the connect is in flight: BlueZ's Connected=true starts
     /// the task before `bluetoothctl connect` returns.
     connected_at: Option<Instant>,
+    /// A handoff task started for it and is waiting for its routing: the
+    /// watcher keeps watching for a stop until the task takes it.
+    claimed: bool,
+}
+
+impl Marker {
+    /// In flight, or within `RECONNECT_TAKE_WINDOW` of its connect.
+    fn fresh(&self, now: Instant) -> bool {
+        self.connected_at
+            .is_none_or(|at| now.saturating_duration_since(at) <= RECONNECT_TAKE_WINDOW)
+    }
 }
 
 static ENTRIES: LazyLock<Mutex<HashMap<String, Entry>>> = LazyLock::new(Default::default);
@@ -273,26 +284,41 @@ pub(crate) fn set_marker(mac: &str, category: u32) {
         e.marker = Some(Marker {
             category,
             connected_at,
+            claimed: false,
         })
     });
 }
 
-/// The marker's category while it is in flight or within
-/// `RECONNECT_TAKE_WINDOW` of its connect, left in place: the watcher can
-/// still clear it on a playback stop.
-pub(crate) fn peek_marker(mac: &str) -> Option<u32> {
+/// A starting handoff task claims a fresh marker, left in place: the
+/// watcher keeps watching for a playback stop, which clears it, until
+/// `take_marker`. Whether there was one to claim.
+pub(crate) fn claim_marker(mac: &str) -> bool {
     let now = now();
-    with_entry(mac, |e| e.marker)
-        .filter(|m| {
-            m.connected_at
-                .is_none_or(|at| now.saturating_duration_since(at) <= RECONNECT_TAKE_WINDOW)
-        })
-        .map(|m| m.category)
+    with_entry(mac, |e| match e.marker.as_mut() {
+        Some(m) if m.fresh(now) => {
+            m.claimed = true;
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The watcher is done with its marker: taken, cleared, or expired with no
+/// task claiming it (removed here, as no one watches for its stop after).
+fn marker_done(mac: &str) -> bool {
+    let now = now();
+    with_entry(mac, |e| {
+        if e.marker.is_some_and(|m| m.claimed || m.fresh(now)) {
+            return false;
+        }
+        e.marker = None;
+        true
+    })
 }
 
 /// Consume the marker: Linux's audio category at the play edge. Its age is
-/// judged at `peek_marker`, before the routing wait; only a stop or a
-/// failure removes it after that.
+/// judged at `claim_marker`, before the routing wait; only a stop or a
+/// failure removes a claimed one after that.
 pub(crate) fn take_marker(mac: &str) -> Option<u32> {
     with_entry(mac, |e| e.marker.take()).map(|m| m.category)
 }
@@ -440,7 +466,7 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
         let last = previous.replace(playing);
         if connected_for_playback {
             stopped(playing);
-            if !playing || peek_marker(&mac).is_none() {
+            if !playing || marker_done(&mac) {
                 return;
             }
             continue;
@@ -494,6 +520,7 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
             e.marker = Some(Marker {
                 category,
                 connected_at: None,
+                claimed: false,
             });
         });
         io.log(
@@ -1195,7 +1222,7 @@ mod tests {
         let rig = Rig::start(mac, fake.clone());
         rig.play_edge().await;
         // The handoff task may start before the connect returns.
-        assert_eq!(peek_marker(mac), Some(AUDIO_CATEGORY_MEDIA));
+        assert!(claim_marker(mac));
         rig.sample(false).await;
         assert_eq!(
             fake.lines("playback stopped before the handoff task took"),
