@@ -115,8 +115,9 @@ impl PlaybackSamples {
 /// The media side effects the handoff core can ask for, injected so tests
 /// need no D-Bus or PipeWire.
 pub(crate) trait MediaActions: Send + Sync {
-    /// Pause local players.
-    fn pause(&self) -> BoxFuture<'static, ()>;
+    /// Pause the local players `streams` says play locally
+    /// (`PlaybackState::live_or_unknown`); whether one matched.
+    fn pause(&self, streams: PlaybackState) -> BoxFuture<'static, bool>;
     /// Activate the AirPods' A2DP profile.
     fn activate_a2dp(&self) -> BoxFuture<'static, ()>;
     /// Run the A2DP resume chain (#200) until it ends, or until `cancel`
@@ -136,8 +137,10 @@ pub(crate) trait MediaActions: Send + Sync {
     }
 }
 
-/// Blocking: pauses the local players and reports what it did.
-type PausePlayers = Arc<dyn Fn() -> media_controller::PauseOutcome + Send + Sync>;
+/// Blocking: pauses the local players whose bus owner PID the filter
+/// accepts and reports what it did.
+type PausePlayers =
+    Arc<dyn Fn(&dyn Fn(Option<u32>) -> bool) -> media_controller::PauseOutcome + Send + Sync>;
 
 /// Production media actions on a clone of the device's `MediaController`
 /// (its state is shared, DECISIONS #5). The device handlers lock the outer
@@ -153,13 +156,16 @@ pub(crate) struct ControllerMedia {
 }
 
 impl MediaActions for ControllerMedia {
-    fn pause(&self) -> BoxFuture<'static, ()> {
+    fn pause(&self, streams: PlaybackState) -> BoxFuture<'static, bool> {
         let controller = self.controller.clone();
         let pause_players = self.pause_players.clone();
         Box::pin(async move {
-            controller
-                .pause_all_media_with(move || pause_players())
+            let outcome = controller
+                .pause_all_media_with(move || {
+                    pause_players(&|owner| streams.live_or_unknown(owner))
+                })
                 .await;
+            outcome.paused + outcome.failed > 0
         })
     }
 
@@ -222,12 +228,12 @@ fn share_media(
 }
 
 /// Poll local playback every `PLAYBACK_POLL`: playing when an MPRIS player
-/// plays beside a live local stream (#302) or a takeover-worthy audio stream
-/// has carried sound for `MIN_STREAM_PLAYBACK` (#10, #88). The poller stops
-/// once the receiver is dropped.
+/// plays with a live local stream of its own (#302, #329) or a
+/// takeover-worthy audio stream has carried sound for `MIN_STREAM_PLAYBACK`
+/// (#10, #88). The poller stops once the receiver is dropped.
 pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
     spawn_playback_poller_with(
-        MediaController::check_if_playing,
+        MediaController::playing_mpris_owners,
         PulsePlaybackStreams::new(),
         PulsePeaks::new(),
         MIN_STREAM_PLAYBACK,
@@ -246,7 +252,8 @@ pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
 /// never holds up the MPRIS samples. Only edges reach the handoff core
 /// (`Input::Playback`), which keeps every takeover decision;
 /// `PlaybackSamples::handle` re-baselines the stream monitor when the core
-/// resets its baseline (#90).
+/// resets its baseline (#90). `mpris` gives the Playing players' bus owner
+/// PIDs, and `live` is whether one of them owns a live stream (#329).
 fn spawn_playback_poller_with<M, S, P>(
     mpris: M,
     streams: S,
@@ -256,7 +263,7 @@ fn spawn_playback_poller_with<M, S, P>(
     observed: impl Fn(Instant) + Send + Sync + 'static,
 ) -> PlaybackSamples
 where
-    M: Fn() -> bool + Send + Sync + 'static,
+    M: Fn() -> Vec<Option<u32>> + Send + Sync + 'static,
     S: PlaybackSource + 'static,
     P: PeakSource + 'static,
 {
@@ -279,11 +286,14 @@ where
             // stream monitor published before that reset.
             let sampled_at = Instant::now();
             let mpris = mpris.clone();
-            let mpris_playing = tokio::task::spawn_blocking(move || mpris())
+            let owners = tokio::task::spawn_blocking(move || mpris())
                 .await
-                .unwrap_or(false);
-            let state = *samples.borrow();
-            let category = local_category(mpris_playing, state.live_or_unknown(), state.counted);
+                .unwrap_or_default();
+            let category = {
+                let state = samples.borrow();
+                let live = owners.iter().any(|&owner| state.live_or_unknown(owner));
+                local_category(!owners.is_empty(), live, state.counted)
+            };
             if play_tx.send((sampled_at, category)).await.is_err() {
                 break;
             }
@@ -298,9 +308,9 @@ where
 }
 
 /// Linux's audio category (#272): an MPRIS player playing with a live local
-/// stream is media (301), else a counted stream is 201, else idle (100). An
-/// MPRIS player with no live stream (a remote control such as Spotify
-/// Connect) plays elsewhere (#302).
+/// stream of its own is media (301), else a counted stream is 201, else idle
+/// (100). An MPRIS player with no live stream of its own (a remote control
+/// such as Spotify Connect) plays elsewhere (#302, #329).
 fn local_category(mpris_playing: bool, live: bool, stream_playing: bool) -> u32 {
     if mpris_playing && live {
         AUDIO_CATEGORY_MEDIA
@@ -597,11 +607,10 @@ impl Shell {
                 Command::PauseMedia => {
                     // Before the pause, so the chain plays nothing after it.
                     self.resume = None;
-                    if self.play_rx.streams.borrow().live_or_unknown() {
-                        self.media.pause().await
-                    } else {
-                        // A playing MPRIS player is a remote control (#302).
-                        self.log("no live local stream; not pausing MPRIS players");
+                    let streams = self.play_rx.streams.borrow().clone();
+                    if !self.media.pause(streams).await {
+                        // Remote controls only, if anything (#302, #329).
+                        self.log("no MPRIS player with a live local stream; not pausing");
                     }
                 }
                 // Activation can take tens of seconds; it must not stall
@@ -1223,10 +1232,10 @@ mod tests {
     }
 
     impl MediaActions for FakeMedia {
-        fn pause(&self) -> BoxFuture<'static, ()> {
+        fn pause(&self, _: PlaybackState) -> BoxFuture<'static, bool> {
             self.records.pauses.fetch_add(1, Ordering::SeqCst);
             trace(&self.mac, "PauseMedia".to_string());
-            Box::pin(async {})
+            Box::pin(async { true })
         }
 
         fn activate_a2dp(&self) -> BoxFuture<'static, ()> {
@@ -1583,7 +1592,7 @@ mod tests {
             min_stream: Duration,
         ) -> Self
         where
-            M: Fn() -> bool + Send + Sync + 'static,
+            M: Fn() -> Vec<Option<u32>> + Send + Sync + 'static,
             S: PlaybackSource + 'static,
         {
             let (records, media) = Self::fake_media(mac);
@@ -2437,7 +2446,7 @@ mod tests {
     async fn production_media_delivers_ear_resumes() {
         let (outer, media) = share_media(
             MediaController::new(String::new(), LOCAL.to_string()),
-            Arc::new(media_controller::PauseOutcome::default),
+            Arc::new(|_: &dyn Fn(Option<u32>) -> bool| media_controller::PauseOutcome::default()),
         );
         let mut ear_rx = media.ear_resumes();
         use EarDetectionStatus::{InEar, OutOfEar};
@@ -2466,7 +2475,7 @@ mod tests {
         // activation return before touching PipeWire.
         let (outer, media) = share_media(
             MediaController::new(String::new(), LOCAL.to_string()),
-            Arc::new(move || {
+            Arc::new(move |_: &dyn Fn(Option<u32>) -> bool| {
                 counted.pauses.fetch_add(1, Ordering::SeqCst);
                 trace(&paused_for, "PauseMedia".to_string());
                 media_controller::PauseOutcome::default()
@@ -2552,20 +2561,33 @@ mod tests {
         assert_eq!(h.handler.started(), all);
     }
 
-    /// #302: a take, then another host asks, through the production media
-    /// adapter with a counting pauser that pauses one player, while the
-    /// stream monitor reports a live local stream or none. Returns the
-    /// pauses and `i_paused_the_media`.
-    async fn yield_pause(mac: &str, live: bool) -> (usize, bool) {
+    /// The bus owner PIDs of a Spotify Connect remote and of Firefox in the
+    /// yield pause tests.
+    const CONNECT_PID: u32 = 99_999_002;
+    const FIREFOX_PID: u32 = 99_999_003;
+
+    /// #302, #329: a take, then another host asks, through the production
+    /// media adapter with a pauser whose Playing players have the bus owners
+    /// `players`, while the stream monitor reports the PIDs owning a live
+    /// local stream `live` (None: no listing yet). Returns the paused
+    /// players' owners and `i_paused_the_media`.
+    async fn yield_pause(
+        mac: &str,
+        players: &[Option<u32>],
+        live: Option<&[u32]>,
+    ) -> (Vec<Option<u32>>, bool) {
         let (manager, mut rx, _tx) = ready_session().await;
         let records = Arc::new(Records::default());
-        let counted = records.clone();
+        let paused_players = Arc::new(StdMutex::new(Vec::new()));
+        let paused_for = paused_players.clone();
+        let players = players.to_vec();
         let (outer, media) = share_media(
             MediaController::new(String::new(), LOCAL.to_string()),
-            Arc::new(move || {
-                counted.pauses.fetch_add(1, Ordering::SeqCst);
+            Arc::new(move |own: &dyn Fn(Option<u32>) -> bool| {
+                let mut paused = paused_for.lock().unwrap();
+                paused.extend(players.iter().copied().filter(|&owner| own(owner)));
                 media_controller::PauseOutcome {
-                    paused: 1,
+                    paused: paused.len(),
                     ..Default::default()
                 }
             }),
@@ -2573,7 +2595,7 @@ mod tests {
         let (play_tx, play_rx) = mpsc::channel(8);
         let streams = watch::channel(PlaybackState {
             counted: false,
-            live: Some(live),
+            live: live.map(|pids| pids.iter().copied().collect()),
         })
         .1;
         let h = Harness::start_playback(
@@ -2604,7 +2626,8 @@ mod tests {
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         let paused = outer.lock().await.i_paused_the_media().await;
         stop_handoff_task(mac);
-        (h.pauses(), paused)
+        let players = paused_players.lock().unwrap().clone();
+        (players, paused)
     }
 
     fn not_pausing(mac: &str) -> bool {
@@ -2614,14 +2637,51 @@ mod tests {
     #[tokio::test]
     async fn yield_pause_skips_remote_control_players() {
         let mac = "5A:00:00:00:03:02";
-        assert_eq!(yield_pause(mac, false).await, (0, false));
+        let connect = [Some(CONNECT_PID)];
+        assert_eq!(yield_pause(mac, &connect, Some(&[])).await, (vec![], false));
         assert!(not_pausing(mac), "{:#?}", traced(mac));
     }
 
     #[tokio::test]
     async fn yield_pause_pauses_local_players() {
         let mac = "5A:00:00:00:03:03";
-        assert_eq!(yield_pause(mac, true).await, (1, true));
+        let firefox = [Some(FIREFOX_PID)];
+        assert_eq!(
+            yield_pause(mac, &firefox, Some(&[FIREFOX_PID])).await,
+            (firefox.to_vec(), true)
+        );
+        assert!(!not_pausing(mac), "{:#?}", traced(mac));
+    }
+
+    /// #329: a Connect remote and a player whose owner lookup failed beside
+    /// Firefox's live stream: only Firefox pauses. Another app's live
+    /// stream pauses nobody.
+    #[tokio::test]
+    async fn yield_pause_spares_remote_beside_live_stream() {
+        let mac = "5A:00:00:00:03:04";
+        let players = [Some(CONNECT_PID), None, Some(FIREFOX_PID)];
+        assert_eq!(
+            yield_pause(mac, &players, Some(&[FIREFOX_PID])).await,
+            (vec![Some(FIREFOX_PID)], true)
+        );
+        assert!(!not_pausing(mac), "{:#?}", traced(mac));
+        let mac = "5A:00:00:00:03:05";
+        assert_eq!(
+            yield_pause(mac, &players[..2], Some(&[FIREFOX_PID])).await,
+            (vec![], false)
+        );
+        assert!(not_pausing(mac), "{:#?}", traced(mac));
+    }
+
+    /// #83: before the first stream listing every Playing player pauses.
+    #[tokio::test]
+    async fn yield_pause_unknown_listing_pauses_every_player() {
+        let mac = "5A:00:00:00:03:06";
+        let players = [Some(CONNECT_PID), None, Some(FIREFOX_PID)];
+        assert_eq!(
+            yield_pause(mac, &players, None).await,
+            (players.to_vec(), true)
+        );
         assert!(!not_pausing(mac), "{:#?}", traced(mac));
     }
 
@@ -2995,12 +3055,22 @@ mod tests {
         }
     }
 
+    /// The process of the test player: its MPRIS bus owner and the owner of
+    /// the test streams (#329). No such process, so /proc names no parent.
+    const PLAYER_PID: u32 = 99_999_001;
+
+    /// The MPRIS sample: the test player while `playing`, else nothing.
+    fn player(playing: bool) -> Vec<Option<u32>> {
+        playing.then_some(Some(PLAYER_PID)).into_iter().collect()
+    }
+
     fn sink_input(index: u32, role: &str) -> StreamProps {
         StreamProps {
             direction: StreamDirection::Playback,
             props: [
                 ("media.role".to_string(), role.to_string()),
                 ("application.name".to_string(), "test player".to_string()),
+                ("application.process.id".to_string(), PLAYER_PID.to_string()),
             ]
             .into(),
             monitor: false,
@@ -3050,7 +3120,7 @@ mod tests {
         let streams = LiveStreams::default();
         streams.set(vec![music(1)]);
         let mut rx = spawn_playback_poller_with(
-            move || reads.load(Ordering::SeqCst),
+            move || player(reads.load(Ordering::SeqCst)),
             streams,
             AllAudible,
             STREAM_TEST_MIN,
@@ -3073,7 +3143,7 @@ mod tests {
         let streams = LiveStreams::default();
         streams.set(vec![event_sound(1)]);
         let mut rx = spawn_playback_poller_with(
-            || false,
+            Vec::new,
             streams.clone(),
             AllAudible,
             STREAM_TEST_MIN,
@@ -3102,7 +3172,7 @@ mod tests {
         let mpris = Arc::new(AtomicBool::new(false));
         let reads = mpris.clone();
         let mut rx = spawn_playback_poller_with(
-            move || reads.load(Ordering::SeqCst),
+            move || player(reads.load(Ordering::SeqCst)),
             StalledStreams(stalled),
             AllAudible,
             STREAM_TEST_MIN,
@@ -3142,7 +3212,7 @@ mod tests {
         observed: impl Fn(Instant) + Send + Sync + 'static,
     ) -> PlaybackSamples {
         let rx = spawn_playback_poller_with(
-            || false,
+            Vec::new,
             source,
             peaks,
             STREAM_TEST_MIN,
@@ -3529,7 +3599,7 @@ mod tests {
             if let Some(gate) = mpris_gate.lock().unwrap().take() {
                 let _ = gate.recv();
             }
-            false
+            Vec::new()
         };
         let streams = LiveStreams::default();
         let h =
@@ -3600,7 +3670,7 @@ mod tests {
         let (manager, mut rx, _tx) = ready_session().await;
         let streams = LiveStreams::default();
         let h =
-            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+            Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
         assert!(h.playback_started.load(Ordering::SeqCst));
         expect_startup(&h, &mut rx).await;
         // The AirPods' own owner report, stepped before the stream starts.
@@ -3643,7 +3713,7 @@ mod tests {
         let streams = LiveStreams::default();
         streams.set(vec![event_sound(21)]);
         let h =
-            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+            Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
         expect_startup(&h, &mut rx).await;
         streams.settle().await;
         tokio::time::sleep(STREAM_TEST_MIN).await;
@@ -3665,7 +3735,7 @@ mod tests {
         let (manager, mut rx, _tx) = ready_session().await;
         let streams = LiveStreams::default();
         let h =
-            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+            Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
         expect_startup(&h, &mut rx).await;
         // The baseline has no stream.
         streams.settle().await;
@@ -3699,7 +3769,7 @@ mod tests {
         let calls = mpris_calls.clone();
         let mpris = move || {
             calls.fetch_add(1, Ordering::SeqCst);
-            false
+            Vec::new()
         };
         let h = Harness::start_streams(mac, &manager, mpris, source, STREAM_TEST_MIN).await;
         expect_startup(&h, &mut rx).await;
@@ -3759,7 +3829,7 @@ mod tests {
         let reads = mpris.clone();
         let streams = LiveStreams::default();
         let mut rx = spawn_playback_poller_with(
-            move || reads.load(Ordering::SeqCst),
+            move || player(reads.load(Ordering::SeqCst)),
             streams.clone(),
             AllAudible,
             STREAM_TEST_MIN,
@@ -3789,7 +3859,7 @@ mod tests {
     async fn playback_poller_mpris_without_live_stream_is_idle() {
         let streams = LiveStreams::default();
         let mut rx = spawn_playback_poller_with(
-            || true,
+            || player(true),
             streams.clone(),
             AllAudible,
             STREAM_TEST_MIN,
@@ -3801,6 +3871,33 @@ mod tests {
         sample_until(&mut rx, false).await;
         for _ in 0..5 {
             assert!(!next_sample(&mut rx).await.1);
+        }
+    }
+
+    /// #329: a playing MPRIS player with a live stream that another process
+    /// owns counts the stream only, never as the player's media.
+    #[tokio::test]
+    async fn playback_poller_mpris_with_other_process_stream_is_not_media() {
+        let streams = LiveStreams::default();
+        let mut rx = spawn_playback_poller_with(
+            || player(true),
+            streams.clone(),
+            AllAudible,
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+            |_| (),
+        );
+        streams.settle().await;
+        let mut other = music(71);
+        other.props.insert(
+            "application.process.id".to_string(),
+            (PLAYER_PID + 1).to_string(),
+        );
+        streams.set(vec![other]);
+        category_until(&mut rx, AUDIO_CATEGORY_STREAM).await;
+        for _ in 0..5 {
+            let category = rx.recv().await.expect("poller running").1;
+            assert_ne!(category, AUDIO_CATEGORY_MEDIA);
         }
     }
 
@@ -3864,7 +3961,7 @@ mod tests {
         let h = Harness::start_streams(
             mac,
             &manager,
-            move || reads.load(Ordering::SeqCst),
+            move || player(reads.load(Ordering::SeqCst)),
             streams.clone(),
             STREAM_TEST_MIN,
         )
@@ -3906,7 +4003,7 @@ mod tests {
         let (manager, mut rx, _tx) = ready_session().await;
         let streams = LiveStreams::default();
         let h =
-            Harness::start_streams(mac, &manager, || false, streams.clone(), STREAM_TEST_MIN).await;
+            Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
         expect_startup(&h, &mut rx).await;
         h.emit_queued(owns(0)).await;
         h.emit_queued(AACPEvent::AudioSource(AudioSource {
@@ -3984,7 +4081,8 @@ mod tests {
         }
 
         /// The core fed as the default path feeds it: each playback sample
-        /// is `local_category` of MPRIS, the listing's live streams and the
+        /// is `local_category` of MPRIS (the test player Playing or not),
+        /// whether it owns one of the listing's live streams and the
         /// real `PlaybackTracker`'s state, as `spawn_playback_poller_with`
         /// combines them.
         struct Pipeline {
@@ -4045,7 +4143,8 @@ mod tests {
                 if let Some(playing) = self.tracker.observe_levels(now, streams, |_| level) {
                     self.streams_playing = playing;
                 }
-                let live = !stream_monitor::live_streams(streams).is_empty();
+                let live =
+                    stream_monitor::live_stream_pids(streams, |_| None).contains(&PLAYER_PID);
                 let category = local_category(mpris, live, self.streams_playing);
                 self.feed(
                     ms,
@@ -4450,6 +4549,30 @@ mod tests {
         fn mpris_with_live_stream_takes() {
             let mut p = remote_owns();
             assert_eq!(p.step(EVENT_MS, true, &[music(1)]), [SendOwnership(true)]);
+        }
+
+        /// #329: a remote-control MPRIS player (Playing, no stream of its
+        /// own) beside a 1 s terminal bell chime of role music while the
+        /// iPhone owns at 301 takes nothing. The twin, where the chime is
+        /// the player's own stream, takes.
+        #[test]
+        fn non_event_chime_beside_remote_player() {
+            let run = |pid: u32| {
+                let mut p = remote_owns();
+                let chime = [sink(&[
+                    ("application.name", "kitty"),
+                    ("media.role", "music"),
+                    ("application.process.id", &pid.to_string()),
+                ])];
+                let end = EVENT_MS + 2 * MIN_MS + POLL_MS;
+                for ms in (EVENT_MS..=end).step_by(POLL_MS as usize) {
+                    let streams: &[StreamProps] = if ms < EVENT_MS + 1000 { &chime } else { &[] };
+                    p.step(ms, true, streams);
+                }
+                p.takes()
+            };
+            assert_eq!(run(PLAYER_PID + 1), NO_TAKE);
+            assert_eq!(run(PLAYER_PID), [vec![SendOwnership(true)]]);
         }
     }
 

@@ -108,6 +108,14 @@ pub(crate) struct SinkInput {
     pub(crate) mute: bool,
     pub(crate) volume: ChannelVolumes,
     pub(crate) props: BTreeMap<String, String>,
+    /// Its client's index; None for a module-created stream.
+    pub(crate) client: Option<u32>,
+}
+
+/// What LibrePods reads of a client (a connection to the sound server).
+pub(crate) struct Client {
+    pub(crate) index: u32,
+    pub(crate) props: BTreeMap<String, String>,
 }
 
 /// What LibrePods reads of a source output (a capture stream).
@@ -226,6 +234,15 @@ impl RawConnection {
             None => unsafe { sys::pa_context_get_sink_input_info_list(context, cb, list) },
             // SAFETY: as above.
             Some(i) => unsafe { sys::pa_context_get_sink_input_info(context, i, cb, list) },
+        })
+    }
+
+    /// Every client.
+    pub(crate) fn clients(&mut self) -> io::Result<Vec<Client>> {
+        let cb = Some(client_cb as extern "C" fn(_, _, _, _));
+        self.query("client list", |context, list| {
+            // SAFETY: `context` is Ready and `list` is what `client_cb` expects.
+            unsafe { sys::pa_context_get_client_info_list(context, cb, list) }
         })
     }
 
@@ -466,6 +483,17 @@ extern "C" fn sink_input_cb(
     }
 }
 
+extern "C" fn client_cb(
+    _: *mut sys::pa_context,
+    info: *const sys::pa_client_info,
+    eol: i32,
+    list: *mut c_void,
+) {
+    // SAFETY: `clients` passes a `List<Client>`; a non-null `info` is a
+    // filled-in entry.
+    unsafe { collect(list, eol, (!info.is_null()).then(|| client_fields(info))) }
+}
+
 extern "C" fn source_output_cb(
     _: *mut sys::pa_context,
     info: *const sys::pa_source_output_info,
@@ -506,6 +534,19 @@ unsafe fn sink_input_fields(info: *const sys::pa_sink_input_info) -> SinkInput {
             corked: (*info).corked != 0,
             mute: (*info).mute != 0,
             volume: volume((*info).volume),
+            props: props((*info).proplist),
+            client: Some((*info).client).filter(|&c| c != sys::PA_INVALID_INDEX),
+        }
+    }
+}
+
+/// A client's fields, read like `sink_input_fields`.
+// SAFETY: callers pass an entry libpulse filled in (or a test built).
+unsafe fn client_fields(info: *const sys::pa_client_info) -> Client {
+    // SAFETY: per the contract; the proplist is null or live for this call.
+    unsafe {
+        Client {
+            index: (*info).index,
             props: props((*info).proplist),
         }
     }
@@ -962,6 +1003,30 @@ mod tests {
             sink_input_fields(p)
         };
         assert!(input.volume.get().is_empty());
+        // SAFETY: `props` is no longer used.
+        unsafe { sys::pa_proplist_free(props) };
+    }
+
+    #[test]
+    fn sink_input_client_and_client_fields_copy_what_the_binding_gave() {
+        let (props, binding) = proplists();
+        let mut input = MaybeUninit::<sys::pa_sink_input_info>::zeroed();
+        let mut client = MaybeUninit::<sys::pa_client_info>::zeroed();
+        let (p, c) = (input.as_mut_ptr(), client.as_mut_ptr());
+        // SAFETY: as in `sink_input_fields_copy_what_the_binding_gave`.
+        let (clients, module, listed) = unsafe {
+            (*p).client = 7;
+            let clients = sink_input_fields(p).client;
+            (*p).client = sys::PA_INVALID_INDEX;
+            let module = sink_input_fields(p).client;
+            (*c).index = 7;
+            (*c).proplist = props;
+            (clients, module, client_fields(c))
+        };
+        assert_eq!(clients, Some(7));
+        assert_eq!(module, None, "a module-created stream has no client");
+        assert_eq!(listed.index, 7);
+        assert_eq!(listed.props, crate::stream_monitor::props(&binding));
         // SAFETY: `props` is no longer used.
         unsafe { sys::pa_proplist_free(props) };
     }
