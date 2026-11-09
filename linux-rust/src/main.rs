@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -162,6 +163,18 @@ async fn async_main(
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
 ) -> bluer::Result<()> {
     let args = Args::parse();
+
+    // Release the A2DP holds before exiting (#294).
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        switching::stop_all_handoff_tasks().await;
+        std::process::exit(0);
+    });
 
     let mut managed_devices_mac: Vec<String> = Vec::new(); // includes ony non-AirPods. AirPods handled separately.
 
