@@ -798,6 +798,9 @@ pub struct MediaController {
     /// `pause_all_media` calls in flight. Released under `state` together
     /// with the self-pause flag they set; read under `state` by the listener.
     ownership_pauses: Arc<AtomicUsize>,
+    /// Ear-removal and ownership-loss pauses started, so the A2DP resume
+    /// never undoes one (#327).
+    self_pauses: Arc<AtomicUsize>,
     /// The handoff's A2DP hold is on (#264): `activate_a2dp_profile` writes
     /// nothing. Set synchronously by the shell, in emit order.
     a2dp_held: Arc<AtomicBool>,
@@ -814,6 +817,7 @@ impl MediaController {
         MediaController {
             state: Arc::new(Mutex::new(state)),
             ownership_pauses: Arc::new(AtomicUsize::new(0)),
+            self_pauses: Arc::default(),
             a2dp_held: Arc::default(),
             profile_write: Arc::default(),
         }
@@ -1019,6 +1023,22 @@ impl MediaController {
             .collect()
     }
 
+    /// The MPRIS players (KDE Connect's excluded) that report Paused.
+    /// Blocking.
+    fn paused_mpris_players() -> Vec<String> {
+        let Ok(conn) = Connection::new_session() else {
+            return Vec::new();
+        };
+        Self::list_mpris_services(&conn)
+            .into_iter()
+            .filter(|service| {
+                conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5))
+                    .get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+                    .is_ok_and(|s| s == "Paused")
+            })
+            .collect()
+    }
+
     fn mpris_playing(conn: &Connection, service: &str) -> bool {
         let proxy = conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
         proxy
@@ -1150,6 +1170,8 @@ impl MediaController {
             } else if !old_all_out {
                 debug!("Pausing media as buds are not fully in ear");
                 let was_playing = self.state.lock().await.is_playing;
+                // Counted before the pause, so the A2DP resume never sees it uncounted.
+                self.self_pauses.fetch_add(1, Ordering::SeqCst);
                 let outcome = self.pause_with(pause_players).await;
                 self.state.lock().await.i_paused_the_media |=
                     removal_self_paused || marks_self_pause(outcome, was_playing);
@@ -1460,6 +1482,8 @@ impl MediaController {
 
         let pending = OwnershipPause::start(&self.ownership_pauses);
         let was_playing = self.state.lock().await.is_playing;
+        // Counted before the pause, so the A2DP resume never sees it uncounted.
+        self.self_pauses.fetch_add(1, Ordering::SeqCst);
         let outcome = tokio::task::spawn_blocking(pause_players).await.unwrap();
 
         let mut state = self.state.lock().await;
@@ -2163,6 +2187,18 @@ impl A2dpResumeIo for MediaController {
                 .await
                 .unwrap_or_default()
         })
+    }
+
+    fn paused(&self) -> BoxFuture<'static, Vec<String>> {
+        Box::pin(async {
+            tokio::task::spawn_blocking(Self::paused_mpris_players)
+                .await
+                .unwrap_or_default()
+        })
+    }
+
+    fn self_pauses(&self) -> usize {
+        self.self_pauses.load(Ordering::SeqCst)
     }
 
     fn transport_active(&self) -> BoxFuture<'static, Option<bool>> {
