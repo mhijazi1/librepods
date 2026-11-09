@@ -91,6 +91,14 @@ features on. If the desktop shows no AirPods battery, set
 Bluetooth. Without it, LibrePods logs one warning and carries on without the
 export.
 
+The LE features (auto-connect when the AirPods leave the case, the case-open
+popup, battery from advertisements) need `org.bluez.AdvertisementMonitorManager1`,
+which BlueZ also marks experimental. Turn it on the same way: `Experimental = true`
+in the `[General]` section of `/etc/bluetooth/main.conf` (NixOS:
+`hardware.bluetooth.settings.General.Experimental = true;`), then restart
+Bluetooth. Without it, LibrePods logs one warning and runs without the LE
+features.
+
 PipeWire's bluez5 plugin also registers a battery with BlueZ for HFP headsets,
 from the headset's own battery reports. BlueZ keeps the first battery provided
 for a device and ignores later ones, so the desktop may show PipeWire's HFP
