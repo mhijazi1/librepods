@@ -1845,7 +1845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_default_path_takes_and_releases() {
+    async fn handoff_default_path_takes_and_keeps_ownership() {
         let mac = "5A:00:00:00:00:01";
         let (manager, mut rx, _tx) = ready_session().await;
         let h = Harness::start(SwitchingMode::default(), mac, &manager).await;
@@ -1866,43 +1866,34 @@ mod tests {
         assert!(!hijack_packets().await.contains(&take));
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
 
-        // ACK, then playback stops: exactly the release.
-        h.emit(owns(1));
-        let stopped = Instant::now();
+        // ACK, then playback stops: Linux stays the idle owner (#262), so
+        // no release packet.
+        h.emit_queued(owns(1)).await;
         h.play(false).await;
-        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
-        let hold = crate::handoff::RELEASE_HOLD;
-        let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
-            .await
-            .expect("expected the release")
-            .expect("send channel open");
-        assert!(stopped.elapsed() >= hold);
-        assert_eq!(release, expected_owns(0).await);
-        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
-        assert_eq!(h.pauses(), 0);
-
-        // The release's ACK pauses nothing: playback already stopped
-        // (DECISIONS #39; handoff::tests::owns_connection_zero_after_own_release_is_noop).
-        h.emit(owns(0));
-        wait_until("the release ACK", || {
+        wait_until("the stop", || {
             traced(mac)
                 .iter()
-                .any(|l| l.starts_with("ACK owner=not-linux"))
+                .any(|l| l == "AUTO playback stopped; keeping ownership")
         })
         .await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
         assert_eq!(h.activations(), 1);
         // The device handler saw both reports too.
-        assert_eq!(h.handler.finished(), named(&[owns(0), owns(1), owns(0)]));
+        assert_eq!(h.handler.finished(), named(&[owns(0), owns(1)]));
 
-        // New playback takes again; another host then takes the AirPods
-        // (a [0] that acknowledges nothing): the core yields once, with
-        // exactly one pause and no packet (#39's `yield_take`).
+        // New playback while Linux owns sends nothing; another host then
+        // takes the AirPods (a [0] that acknowledges nothing): the core
+        // yields once, with exactly one pause and no packet (#39's
+        // `yield_take`).
         h.play(true).await;
-        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        wait_until("the play edge", || {
+            traced(mac)
+                .iter()
+                .any(|l| l == "AUTO playback started; Linux already owns")
+        })
+        .await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
-        h.emit(owns(1));
         h.emit(owns(0));
         wait_until("the yield's pause", || h.pauses() >= 1).await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
@@ -2875,20 +2866,15 @@ mod tests {
         let task = handoff_task(mac).expect("handoff task");
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;
-        h.emit(owns(1));
-        // Playback stops: the release is pending. Playback restarts during
-        // it, so its ACK carries the deferred pause (#39 keeps that one).
-        let stopped = Instant::now();
+        h.emit_queued(owns(1)).await;
+        // Playback stops: Linux stays the idle owner (#262), so no release.
         h.play(false).await;
-        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
-        let hold = crate::handoff::RELEASE_HOLD;
-        let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
-            .await
-            .expect("expected the release")
-            .expect("send channel open");
-        assert!(stopped.elapsed() >= hold);
-        assert_eq!(release, expected_owns(0).await);
-        h.play(true).await;
+        wait_until("the stop", || {
+            traced(mac)
+                .iter()
+                .any(|l| l == "AUTO playback stopped; keeping ownership")
+        })
+        .await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
 
@@ -2901,21 +2887,21 @@ mod tests {
         .await;
         let before = traced(mac).len();
 
-        // The release ACK arrives, then the receive loop clears the session.
-        // The test runtime is single-threaded and neither call yields, so no
-        // task sees the ACK before the session is gone.
-        let release_ack = expected_owns(0).await;
-        manager.receive_packet(&release_ack).await;
+        // Another host's [0] arrives, then the receive loop clears the
+        // session. The test runtime is single-threaded and neither call
+        // yields, so no task sees the [0] before the session is gone.
+        let loss = expected_owns(0).await;
+        manager.receive_packet(&loss).await;
         manager.disconnect().await;
         wait_until("the task to end", || task.is_finished()).await;
 
-        // As in handoff::tests::session_loss_before_release_ack_does_not_retake:
-        // SessionLost → [], Ownership([0]) → [PauseMedia], Disconnected →
-        // [DropSession], with the case closure from the queued wear report.
+        // SessionLost → [], Ownership([0]) → the yield's [PauseMedia],
+        // Disconnected → [DropSession], with the case closure from the
+        // queued wear report.
         let trace = traced(mac)[before..].to_vec();
         let expected = [
             "SESSION lost",
-            "ACK owner=not-linux",
+            "YIELD",
             "PauseMedia",
             "DISCONNECTED",
             "CASE waiting for new Linux playback",
@@ -3869,18 +3855,16 @@ mod tests {
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
 
-        // ACK, then the stream ends: the core's usual release.
-        h.emit(owns(1));
-        let stopped = Instant::now();
+        // ACK, then the stream ends: Linux stays the idle owner (#262), so
+        // no release packet.
+        h.emit_queued(owns(1)).await;
         streams.set(Vec::new());
-        // shortcut: waits the real RELEASE_HOLD; std::time::Instant ignores a paused clock (#249)
-        let hold = crate::handoff::RELEASE_HOLD;
-        let release = tokio::time::timeout(hold + Duration::from_secs(3), rx.recv())
-            .await
-            .expect("expected the release")
-            .expect("send channel open");
-        assert!(stopped.elapsed() >= hold);
-        assert_eq!(release, expected_owns(0).await);
+        wait_until("the stop", || {
+            traced(mac)
+                .iter()
+                .any(|l| l == "AUTO playback stopped; keeping ownership")
+        })
+        .await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
 
@@ -4634,10 +4618,11 @@ mod tests {
         }
 
         /// #205: a track change's gap (MPRIS stopped, the old stream gone)
-        /// keeps the AirPods; a real stop releases after `RELEASE_HOLD`.
+        /// keeps the AirPods; so does a real stop: Linux stays the idle
+        /// owner (#262).
         #[test]
         fn non_event_track_change_keeps_ownership() {
-            let hold_ms = crate::handoff::RELEASE_HOLD.as_millis() as u64;
+            let minute_ms = 60_000;
             let sent = |p: &Pipeline, owner| {
                 let c = SendOwnership(owner);
                 p.log.iter().flatten().filter(|&x| *x == c).count()
@@ -4648,7 +4633,7 @@ mod tests {
             let gap = EVENT_MS + POLL_MS;
             p.step(gap, false, &[]);
             let next = gap + POLL_MS;
-            for ms in (next..=next + 2 * hold_ms).step_by(POLL_MS as usize) {
+            for ms in (next..=next + minute_ms).step_by(POLL_MS as usize) {
                 p.step(ms, true, &[music(2)]);
                 p.feed(ms, Input::Tick);
             }
@@ -4656,13 +4641,13 @@ mod tests {
             assert_eq!(sent(&p, false), 0);
 
             // The player stops.
-            let stop = next + 2 * hold_ms + POLL_MS;
-            for ms in (stop..=stop + hold_ms + POLL_MS).step_by(POLL_MS as usize) {
+            let stop = next + minute_ms + POLL_MS;
+            for ms in (stop..=stop + minute_ms).step_by(POLL_MS as usize) {
                 p.step(ms, false, &[]);
                 p.feed(ms, Input::Tick);
             }
             assert_eq!(sent(&p, true), 1);
-            assert_eq!(sent(&p, false), 1);
+            assert_eq!(sent(&p, false), 0);
         }
 
         /// #301/#304: a local MPRIS player with a live music stream plays
