@@ -1393,6 +1393,37 @@ mod tests {
     }
 
     impl Harness {
+        /// Fresh records and a fake media adapter and controller for `mac`.
+        fn fake_media(
+            mac: &str,
+        ) -> (
+            Arc<Records>,
+            (Arc<Mutex<MediaController>>, Arc<dyn MediaActions>),
+        ) {
+            let records = Arc::new(Records::default());
+            let media = Arc::new(FakeMedia {
+                records: records.clone(),
+                mac: mac.to_string(),
+            });
+            let media_controller = Arc::new(Mutex::new(MediaController::new(
+                mac.to_string(),
+                LOCAL.to_string(),
+            )));
+            (records, (media_controller, media))
+        }
+
+        /// The sender `play` uses and the playback samples it feeds.
+        fn play_channel() -> (
+            mpsc::Sender<(Instant, bool)>,
+            impl FnOnce() -> PlaybackSamples,
+        ) {
+            let (play_tx, play_rx) = mpsc::channel(8);
+            (play_tx, move || PlaybackSamples {
+                rx: play_rx,
+                rebaseline: Default::default(),
+            })
+        }
+
         async fn start(mode: SwitchingMode, mac: &str, manager: &AACPManager) -> Self {
             Self::start_with(mode, mac, manager, false).await
         }
@@ -1404,26 +1435,10 @@ mod tests {
             manager: &AACPManager,
             block_ear: bool,
         ) -> Self {
-            let records = Arc::new(Records::default());
-            let media = Arc::new(FakeMedia {
-                records: records.clone(),
-                mac: mac.to_string(),
-            });
-            let media_controller = Arc::new(Mutex::new(MediaController::new(
-                mac.to_string(),
-                LOCAL.to_string(),
-            )));
+            let (records, media) = Self::fake_media(mac);
             let handler = DeviceHandler::default();
             handler.block_ear.store(block_ear, Ordering::SeqCst);
-            Self::start_wired(
-                mode,
-                mac,
-                manager,
-                (media_controller, media),
-                records,
-                Arc::new(handler),
-            )
-            .await
+            Self::start_wired(mode, mac, manager, media, records, Arc::new(handler)).await
         }
 
         /// Start with the given controller and media adapter, and device
@@ -1436,7 +1451,6 @@ mod tests {
             records: Arc<Records>,
             handler: Arc<DeviceHandler>,
         ) -> Self {
-            let (play_tx, play_rx) = mpsc::channel(8);
             Self::start_playback(
                 mode,
                 mac,
@@ -1444,10 +1458,7 @@ mod tests {
                 media,
                 records,
                 handler,
-                (play_tx, move || PlaybackSamples {
-                    rx: play_rx,
-                    rebaseline: Default::default(),
-                }),
+                Self::play_channel(),
                 ConnectMode::default(),
             )
             .await
@@ -1460,27 +1471,15 @@ mod tests {
             mac: &str,
             manager: &AACPManager,
         ) -> Self {
-            let records = Arc::new(Records::default());
-            let media = Arc::new(FakeMedia {
-                records: records.clone(),
-                mac: mac.to_string(),
-            });
-            let media_controller = Arc::new(Mutex::new(MediaController::new(
-                mac.to_string(),
-                LOCAL.to_string(),
-            )));
-            let (play_tx, play_rx) = mpsc::channel(8);
+            let (records, media) = Self::fake_media(mac);
             Self::start_playback(
                 SwitchingMode::Handoff,
                 mac,
                 manager,
-                (media_controller, media),
+                media,
                 records,
                 Arc::new(DeviceHandler::default()),
-                (play_tx, move || PlaybackSamples {
-                    rx: play_rx,
-                    rebaseline: Default::default(),
-                }),
+                Self::play_channel(),
                 connect_mode,
             )
             .await
@@ -1500,21 +1499,13 @@ mod tests {
             M: Fn() -> bool + Send + Sync + 'static,
             S: PlaybackSource + 'static,
         {
-            let records = Arc::new(Records::default());
-            let media = Arc::new(FakeMedia {
-                records: records.clone(),
-                mac: mac.to_string(),
-            });
-            let media_controller = Arc::new(Mutex::new(MediaController::new(
-                mac.to_string(),
-                LOCAL.to_string(),
-            )));
+            let (records, media) = Self::fake_media(mac);
             let (play_tx, _) = mpsc::channel(1);
             Self::start_playback(
                 SwitchingMode::Handoff,
                 mac,
                 manager,
-                (media_controller, media),
+                media,
                 records,
                 Arc::new(DeviceHandler::default()),
                 (play_tx, move || {

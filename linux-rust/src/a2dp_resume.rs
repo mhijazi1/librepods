@@ -15,6 +15,7 @@ use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use futures::future::BoxFuture;
 use log::{info, warn};
+use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -71,6 +72,9 @@ const _: () = assert!(
 
 /// How often the transport poller reads BlueZ.
 const TRANSPORT_POLL: Duration = Duration::from_millis(500);
+/// The proxy timeout of each poller bus call, and the most a fresh read's
+/// call gets.
+const TRANSPORT_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One side effect of the chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,8 +334,8 @@ pub(crate) fn spawn_transport_poller(airpods_mac: &str) -> mpsc::Receiver<bool> 
                 }
                 let active = bus.as_ref().and_then(|bus| {
                     reader.read(
-                        || transport_paths(bus, &device),
-                        |path| transport_state(bus, path),
+                        || transport_paths(bus, &device, TRANSPORT_CALL_TIMEOUT),
+                        |path| transport_state(bus, path, TRANSPORT_CALL_TIMEOUT),
                     )
                 });
                 // The reader cleared its paths on that None too.
@@ -352,18 +356,86 @@ fn device_fragment(airpods_mac: &str) -> String {
     format!("/dev_{}/", airpods_mac.to_uppercase().replace(':', "_"))
 }
 
-/// One blocking read of whether the AirPods' A2DP transport is active. None
-/// for no MAC (never idle: "/dev_/" matches no transport) or when BlueZ
-/// can't be read.
+/// The fresh reads' one system bus connection, shared by `read_shared`.
+static FRESH_BUS: Mutex<Option<Connection>> = Mutex::new(None);
+
+/// One blocking read of whether the AirPods' A2DP transport is active, on
+/// the shared `FRESH_BUS` connection. None for no MAC (never idle: "/dev_/"
+/// matches no transport), when another read holds the connection (a stuck
+/// open or call), or when BlueZ can't be read in `TRANSPORT_READ_TIMEOUT`:
+/// the chain stops waiting then, and this blocking read can't be aborted.
 pub(crate) fn read_transport_once(airpods_mac: &str) -> Option<bool> {
+    // The budget counts the connection's opening too.
+    let deadline = Instant::now() + TRANSPORT_READ_TIMEOUT;
     if airpods_mac.is_empty() {
         return None;
     }
-    let bus = Connection::new_system().ok()?;
     let device = device_fragment(airpods_mac);
+    read_shared(
+        &FRESH_BUS,
+        || Connection::new_system().ok(),
+        |bus| {
+            read_within(
+                deadline,
+                Instant::now,
+                |timeout| transport_paths(bus, &device, timeout),
+                |path, timeout| transport_state(bus, path, timeout),
+            )
+        },
+    )
+}
+
+/// `read` on the bus in `slot`, opened by `open` only when the slot is
+/// empty. None at once when another read holds the slot, so a stalled bus
+/// pins one thread, not one per read. A None read drops the bus, so the
+/// next read reopens; a poisoned slot is cleared and reopened.
+fn read_shared<B>(
+    slot: &Mutex<Option<B>>,
+    open: impl FnOnce() -> Option<B>,
+    read: impl FnOnce(&B) -> Option<bool>,
+) -> Option<bool> {
+    let mut bus = match slot.try_lock() {
+        Ok(bus) => bus,
+        Err(TryLockError::WouldBlock) => return None,
+        Err(TryLockError::Poisoned(poisoned)) => {
+            slot.clear_poison();
+            let mut bus = poisoned.into_inner();
+            *bus = None;
+            bus
+        }
+    };
+    if bus.is_none() {
+        *bus = open();
+    }
+    let active = bus.as_ref().and_then(read);
+    if active.is_none() {
+        *bus = None;
+    }
+    active
+}
+
+/// A fresh `TransportReader` read that makes no bus call after `deadline`:
+/// each call's proxy timeout is the time left, at most
+/// `TRANSPORT_CALL_TIMEOUT`. Past it, a lookup fails the bus and a state
+/// is unknown, so the read is None.
+fn read_within(
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+    mut lookup: impl FnMut(Duration) -> Option<Vec<String>>,
+    mut state: impl FnMut(&str, Duration) -> Result<Option<bool>, Gone>,
+) -> Option<bool> {
+    // Under 1 ms is spent: dbus rounds down to whole ms, and 0 is special.
+    let timeout = || {
+        Some(deadline.saturating_duration_since(now()))
+            .filter(|left| *left >= Duration::from_millis(1))
+            .map(|left| left.min(TRANSPORT_CALL_TIMEOUT))
+    };
     TransportReader::default().read(
-        || transport_paths(&bus, &device),
-        |path| transport_state(&bus, path),
+        || lookup(timeout()?),
+        |path| match timeout() {
+            Some(timeout) => state(path, timeout),
+            None => Ok(None),
+        },
     )
 }
 
@@ -448,10 +520,10 @@ impl TransportReader {
 }
 
 /// The `MediaTransport1` paths under `device` (`/dev_XX_..._XX/`), from
-/// BlueZ's object tree. None when BlueZ can't be read.
-fn transport_paths(bus: &Connection, device: &str) -> Option<Vec<String>> {
+/// BlueZ's object tree. None when BlueZ can't be read in `timeout`.
+fn transport_paths(bus: &Connection, device: &str, timeout: Duration) -> Option<Vec<String>> {
     let objects = bus
-        .with_proxy("org.bluez", "/", Duration::from_secs(2))
+        .with_proxy("org.bluez", "/", timeout)
         .get_managed_objects()
         .ok()?;
     Some(
@@ -466,10 +538,10 @@ fn transport_paths(bus: &Connection, device: &str) -> Option<Vec<String>> {
 }
 
 /// Whether the transport at `path` is not idle. Gone when BlueZ no longer
-/// has it; Ok(None) when BlueZ can't be read.
-fn transport_state(bus: &Connection, path: &str) -> Result<Option<bool>, Gone> {
+/// has it; Ok(None) when BlueZ can't be read in `timeout`.
+fn transport_state(bus: &Connection, path: &str, timeout: Duration) -> Result<Option<bool>, Gone> {
     let state: Result<String, _> = bus
-        .with_proxy("org.bluez", path, Duration::from_secs(2))
+        .with_proxy("org.bluez", path, timeout)
         .get("org.bluez.MediaTransport1", "State");
     match state {
         Ok(state) => Ok(Some(state != "idle")),
@@ -487,6 +559,7 @@ fn transport_state(bus: &Connection, path: &str) -> Result<Option<bool>, Gone> {
 mod tests {
     use super::*;
     use Action::*;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -1026,6 +1099,92 @@ mod tests {
         assert_eq!(read_transport_once(""), None);
     }
 
+    /// A `read_shared` opener that counts its calls and opens bus `n`.
+    fn opener(opens: &Cell<usize>, n: u32) -> impl FnOnce() -> Option<u32> {
+        move || {
+            opens.set(opens.get() + 1);
+            Some(n)
+        }
+    }
+
+    #[test]
+    fn shared_bus_reads_reuse_one_open() {
+        let (slot, opens) = (Mutex::new(None), Cell::new(0));
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 1), |_| Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 2), |bus| Some(*bus != 1)),
+            Some(false)
+        );
+        assert_eq!(opens.get(), 1);
+    }
+
+    #[test]
+    fn shared_bus_unknown_read_reopens() {
+        let (slot, opens) = (Mutex::new(None), Cell::new(0));
+        assert_eq!(read_shared(&slot, opener(&opens, 1), |_| None), None);
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 2), |bus| Some(*bus == 2)),
+            Some(true)
+        );
+        assert_eq!(opens.get(), 2);
+        // A failed open reads unknown without reading.
+        let failed = read_shared(&Mutex::new(None::<u32>), || None, |_| panic!("read"));
+        assert_eq!(failed, None);
+    }
+
+    #[test]
+    fn shared_bus_busy_is_unknown() {
+        let slot = Mutex::new(None);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let busy_opens = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                let open = move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some(1)
+                };
+                read_shared(&slot, open, |_| Some(true))
+            });
+            entered_rx.recv().unwrap();
+            let start = Instant::now();
+            let open = || {
+                busy_opens.fetch_add(1, Ordering::SeqCst);
+                Some(2)
+            };
+            let busy = read_shared(&slot, open, |_| Some(false));
+            let took = start.elapsed();
+            // Release before asserting, so a failure can't hang the scope.
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), Some(true));
+            assert_eq!(busy, None);
+            assert!(took < ms(50), "busy read took {took:?}");
+            assert_eq!(busy_opens.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn shared_bus_poisoned_slot_reopens() {
+        let (slot, opens) = (Mutex::new(None), Cell::new(0));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_shared(&slot, opener(&opens, 1), |_| panic!("read"))
+        }));
+        assert!(panicked.is_err() && slot.is_poisoned());
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 2), |bus| Some(*bus == 2)),
+            Some(true)
+        );
+        assert_eq!(
+            read_shared(&slot, opener(&opens, 3), |bus| Some(*bus == 2)),
+            Some(true)
+        );
+        assert_eq!(opens.get(), 2);
+    }
+
     #[test]
     fn device_fragment_matches_bluez_path() {
         let device = device_fragment("aa:bb:cc:dd:ee:ff");
@@ -1073,18 +1232,29 @@ mod tests {
 
     impl FakeBlueZ {
         fn read(&mut self, reader: &mut TransportReader) -> Option<bool> {
+            let (lookup, state) = self.calls();
+            reader.read(lookup, state)
+        }
+
+        /// The bus calls: (lookup, state).
+        fn calls(
+            &mut self,
+        ) -> (
+            impl FnMut() -> Option<Vec<String>> + '_,
+            impl FnMut(&str) -> Result<Option<bool>, Gone> + '_,
+        ) {
             let (paths, states) = (&self.paths, &self.states);
             let lookup_seq = &mut self.lookup_seq;
             let (lookups, reads) = (&mut self.lookups, &mut self.reads);
-            reader.read(
-                || {
+            (
+                move || {
                     *lookups += 1;
                     lookup_seq
                         .pop_front()
                         .unwrap_or_else(|| paths.clone())
                         .map(|p| p.iter().map(|p| p.to_string()).collect())
                 },
-                |path| {
+                move |path: &str| {
                     *reads += 1;
                     match states.iter().find(|(p, _)| *p == path) {
                         Some((_, Some(state))) => Ok(Some(*state != "idle")),
@@ -1093,6 +1263,33 @@ mod tests {
                     }
                 },
             )
+        }
+
+        /// `read_transport_once`'s budgeted read, each call taking `cost` on
+        /// an injected clock. Also returns each call's (time into the read,
+        /// proxy timeout).
+        fn read_fresh(&mut self, cost: Duration) -> (Option<bool>, Vec<(Duration, Duration)>) {
+            let t0 = Instant::now();
+            let clock = Cell::new(t0);
+            let calls = RefCell::new(Vec::new());
+            let call = |timeout| {
+                calls.borrow_mut().push((clock.get() - t0, timeout));
+                clock.set(clock.get() + cost);
+            };
+            let (mut lookup, mut state) = self.calls();
+            let active = read_within(
+                t0 + TRANSPORT_READ_TIMEOUT,
+                || clock.get(),
+                |timeout| {
+                    call(timeout);
+                    lookup()
+                },
+                |path, timeout| {
+                    call(timeout);
+                    state(path)
+                },
+            );
+            (active, calls.into_inner())
         }
     }
 
@@ -1256,5 +1453,97 @@ mod tests {
         bluez.states = vec![(FD0, Some("active"))];
         assert_eq!(bluez.read(&mut reader), Some(true));
         assert_eq!((bluez.lookups, bluez.reads), (3, 3));
+    }
+
+    fn ms(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn fresh_read_budget_fast_calls_read_like_unbudgeted() {
+        let fakes = || {
+            [
+                FakeBlueZ {
+                    paths: Some(vec![FD0]),
+                    states: vec![(FD0, Some("active"))],
+                    ..Default::default()
+                },
+                FakeBlueZ {
+                    paths: Some(vec![]),
+                    ..Default::default()
+                },
+                FakeBlueZ {
+                    paths: Some(vec![FD0, FD1]),
+                    states: vec![(FD0, Some("idle")), (FD1, Some("idle"))],
+                    ..Default::default()
+                },
+                // Gone after both lookups.
+                FakeBlueZ {
+                    paths: Some(vec![FD0]),
+                    ..Default::default()
+                },
+            ]
+        };
+        let expected = [Some(true), Some(false), Some(false), None];
+        for ((mut fresh, mut plain), want) in fakes().into_iter().zip(fakes()).zip(expected) {
+            let (active, calls) = fresh.read_fresh(Duration::ZERO);
+            assert_eq!(active, want);
+            assert_eq!(plain.read(&mut TransportReader::default()), want);
+            assert_eq!((fresh.lookups, fresh.reads), (plain.lookups, plain.reads));
+            assert_eq!(calls.len(), fresh.lookups + fresh.reads);
+            assert!(calls.iter().all(|&(_, t)| t == TRANSPORT_READ_TIMEOUT));
+        }
+    }
+
+    #[test]
+    fn fresh_read_budget_shrinks_then_stops_calling() {
+        // lookup -> gone state -> lookup, then spent before the second state.
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0]),
+            ..Default::default()
+        };
+        let (active, calls) = bluez.read_fresh(ms(200));
+        assert_eq!(active, None);
+        // Each timeout is the budget left at its call: 500 ms less its time.
+        assert_eq!(
+            calls,
+            [(ms(0), ms(500)), (ms(200), ms(300)), (ms(400), ms(100))]
+        );
+        assert_eq!((bluez.lookups, bluez.reads), (2, 1));
+
+        // Spent before the second lookup: it fails like the bus.
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0]),
+            ..Default::default()
+        };
+        let (active, calls) = bluez.read_fresh(ms(300));
+        assert_eq!(active, None);
+        assert_eq!(calls, [(ms(0), ms(500)), (ms(300), ms(200))]);
+        assert_eq!((bluez.lookups, bluez.reads), (1, 1));
+    }
+
+    #[test]
+    fn fresh_read_budget_spent_never_reads_idle() {
+        // Spent after the first of two idle paths: unknown, not idle.
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0, FD1]),
+            states: vec![(FD0, Some("idle")), (FD1, Some("idle"))],
+            ..Default::default()
+        };
+        let (active, calls) = bluez.read_fresh(ms(300));
+        assert_eq!(active, None);
+        assert_eq!(calls, [(ms(0), ms(500)), (ms(300), ms(200))]);
+        assert_eq!((bluez.lookups, bluez.reads), (1, 1));
+
+        // Under 1 ms left counts as spent: no zero timeout reaches dbus.
+        let mut bluez = FakeBlueZ {
+            paths: Some(vec![FD0]),
+            states: vec![(FD0, Some("idle"))],
+            ..Default::default()
+        };
+        let (active, calls) = bluez.read_fresh(Duration::from_micros(499_500));
+        assert_eq!(active, None);
+        assert_eq!(calls, [(ms(0), ms(500))]);
+        assert_eq!((bluez.lookups, bluez.reads), (1, 0));
     }
 }

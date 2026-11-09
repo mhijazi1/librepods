@@ -591,11 +591,15 @@ impl Handoff {
                 }
                 self.automatic = true;
                 self.announce(out);
+                // A still-held stop release (#205) fires only if a stopped
+                // sample follows this baseline before the hold ends (#253).
                 self.reset_baseline(now);
                 out.push(Command::DrainPlayback);
                 self.say("AUTO enabled; waiting for a new playback start after the baseline");
             }
             Input::Manual => {
+                // A held stop release (#205) never fires while manual: Linux keeps the AirPods,
+                // as the Mac keeps them when its setting changes after a stop (#253, #255).
                 self.automatic = false;
                 self.say("AUTO disabled");
             }
@@ -3287,6 +3291,25 @@ mod tests {
         assert_eq!(p.play(2000, true), []);
         assert_eq!(skips(&mut p), 1);
 
+        // A remote request after Linux's playback release was acknowledged.
+        let mut p = last_owner_take();
+        assert_eq!(p.play(1100, false), []);
+        assert_eq!(p.hold_ends(1100), [SendOwnership(false)]);
+        assert_eq!(p.feed(1200, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(1300, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.play(2000, true), []);
+        assert_eq!(skips(&mut p), 1);
+
+        // A remote request after Linux's user release was acknowledged.
+        let mut p = ready_in(WhenLastConnected);
+        assert_eq!(p.feed(100, Input::Take), [SendOwnership(true)]);
+        assert_eq!(p.feed(200, Input::Ownership(vec![1])), []);
+        assert_eq!(p.feed(300, Input::Release), [SendOwnership(false)]);
+        assert_eq!(p.feed(400, Input::Ownership(vec![0])), [PauseMedia]);
+        assert_eq!(p.feed(500, Input::RemoteOwnershipRequest), []);
+        assert_eq!(p.play(1000, true), []);
+        assert_eq!(skips(&mut p), 1);
+
         // A remote host already given the AirPods asks again.
         let mut p = ready_in(WhenLastConnected);
         assert_eq!(p.feed(20, Input::Ownership(vec![1])), []);
@@ -4420,5 +4443,66 @@ mod tests {
         // The twin: the same sequences hold and release with the flag on.
         let on = holds(&hold_sequences(true));
         assert!(on.contains(&HoldA2dp(true)) && on.contains(&HoldA2dp(false)));
+    }
+
+    // #253: a mode toggle during the release hold (today's behaviour, #255).
+
+    /// Manual during the hold armed at 2000, then Ticks and stopped samples
+    /// every 100 ms through `2000 + 2 * HOLD_MS`: nothing is ever sent.
+    fn manual_during_release_hold() -> Probe {
+        let mut p = acked_auto_take();
+        assert_eq!(p.play(2000, false), []);
+        assert_eq!(p.feed(3000, Input::Manual), []);
+        for ms in (3000..=2000 + 2 * HOLD_MS).step_by(100) {
+            assert_eq!(p.feed(ms, Input::Tick), [], "{ms}");
+            assert_eq!(p.play(ms, false), [], "{ms}");
+        }
+        p
+    }
+
+    #[test]
+    fn manual_during_release_hold_keeps_ownership() {
+        manual_during_release_hold();
+    }
+
+    #[test]
+    fn manual_then_auto_after_release_hold_keeps_ownership() {
+        let mut p = manual_during_release_hold();
+        let auto = 2100 + 2 * HOLD_MS;
+        assert_eq!(
+            p.feed(auto, Input::Auto),
+            [ConnectA2dp, Announce, DrainPlayback]
+        );
+        for ms in (auto..=auto + 2 * HOLD_MS).step_by(100) {
+            assert_eq!(p.feed(ms, Input::Tick), [], "{ms}");
+            assert_eq!(p.play(ms, false), [], "{ms}");
+        }
+    }
+
+    #[test]
+    fn auto_during_release_hold_pins_today_behaviour() {
+        let end = 2000 + HOLD_MS;
+        for sample_before_end in [true, false] {
+            let mut p = acked_auto_take();
+            assert_eq!(p.play(2000, false), []);
+            assert_eq!(
+                p.feed(end - 100, Input::Auto),
+                [ConnectA2dp, Announce, DrainPlayback]
+            );
+            // The new baseline clears `was_playing`; the hold survives, so
+            // a stopped sample before its end lets it release.
+            if sample_before_end {
+                assert_eq!(p.play(end - 50, false), []);
+            }
+            for ms in (end..=2000 + 2 * HOLD_MS).step_by(100) {
+                let released = if sample_before_end && ms == end {
+                    vec![SendOwnership(false)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(p.feed(ms, Input::Tick), released, "{ms}");
+                assert_eq!(p.play(ms, false), [], "{ms}");
+            }
+        }
     }
 }
