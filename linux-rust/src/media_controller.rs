@@ -1826,6 +1826,11 @@ impl MediaController {
         self.state.lock().await.i_paused_the_media
     }
 
+    #[cfg(test)]
+    pub(crate) async fn set_playing(&self, playing: bool) {
+        self.state.lock().await.is_playing = playing;
+    }
+
     /// The A2DP hold is on, so an activation must not write (#264).
     fn a2dp_hold_skips(&self) -> bool {
         let held = self.a2dp_held.load(Ordering::SeqCst);
