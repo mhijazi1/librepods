@@ -98,9 +98,9 @@ pub(crate) enum Input {
     /// Another host asked Linux to give up ownership. While any Linux release
     /// is pending (playback/auto, user, quit or remote) the request joins it
     /// and sends no second "not owning" (#61, #137). The join pauses at most
-    /// once, in automatic mode when Linux had taken: for a user/quit release
-    /// or a playback restart during the release. A repeat after Linux's
-    /// remote release timed out re-sends it without pausing again (#61).
+    /// once, in automatic mode when Linux had taken, for a user/quit release.
+    /// A repeat after Linux's remote release timed out re-sends it without
+    /// pausing again (#61).
     /// While a local call holds or is taking the AirPods, a pending or
     /// timed-out remote release still goes ahead (joined, or re-sent); any
     /// other request is refused (#11), and a release Linux already sent is
@@ -265,9 +265,9 @@ pub(crate) struct Handoff {
     playback_baseline_at: Instant,
     /// A take was sent for playback seen before the last baseline reset (a
     /// reconnect for requested playback). Until the first post-baseline
-    /// sample arrives, release decisions treat playback as running, so a
-    /// "stopped" first sample is a stop edge. Takeover decisions still see
-    /// no baseline.
+    /// sample arrives, stop edges treat playback as running, so a "stopped"
+    /// first sample during the take defers its A2DP resume (#205). Takeover
+    /// decisions still see no baseline.
     take_assumes_playing: bool,
     /// The take sent on reconnect is awaiting its acknowledgement. The
     /// session's queued OwnsConnection=0 reports from this window answer the
@@ -578,8 +578,9 @@ impl Handoff {
                 // nothing and yields a later take (#61, #137). Join it,
                 // keeping its `since` so the ACK timeout is not pushed back,
                 // and make now the one pause its ACK would have made: a
-                // user/quit release, or a playback restart it would retake
-                // for. A remote release already paused when it was sent. A
+                // user/quit release's. Linux's only playback release (Auto's)
+                // is sent holding no take, so it has nothing to pause. A
+                // remote release already paused when it was sent. A
                 // local call refuses (below) any release but a remote one, so
                 // the release still settles for the call (#11).
                 let call_holds = self.local_call && self.requested_take;
@@ -590,8 +591,7 @@ impl Handoff {
                 {
                     if self.automatic
                         && self.requested_take
-                        && (matches!(p.cause, Cause::User | Cause::Quit)
-                            || self.play_during_release)
+                        && matches!(p.cause, Cause::User | Cause::Quit)
                     {
                         out.push(Command::PauseMedia);
                     }
@@ -761,8 +761,8 @@ impl Handoff {
         // start (#272), unless Linux already holds one.
         let rose = previous == Some(true) && category > last_category && !self.requested_take;
         let fresh_play = (previous == Some(false) && playing) || rose;
-        // Release edges also count a take sent for playback before the
-        // baseline: the stop after a reconnect take must not be lost.
+        // Stop edges also count a take sent for playback before the
+        // baseline: a stop during a reconnect take defers its resume (#205).
         let stopped =
             (previous == Some(true) || (previous.is_none() && assumed_playing)) && !playing;
         let resume_deferred = playing && std::mem::take(&mut self.resume_deferred);
@@ -849,26 +849,18 @@ impl Handoff {
     ///   the session's stale init report and only updates `owner` (#43,
     ///   #49);
     /// - the acknowledgement of Linux's own release pauses only after a user
-    ///   or quit release (upstream #841), or as the deferred pause of a
-    ///   blocked retake; a playback-stop or remote-request release left
-    ///   nothing playing to pause. A 0 within `LATE_ACK_WINDOW` of sending
-    ///   a release whose acknowledgement timed out is that release's late
-    ///   acknowledgement and follows the same rule, without a second
-    ///   reconcile (#55); a later 0 falls through to the rule below (#62);
+    ///   or quit release (upstream #841); Auto's playback release is sent
+    ///   holding no take, and a remote-request release already paused. A 0
+    ///   within `LATE_ACK_WINDOW` of sending a release whose acknowledgement
+    ///   timed out is that release's late acknowledgement and follows the
+    ///   same rule, without a second reconcile (#55); a later 0 falls through
+    ///   to the rule below (#62);
     /// - otherwise, while Linux holds or is taking the AirPods, another host
     ///   took them: `yield_take` yields once.
     fn ownership(&mut self, now: Instant, value: Vec<u8>, out: &mut Vec<Command>) {
         let acked = self
             .pending
             .filter(|p| value.as_slice() == [u8::from(p.desired)]);
-        // Our own release was acknowledged while the user started playing
-        // again: the reconcile below may take the AirPods back, and pausing
-        // the players first would undo the play it is acting on. The pause
-        // upstream #841 makes here is deferred until the reconcile has
-        // decided, and made unless it actually re-took.
-        let replay_play = acked.is_some_and(|p| !p.desired)
-            && self.play_during_release
-            && self.was_playing == Some(true);
         let was_linux = self.owner.as_deref() == Some(&[1]);
         self.owner = Some(value.clone());
         if value == [1] {
@@ -882,8 +874,8 @@ impl Handoff {
             // A stale report queued while the reconnected session
             // initialized, not a loss of the pending take (which wants 1, so
             // this is not its acknowledgement): neither pause the playback
-            // the take is for nor forget the take, or a stop during it could
-            // not be released.
+            // the take is for nor forget the take, which a stop during it
+            // keeps (#262).
             self.say("OWNER stale not-linux report during the reconnect take; ignored");
             return;
         }
@@ -901,27 +893,24 @@ impl Handoff {
                     && now.saturating_duration_since(sent) <= LATE_ACK_WINDOW
             })
             .map(|(cause, _)| cause);
-        let mut deferred_pause = false;
         if value == [0] {
             match acked.map(|p| p.cause).or(late_release) {
-                // The acknowledgement of Linux's own release (#39). A release
-                // for stopped playback or for a remote request already left
-                // nothing to pause: the players were stopped, or
-                // RemoteOwnershipRequest paused them when it yielded. Only
-                // the deferred pause of a blocked retake remains. A user or
-                // quit release may leave Linux playing, so upstream #841's
-                // pause stays. A late acknowledgement (#55) is handled the
-                // same way; it cannot be a replay, as nothing was pending.
+                // The acknowledgement of Linux's own release (#39). Auto's
+                // playback release is sent holding no take, and
+                // RemoteOwnershipRequest paused when it yielded, so neither
+                // has anything to pause. A user or quit release may leave
+                // Linux playing, so upstream #841's pause stays. A late
+                // acknowledgement (#55) is handled the same way.
                 Some(cause) => {
                     // A remote release handed the AirPods to the other host.
                     if cause == Cause::Remote {
                         self.last_owner_linux = false;
                     }
-                    if self.requested_take && self.automatic {
-                        match cause {
-                            Cause::User | Cause::Quit => out.push(Command::PauseMedia),
-                            Cause::Playback | Cause::Remote => deferred_pause = replay_play,
-                        }
+                    if self.requested_take
+                        && self.automatic
+                        && matches!(cause, Cause::User | Cause::Quit)
+                    {
+                        out.push(Command::PauseMedia);
                     }
                 }
                 // Another host took the AirPods from a take Linux made or
@@ -962,19 +951,10 @@ impl Handoff {
             self.requested_take = false;
         }
         if self.quitting {
-            if deferred_pause {
-                out.push(Command::PauseMedia);
-            }
             out.push(Command::Exit);
             return;
         }
-        let first = out.len();
         self.reconcile(now, out);
-        if deferred_pause && !out[first..].contains(&Command::SendOwnership(true)) {
-            // The retake was blocked: the AirPods went to the other host, so
-            // stop playing here as upstream does.
-            out.push(Command::PauseMedia);
-        }
         self.hold_if_remote_source(out);
         // The take holds unless the reconcile just released it.
         let held = pending.desired && self.live() && self.requested_take && self.pending.is_none();
@@ -1207,7 +1187,8 @@ impl Handoff {
         self.recovery = CaseRecovery::Immediate;
         self.reset_baseline(now);
         // The take was for playback seen before this baseline: a first
-        // sample that finds it stopped must release.
+        // sample that finds it stopped is a stop edge: the take is kept
+        // (#262) and, while still pending, defers its resume (#205).
         self.take_assumes_playing = took;
         // The session's queued OwnsConnection=0 reports predate this take.
         self.reconnect_take_pending = took;
