@@ -76,9 +76,20 @@ fn merge_battery(prev: &[BatteryInfo], update: &[BatteryInfo]) -> Vec<BatteryInf
     merged
 }
 
+/// Remembers the first non-Disconnected Case entry of `battery` for `mac`, for the
+/// next connect seed. A missing or Disconnected Case leaves the map alone.
+fn remember_case(last_case: &mut HashMap<String, BatteryInfo>, mac: &str, battery: &[BatteryInfo]) {
+    if let Some(case) = battery
+        .iter()
+        .find(|b| b.component == BatteryComponent::Case && b.status != BatteryStatus::Disconnected)
+    {
+        last_case.insert(mac.to_string(), case.clone());
+    }
+}
+
 /// The battery an AirPods tab starts with on connect: the case entry remembered at
-/// its last disconnect merged with the AACP report, so a Disconnected case in the
-/// report keeps the remembered level (#461).
+/// its last disconnect or from an advert while disconnected, merged with the AACP
+/// report, so a Disconnected case in the report keeps the remembered level (#461).
 fn connect_seed(last_case: Option<&BatteryInfo>, aacp: &[BatteryInfo]) -> Vec<BatteryInfo> {
     merge_battery(
         last_case.map(std::slice::from_ref).unwrap_or_default(),
@@ -672,13 +683,8 @@ impl App {
                             .connected_devices
                             .retain(|device| device != &mac);
 
-                        if let Some(DeviceState::AirPods(state)) = self.device_states.remove(&mac)
-                            && let Some(case) = state.battery.into_iter().find(|b| {
-                                b.component == BatteryComponent::Case
-                                    && b.status != BatteryStatus::Disconnected
-                            })
-                        {
-                            self.last_case.insert(mac.clone(), case);
+                        if let Some(DeviceState::AirPods(state)) = self.device_states.remove(&mac) {
+                            remember_case(&mut self.last_case, &mac, &state.battery);
                         }
 
                         if matches!(&self.selected_tab, Tab::Device(selected_mac) if selected_mac == &mac)
@@ -783,6 +789,9 @@ impl App {
                                 {
                                     state.battery = merge_battery(&state.battery, &battery_info);
                                     debug!("Updated battery info for {}: {:?}", mac, state.battery);
+                                } else if !self.device_states.contains_key(&mac) {
+                                    // LE advert while disconnected: keep its case for the connect seed.
+                                    remember_case(&mut self.last_case, &mac, &battery_info);
                                 }
                             }
                             _ => {}
@@ -2125,6 +2134,56 @@ mod tests {
             battery_tab_label(&connect_seed(None, &connect_report())),
             "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} --"
         );
+    }
+
+    #[test]
+    fn remember_case_advert_while_disconnected_seeds_connect() {
+        let mut last_case = HashMap::new();
+        remember_case(
+            &mut last_case,
+            MAC,
+            &[
+                info(BatteryComponent::Left, 85, BatteryStatus::NotCharging),
+                info(BatteryComponent::Case, 70, BatteryStatus::NotCharging),
+            ],
+        );
+        assert_eq!(
+            battery_tab_label(&connect_seed(last_case.get(MAC), &connect_report())),
+            "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} 70%"
+        );
+    }
+
+    #[test]
+    fn remember_case_newer_advert_replaces_remembered() {
+        let mut last_case = HashMap::from([(
+            MAC.to_string(),
+            info(BatteryComponent::Case, 60, BatteryStatus::NotCharging),
+        )]);
+        remember_case(
+            &mut last_case,
+            MAC,
+            &[info(BatteryComponent::Case, 80, BatteryStatus::Charging)],
+        );
+        assert_eq!(
+            battery_tab_label(&connect_seed(last_case.get(MAC), &connect_report())),
+            "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} 80%\u{1002E6}"
+        );
+    }
+
+    #[test]
+    fn remember_case_without_usable_case_keeps_map() {
+        let kept = info(BatteryComponent::Case, 90, BatteryStatus::NotCharging);
+        let mut last_case = HashMap::from([(MAC.to_string(), kept.clone())]);
+        let mut empty = HashMap::new();
+        for battery in [
+            vec![info(BatteryComponent::Left, 80, BatteryStatus::NotCharging)],
+            vec![case_disconnected(0)],
+        ] {
+            remember_case(&mut last_case, MAC, &battery);
+            remember_case(&mut empty, MAC, &battery);
+        }
+        assert_eq!(last_case, HashMap::from([(MAC.to_string(), kept)]));
+        assert!(empty.is_empty());
     }
 
     const MAC: &str = "AA:BB:CC:DD:EE:FF";
