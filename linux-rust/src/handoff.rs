@@ -471,8 +471,9 @@ impl Handoff {
                     self.announce(out);
                 }
                 self.hosts = new;
-                // The other host left: nothing to hold A2DP for (#264).
-                if self.hosts.iter().all(|d| d.mac == self.local) {
+                // The other host left: nothing to hold A2DP for (#264). An
+                // empty list is no evidence of that.
+                if !self.hosts.is_empty() && self.hosts.iter().all(|d| d.mac == self.local) {
                     self.remote_owns = false;
                     self.sync_hold(false, out);
                 }
@@ -4457,10 +4458,30 @@ mod tests {
             old: two_hosts(),
             new: hosts,
         };
-        // The other host is still there: still held.
+        // The other host is still there, or the list is empty: still held.
         assert_eq!(p.feed(200, only(two_hosts())), []);
+        assert_eq!(p.feed(250, only(vec![])), []);
         assert_eq!(p.feed(300, only(vec![host(LOCAL)])), [HoldA2dp(false)]);
         assert_eq!(p.feed(400, only(vec![host(LOCAL)])), []);
+    }
+
+    #[test]
+    fn hold_kept_by_host_list_during_pending_take() {
+        let mut p = held();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        let hosts = |new| Input::ConnectedDevices {
+            old: two_hosts(),
+            new,
+        };
+        let mut all = p.feed(550, hosts(two_hosts()));
+        all.extend(p.feed(560, hosts(vec![])));
+        all.extend(p.feed(570, hosts(two_hosts())));
+        assert_eq!(holds(&all), []);
+        // Its ACK still ends the hold.
+        assert_eq!(
+            holds(&p.feed(600, Input::Ownership(vec![1]))),
+            [HoldA2dp(false)]
+        );
     }
 
     /// The c1/c2 sequences of the tests above; every command, in order.

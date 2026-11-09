@@ -660,6 +660,9 @@ pub struct MediaController {
     /// The handoff's A2DP hold is on (#264): `activate_a2dp_profile` writes
     /// nothing. Set synchronously by the shell, in emit order.
     a2dp_held: Arc<AtomicBool>,
+    /// Serializes activation's last hold check + write with the hold's
+    /// read + write, so a write in flight can't undo a hold (#264).
+    profile_write: Arc<Mutex<()>>,
 }
 
 impl MediaController {
@@ -671,6 +674,7 @@ impl MediaController {
             state: Arc::new(Mutex::new(state)),
             ownership_pauses: Arc::new(AtomicUsize::new(0)),
             a2dp_held: Arc::default(),
+            profile_write: Arc::default(),
         }
     }
 
@@ -1240,7 +1244,9 @@ impl MediaController {
             ProfileChoice::Activate(profile) => profile,
         };
 
-        // A hold that started during the activation wins (#264).
+        // A hold that started during the activation wins (#264); the lock
+        // keeps the hold's card read behind this write.
+        let _write = before_deadline(deadline, || self.profile_write.lock()).await?;
         if self.a2dp_hold_skips() {
             return Ok(());
         }
@@ -1558,6 +1564,11 @@ impl MediaController {
                 state.cached_a2dp_profile.clone(),
             )
         };
+        // An empty MAC would match the first card with a device string.
+        if mac.is_empty() {
+            debug!("A2DP hold({hold}): no connected device MAC");
+            return;
+        }
         let card_mac = mac.clone();
         let read = || async move {
             tokio::task::spawn_blocking(move || {
@@ -1598,6 +1609,8 @@ impl MediaController {
         S: FnMut() -> SFut,
         SFut: Future<Output = Option<String>>,
     {
+        // Held from the read through the write, not during the sink wait.
+        let write_lock = self.profile_write.lock().await;
         let Some(card) = read().await else {
             debug!("A2DP hold({hold}): no AirPods card");
             return;
@@ -1619,7 +1632,9 @@ impl MediaController {
             debug!("A2DP hold({hold}): superseded, card left as is");
             return;
         }
-        if !write(card.index, profile.clone()).await {
+        let written = write(card.index, profile.clone()).await;
+        drop(write_lock);
+        if !written {
             warn!("A2DP hold({hold}): failed to set the card to {profile}");
             return;
         }
@@ -3911,5 +3926,64 @@ mod tests {
         let none = Vec::<String>::new();
         assert_eq!(apply_hold(true, |c| c.set_a2dp_held(false)).await, none);
         assert_eq!(apply_hold(false, |c| c.set_a2dp_held(true)).await, none);
+    }
+
+    #[tokio::test]
+    async fn hold_wins_over_activation_write_in_flight() {
+        let controller = MediaController::new(String::new(), String::new());
+        let card = std::cell::RefCell::new("off".to_string());
+        let log = std::cell::RefCell::new(Vec::new());
+        let set_card = |profile: String| {
+            *card.borrow_mut() = profile.clone();
+            log.borrow_mut().push(profile);
+            true
+        };
+        let set_card = &set_card;
+        let (entered, gate) = (tokio::sync::Notify::new(), tokio::sync::Notify::new());
+        let activation = controller.activate_a2dp_profile_with(
+            Instant::now() + A2DP_ACTIVATION_DEADLINE,
+            || async { Some(3) },
+            || async { true },
+            |_| async { ProfileChoice::Activate("a2dp-sink".to_string()) },
+            // Past its last hold check, stalled before the write (pulse connect).
+            |_, profile| async {
+                entered.notify_one();
+                gate.notified().await;
+                set_card(profile)
+            },
+        );
+        let hold = async {
+            entered.notified().await;
+            controller.set_a2dp_held(true);
+            let read = || async {
+                Some(pulse::Card {
+                    index: 3,
+                    name: None,
+                    device_string: None,
+                    profiles: profiles(&["off", "a2dp-sink"]),
+                    active_profile: Some(card.borrow().clone()),
+                })
+            };
+            let apply = controller.apply_a2dp_hold_with(
+                true,
+                "",
+                PreferredCodec::Aac,
+                read,
+                |_, profile| async move { set_card(profile) },
+                || async { None },
+            );
+            let open_gate = async {
+                // Without the lock the hold reads `off` and finishes here.
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                gate.notify_one();
+            };
+            tokio::join!(apply, open_gate);
+        };
+        let (outcome, ()) = tokio::join!(activation, hold);
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(*card.borrow(), "off");
+        assert_eq!(log.into_inner(), ["a2dp-sink", "off"]);
     }
 }
