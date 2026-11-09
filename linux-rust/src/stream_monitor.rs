@@ -684,8 +684,8 @@ fn list_reusing<C, T>(
 /// sink input has no process id of its own.
 fn sink_inputs(connection: &mut pulse::RawConnection) -> io::Result<Vec<StreamProps>> {
     let inputs = connection.sink_inputs(None)?;
-    // shortcut: a client-less (module-created) stream has no pid, so the
-    // clients are listed on every poll while one exists (#344).
+    // shortcut: clients are listed on every poll while a stream lacks its own pid (#344).
+    // Native PipeWire streams (mpv, pw-cat) need that; client-less module streams don't.
     let clients = if inputs.iter().all(|i| stream_pid(&i.props, None).is_some()) {
         Vec::new()
     } else {
