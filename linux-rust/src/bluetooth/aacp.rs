@@ -6,7 +6,7 @@ use bluer::{
     Address, AddressType, Error, Result,
     l2cap::{SeqPacket, Socket, SocketAddr},
 };
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
@@ -20,6 +20,13 @@ const PSM: u16 = 0x1001;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const HEADER_BYTES: [u8; 4] = [0x04, 0x00, 0x04, 0x00];
+// The AirPods answer the handshake with a non-AACP packet starting with these
+// bytes (all captures: 010004000000010003000000000000000000).
+const HANDSHAKE_REPLY_PREFIX: [u8; 4] = [0x01, 0x00, 0x04, 0x00];
+// The reply can come 1-2 s late after a Mac eviction; requests sent before it are dropped.
+const HANDSHAKE_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+const INIT_REQUEST_GAP: Duration = Duration::from_millis(300);
+const INIT_REPORT_WAIT: Duration = Duration::from_secs(5);
 
 pub mod opcodes {
     pub const SET_FEATURE_FLAGS: u8 = 0x4D;
@@ -53,6 +60,10 @@ pub(crate) fn is_known_ignored_opcode(opcode: u8) -> bool {
         opcode,
         opcodes::UNKNOWN_0X02 | opcodes::UNKNOWN_0X2B | opcodes::UNKNOWN_0X4C
     )
+}
+
+pub(crate) fn is_handshake_reply(packet: &[u8]) -> bool {
+    packet.starts_with(&HANDSHAKE_REPLY_PREFIX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -343,11 +354,13 @@ pub struct AACPManagerState {
     pub ear_detection_status: Vec<EarDetectionStatus>,
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub airpods_mac: Option<Address>,
+    handshake_replied: bool,
 }
 
 impl AACPManagerState {
     fn clear_connection(&mut self) {
         self.sender = None;
+        self.handshake_replied = false;
         self.owns = false;
         self.control_command_status_list.clear();
         self.connected_devices.clear();
@@ -372,6 +385,7 @@ impl AACPManagerState {
             ear_detection_status: Vec::new(),
             event_tx: None,
             airpods_mac: None,
+            handshake_replied: false,
         }
     }
 }
@@ -549,10 +563,16 @@ impl AACPManager {
 
     pub async fn receive_packet(&self, packet: &[u8]) {
         if !packet.starts_with(&HEADER_BYTES) {
-            debug!(
-                "Received packet does not start with expected header: {}",
-                hex::encode(packet)
-            );
+            if is_handshake_reply(packet)
+                && !std::mem::replace(&mut self.state.lock().await.handshake_replied, true)
+            {
+                info!("Received AACP handshake reply: {}", hex::encode(packet));
+            } else {
+                debug!(
+                    "Received packet does not start with expected header: {}",
+                    hex::encode(packet)
+                );
+            }
             return;
         }
         if packet.len() < 5 {
@@ -934,6 +954,66 @@ impl AACPManager {
             0x00, 0x00,
         ];
         self.send_packet(&packet).await
+    }
+
+    /// Session init: handshake, wait (bounded) for its reply, then feature
+    /// flags and the notification request. If no host-state report follows
+    /// within INIT_REPORT_WAIT, the three are re-sent once (as Android does).
+    pub async fn initialize(&self) -> Result<()> {
+        self.send_handshake().await?;
+        if !self
+            .wait_for_state(HANDSHAKE_REPLY_TIMEOUT, |s| s.handshake_replied)
+            .await?
+        {
+            warn!(
+                "No AACP handshake reply within {HANDSHAKE_REPLY_TIMEOUT:?}, sending requests anyway"
+            );
+        }
+        self.send_init_requests().await?;
+        let reported = |s: &AACPManagerState| {
+            !s.connected_devices.is_empty() || !s.ear_detection_status.is_empty()
+        };
+        if self.wait_for_state(INIT_REPORT_WAIT, reported).await? {
+            return Ok(());
+        }
+        warn!("No host-state report within {INIT_REPORT_WAIT:?}, re-sending init requests once");
+        self.send_handshake().await?;
+        sleep(INIT_REQUEST_GAP).await;
+        self.send_init_requests().await
+    }
+
+    async fn send_init_requests(&self) -> Result<()> {
+        self.send_set_feature_flags_packet().await?;
+        sleep(INIT_REQUEST_GAP).await;
+        self.send_notification_request().await
+    }
+
+    /// Polls the state until `done` holds (true) or `timeout` passes (false).
+    /// NotConnected once the session drops. The lock is never held across a sleep.
+    async fn wait_for_state(
+        &self,
+        timeout: Duration,
+        done: impl Fn(&AACPManagerState) -> bool,
+    ) -> Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let state = self.state.lock().await;
+                if done(&state) {
+                    return Ok(true);
+                }
+                if state.sender.is_none() {
+                    return Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "AACP session dropped during init",
+                    )));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            sleep(POLL_INTERVAL).await;
+        }
     }
 
     pub async fn send_proximity_keys_request(
@@ -3144,5 +3224,161 @@ mod tests {
         let written: HashMap<String, DeviceData> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written.keys().collect::<Vec<_>>(), [AIRPODS_MAC]);
+    }
+
+    // The handshake reply as captured in all 15 hw sessions (#286).
+    fn handshake_reply() -> Vec<u8> {
+        hex::decode("010004000000010003000000000000000000").unwrap()
+    }
+
+    async fn handshake_replied(manager: &AACPManager) -> bool {
+        manager.state.lock().await.handshake_replied
+    }
+
+    #[test]
+    fn handshake_reply_matcher() {
+        assert!(is_handshake_reply(&handshake_reply()));
+        assert!(is_handshake_reply(&[0x01, 0x00, 0x04, 0x00]));
+        assert!(!is_handshake_reply(&[0x01, 0x00, 0x04]));
+        assert!(!is_handshake_reply(&[0x02, 0x00, 0x04, 0x00, 0x00]));
+        assert!(!is_handshake_reply(&HEADER_BYTES));
+    }
+
+    #[tokio::test]
+    async fn handshake_reply_is_recorded() {
+        let manager = AACPManager::new();
+        manager.receive_packet(&handshake_reply()).await;
+        assert!(handshake_replied(&manager).await);
+    }
+
+    #[tokio::test]
+    async fn handshake_reply_other_non_header_packet_records_nothing() {
+        let manager = AACPManager::new();
+        manager
+            .receive_packet(&[0x02, 0x00, 0x04, 0x00, 0x00])
+            .await;
+        assert!(!handshake_replied(&manager).await);
+    }
+
+    #[tokio::test]
+    async fn handshake_reply_reset_by_clear_connection_and_disconnect() {
+        let manager = AACPManager::new();
+        manager.receive_packet(&handshake_reply()).await;
+        manager.disconnect().await;
+        assert!(!handshake_replied(&manager).await);
+
+        manager.receive_packet(&handshake_reply()).await;
+        manager.state.lock().await.clear_connection();
+        assert!(!handshake_replied(&manager).await);
+    }
+
+    const HANDSHAKE: u8 = 0x00;
+    const FLAGS: u8 = opcodes::SET_FEATURE_FLAGS;
+    const NOTIFY: u8 = opcodes::REQUEST_NOTIFICATIONS;
+
+    // Drains the send channel into data-packet opcodes, the handshake as HANDSHAKE.
+    fn drain_kinds(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|p| {
+                if p.starts_with(&HEADER_BYTES) {
+                    p[4]
+                } else {
+                    assert_eq!(p[..6], [0x00, 0x00, 0x04, 0x00, 0x01, 0x00], "{p:02x?}");
+                    HANDSHAKE
+                }
+            })
+            .collect()
+    }
+
+    fn spawn_initialize(manager: &AACPManager) -> tokio::task::JoinHandle<Result<()>> {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.initialize().await })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_waits_for_handshake_reply() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        let _task = spawn_initialize(&manager);
+
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(drain_kinds(&mut rx), [HANDSHAKE]);
+
+        manager.receive_packet(&handshake_reply()).await;
+        sleep(Duration::from_secs(1)).await;
+        assert!(Duration::from_secs(2) < HANDSHAKE_REPLY_TIMEOUT);
+        assert_eq!(drain_kinds(&mut rx), [FLAGS, NOTIFY]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_reply_before_wait_is_not_missed() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager.receive_packet(&handshake_reply()).await;
+        let _task = spawn_initialize(&manager);
+
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(drain_kinds(&mut rx), [HANDSHAKE, FLAGS, NOTIFY]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_without_reply_sends_requests_after_timeout() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        let _task = spawn_initialize(&manager);
+
+        sleep(HANDSHAKE_REPLY_TIMEOUT - Duration::from_millis(100)).await;
+        assert_eq!(drain_kinds(&mut rx), [HANDSHAKE]);
+
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(drain_kinds(&mut rx), [FLAGS, NOTIFY]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_resends_once_without_report() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager.receive_packet(&handshake_reply()).await;
+        let task = spawn_initialize(&manager);
+
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(drain_kinds(&mut rx), [HANDSHAKE, FLAGS, NOTIFY]);
+
+        sleep(INIT_REPORT_WAIT + Duration::from_secs(1)).await;
+        assert_eq!(drain_kinds(&mut rx), [HANDSHAKE, FLAGS, NOTIFY]);
+        assert!(task.is_finished());
+        assert!(task.await.unwrap().is_ok());
+
+        sleep(INIT_REPORT_WAIT * 2).await;
+        assert!(drain_kinds(&mut rx).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_report_in_time_sends_nothing_more() {
+        let ear_detection = with_header(&[opcodes::EAR_DETECTION, 0x00, 0x00, 0x00]);
+        for report in [with_header(CONNECTED_DEVICES_PAYLOAD), ear_detection] {
+            let (manager, mut rx) = manager_with_send_channel().await;
+            manager.receive_packet(&handshake_reply()).await;
+            let task = spawn_initialize(&manager);
+
+            sleep(Duration::from_secs(1)).await;
+            manager.receive_packet(&report).await;
+            sleep(Duration::from_secs(1)).await;
+            assert!(task.is_finished(), "report {report:02x?}");
+            assert!(task.await.unwrap().is_ok());
+
+            sleep(INIT_REPORT_WAIT * 2).await;
+            assert_eq!(drain_kinds(&mut rx), [HANDSHAKE, FLAGS, NOTIFY]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_session_drop_ends_report_wait() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager.receive_packet(&handshake_reply()).await;
+        let task = spawn_initialize(&manager);
+
+        sleep(Duration::from_secs(1)).await;
+        manager.state.lock().await.clear_connection();
+        sleep(Duration::from_secs(1)).await;
+        assert!(task.is_finished());
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(drain_kinds(&mut rx), [HANDSHAKE, FLAGS, NOTIFY]);
     }
 }

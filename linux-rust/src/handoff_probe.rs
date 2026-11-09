@@ -114,11 +114,7 @@ async fn connect_control(address: Address) -> Result<ControlSession> {
         if manager.state.lock().await.sender.is_none() {
             return Err("AirPods control connection failed".into());
         }
-        manager.send_handshake().await?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        manager.send_set_feature_flags_packet().await?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        manager.send_notification_request().await?;
+        manager.initialize().await?;
         // A missing ownership report does not prove that Linux is unowned.
         manager
             .send_control_command(Control::OwnsConnection, &[0])
