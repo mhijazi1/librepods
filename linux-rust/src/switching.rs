@@ -35,7 +35,7 @@ use crate::media_controller::{
     self, AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_STREAM, MediaController,
 };
 use crate::stream_monitor::{
-    self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PulsePeaks,
+    self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PlaybackState, PulsePeaks,
     PulsePlaybackStreams,
 };
 use crate::utils::{self, ConnectMode, SwitchingMode};
@@ -46,7 +46,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
 /// How often the handoff task ticks the core (ACK timeouts) and checks that
@@ -67,6 +67,8 @@ pub(crate) struct PlaybackSamples {
     rx: mpsc::Receiver<(Instant, u32)>,
     /// Asks the stream monitor to re-baseline at the core's reset (#90).
     rebaseline: Arc<StdMutex<Option<Instant>>>,
+    /// The stream monitor's state, read at `Command::PauseMedia` (#302).
+    streams: watch::Receiver<PlaybackState>,
 }
 
 impl PlaybackSamples {
@@ -212,9 +214,9 @@ fn share_media(
 }
 
 /// Poll local playback every `PLAYBACK_POLL`: playing when an MPRIS player
-/// plays or a takeover-worthy audio stream has carried sound for
-/// `MIN_STREAM_PLAYBACK` (#10, #88). The poller stops once the receiver is
-/// dropped.
+/// plays beside a live local stream (#302) or a takeover-worthy audio stream
+/// has carried sound for `MIN_STREAM_PLAYBACK` (#10, #88). The poller stops
+/// once the receiver is dropped.
 pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
     spawn_playback_poller_with(
         MediaController::check_if_playing,
@@ -229,8 +231,8 @@ pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
 /// `spawn_playback_poller` with its sources, minimum stream duration and
 /// interval injected, and the stream monitor's `observed` hook. Every
 /// `interval` it samples `mpris` on the blocking pool and sends
-/// `(sampled_at, local_category(mpris, streams))`, where `streams` is the
-/// latest state of the stream monitor over `streams` and `peaks`. The stream monitor
+/// `(sampled_at, local_category(mpris, live, counted))` over the latest
+/// state of the stream monitor over `streams` and `peaks`. The stream monitor
 /// samples in its own task (`stream_monitor::spawn_stream_playback`), so a
 /// sound server that never answers leaves the stream state as it was but
 /// never holds up the MPRIS samples. Only edges reach the handoff core
@@ -261,6 +263,7 @@ where
         observed,
     );
     let mpris = Arc::new(mpris);
+    let samples = streams.clone();
     tokio::spawn(async move {
         loop {
             // Stamped before the stream state is read: a sample
@@ -271,20 +274,27 @@ where
             let mpris_playing = tokio::task::spawn_blocking(move || mpris())
                 .await
                 .unwrap_or(false);
-            let category = local_category(mpris_playing, *streams.borrow());
+            let state = *samples.borrow();
+            let category = local_category(mpris_playing, state.live_or_unknown(), state.counted);
             if play_tx.send((sampled_at, category)).await.is_err() {
                 break;
             }
             tokio::time::sleep(interval).await;
         }
     });
-    PlaybackSamples { rx, rebaseline }
+    PlaybackSamples {
+        rx,
+        rebaseline,
+        streams,
+    }
 }
 
-/// Linux's audio category (#272): an MPRIS player playing is media (301),
-/// else a counted stream is 201, else idle (100).
-fn local_category(mpris_playing: bool, stream_playing: bool) -> u32 {
-    if mpris_playing {
+/// Linux's audio category (#272): an MPRIS player playing with a live local
+/// stream is media (301), else a counted stream is 201, else idle (100). An
+/// MPRIS player with no live stream (a remote control such as Spotify
+/// Connect) plays elsewhere (#302).
+fn local_category(mpris_playing: bool, live: bool, stream_playing: bool) -> u32 {
+    if mpris_playing && live {
         AUDIO_CATEGORY_MEDIA
     } else if stream_playing {
         AUDIO_CATEGORY_STREAM
@@ -521,6 +531,14 @@ struct Shell {
 pub(crate) type LineSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl Shell {
+    /// Log a line of the handoff task and hand it to the line sink.
+    fn log(&self, line: &str) {
+        info!("Handoff {}: {line}", self.mac);
+        if let Some(sink) = &self.lines {
+            sink(line);
+        }
+    }
+
     /// Wait until the router has forwarded every event still in the primary
     /// AACP queue to `events`. Returns at once if the router has ended (the
     /// primary queue closed after it forwarded everything).
@@ -569,7 +587,12 @@ impl Shell {
                 Command::PauseMedia => {
                     // Before the pause, so the chain plays nothing after it.
                     self.resume = None;
-                    self.media.pause().await
+                    if self.play_rx.streams.borrow().live_or_unknown() {
+                        self.media.pause().await
+                    } else {
+                        // A playing MPRIS player is a remote control (#302).
+                        self.log("no live local stream; not pausing MPRIS players");
+                    }
                 }
                 // Activation can take tens of seconds; it must not stall
                 // ownership answers and events behind it.
@@ -620,10 +643,7 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     let (now, commands) = shell.play_rx.handle(|now| core.handle(now, input));
     remember_last_owner_linux(&shell.mac, core.last_owner_linux());
     for line in core.take_lines() {
-        info!("Handoff {}: {line}", shell.mac);
-        if let Some(sink) = &shell.lines {
-            sink(&line);
-        }
+        shell.log(&line);
     }
     shell.execute(now, commands).await
 }
@@ -1467,6 +1487,7 @@ mod tests {
             (play_tx, move || PlaybackSamples {
                 rx: play_rx,
                 rebaseline: Default::default(),
+                streams: watch::channel(PlaybackState::default()).1,
             })
         }
 
@@ -1675,9 +1696,11 @@ mod tests {
             let _ = self.a2dp_tx.send(active).await;
         }
 
-        /// A sample from an MPRIS player (301) playing, or idle (100).
+        /// A sample from a local MPRIS player (301, with its live stream)
+        /// playing, or idle (100).
         async fn play(&self, playing: bool) {
-            self.play_category(local_category(playing, false)).await;
+            self.play_category(local_category(playing, playing, false))
+                .await;
         }
 
         async fn play_category(&self, category: u32) {
@@ -2072,6 +2095,7 @@ mod tests {
             move || PlaybackSamples {
                 rx: play_rx,
                 rebaseline: Default::default(),
+                streams: watch::channel(PlaybackState::default()).1,
             },
             move |_: &str| call_rx,
         )
@@ -2488,6 +2512,79 @@ mod tests {
         ]);
         wait_until("the handler to catch up", || h.handler.finished() == all).await;
         assert_eq!(h.handler.started(), all);
+    }
+
+    /// #302: a take, then another host asks, through the production media
+    /// adapter with a counting pauser that pauses one player, while the
+    /// stream monitor reports a live local stream or none. Returns the
+    /// pauses and `i_paused_the_media`.
+    async fn yield_pause(mac: &str, live: bool) -> (usize, bool) {
+        let (manager, mut rx, _tx) = ready_session().await;
+        let records = Arc::new(Records::default());
+        let counted = records.clone();
+        let (outer, media) = share_media(
+            MediaController::new(String::new(), LOCAL.to_string()),
+            Arc::new(move || {
+                counted.pauses.fetch_add(1, Ordering::SeqCst);
+                media_controller::PauseOutcome {
+                    paused: 1,
+                    ..Default::default()
+                }
+            }),
+        );
+        let (play_tx, play_rx) = mpsc::channel(8);
+        let streams = watch::channel(PlaybackState {
+            counted: false,
+            live: Some(live),
+        })
+        .1;
+        let h = Harness::start_playback(
+            SwitchingMode::Handoff,
+            mac,
+            &manager,
+            (outer.clone(), media),
+            records,
+            Arc::new(DeviceHandler::default()),
+            (play_tx, move || PlaybackSamples {
+                rx: play_rx,
+                rebaseline: Default::default(),
+                streams,
+            }),
+            ConnectMode::default(),
+        )
+        .await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(REMOTE).await
+        );
+        assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
+        expect_take(&h, &mut rx).await;
+        h.emit(owns(1));
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        let paused = outer.lock().await.i_paused_the_media().await;
+        stop_handoff_task(mac);
+        (h.pauses(), paused)
+    }
+
+    fn not_pausing(mac: &str) -> bool {
+        traced(mac).iter().any(|l| l.contains("not pausing"))
+    }
+
+    #[tokio::test]
+    async fn yield_pause_skips_remote_control_players() {
+        let mac = "5A:00:00:00:03:02";
+        assert_eq!(yield_pause(mac, false).await, (0, false));
+        assert!(not_pausing(mac), "{:#?}", traced(mac));
+    }
+
+    #[tokio::test]
+    async fn yield_pause_pauses_local_players() {
+        let mac = "5A:00:00:00:03:03";
+        assert_eq!(yield_pause(mac, true).await, (1, true));
+        assert!(!not_pausing(mac), "{:#?}", traced(mac));
     }
 
     #[tokio::test]
@@ -2911,9 +3008,12 @@ mod tests {
     async fn playback_poller_mpris_only_still_plays() {
         let mpris = Arc::new(AtomicBool::new(false));
         let reads = mpris.clone();
+        // The player's stream, live but in the baseline, so never counted.
+        let streams = LiveStreams::default();
+        streams.set(vec![music(1)]);
         let mut rx = spawn_playback_poller_with(
             move || reads.load(Ordering::SeqCst),
-            LiveStreams::default(),
+            streams,
             AllAudible,
             STREAM_TEST_MIN,
             STREAM_TEST_POLL,
@@ -2922,7 +3022,7 @@ mod tests {
         assert!(!next_sample(&mut rx).await.1);
         mpris.store(true, Ordering::SeqCst);
         sample_until(&mut rx, true).await;
-        // Every sample says so while MPRIS plays, with no stream at all.
+        // Every sample says so while MPRIS plays, with no counted stream.
         for _ in 0..5 {
             assert!(next_sample(&mut rx).await.1);
         }
@@ -3218,6 +3318,7 @@ mod tests {
         let samples = PlaybackSamples {
             rx: mpsc::channel(1).1,
             rebaseline: rx.rebaseline.clone(),
+            streams: rx.streams.clone(),
         };
         let (reset_tx, reset) = oneshot::channel();
         let (finish, finished) = std::sync::mpsc::channel::<()>();
@@ -3643,6 +3744,76 @@ mod tests {
         category_until(&mut rx, AUDIO_CATEGORY_IDLE).await;
     }
 
+    /// #302: a playing MPRIS player with no live local stream (a remote
+    /// control such as Spotify Connect) is idle once the stream monitor has
+    /// listed.
+    #[tokio::test]
+    async fn playback_poller_mpris_without_live_stream_is_idle() {
+        let streams = LiveStreams::default();
+        let mut rx = spawn_playback_poller_with(
+            || true,
+            streams.clone(),
+            AllAudible,
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+            |_| (),
+        );
+        streams.settle().await;
+        // Samples taken before the first listing may still be queued.
+        sample_until(&mut rx, false).await;
+        for _ in 0..5 {
+            assert!(!next_sample(&mut rx).await.1);
+        }
+    }
+
+    /// #302: Linux's category over every (mpris, live, counted), the live
+    /// input from the stream monitor's live filter over a music stream
+    /// (live, baseline or not: the filter has none) or over a corked, a
+    /// muted and an event stream (not live).
+    #[test]
+    fn local_category_needs_live_stream_for_mpris() {
+        let not_live = [
+            StreamProps {
+                corked: true,
+                ..music(1)
+            },
+            StreamProps {
+                muted: true,
+                ..music(1)
+            },
+            event_sound(1),
+        ];
+        let (media, stream, idle) = (
+            AUDIO_CATEGORY_MEDIA,
+            AUDIO_CATEGORY_STREAM,
+            AUDIO_CATEGORY_IDLE,
+        );
+        for (mpris, live, counted, category) in [
+            (true, true, true, media),
+            (true, true, false, media),
+            (true, false, true, stream),
+            (true, false, false, idle),
+            (false, true, true, stream),
+            (false, true, false, idle),
+            (false, false, true, stream),
+            (false, false, false, idle),
+        ] {
+            let listings = if live {
+                vec![music(1)]
+            } else {
+                not_live.to_vec()
+            };
+            for s in listings {
+                let filtered = !stream_monitor::live_streams(&[s.clone()]).is_empty();
+                assert_eq!(
+                    local_category(mpris, filtered, counted),
+                    category,
+                    "mpris={mpris} counted={counted} {s:?}"
+                );
+            }
+        }
+    }
+
     /// The owner plays media and relays 301: a counted stream (201) takes
     /// nothing, an MPRIS player (301) takes once.
     #[tokio::test]
@@ -3746,8 +3917,9 @@ mod tests {
         }
 
         /// The core fed as the default path feeds it: each playback sample
-        /// is `local_category` of MPRIS and the real `PlaybackTracker`'s
-        /// state, as `spawn_playback_poller_with` combines them.
+        /// is `local_category` of MPRIS, the listing's live streams and the
+        /// real `PlaybackTracker`'s state, as `spawn_playback_poller_with`
+        /// combines them.
         struct Pipeline {
             core: Handoff,
             tracker: PlaybackTracker,
@@ -3806,7 +3978,8 @@ mod tests {
                 if let Some(playing) = self.tracker.observe_levels(now, streams, |_| level) {
                     self.streams_playing = playing;
                 }
-                let category = local_category(mpris, self.streams_playing);
+                let live = !stream_monitor::live_streams(streams).is_empty();
+                let category = local_category(mpris, live, self.streams_playing);
                 self.feed(
                     ms,
                     Input::Playback {
@@ -4144,9 +4317,10 @@ mod tests {
             assert_eq!(sent(&p, false), 1);
         }
 
-        /// #301/#304: a Spotify-Connect-like MPRIS player (no stream) plays
+        /// #301/#304: a local MPRIS player with a live music stream plays
         /// while the iPhone owns; ear detection pauses it on a bud out and
         /// resumes it on the bud in. The twin with no reinsertion takes.
+        /// (#302: an MPRIS-only player would no longer take at all.)
         #[test]
         fn non_event_ear_resume_while_remote_owns() {
             let run = |reinsert: bool| {
@@ -4163,18 +4337,67 @@ mod tests {
                 p.feed(20, relay);
                 // Already playing at the session start's baseline: no edge.
                 p.feed(30, Input::Auto);
-                p.step(40, true, &[]);
+                p.step(40, true, &[music(1)]);
                 p.feed(100, Input::EarState(vec![InEar, OutOfEar]));
                 p.step(150, false, &[]);
                 p.step(200, false, &[]);
                 if reinsert {
                     p.feed(300, Input::EarState(vec![InEar, InEar]));
                 }
-                p.event(true, &[]);
+                p.event(true, &[music(1)]);
                 p.takes()
             };
             assert_eq!(run(true), NO_TAKE);
             assert_eq!(run(false), [vec![SendOwnership(true)]]);
+        }
+
+        /// `ready`, then the iPhone owns (AudioSource REMOTE Media) and
+        /// relays 301.
+        fn remote_owns() -> Pipeline {
+            let mut p = Pipeline::ready();
+            p.feed(
+                20,
+                Input::AudioSource(AudioSource {
+                    mac: REMOTE.to_string(),
+                    r#type: AudioSourceType::Media,
+                }),
+            );
+            p.feed(
+                20,
+                Input::MediaInformation {
+                    host: REMOTE.to_string(),
+                    category: crate::media_controller::AUDIO_CATEGORY_MEDIA,
+                },
+            );
+            p
+        }
+
+        /// `remote_owns`, then an MPRIS player plays over `streams` from
+        /// the event on.
+        fn remote_owns_case(streams: &[StreamProps]) -> Pipeline {
+            let mut p = remote_owns();
+            p.event(true, streams);
+            p
+        }
+
+        /// #302: a remote-control MPRIS player (Spotify Connect: Playing,
+        /// no local stream) while the iPhone owns takes nothing. The twin
+        /// with a live local music stream takes.
+        #[test]
+        fn non_event_remote_control_player() {
+            assert_eq!(remote_owns_case(&[]).takes(), NO_TAKE);
+            assert_eq!(
+                remote_owns_case(&[music(1)]).takes(),
+                [vec![SendOwnership(true)]]
+            );
+        }
+
+        /// #302: MPRIS with a live stream needs no peak debounce: the take
+        /// is in the event's first sample.
+        #[test]
+        fn mpris_with_live_stream_takes() {
+            let mut p = remote_owns();
+            assert_eq!(p.step(EVENT_MS, true, &[music(1)]), [SendOwnership(true)]);
         }
     }
 
