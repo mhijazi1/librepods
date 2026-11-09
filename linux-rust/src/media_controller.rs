@@ -743,7 +743,6 @@ where
     if wait_for_a2dp_profile(attempts, interval, &mut available, &mut sleep).await {
         return true;
     }
-    warn!("A2DP profile still missing, restarting WirePlumber as a last resort");
     restart().await && wait_for_a2dp_profile(attempts, interval, &mut available, &mut sleep).await
 }
 
@@ -769,6 +768,25 @@ where
         }
     }
     false
+}
+
+/// Why an activation stops after a failed A2DP recovery.
+#[derive(Debug, PartialEq)]
+enum FailedRecovery {
+    /// The hold (#264) wins, even past the deadline: nothing to report.
+    Held,
+    Deadline,
+    Unavailable,
+}
+
+fn failed_recovery(held: bool, past_deadline: bool) -> FailedRecovery {
+    if held {
+        FailedRecovery::Held
+    } else if past_deadline {
+        FailedRecovery::Deadline
+    } else {
+        FailedRecovery::Unavailable
+    }
 }
 
 struct MediaControllerState {
@@ -1419,8 +1437,11 @@ impl MediaController {
                 },
                 // A held card must stay off: no WirePlumber restart (#264).
                 move || async move {
-                    !self.a2dp_hold_skips()
-                        && before_deadline(deadline, restart).await.unwrap_or(false)
+                    if self.a2dp_hold_skips() {
+                        return false;
+                    }
+                    warn!("A2DP profile still missing, restarting WirePlumber as a last resort");
+                    before_deadline(deadline, restart).await.unwrap_or(false)
                 },
                 tokio::time::sleep,
             )
@@ -1477,11 +1498,14 @@ impl MediaController {
         }
 
         if !before_deadline(deadline, recover).await? {
-            if Instant::now() >= deadline {
-                return Err(DeadlineExceeded);
+            match failed_recovery(self.a2dp_hold_skips(), Instant::now() >= deadline) {
+                FailedRecovery::Held => return Ok(()),
+                FailedRecovery::Deadline => return Err(DeadlineExceeded),
+                FailedRecovery::Unavailable => {
+                    error!("A2DP profile unavailable, skipping profile activation");
+                    return Ok(());
+                }
             }
-            error!("A2DP profile unavailable, skipping profile activation");
-            return Ok(());
         }
 
         let Some(idx) = self.state.lock().await.device_index else {
@@ -4034,6 +4058,51 @@ mod tests {
                 .await;
             assert!(!recovered);
             assert_eq!(restarts.get(), expected_restarts);
+        }
+    }
+
+    #[test]
+    fn failed_recovery_held_wins() {
+        assert_eq!(failed_recovery(true, true), FailedRecovery::Held);
+        assert_eq!(failed_recovery(true, false), FailedRecovery::Held);
+        assert_eq!(failed_recovery(false, true), FailedRecovery::Deadline);
+        assert_eq!(failed_recovery(false, false), FailedRecovery::Unavailable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_recovery_activation_held_or_unavailable() {
+        // A hold set by the first availability check skips the restart; the
+        // unheld card restarts once. Neither chooses nor sets a profile.
+        for (hold, expected_restarts) in [(true, 0), (false, 1)] {
+            let controller = MediaController::new(String::new(), String::new());
+            let steps = Steps::default();
+            let first = std::cell::Cell::new(true);
+            let deadline = Instant::now() + A2DP_ACTIVATION_DEADLINE;
+            let outcome = controller
+                .activate_a2dp_profile_with(
+                    deadline,
+                    || steps.step("lookup", Duration::ZERO, Some(3)),
+                    || steps.step("connect", Duration::ZERO, None),
+                    || {
+                        controller.recover_a2dp_availability_by(
+                            deadline,
+                            || steps.step("find", Duration::ZERO, Some(3)),
+                            || {
+                                if first.replace(false) && hold {
+                                    controller.set_a2dp_held(true);
+                                }
+                                steps.step("available", Duration::ZERO, false)
+                            },
+                            || steps.step("restart", Duration::ZERO, true),
+                        )
+                    },
+                    |_| steps.step("choose", Duration::ZERO, ProfileChoice::Unavailable),
+                    |_, _| steps.step("set", Duration::ZERO, true),
+                )
+                .await;
+            assert_eq!(outcome, Ok(()));
+            assert_eq!(steps.started("restart"), expected_restarts);
+            assert_eq!(steps.started("choose") + steps.started("set"), 0);
         }
     }
 
