@@ -646,7 +646,7 @@ fn select_a2dp_profile(
 }
 
 /// Longest the A2DP hold's release waits for the AirPods sink (#264).
-pub(crate) const HOLD_RELEASE_WAIT: Duration = Duration::from_secs(3);
+const HOLD_RELEASE_WAIT: Duration = Duration::from_secs(3);
 
 /// The A2DP hold's write (#264): `off`, only from an active A2DP profile, so
 /// a call, a card already off or an unknown profile is left alone.
