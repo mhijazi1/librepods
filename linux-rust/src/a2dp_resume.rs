@@ -6,11 +6,10 @@
 //! the AirPods sink (suspend, then resume), then kick the players that were
 //! playing at the take (MPRIS Pause, then Play), then, as a last resort,
 //! cycle the card profile once and play them again. Any audible check stops
-//! it. `run` drives it on injected I/O
-//! (`A2dpResumeIo`); the production I/O is `MediaController`'s. The transport
-//! state the core needs comes from `spawn_transport_poller`, which only reads
-//! BlueZ's `MediaTransport1.State` (never `Acquire`: the fd would go to
-//! LibrePods instead of PipeWire).
+//! it. `run` drives it on injected I/O (`A2dpResumeIo`); the production I/O
+//! is `MediaController`'s. The transport state the core needs comes from
+//! `spawn_transport_poller`, which only reads BlueZ's `MediaTransport1.State`
+//! (never `Acquire`: the fd would go to LibrePods instead of PipeWire).
 
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
