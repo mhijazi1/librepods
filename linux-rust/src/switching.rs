@@ -67,7 +67,8 @@ pub(crate) struct PlaybackSamples {
     rx: mpsc::Receiver<(Instant, u32)>,
     /// Asks the stream monitor to re-baseline at the core's reset (#90).
     rebaseline: Arc<StdMutex<Option<Instant>>>,
-    /// The stream monitor's state, read at `Command::PauseMedia` (#302).
+    /// The stream monitor's state, read at `Command::PauseMedia` (#302) and
+    /// `Command::ResumeA2dp` (#330).
     streams: watch::Receiver<PlaybackState>,
 }
 
@@ -111,7 +112,8 @@ impl PlaybackSamples {
         while self.rx.try_recv().is_ok() {}
     }
 
-    /// The stream monitor's state now, for `Command::PauseMedia` (#302).
+    /// The stream monitor's state now, for `Command::PauseMedia` (#302) and
+    /// `Command::ResumeA2dp` (#330).
     pub(crate) fn streams(&self) -> PlaybackState {
         self.streams.borrow().clone()
     }
