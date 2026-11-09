@@ -219,7 +219,7 @@ pub(crate) struct PlaybackTracker {
 }
 
 /// The worthy, uncorked, unmuted streams of a listing.
-fn live_streams(streams: &[StreamProps]) -> HashSet<u32> {
+pub(crate) fn live_streams(streams: &[StreamProps]) -> HashSet<u32> {
     streams
         .iter()
         .filter(|s| !s.corked && !s.muted && is_takeover_worthy(s))
@@ -360,9 +360,28 @@ impl PlaybackTracker {
 /// A playback listing with its candidates' peak levels.
 pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 
+/// What the stream monitor publishes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct PlaybackState {
+    /// A stream counts as playing (`PlaybackTracker`).
+    pub(crate) counted: bool,
+    /// The last successful listing had a live stream (`live_streams`,
+    /// baseline included, no peak gate); None before the first one (#302).
+    pub(crate) live: Option<bool>,
+}
+
+impl PlaybackState {
+    /// `live`, unknown counting as live: before the first successful
+    /// listing (a stalled sound server, #83) MPRIS plays as before #302.
+    pub(crate) fn live_or_unknown(&self) -> bool {
+        self.live.unwrap_or(true)
+    }
+}
+
 /// Sample `source` and `peaks` every `interval` with a `PlaybackTracker`
-/// and publish the stream-playing state (initially false; streams already
-/// playing in the first listing never make it true, see `PlaybackTracker`).
+/// and publish the stream-playing state (initially not counted; streams
+/// already playing in the first listing never count, see
+/// `PlaybackTracker`) with the live presence of each successful listing.
 /// Each sample is timed when the listing and levels return. Sampling runs on
 /// the blocking pool in its own task, so a sound server that never answers
 /// stalls only this state, never the caller, and only until its connect or
@@ -381,7 +400,7 @@ pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 /// request. `observed` is called with each observe's time before the
 /// publish, under the lock (a test hook). The task stops once every
 /// receiver is dropped, dropping `peaks`; if sampling panics the state
-/// drops to false.
+/// drops to not counted, live unknown.
 pub(crate) fn spawn_stream_playback<S, P>(
     source: S,
     peaks: P,
@@ -389,12 +408,12 @@ pub(crate) fn spawn_stream_playback<S, P>(
     interval: Duration,
     rebaseline: Arc<Mutex<Option<Instant>>>,
     observed: impl Fn(Instant) + Send + Sync + 'static,
-) -> watch::Receiver<bool>
+) -> watch::Receiver<PlaybackState>
 where
     S: PlaybackSource + 'static,
     P: PeakSource + 'static,
 {
-    let (tx, rx) = watch::channel(false);
+    let (tx, rx) = watch::channel(PlaybackState::default());
     let observed = Arc::new(observed);
     tokio::spawn(async move {
         let mut state = Some((PlaybackTracker::new(min), source, peaks));
@@ -408,10 +427,14 @@ where
                 if let Some(sample) = tracker.sample(&mut source, &mut peaks) {
                     let mut request = rebaseline.lock().unwrap_or_else(PoisonError::into_inner);
                     let now = Instant::now();
-                    let change = tracker.observe_sample(now, request.take(), &sample);
+                    tracker.observe_sample(now, request.take(), &sample);
                     observed(now);
-                    if let Some(playing) = change {
-                        publish.send_replace(playing);
+                    let state = PlaybackState {
+                        counted: tracker.playing,
+                        live: Some(!live_streams(&sample.0).is_empty()),
+                    };
+                    if *publish.borrow() != state {
+                        publish.send_replace(state);
                     }
                 }
                 (tracker, source, peaks)
@@ -419,7 +442,7 @@ where
             .await;
             let Ok(sampled) = sampled else {
                 log::error!("Stream playback monitor stopped: sampling panicked");
-                tx.send_replace(false);
+                tx.send_replace(PlaybackState::default());
                 break;
             };
             state = Some(sampled);
@@ -1832,13 +1855,13 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        assert!(!*rx.borrow());
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
+        assert!(!rx.borrow().counted);
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| s.counted))
             .await
             .expect("stream playback")
             .expect("monitor running");
         script.lock().unwrap().push_back(Ok(vec![]));
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| !*playing))
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| !s.counted))
             .await
             .expect("stream playback ended")
             .expect("monitor running");
@@ -1862,7 +1885,7 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| s.counted))
             .await
             .expect("stream playback after a timeout")
             .expect("monitor running");
@@ -1872,8 +1895,8 @@ mod tests {
             .unwrap()
             .extend([timed_out(), timed_out(), Ok(vec![])]);
         tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(*rx.borrow());
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| !*playing))
+        assert!(rx.borrow().counted);
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| !s.counted))
             .await
             .expect("stream playback ended")
             .expect("monitor running");
@@ -1883,6 +1906,55 @@ mod tests {
         script.lock().unwrap().push_back(Ok(vec![music(2)]));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(script.lock().unwrap().len(), 1);
+    }
+
+    /// #302: a stream in the first listing is live but never counted; live
+    /// is unknown before that listing, kept through failed listings, and
+    /// off once the stream corks.
+    #[tokio::test]
+    async fn spawned_stream_playback_publishes_live_baseline_stream() {
+        let source = FakePlayback::new(vec![Ok(vec![music(1)])]);
+        let script = source.script.clone();
+        let mut rx = spawn_stream_playback(
+            source,
+            AllAudible,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            Default::default(),
+            |_| (),
+        );
+        assert_eq!(rx.borrow().live, None);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            rx.wait_for(|s| s.live == Some(true)),
+        )
+        .await
+        .expect("live baseline stream")
+        .expect("monitor running");
+        script
+            .lock()
+            .unwrap()
+            .extend([timed_out(), timed_out(), Ok(vec![music(1)])]);
+        // Past the minimum and the failed listings: no change at all.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(script.lock().unwrap().is_empty());
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(
+            *rx.borrow(),
+            PlaybackState {
+                counted: false,
+                live: Some(true)
+            }
+        );
+        script.lock().unwrap().push_back(Ok(vec![corked_music(1)]));
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            rx.wait_for(|s| s.live == Some(false)),
+        )
+        .await
+        .expect("corked stream not live")
+        .expect("monitor running");
+        assert!(!rx.borrow().counted);
     }
 
     /// A sound server slow to answer once: the first listing (the baseline)
@@ -1929,7 +2001,7 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|playing| *playing))
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| s.counted))
             .await
             .expect("stream playback")
             .expect("monitor running");
@@ -2495,12 +2567,12 @@ mod tests {
             Default::default(),
             |_| (),
         );
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| *playing))
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| s.counted))
             .await
             .expect("stream playback")
             .expect("monitor running");
         die.store(true, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|playing| !*playing))
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| !s.counted))
             .await
             .expect("stream playback off once the thread died")
             .expect("monitor running");
