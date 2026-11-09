@@ -900,7 +900,8 @@ async fn run_handoff(mut shell: Shell) {
             return;
         }
     }
-    // The core's own automatic startup: A2DP, "not owning", announce.
+    // The core's own automatic startup: A2DP, "not owning" (or the connect
+    // take from an idle other host, #324), announce.
     if !for_playback && step(&mut core, &mut shell, Input::Auto).await {
         return;
     }
@@ -1548,6 +1549,24 @@ mod tests {
         (manager, rx, tx)
     }
 
+    /// `ready_session` with no audio source reported yet: the startup's
+    /// connect take (#324) needs a confirmed idle source, so the startup
+    /// sends "not owning" and the playback take stays under test.
+    /// `expect_startup` then reports the idle source.
+    async fn no_source_session() -> (AACPManager, mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
+        let session = ready_session().await;
+        session.0.state.lock().await.audio_source = None;
+        session
+    }
+
+    /// The idle audio source report `no_source_session` holds back.
+    fn idle_source() -> AACPEvent {
+        AACPEvent::AudioSource(AudioSource {
+            mac: "00:00:00:00:00:00".to_string(),
+            r#type: AudioSourceType::None,
+        })
+    }
+
     /// The bytes one `send_*` call puts on the wire, from a reference
     /// injected manager.
     async fn reference<F, Fut>(send: F) -> Vec<u8>
@@ -1906,10 +1925,25 @@ mod tests {
         }
     }
 
-    /// Startup: the core's automatic start, [ConnectA2dp, SendOwnership(false),
-    /// Announce], and nothing else.
+    /// Startup on a `no_source_session` (or one whose connect mode blocks
+    /// the connect take): the core's automatic start, [ConnectA2dp,
+    /// SendOwnership(false), Announce], and nothing else; then the idle
+    /// source report `no_source_session` held back.
     async fn expect_startup(h: &Harness, rx: &mut mpsc::Receiver<Vec<u8>>) {
         assert_eq!(next_packet(rx).await, expected_owns(0).await);
+        assert_eq!(next_packet(rx).await, expected_new_device(REMOTE).await);
+        assert_eq!(next_packet(rx).await, expected_tipi(REMOTE).await);
+        assert_eq!(rest(rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.activations(), 1);
+        assert_eq!(h.pauses(), 0);
+        h.emit_queued(idle_source()).await;
+    }
+
+    /// Startup on a `ready_session`: the connect take from the idle other
+    /// host (#324), [ConnectA2dp, SendOwnership(true), Announce], and
+    /// nothing else.
+    async fn expect_connect_take(h: &Harness, rx: &mut mpsc::Receiver<Vec<u8>>) {
+        assert_eq!(next_packet(rx).await, expected_owns(1).await);
         assert_eq!(next_packet(rx).await, expected_new_device(REMOTE).await);
         assert_eq!(next_packet(rx).await, expected_tipi(REMOTE).await);
         assert_eq!(rest(rx).await, Vec::<Vec<u8>>::new());
@@ -1960,7 +1994,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_automatically_takes_new_playback() {
         let mac = "5A:00:00:00:01:53";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start_connect(ConnectMode::Automatically, mac, &manager).await;
         expect_startup(&h, &mut rx).await;
 
@@ -1969,10 +2003,31 @@ mod tests {
         stop_handoff_task(mac);
     }
 
+    /// #324: the daemon's session start finds the other host idle, so its
+    /// first ownership packet is OwnsConnection [1], as the Mac takes when it
+    /// connects (spike #325), with no pause; the acknowledged idle take
+    /// sends nothing more.
+    #[tokio::test]
+    async fn startup_takes_from_idle_remote_owner() {
+        let mac = "5A:00:00:00:03:24";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let h = Harness::start_connect(ConnectMode::Automatically, mac, &manager).await;
+        expect_connect_take(&h, &mut rx).await;
+        h.emit_queued(owns(1)).await;
+        h.play(false).await;
+        wait_until("the take's ACK", || {
+            traced(mac).iter().any(|l| l.starts_with("ACK owner=linux"))
+        })
+        .await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        stop_handoff_task(mac);
+    }
+
     #[tokio::test]
     async fn handoff_default_path_takes_and_keeps_ownership() {
         let mac = "5A:00:00:00:00:01";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::default(), mac, &manager).await;
         assert!(h.playback_started.load(Ordering::SeqCst));
         assert!(handoff_task(mac).is_some());
@@ -2004,8 +2059,11 @@ mod tests {
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
         assert_eq!(h.activations(), 1);
-        // The device handler saw both reports too.
-        assert_eq!(h.handler.finished(), named(&[owns(0), owns(1)]));
+        // The device handler saw every report too.
+        assert_eq!(
+            h.handler.finished(),
+            named(&[idle_source(), owns(0), owns(1)])
+        );
 
         // New playback while Linux owns sends nothing; another host then
         // takes the AirPods (a [0] that acknowledges nothing): the core
@@ -2058,7 +2116,7 @@ mod tests {
     #[tokio::test]
     async fn a2dp_resume_chain_runs_after_take_ack_without_release() {
         let mac = "5A:00:00:00:00:C8";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         resumed_take(&h, &mut rx, mac).await;
         let trace = traced(mac);
@@ -2096,7 +2154,7 @@ mod tests {
     #[tokio::test]
     async fn a2dp_resume_chain_stops_after_yield() {
         let mac = "5A:00:00:00:00:C9";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         resumed_take(&h, &mut rx, mac).await;
         // Another host takes the AirPods while the kick has the player
@@ -2133,7 +2191,7 @@ mod tests {
     /// acts no more after the yield's pause.
     async fn yield_during_audio_check(mac: &str, check: usize) {
         HELD_CHECKS.lock().unwrap().push(mac.to_string());
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         resumed_take(&h, &mut rx, mac).await;
         let count = |trace: &[String], entry: &str| trace.iter().filter(|l| *l == entry).count();
@@ -2323,7 +2381,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_remote_request_yields_once() {
         let mac = "5A:00:00:00:00:02";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;
@@ -2372,7 +2430,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_local_call_refuses_remote_and_advertises() {
         let mac = "5A:00:00:00:00:0C";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;
@@ -2467,7 +2525,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_task_ends_on_session_loss_without_reconnect() {
         let mac = "5A:00:00:00:00:03";
-        let (manager, mut rx, tx) = ready_session().await;
+        let (manager, mut rx, tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         let task = handoff_task(mac).expect("handoff task");
         expect_startup(&h, &mut rx).await;
@@ -2497,7 +2555,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_closed_event_stream_feeds_session_lost_then_disconnected() {
         let mac = "5A:00:00:00:00:12";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let mut h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         let task = handoff_task(mac).expect("handoff task");
         expect_startup(&h, &mut rx).await;
@@ -2570,7 +2628,7 @@ mod tests {
     #[tokio::test]
     async fn normal_start_keeps_running_playback_as_baseline() {
         let mac = "5A:00:00:00:07:08";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         h.play(true).await;
         expect_startup(&h, &mut rx).await;
@@ -2593,7 +2651,7 @@ mod tests {
         reconnect::set_marker(mac, AUDIO_CATEGORY_MEDIA);
         tokio::time::advance(reconnect::RECONNECT_TAKE_WINDOW + Duration::from_secs(1)).await;
         tokio::time::resume();
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         h.play(true).await;
         expect_startup(&h, &mut rx).await;
@@ -2774,7 +2832,9 @@ mod tests {
             });
         }
         h.play(true).await;
-        expect_startup(&h, &mut rx).await;
+        // The normal start: the idle other host gets the connect take
+        // (#324), not the reconnect's playback take.
+        expect_connect_take(&h, &mut rx).await;
         assert!(
             !traced(mac)
                 .iter()
@@ -2820,7 +2880,9 @@ mod tests {
             traced(mac).iter().any(|l| l.starts_with("AUTO enabled"))
         })
         .await;
-        expect_startup(&h, &mut rx).await;
+        // The idle other host gets the connect take (#324), not the
+        // reconnect's playback take.
+        expect_connect_take(&h, &mut rx).await;
         assert!(
             !traced(mac)
                 .iter()
@@ -2879,7 +2941,7 @@ mod tests {
             ("5A:00:00:00:07:0D", EarDetectionStatus::OutOfEar, false),
         ] {
             reconnect::case_closed_at_drop(mac, !closed);
-            let (manager, mut rx, _tx) = ready_session().await;
+            let (manager, mut rx, _tx) = no_source_session().await;
             let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
             let task = handoff_task(mac).expect("handoff task");
             expect_startup(&h, &mut rx).await;
@@ -2893,7 +2955,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_not_stalled_by_slow_device_handler() {
         let mac = "5A:00:00:00:00:08";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start_with(SwitchingMode::Handoff, mac, &manager, true).await;
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;
@@ -2903,7 +2965,7 @@ mod tests {
         let worn = wear(EarDetectionStatus::InEar);
         h.emit(worn.clone());
         wait_until("the handler to block", || {
-            h.handler.started() == named(&[owns(0), worn.clone()])
+            h.handler.started() == named(&[idle_source(), owns(0), worn.clone()])
         })
         .await;
         // Queued behind it: the take's ACK, then another host's request.
@@ -2922,12 +2984,21 @@ mod tests {
                 < position(&trace, "REMOTE requested ownership; yielding")
         );
         // The handler is still blocked on the wear report.
-        assert_eq!(h.handler.started(), named(&[owns(0), worn.clone()]));
-        assert_eq!(h.handler.finished(), named(&[owns(0)]));
+        assert_eq!(
+            h.handler.started(),
+            named(&[idle_source(), owns(0), worn.clone()])
+        );
+        assert_eq!(h.handler.finished(), named(&[idle_source(), owns(0)]));
 
         // Released, it handles every event once, in order.
         h.handler.release.notify_one();
-        let all = named(&[owns(0), worn, owns(1), AACPEvent::OwnershipToFalseRequest]);
+        let all = named(&[
+            idle_source(),
+            owns(0),
+            worn,
+            owns(1),
+            AACPEvent::OwnershipToFalseRequest,
+        ]);
         wait_until("the handler to catch up", || h.handler.finished() == all).await;
         assert_eq!(h.handler.started(), all);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
@@ -3039,7 +3110,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_production_media_ignores_held_controller_lock() {
         let mac = "5A:00:00:00:00:0B";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let records = Arc::new(Records::default());
         let counted = records.clone();
         let paused_for = mac.to_string();
@@ -3077,6 +3148,7 @@ mod tests {
         );
         assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        h.emit_queued(idle_source()).await;
         expect_take(&h, &mut rx).await;
         h.emit(owns(1));
         wait_until("the take's ACK", || {
@@ -3120,11 +3192,15 @@ mod tests {
         manager.disconnect().await;
         wait_until("the task to end", || task.is_finished()).await;
         assert!(outer.try_lock().is_err(), "the mutex was held throughout");
-        assert_eq!(h.handler.finished(), named(&[owns(0), owns(1)]));
+        assert_eq!(
+            h.handler.finished(),
+            named(&[idle_source(), owns(0), owns(1)])
+        );
 
         // Released, ear detection and the rest run once, in order.
         h.handler.release.notify_one();
         let all = named(&[
+            idle_source(),
             owns(0),
             owns(1),
             worn,
@@ -3180,7 +3256,7 @@ mod tests {
         live: Option<&[u32]>,
         pause_players: PausePlayers,
     ) -> MediaController {
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let records = Arc::new(Records::default());
         let controller = MediaController::new(String::new(), LOCAL.to_string());
         controller.set_playing(is_playing).await;
@@ -3215,6 +3291,7 @@ mod tests {
             expected_new_device(REMOTE).await
         );
         assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
+        h.emit_queued(idle_source()).await;
         expect_take(&h, &mut rx).await;
         h.emit(owns(1));
         h.emit(AACPEvent::OwnershipToFalseRequest);
@@ -3381,7 +3458,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_session_loss_drains_primary_queue() {
         let mac = "5A:00:00:00:00:09";
-        let (manager, mut rx, tx) = ready_session().await;
+        let (manager, mut rx, tx) = no_source_session().await;
         let h = Harness::start_with(SwitchingMode::Handoff, mac, &manager, true).await;
         let task = handoff_task(mac).expect("handoff task");
         expect_startup(&h, &mut rx).await;
@@ -3402,7 +3479,7 @@ mod tests {
         let in_case = wear(EarDetectionStatus::InCase);
         h.emit(in_case.clone());
         wait_until("the handler to block", || {
-            h.handler.started() == named(&[owns(0), owns(1), in_case.clone()])
+            h.handler.started() == named(&[idle_source(), owns(0), owns(1), in_case.clone()])
         })
         .await;
         let before = traced(mac).len();
@@ -3443,9 +3520,13 @@ mod tests {
 
         // Released, the handler gets the wear report once, then the rest in
         // order.
-        assert_eq!(h.handler.finished(), named(&[owns(0), owns(1)]));
+        assert_eq!(
+            h.handler.finished(),
+            named(&[idle_source(), owns(0), owns(1)])
+        );
         h.handler.release.notify_one();
         let all = named(&[
+            idle_source(),
             owns(0),
             owns(1),
             in_case,
@@ -3613,7 +3694,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_take_and_yield_route_default_sink() {
         let mac = "5A:00:00:00:00:28";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;
@@ -4271,12 +4352,13 @@ mod tests {
     /// or briefly. The first MPRIS poll waits for the reset, so the
     /// poller's pending sample is stamped after it. Returns the harness, the
     /// packets after Auto's and the reply to its "not owning", and when the
-    /// stream started.
+    /// stream started. No audio source at the start (`no_source_session`),
+    /// so no connect take (#324); its idle report follows Auto's packets.
     async fn step_rebaseline(
         mac: &str,
         before_reset: bool,
     ) -> (Harness, mpsc::Receiver<Vec<u8>>, Instant) {
-        let (manager, mut rx, tx) = ready_session().await;
+        let (manager, mut rx, tx) = no_source_session().await;
         let mut queued = 0;
         while tx.try_send(Vec::new()).is_ok() {
             queued += 1;
@@ -4325,6 +4407,7 @@ mod tests {
             expected_new_device(REMOTE).await
         );
         assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
+        h.emit_queued(idle_source()).await;
         h.emit(owns(0));
         (h, rx, started)
     }
@@ -4355,7 +4438,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_stream_playback_takes() {
         let mac = "5A:00:00:00:00:0D";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let streams = LiveStreams::default();
         let h =
             Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
@@ -4394,7 +4477,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_event_sound_stream_never_takes() {
         let mac = "5A:00:00:00:00:0E";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         // An event sound open from the start, for longer than the minimum.
         let streams = LiveStreams::default();
         streams.set(vec![event_sound(21)]);
@@ -4418,7 +4501,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_muted_stream_never_takes() {
         let mac = "5A:00:00:00:00:11";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let streams = LiveStreams::default();
         let h =
             Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
@@ -4443,7 +4526,7 @@ mod tests {
     /// optionally held until playback samples have reached the core: no
     /// take while it keeps playing, one take once it is paused and resumed.
     async fn preexisting_stream_case(mac: &str, delay_first_listing: bool) {
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let streams = LiveStreams::default();
         streams.set(vec![music(31)]);
         let (release, gate) = std::sync::mpsc::channel::<()>();
@@ -4640,7 +4723,7 @@ mod tests {
     #[tokio::test]
     async fn category_stream_against_relayed_media_waits_for_mpris() {
         let mac = "5A:00:00:00:02:72";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let mpris = Arc::new(AtomicBool::new(false));
         let reads = mpris.clone();
         let streams = LiveStreams::default();
@@ -4686,7 +4769,7 @@ mod tests {
     #[tokio::test]
     async fn category_stream_against_relayed_idle_takes() {
         let mac = "5A:00:00:00:02:73";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let streams = LiveStreams::default();
         let h =
             Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
@@ -4766,6 +4849,20 @@ mod tests {
             }
         }
 
+        /// `facts` before the audio source report: no connect take (#324),
+        /// so Linux does not own when the session starts.
+        fn no_source() -> SessionFacts {
+            SessionFacts {
+                audio: None,
+                ..facts()
+            }
+        }
+
+        /// The idle audio source report `no_source` holds back.
+        fn idle_source() -> Input {
+            Input::AudioSource(facts().audio.unwrap())
+        }
+
         /// The core fed as the default path feeds it: each playback sample
         /// combines the MPRIS owners, the listing's live streams and the
         /// real `PlaybackTracker`'s state with `sample_sources`, as
@@ -4788,6 +4885,11 @@ mod tests {
             /// plus a remote host, worn, idle audio, owner [0], then a
             /// stopped sample and an empty stream listing as the baselines.
             fn ready() -> Self {
+                Self::seeded(facts())
+            }
+
+            /// `ready` with the session's `facts` instead.
+            fn seeded(facts: SessionFacts) -> Self {
                 let t0 = Instant::now();
                 let mut p = Pipeline {
                     core: Handoff::new(LOCAL.to_string(), t0, true, true),
@@ -4798,7 +4900,7 @@ mod tests {
                     t0,
                     log: Vec::new(),
                 };
-                for input in seed_inputs(facts()) {
+                for input in seed_inputs(facts) {
                     p.feed(0, input);
                 }
                 assert_eq!(p.step(10, false, &[]), []);
@@ -4944,7 +5046,8 @@ mod tests {
         const RECONNECT_MS: u64 = DISCONNECT_MS + POLL_MS + MIN_MS + POLL_MS;
 
         /// The session drops while worn (recovery Immediate) and a new one
-        /// comes at `RECONNECT_MS`; the player (a music stream, with MPRIS
+        /// comes at `RECONNECT_MS`, before its audio source report, so with
+        /// no connect take (#324); the player (a music stream, with MPRIS
         /// when `mpris`) plays from `start` ms on.
         fn reconnect_case(start: u64, mpris: bool) -> Pipeline {
             let mut p = Pipeline::ready();
@@ -4964,7 +5067,8 @@ mod tests {
                 if ms == RECONNECT_MS {
                     // The tracker counts a stream that lasted the minimum.
                     assert_eq!(p.streams_playing, start + MIN_MS < ms);
-                    p.feed(ms, Input::Reconnected(facts()));
+                    p.feed(ms, Input::Reconnected(no_source()));
+                    assert_eq!(p.feed(ms, idle_source()), []);
                 }
                 let playing = ms >= start;
                 let streams: &[StreamProps] = if playing { &player } else { &[] };
@@ -5002,11 +5106,12 @@ mod tests {
         /// Under the minimum after `EVENT_MS`.
         const RESET_MS: u64 = EVENT_MS + 3 * POLL_MS;
 
-        /// `ready`, then a live `Input::Auto` and an owner report [0] at
-        /// `RESET_MS`; a music stream with no MPRIS player plays from
+        /// `ready` before the audio source report, then a live `Input::Auto`
+        /// (no connect take, #324), the owner report [0] and the idle source
+        /// at `RESET_MS`; a music stream with no MPRIS player plays from
         /// `start` ms on.
         fn auto_reset_case(start: u64) -> Pipeline {
-            let mut p = Pipeline::ready();
+            let mut p = Pipeline::seeded(no_source());
             let stream = [music(1)];
             for ms in (EVENT_MS..=RESET_MS + 2 * MIN_MS + POLL_MS).step_by(POLL_MS as usize) {
                 if ms == RESET_MS {
@@ -5022,6 +5127,7 @@ mod tests {
                     );
                     // The AirPods' own owner report.
                     assert_eq!(p.feed(ms, Input::Ownership(vec![0])), []);
+                    assert_eq!(p.feed(ms, idle_source()), []);
                 }
                 let streams: &[StreamProps] = if ms >= start { &stream } else { &[] };
                 p.step(ms, false, streams);
@@ -5609,10 +5715,11 @@ mod tests {
         }
 
         /// The second player (on stream A, which counts already) starts at
-        /// the reset's first sample, or its second when `later`.
+        /// the reset's first sample, or its second when `later`. The iPhone
+        /// relays 201, so Auto makes no connect take (#324).
         fn after_reset(later: bool) -> Vec<Command> {
             let a = owned_by(SECOND_PID, music(1));
-            let (mut p, ms) = yielded(&[], &[a.clone()], IDLE);
+            let (mut p, ms) = yielded(&[], &[a.clone()], STREAM);
             assert_eq!(
                 p.feed(ms, Input::Auto),
                 [
@@ -5698,12 +5805,14 @@ mod tests {
                 r#type: AudioSourceType::Media,
             };
             p.feed(20, Input::AudioSource(remote));
+            // The relay comes after Auto: an idle iPhone at the session
+            // start would get the connect take (#324).
+            p.feed(30, Input::Auto);
             let relay = Input::MediaInformation {
                 host: REMOTE.to_string(),
                 category: IDLE,
             };
-            p.feed(20, relay);
-            p.feed(30, Input::Auto);
+            p.feed(35, relay);
             p.step(40, true, &[music(1)]);
             p.feed(100, Input::EarState(vec![InEar, OutOfEar]));
             p.step(150, false, &[]);
@@ -5765,7 +5874,7 @@ mod tests {
     #[tokio::test]
     async fn hold_on_remote_yield_released_before_retake_route() {
         let mac = "5A:00:00:00:01:08";
-        let (manager, mut rx, _tx) = ready_session().await;
+        let (manager, mut rx, _tx) = no_source_session().await;
         let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
         expect_startup(&h, &mut rx).await;
         expect_take(&h, &mut rx).await;

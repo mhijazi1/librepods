@@ -46,6 +46,10 @@ pub(crate) enum TakeoverTrigger {
     /// The control session came back for playback that started while it was
     /// down after a case-closed disconnect (#841 case recovery).
     ReconnectedForPlayback,
+    /// A session start or reconnect found the other host idle: Linux takes,
+    /// as the Mac does about 1.2 s after it connects (#324, spike #325).
+    /// Guarded like an automatic take.
+    Connected,
     /// The user asked for the AirPods (handoff probe `take`).
     Manual,
 }
@@ -3111,6 +3115,7 @@ mod tests {
             for trigger in [
                 TakeoverTrigger::Manual,
                 TakeoverTrigger::ReconnectedForPlayback,
+                TakeoverTrigger::Connected,
             ] {
                 let recovery = match trigger {
                     TakeoverTrigger::ReconnectedForPlayback => CaseRecovery::PlaybackRequested,
@@ -3260,6 +3265,16 @@ mod tests {
                 expected,
                 "reconnect {local} {audio:?} {relays:?}"
             );
+            let connected = TakeoverInputs::handoff(
+                TakeoverTrigger::Connected,
+                routing,
+                CaseRecovery::Immediate,
+            );
+            assert_eq!(
+                decide_takeover(connected).action,
+                expected,
+                "connected {local} {audio:?} {relays:?}"
+            );
         }
         // Local media is never remote activity, whatever the categories.
         let local_media = category_routing(IDLE, Some((LOCAL, Media)), &[(LOCAL, MEDIA)]);
@@ -3291,6 +3306,67 @@ mod tests {
         assert_eq!(
             manual(category_routing(IDLE, Some((LOCAL, Media)), &[])),
             take
+        );
+    }
+
+    #[test]
+    fn connected_trigger_guards() {
+        // #324: a connect take is guarded like an automatic take, Linux
+        // asking at 100.
+        use AudioSourceType::{Call, Media};
+        const IDLE: u32 = AUDIO_CATEGORY_IDLE;
+        let connected = |routing, recovery| {
+            decide_takeover(TakeoverInputs::handoff(
+                TakeoverTrigger::Connected,
+                routing,
+                recovery,
+            ))
+            .action
+        };
+        let skip = TakeoverAction::Skip;
+        let ready = || category_routing(IDLE, Some((REMOTE, AudioSourceType::None)), &[]);
+        use CaseRecovery::*;
+        assert_eq!(connected(ready(), Immediate), TakeoverAction::TakeOver);
+        assert_eq!(
+            connected(ready(), WaitingForPlayback),
+            skip(TakeoverSkip::AwaitingNewPlayback)
+        );
+        let no_session = RoutingSnapshot {
+            has_session: false,
+            ..ready()
+        };
+        assert_eq!(
+            connected(no_session, Immediate),
+            skip(TakeoverSkip::NoSession)
+        );
+        assert_eq!(
+            connected(routing_with_hosts(&[LOCAL]), Immediate),
+            skip(TakeoverSkip::NoRemoteHost)
+        );
+        let remote_media = category_routing(IDLE, Some((REMOTE, Media)), &[]);
+        assert_eq!(
+            connected(remote_media, Immediate),
+            skip(TakeoverSkip::RemoteCategoryHigher {
+                local: IDLE,
+                remote: AUDIO_CATEGORY_MEDIA
+            })
+        );
+        let idle_relay = category_routing(IDLE, Some((REMOTE, Media)), &[(REMOTE, IDLE)]);
+        assert_eq!(connected(idle_relay, Immediate), TakeoverAction::TakeOver);
+        for audio in [Some((REMOTE, Call)), None] {
+            assert_eq!(
+                connected(category_routing(IDLE, audio, &[]), Immediate),
+                skip(TakeoverSkip::AudioNotIdle),
+                "{audio:?}"
+            );
+        }
+        let not_worn = RoutingSnapshot {
+            bud_in_ear: false,
+            ..ready()
+        };
+        assert_eq!(
+            connected(not_worn, Immediate),
+            skip(TakeoverSkip::NoBudInEar)
         );
     }
 

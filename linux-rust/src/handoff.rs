@@ -43,6 +43,8 @@ const NO_SESSION: &str =
 /// maps it to `Kind::Other`: it is no take request.
 const CONNECT_MODE_SKIP: &str =
     "AUTO takeover skipped: connect mode is when-last-connected and Linux was not the last owner";
+/// The connect take (#324).
+const CONNECT_TAKE: &str = "AUTO connected while the other host is idle; requested Linux ownership";
 
 /// Routing, wear and ownership facts of a freshly made control session,
 /// copied by the shell so a take right after a reconnect sees them before the
@@ -145,7 +147,9 @@ pub(crate) enum Input {
     /// yields to it. While any request is pending (a repeated Auto, a
     /// release or a take) it sends no "not owning", so no reply is left
     /// acknowledging nothing. Nor while Linux holds a take: Linux stays the
-    /// idle owner (#262).
+    /// idle owner (#262). When the other host is idle (the connect take's
+    /// guards, #324), it takes with only "owning" instead, or keeps an owner
+    /// already reported as Linux ([1]) without sending anything.
     Auto,
     /// Switch to manual mode (REPL `manual`). Linux keeps the AirPods it
     /// holds (#253).
@@ -295,9 +299,13 @@ pub(crate) struct Handoff {
     local_call: bool,
     /// Last `Input::A2dpTransport` report; None until one arrives.
     a2dp_active: Option<bool>,
-    /// The take's ACK skipped the A2DP resume for a stop during it; the next
-    /// play edge while Linux owns resumes (#205). Any playing sample, request,
-    /// yield or disconnect clears it.
+    /// The A2DP resume Linux's take owes, put off until Linux plays. Set by
+    /// a take's ACK for a stop during the take (#205), and by #324's idle
+    /// connect take (its ACK then skips the resume) or keep at owner [1].
+    /// The next play edge, or the session's first playing sample, uses it:
+    /// while Linux owns it resumes once (`resume_if_idle`); while the take
+    /// is pending its ACK resumes instead. Any request, yield or disconnect
+    /// clears it.
     resume_deferred: bool,
     recovery: CaseRecovery,
     case_closed: bool,
@@ -701,11 +709,30 @@ impl Handoff {
                 }
                 // Queued replays are fed before REPL input, so the #79 exemption can end here.
                 self.snapshot_hosts.clear();
+                let take = self.connect_take_allowed();
+                // The AirPods already report Linux (an app restart while it
+                // owned): keep them as an idle take (#324).
+                let keep = take && self.owner.as_deref() == Some(&[1]);
+                // An idle other host (#324): Linux takes, so hold nothing.
+                if take {
+                    self.remote_owns = false;
+                }
                 // A session start: restores a card an earlier run left `off`
                 // (#264); before ConnectA2dp, which the hold blocks.
                 self.sync_hold(true, out);
                 out.push(Command::ConnectA2dp);
-                if !self.requested_take && self.pending.is_none() {
+                if keep {
+                    self.requested_take = true;
+                    self.last_owner_linux = true;
+                    self.routed_away = false;
+                    self.resume_deferred = true;
+                    if self.default_sink_routing {
+                        out.push(Command::RouteToAirPods);
+                    }
+                    self.say("AUTO connected; Linux already owns the AirPods, keeping them");
+                } else if take {
+                    self.connect_take(now, out);
+                } else if !self.requested_take && self.pending.is_none() {
                     // Tracked like an automatic release (#54) only when
                     // Linux owns: the AirPods reply only to a real change
                     // (#159, #289). A release already pending covers it: a
@@ -798,7 +825,10 @@ impl Handoff {
         // baseline: a stop during a reconnect take defers its resume (#205).
         let stopped =
             (previous == Some(true) || (previous.is_none() && assumed_playing)) && !playing;
-        let resume_deferred = playing && std::mem::take(&mut self.resume_deferred);
+        // A session's first playing sample also uses the deferral: Linux
+        // already played when #324's take connected.
+        let resume_deferred = (fresh_play || (playing && previous.is_none()))
+            && std::mem::take(&mut self.resume_deferred);
         if !self.automatic {
             return;
         }
@@ -824,7 +854,7 @@ impl Handoff {
         match self.pending {
             // Linux stayed the idle owner (#262), as the Mac does: a fresh
             // take's host and wear policy is moot.
-            None if owning && fresh_play => {
+            None if owning && (fresh_play || resume_deferred) => {
                 self.say("AUTO playback started; Linux already owns");
                 if resume_deferred {
                     self.resume_if_idle(out);
@@ -1004,8 +1034,8 @@ impl Handoff {
         if held && self.default_sink_routing {
             out.push(Command::RouteToAirPods);
         }
-        // A stop during the take (#205) defers the resume to the next play
-        // edge while Linux owns.
+        // A stop during the take (#205), or an idle connect take (#324),
+        // defers the resume until Linux plays.
         if held && self.automatic && !self.resume_deferred {
             self.resume_if_idle(out);
         }
@@ -1225,6 +1255,11 @@ impl Handoff {
                 false
             }
         };
+        // An ordinary reconnect takes from an idle other host (#324).
+        let connect_take = !took && self.automatic && self.connect_take_allowed();
+        if connect_take {
+            self.connect_take(now, out);
+        }
         self.recovery = CaseRecovery::Immediate;
         self.reset_baseline(now);
         // The take was for playback seen before this baseline: a first
@@ -1232,7 +1267,7 @@ impl Handoff {
         // (#262) and, while still pending, defers its resume (#205).
         self.take_assumes_playing = took;
         // The session's queued OwnsConnection=0 reports predate this take.
-        self.reconnect_take_pending = took;
+        self.reconnect_take_pending = took || connect_take;
         out.push(Command::DrainPlayback);
         self.retry_delay = FIRST_RETRY;
         self.say("RECONNECTED with fresh routing and wear state");
@@ -1406,6 +1441,29 @@ impl Handoff {
             self.recovery,
         ))
     }
+
+    /// A session start or reconnect may take from an idle other host, as the
+    /// Mac does (#324, spike #325): no take held or pending, the connect
+    /// mode allows it, and the policy allows it with Linux asking at 100.
+    fn connect_take_allowed(&self) -> bool {
+        let routing = RoutingSnapshot {
+            local_category: AUDIO_CATEGORY_IDLE,
+            ..self.routing()
+        };
+        let inputs = TakeoverInputs::handoff(TakeoverTrigger::Connected, routing, self.recovery);
+        !self.requested_take
+            && self.pending.is_none()
+            && self.auto_take_allowed()
+            && decide_takeover(inputs).action == TakeoverAction::TakeOver
+    }
+
+    /// The connect take: only "owning" is sent. It is idle, so it stays
+    /// (#262) and its A2DP resume waits until Linux plays.
+    fn connect_take(&mut self, now: Instant, out: &mut Vec<Command>) {
+        self.request(now, true, Cause::Playback, out);
+        self.resume_deferred = true;
+        self.say(CONNECT_TAKE);
+    }
 }
 
 #[cfg(test)]
@@ -1454,6 +1512,17 @@ mod tests {
         }
     }
 
+    /// `ready_facts` before any wear report: the connect take (#324) needs a
+    /// bud in, so `Auto` keeps its "not owning" and a reconnect takes
+    /// nothing. `Probe::wear_in` then gives the first report, which is no
+    /// reinsertion.
+    fn unworn_facts() -> SessionFacts {
+        SessionFacts {
+            ears: Vec::new(),
+            ..ready_facts()
+        }
+    }
+
     /// A core driven with millisecond offsets from a fixed start.
     struct Probe {
         core: Handoff,
@@ -1488,6 +1557,12 @@ mod tests {
 
         fn at(&self, ms: u64) -> Instant {
             self.t0 + Duration::from_millis(ms)
+        }
+
+        /// The first wear report, both buds in, at `ms`, after a session
+        /// start made with `unworn_facts`; it sends nothing.
+        fn wear_in(&mut self, ms: u64) {
+            assert_eq!(self.feed(ms, Input::EarState(vec![InEar, InEar])), []);
         }
 
         fn feed(&mut self, ms: u64, input: Input) -> Vec<Command> {
@@ -1855,9 +1930,10 @@ mod tests {
         assert_eq!(p.feed(1200, Input::ReconnectFailed("x".into())), []);
         assert_eq!(p.feed(2100, Input::Tick), []);
         assert_eq!(p.feed(2200, Input::Tick), [Reconnect { audio: true }]);
+        // The other host is idle and a bud is in: the connect take (#324).
         assert_eq!(
             p.feed(2300, Input::Reconnected(ready_facts())),
-            [AdoptSession, Announce, DrainPlayback]
+            [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
         );
     }
 
@@ -1918,13 +1994,15 @@ mod tests {
 
     #[test]
     fn baseline_ignores_preexisting_playback() {
-        // Auto mode starts while something is already playing.
+        // Auto mode starts while something is already playing. Buds out at
+        // the start, so no connect take (#324) hides the playback take.
         let mut p = Probe::new(false, true);
-        p.routing(ready_facts());
+        p.routing(unworn_facts());
         assert_eq!(
             p.feed(1000, Input::Auto),
             [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
         );
+        p.wear_in(1000);
         // The reply to Auto's "not owning" (#54).
         assert_eq!(p.feed(1050, Input::Ownership(vec![0])), []);
         // A stopped sample from before the baseline is not an observation.
@@ -1939,9 +2017,10 @@ mod tests {
         assert_eq!(p.feed(3000, Input::Disconnected), [PauseMedia, DropSession]);
         assert_eq!(p.feed(4000, Input::Tick), [Reconnect { audio: true }]);
         assert_eq!(
-            p.feed(5000, Input::Reconnected(ready_facts())),
+            p.feed(5000, Input::Reconnected(unworn_facts())),
             [AdoptSession, Announce, DrainPlayback]
         );
+        p.wear_in(5000);
         assert_eq!(p.play(4900, false), []);
         assert_eq!(p.play(5100, true), []);
         assert_eq!(p.play(5600, true), []);
@@ -1990,16 +2069,19 @@ mod tests {
 
     /// Linux owns the AirPods without a take of its own, so `Auto` at 100 ms
     /// sends a tracked "not owning" (#54); a stopped baseline sample at 200.
+    /// The buds go in only after `Auto`, so the connect take (#324) doesn't
+    /// keep the ownership instead.
     fn auto_release() -> Probe {
         let mut p = Probe::new(false, true);
         p.routing(SessionFacts {
             owner: Some(vec![1]),
-            ..ready_facts()
+            ..unworn_facts()
         });
         assert_eq!(
             p.feed(100, Input::Auto),
             [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
         );
+        p.wear_in(150);
         assert_eq!(p.play(200, false), []);
         p
     }
@@ -2406,16 +2488,17 @@ mod tests {
         // #54: a stop->play edge lands before the reply to Auto's "not
         // owning"; the reply acknowledges that release and the edge is
         // retaken, with no yield or pause. Owner [1]: the only case where
-        // the AirPods reply (#289).
+        // the AirPods reply (#289). Buds in only after Auto: no connect take.
         let mut p = Probe::new(false, true);
         p.routing(SessionFacts {
             owner: Some(vec![1]),
-            ..ready_facts()
+            ..unworn_facts()
         });
         assert_eq!(
             p.feed(100, Input::Auto),
             [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
         );
+        p.wear_in(150);
         p.core.take_lines();
         let mut all = p.play(200, false);
         all.extend(p.play(300, true));
@@ -2431,14 +2514,16 @@ mod tests {
     fn repeated_auto_reply_never_yields() {
         // A second Auto while the first one's release is pending sends no
         // second "not owning", so no reply is left acknowledging nothing.
-        // Owner [1]: the only case where the AirPods reply (#289).
+        // Owner [1]: the only case where the AirPods reply (#289). Buds in
+        // only after the Autos: no connect take.
         let mut p = Probe::new(false, true);
         p.routing(SessionFacts {
             owner: Some(vec![1]),
-            ..ready_facts()
+            ..unworn_facts()
         });
         let mut all = p.feed(100, Input::Auto);
         all.extend(p.feed(150, Input::Auto));
+        p.wear_in(160);
         all.extend(p.play(200, false));
         all.extend(p.play(300, true));
         let releases = all.iter().filter(|c| **c == SendOwnership(false)).count();
@@ -2456,11 +2541,12 @@ mod tests {
     #[test]
     fn auto_tracked_when_linux_owner_acks() {
         // Owner [1]: the AirPods reply to Auto's "not owning", and that [0]
-        // acknowledges it rather than being a loss (#54).
+        // acknowledges it rather than being a loss (#54). Buds out: no
+        // connect take.
         let mut p = Probe::new(false, true);
         p.routing(SessionFacts {
             owner: Some(vec![1]),
-            ..ready_facts()
+            ..unworn_facts()
         });
         assert_eq!(
             p.feed(100, Input::Auto),
@@ -2476,14 +2562,19 @@ mod tests {
     }
 
     /// A manual, live session with `facts` gets Auto at 100 ms: owner [0] or
-    /// unknown, so its "not owning" is untracked (#289).
+    /// unknown, so its "not owning" is untracked (#289). The buds go in only
+    /// after it, so the connect take (#324) doesn't replace that release.
     fn untracked_auto(facts: SessionFacts) -> Probe {
         let mut p = Probe::new(false, true);
-        p.routing(facts);
+        p.routing(SessionFacts {
+            ears: unworn_facts().ears,
+            ..facts
+        });
         assert_eq!(
             p.feed(100, Input::Auto),
             [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
         );
+        p.wear_in(100);
         assert!(p.core.pending.is_none());
         p.core.take_lines();
         p
@@ -2934,14 +3025,17 @@ mod tests {
 
     #[test]
     fn remote_request_joins_pending_auto_release() {
-        // #49's Auto release joined by a remote request (#137).
+        // #49's Auto release joined by a remote request (#137). The buds go
+        // in only after Auto, so the connect take (#324) doesn't keep the
+        // ownership instead.
         let mut p = Probe::new(false, true);
         p.routing(SessionFacts {
             owner: Some(vec![1]),
-            ..ready_facts()
+            ..unworn_facts()
         });
         let all = [
             p.feed(100, Input::Auto),
+            p.feed(150, Input::EarState(vec![InEar, InEar])),
             p.feed(200, Input::RemoteOwnershipRequest),
             p.feed(300, Input::Ownership(vec![0])),
             p.play(400, false),
@@ -2952,6 +3046,7 @@ mod tests {
             all,
             [
                 vec![ConnectA2dp, SendOwnership(false), Announce, DrainPlayback],
+                vec![],
                 vec![],
                 vec![],
                 vec![],
@@ -3163,9 +3258,10 @@ mod tests {
 
     #[test]
     fn local_call_recorded_without_live_session() {
-        // Manual mode records the call; going automatic advertises it.
+        // Manual mode records the call; going automatic advertises it. Buds
+        // out: the connect take (#324) is not under test here.
         let mut p = Probe::new(false, true);
-        p.routing(ready_facts());
+        p.routing(unworn_facts());
         assert_eq!(p.feed(100, Input::LocalCall(true)), []);
         assert_eq!(
             p.feed(200, Input::Auto),
@@ -3185,9 +3281,16 @@ mod tests {
         assert_eq!(p.feed(1150, Input::LocalCall(false)), []);
         assert_eq!(p.feed(1160, Input::LocalCall(true)), []);
         assert_eq!(p.feed(2200, Input::Tick), [Reconnect { audio: true }]);
+        // The idle other host: the connect take (#324), after the call's advert.
         assert_eq!(
             p.feed(2300, Input::Reconnected(ready_facts())),
-            [AdoptSession, Announce, AdvertiseCall(true), DrainPlayback]
+            [
+                AdoptSession,
+                Announce,
+                AdvertiseCall(true),
+                SendOwnership(true),
+                DrainPlayback
+            ]
         );
 
         // A new host announced during the call learns of it too.
@@ -3676,14 +3779,17 @@ mod tests {
     fn when_last_connected_reconcile_retake_gated() {
         // A play edge during Linux's release retakes once it settles only
         // while Linux is the last owner: here a remote host's media cleared
-        // it. Auto's release: Linux owns ([1]) without a take.
+        // it. Auto's release: Linux owns ([1]) without a take, and the buds
+        // are out at Auto, so the connect take (#324) doesn't keep it.
         let released = || {
             let mut p = ready_in(WhenLastConnected);
             assert_eq!(p.feed(20, Input::Ownership(vec![1])), []);
+            assert_eq!(p.feed(30, Input::EarState(vec![OutOfEar, OutOfEar])), []);
             assert_eq!(
                 p.feed(100, Input::Auto),
                 [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
             );
+            p.wear_in(150);
             assert_eq!(p.play(1100, false), []);
             p.core.take_lines();
             p
@@ -4391,18 +4497,20 @@ mod tests {
 
     /// The daemon's start with `hold` and routing on: seed facts, then the
     /// session start's `Auto`, its release acknowledged, then a "stopped"
-    /// baseline sample.
+    /// baseline sample. The buds go in only after `Auto`, so the connect
+    /// take (#324) doesn't replace that release.
     fn hold_ready(hold: bool) -> Probe {
         let mut p = Probe::new(false, true);
         p.core.a2dp_hold = hold;
         p.core.default_sink_routing = true;
-        p.routing(ready_facts());
+        p.routing(unworn_facts());
         let start = p.feed(5, Input::Auto);
         assert_eq!(
             holds(&start),
             if hold { vec![HoldA2dp(false)] } else { vec![] }
         );
         assert_eq!(p.feed(8, Input::Ownership(vec![0])), []);
+        p.wear_in(9);
         assert_eq!(p.play(10, false), []);
         p
     }
@@ -4424,9 +4532,10 @@ mod tests {
 
     #[test]
     fn hold_session_start_idle_releases_before_connect_a2dp() {
+        // Buds out: Auto keeps its release, no connect take (#324).
         let mut p = Probe::new(false, true);
         p.core.a2dp_hold = true;
-        p.routing(ready_facts());
+        p.routing(unworn_facts());
         assert_eq!(
             p.feed(5, Input::Auto),
             [
@@ -4480,13 +4589,20 @@ mod tests {
             p.feed(1300, Input::Reconnected(remote)),
             [AdoptSession, HoldA2dp(true), Announce, DrainPlayback]
         );
-        // Idle facts restore the card.
+        // Idle facts restore the card, and the idle other host gets the
+        // connect take (#324).
         let mut p = hold_ready(true);
         assert_eq!(p.feed(200, Input::Disconnected), [DropSession]);
         assert_eq!(p.feed(1200, Input::Tick), [Reconnect { audio: true }]);
         assert_eq!(
             p.feed(1300, Input::Reconnected(ready_facts())),
-            [AdoptSession, HoldA2dp(false), Announce, DrainPlayback]
+            [
+                AdoptSession,
+                HoldA2dp(false),
+                Announce,
+                SendOwnership(true),
+                DrainPlayback
+            ]
         );
     }
 
@@ -5017,15 +5133,17 @@ mod tests {
     #[test]
     fn fresh_source_during_release() {
         let run = |owner| {
+            // No wear report at Auto, so no connect take (#324).
             let mut p = Probe::new(false, true);
             p.routing(SessionFacts {
                 owner: Some(vec![1]),
-                ..ready_facts()
+                ..unworn_facts()
             });
             assert_eq!(
                 p.feed(100, Input::Auto),
                 [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
             );
+            p.wear_in(140);
             assert_eq!(p.feed(150, remote_media()), []);
             assert_eq!(p.feed(160, relay(REMOTE, owner)), []);
             assert_eq!(p.play_category(200, MEDIA), []);
@@ -5197,7 +5315,8 @@ mod tests {
             p.feed(1000, Input::Auto),
             [
                 ConnectA2dp,
-                SendOwnership(false),
+                // The idle other host: the connect take (#324).
+                SendOwnership(true),
                 Announce,
                 RelayCategory(MEDIA),
                 DrainPlayback
@@ -5238,9 +5357,16 @@ mod tests {
         assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
         assert_eq!(p.feed(1100, Input::Disconnected), [PauseMedia, DropSession]);
         assert_eq!(p.feed(2200, Input::Tick), [Reconnect { audio: true }]);
+        // The idle other host: the connect take (#324) after the relay.
         assert_eq!(
             p.feed(2300, Input::Reconnected(ready_facts())),
-            [AdoptSession, Announce, RelayCategory(MEDIA), DrainPlayback]
+            [
+                AdoptSession,
+                Announce,
+                RelayCategory(MEDIA),
+                SendOwnership(true),
+                DrainPlayback
+            ]
         );
         assert_eq!(p.play_category(2500, MEDIA), []);
         // 301 set while disconnected.
@@ -5250,18 +5376,25 @@ mod tests {
         assert_eq!(p.feed(1200, Input::Tick), [Reconnect { audio: true }]);
         assert_eq!(
             p.feed(1300, Input::Reconnected(ready_facts())),
-            [AdoptSession, Announce, RelayCategory(MEDIA), DrainPlayback]
+            [
+                AdoptSession,
+                Announce,
+                RelayCategory(MEDIA),
+                SendOwnership(true),
+                DrainPlayback
+            ]
         );
         assert_eq!(p.play_category(1500, MEDIA), []);
     }
 
+    // The idle other host also gets the connect take (#324).
     #[test]
     fn category_relay_after_announce_none_when_idle() {
         let mut p = relaying();
         p.feed(100, Input::Manual);
         assert_eq!(
             p.feed(1000, Input::Auto),
-            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+            [ConnectA2dp, SendOwnership(true), Announce, DrainPlayback]
         );
     }
 
@@ -5272,7 +5405,7 @@ mod tests {
         assert_eq!(p.play_category(500, MEDIA), []);
         assert_eq!(
             p.feed(1000, Input::Auto),
-            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+            [ConnectA2dp, SendOwnership(true), Announce, DrainPlayback]
         );
     }
 
@@ -5439,14 +5572,16 @@ mod tests {
             ("ack", 1100, Input::Ownership(vec![0])),
             ("timeout", timed_out, Input::Tick),
         ] {
-            // Auto releases the AirPods Linux owned while the iPhone plays.
+            // Auto releases the AirPods Linux owned while the iPhone plays;
+            // no wear report yet, so no connect take (#324).
             let mut p = Probe::new(false, true);
             p.routing(SessionFacts {
                 owner: Some(vec![1]),
-                ..ready_facts()
+                ..unworn_facts()
             });
             let mut all = p.feed(100, Input::Auto);
             assert_eq!(takes(&all), 0, "{name}: {all:?}");
+            p.wear_in(140);
             all.extend(p.feed(150, remote_media()));
             all.extend(p.feed(160, relay(REMOTE, MEDIA)));
             all.extend(p.play_category(200, MEDIA));
@@ -5511,9 +5646,10 @@ mod tests {
                 let mut p = Probe::new(false, true);
                 p.routing(SessionFacts {
                     owner: Some(vec![1]),
-                    ..ready_facts()
+                    ..unworn_facts()
                 });
                 let mut all = p.feed(100, Input::Auto);
+                p.wear_in(140);
                 all.extend(p.feed(150, remote_media()));
                 all.extend(p.feed(160, relay(REMOTE, MEDIA)));
                 all.extend(p.play_category(200, MEDIA));
@@ -5604,5 +5740,429 @@ mod tests {
         p.feed(after + 200, Input::EarState(vec![InEar, InEar]));
         resumed(&mut p, after + 250, false);
         assert_eq!(p.play_category(after + 300, MEDIA), [SendOwnership(true)]);
+    }
+
+    // #324: the connect take from an idle other host.
+
+    /// A manual live session seeded with `facts` (default sink routing on,
+    /// an idle A2DP transport, `hold` for #264), then the session start's
+    /// `Auto` at 10 ms; returns its commands.
+    fn session_start(facts: SessionFacts, hold: bool) -> (Probe, Vec<Command>) {
+        let mut p = Probe::new(false, true);
+        p.core.default_sink_routing = true;
+        p.core.a2dp_hold = hold;
+        p.routing(facts);
+        assert_eq!(p.feed(5, idle_transport()), []);
+        p.core.take_lines();
+        let out = p.feed(10, Input::Auto);
+        (p, out)
+    }
+
+    /// `session_start` with idle facts and owner [0], its take acked at
+    /// 100 ms.
+    fn acked_connect_take(hold: bool) -> Probe {
+        let (mut p, _) = session_start(ready_facts(), hold);
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), [RouteToAirPods]);
+        p
+    }
+
+    /// An automatic live session that drops at 0 ms and reconnects at
+    /// 1100 ms with `facts`; returns the reconnect's commands.
+    fn ordinary_reconnect(p: &mut Probe, facts: SessionFacts) -> Vec<Command> {
+        assert_eq!(p.feed(0, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(1000, Input::Tick), [Reconnect { audio: true }]);
+        p.feed(1100, Input::Reconnected(facts))
+    }
+
+    #[test]
+    fn session_start_take_with_idle_remote_owner() {
+        for (owner, hold) in [(None, false), (Some(vec![0]), false), (Some(vec![0]), true)] {
+            let name = format!("owner={owner:?} hold={hold}");
+            let (mut p, auto) = session_start(
+                SessionFacts {
+                    owner,
+                    ..ready_facts()
+                },
+                hold,
+            );
+            let mut expected = if hold { vec![HoldA2dp(false)] } else { vec![] };
+            expected.extend([ConnectA2dp, SendOwnership(true), Announce, DrainPlayback]);
+            assert_eq!(auto, expected, "{name}");
+            assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 1, "{name}");
+            // The idle take routes but leaves the A2DP resume to a play edge.
+            assert_eq!(
+                p.feed(100, Input::Ownership(vec![1])),
+                [RouteToAirPods],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_take_with_idle_remote_owner() {
+        for (owner, hold) in [
+            (None, false),
+            (Some(vec![0]), false),
+            (Some(vec![1]), false),
+            (Some(vec![0]), true),
+        ] {
+            let name = format!("owner={owner:?} hold={hold}");
+            let mut p = Probe::new(true, true);
+            p.core.a2dp_hold = hold;
+            let out = ordinary_reconnect(
+                &mut p,
+                SessionFacts {
+                    owner,
+                    ..ready_facts()
+                },
+            );
+            let mut expected = vec![AdoptSession];
+            if hold {
+                expected.push(HoldA2dp(false));
+            }
+            expected.extend([Announce, SendOwnership(true), DrainPlayback]);
+            assert_eq!(out, expected, "{name}");
+            assert!(p.core.reconnect_take_pending(), "{name}");
+            assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 1, "{name}");
+        }
+        // A playback reconnect sends its one take, not a second one.
+        let mut p = Probe::new(true, false);
+        p.core = p.core.with_playback_requested();
+        let out = p.feed(100, Input::Reconnected(ready_facts()));
+        assert_eq!(takes(&out), 1, "{out:?}");
+        assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 0);
+    }
+
+    #[test]
+    fn connect_take_ignores_stale_init_ownership() {
+        let mut p = Probe::new(true, true);
+        ordinary_reconnect(&mut p, ready_facts());
+        p.core.take_lines();
+        let mut all = p.feed(1200, Input::Ownership(vec![0]));
+        all.extend(p.feed(1300, Input::InitBacklogDrained));
+        all.extend(p.feed(1400, Input::Ownership(vec![1])));
+        assert_eq!(all, []);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, "ACK owner=linux"), 1);
+        assert_eq!(count_lines(&lines, "YIELD"), 0);
+    }
+
+    #[test]
+    fn session_start_keeps_reported_linux_ownership() {
+        let linux = || SessionFacts {
+            owner: Some(vec![1]),
+            ..ready_facts()
+        };
+        let (mut p, auto) = session_start(linux(), false);
+        assert_eq!(auto, [ConnectA2dp, RouteToAirPods, Announce, DrainPlayback]);
+        assert!(p.core.pending.is_none());
+        assert!(p.core.requested_take && p.core.last_owner_linux);
+        assert_eq!(p.play(100, false), []);
+        p.idle_ticks(100);
+        p.core.take_lines();
+        // The deferred resume runs on the first play edge, once.
+        assert_eq!(p.play(61_000, true), [ResumeA2dp]);
+        assert_eq!(
+            count_lines(
+                &p.core.take_lines(),
+                "AUTO playback started; Linux already owns"
+            ),
+            1
+        );
+        assert_eq!(p.play(61_500, false), []);
+        assert_eq!(p.play(62_000, true), []);
+        // A remote media report after the [1] cleared the last owner and
+        // asks for the hold; its relay of 100 still lets Linux keep the
+        // AirPods, so it is the last owner again and holds nothing.
+        let mut p = Probe::new(false, true);
+        p.core.a2dp_hold = true;
+        p.routing(linux());
+        p.feed(
+            1,
+            Input::AudioSource(source(REMOTE, AudioSourceType::Media)),
+        );
+        p.feed(2, relay(REMOTE, IDLE));
+        assert!(!p.core.last_owner_linux);
+        assert_eq!(
+            p.feed(10, Input::Auto),
+            [HoldA2dp(false), ConnectA2dp, Announce, DrainPlayback]
+        );
+        assert!(p.core.requested_take && p.core.last_owner_linux);
+        // c1's conditions fail (no bud in): today's tracked release (#54).
+        let (p, auto) = session_start(
+            SessionFacts {
+                ears: vec![OutOfEar, OutOfEar],
+                ..linux()
+            },
+            false,
+        );
+        assert_eq!(
+            auto,
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback]
+        );
+        assert!(p.core.pending.is_some());
+    }
+
+    #[test]
+    fn connect_take_ignores_relay_age() {
+        // #325 q1 was not run: every connect kind takes alike, however long
+        // ago the other host relayed 100.
+        const MINUTES: u64 = 10 * 60_000;
+        let mut p = Probe::new(false, true);
+        p.routing(ready_facts());
+        p.feed(0, relay(REMOTE, IDLE));
+        assert_eq!(takes(&p.feed(MINUTES, Input::Auto)), 1);
+        let mut p = Probe::new(true, true);
+        p.routing(ready_facts());
+        p.feed(0, relay(REMOTE, IDLE));
+        assert_eq!(p.feed(MINUTES, Input::Disconnected), [DropSession]);
+        assert_eq!(
+            p.feed(MINUTES + 1000, Input::Tick),
+            [Reconnect { audio: true }]
+        );
+        assert_eq!(
+            takes(&p.feed(MINUTES + 1100, Input::Reconnected(ready_facts()))),
+            1
+        );
+        // An old relay of 100 beats the stale media report at Auto.
+        let mut p = Probe::new(false, true);
+        p.routing(SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Media)),
+            ..ready_facts()
+        });
+        p.feed(0, relay(REMOTE, IDLE));
+        assert_eq!(takes(&p.feed(MINUTES, Input::Auto)), 1);
+    }
+
+    #[test]
+    fn connect_take_from_relayed_idle_media_holds_nothing() {
+        // The media report asked for the hold, but its relay of 100 lets
+        // Linux take: the card is not held off and the ACK only routes.
+        let mut p = Probe::new(false, true);
+        p.core.default_sink_routing = true;
+        p.core.a2dp_hold = true;
+        p.routing(SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Media)),
+            ..ready_facts()
+        });
+        p.feed(5, relay(REMOTE, IDLE));
+        assert_eq!(p.feed(6, idle_transport()), []);
+        assert_eq!(
+            p.feed(10, Input::Auto),
+            [
+                HoldA2dp(false),
+                ConnectA2dp,
+                SendOwnership(true),
+                Announce,
+                DrainPlayback
+            ]
+        );
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), [RouteToAirPods]);
+    }
+
+    #[test]
+    fn connect_take_first_sample_before_ack_resumes() {
+        // Linux already plays at connect (c10 a): the ACK resumes once.
+        for owner in [None, Some(vec![0])] {
+            let facts = SessionFacts {
+                owner: owner.clone(),
+                ..ready_facts()
+            };
+            let (mut p, _) = session_start(facts, false);
+            assert_eq!(p.play(50, true), [], "{owner:?}");
+            assert_eq!(
+                p.feed(100, Input::Ownership(vec![1])),
+                [RouteToAirPods, ResumeA2dp],
+                "{owner:?}"
+            );
+            assert_eq!(p.play(200, false), []);
+            assert_eq!(p.play(700, true), [], "{owner:?}");
+        }
+        // A streaming transport has nothing to resume.
+        let (mut p, _) = session_start(ready_facts(), false);
+        assert_eq!(p.feed(20, Input::A2dpTransport { active: true }), []);
+        assert_eq!(p.play(50, true), []);
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), [RouteToAirPods]);
+        assert_eq!(p.play(200, false), []);
+        assert_eq!(p.play(700, true), []);
+        // A stop before the ACK still defers to the next play edge (#205).
+        let (mut p, _) = session_start(ready_facts(), false);
+        assert_eq!(p.play(50, true), []);
+        assert_eq!(p.play(70, false), []);
+        assert_eq!(p.feed(100, Input::Ownership(vec![1])), [RouteToAirPods]);
+        assert_eq!(p.play(700, true), [ResumeA2dp]);
+        assert_eq!(p.play(1200, false), []);
+        assert_eq!(p.play(1700, true), []);
+    }
+
+    #[test]
+    fn connect_take_first_sample_after_ack_resumes() {
+        let linux = || SessionFacts {
+            owner: Some(vec![1]),
+            ..ready_facts()
+        };
+        // The acked take (c10 b) and the keep path at owner [1] (c10 c).
+        for mut p in [acked_connect_take(false), session_start(linux(), false).0] {
+            p.core.take_lines();
+            assert_eq!(p.play(200, true), [ResumeA2dp]);
+            assert_eq!(
+                count_lines(
+                    &p.core.take_lines(),
+                    "AUTO playback started; Linux already owns"
+                ),
+                1
+            );
+            assert_eq!(p.play(700, false), []);
+            assert_eq!(p.play(1200, true), []);
+        }
+        // A streaming transport has nothing to resume.
+        for mut p in [acked_connect_take(false), session_start(linux(), false).0] {
+            assert_eq!(p.feed(150, Input::A2dpTransport { active: true }), []);
+            assert_eq!(p.play(200, true), []);
+            assert_eq!(p.play(700, false), []);
+            assert_eq!(p.play(1200, true), []);
+        }
+    }
+
+    /// No connect take for `facts` in `mode` (with `relayed` from REMOTE
+    /// before the start): Auto and an ordinary reconnect keep today's
+    /// commands.
+    fn assert_no_connect_take(facts: SessionFacts, mode: ConnectMode, relayed: Option<u32>) {
+        let name = format!("{facts:?} {mode:?} {relayed:?}");
+        let mut p = Probe::new(false, true);
+        p.core.connect_mode = mode;
+        p.routing(facts.clone());
+        if let Some(category) = relayed {
+            p.feed(5, relay(REMOTE, category));
+        }
+        assert_eq!(
+            p.feed(10, Input::Auto),
+            [ConnectA2dp, SendOwnership(false), Announce, DrainPlayback],
+            "auto {name}"
+        );
+        // A reconnect forgets the relays: only facts without one apply.
+        if relayed.is_none() {
+            let mut p = Probe::new(true, true);
+            p.core.connect_mode = mode;
+            assert_eq!(
+                ordinary_reconnect(&mut p, facts),
+                [AdoptSession, Announce, DrainPlayback],
+                "reconnect {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_connect_take_remote_media_or_call() {
+        let auto = ConnectMode::Automatically;
+        for r#type in [AudioSourceType::Media, AudioSourceType::Call] {
+            let remote = || SessionFacts {
+                audio: Some(source(REMOTE, r#type)),
+                ..ready_facts()
+            };
+            assert_no_connect_take(remote(), auto, None);
+            assert_no_connect_take(remote(), auto, Some(STREAM));
+        }
+        // A call's relay of 100 doesn't make it idle.
+        let call = SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Call)),
+            ..ready_facts()
+        };
+        assert_no_connect_take(call, auto, Some(IDLE));
+        // An idle report whose host relays above 100.
+        let relayed_busy = SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::None)),
+            ..ready_facts()
+        };
+        assert_no_connect_take(relayed_busy, auto, Some(STREAM));
+    }
+
+    #[test]
+    fn no_connect_take_no_bud_in_ear() {
+        for ears in [vec![OutOfEar, OutOfEar], vec![InCase, OutOfEar], vec![]] {
+            let facts = SessionFacts {
+                ears,
+                ..ready_facts()
+            };
+            assert_no_connect_take(facts, ConnectMode::Automatically, None);
+        }
+    }
+
+    #[test]
+    fn no_connect_take_when_last_connected_and_not_last_owner() {
+        assert_no_connect_take(ready_facts(), ConnectMode::WhenLastConnected, None);
+    }
+
+    #[test]
+    fn no_connect_take_without_a_remote_host() {
+        for hosts in [vec![host(LOCAL)], vec![]] {
+            let facts = SessionFacts {
+                hosts,
+                ..ready_facts()
+            };
+            assert_no_connect_take(facts, ConnectMode::Automatically, None);
+        }
+    }
+
+    #[test]
+    fn no_connect_take_on_manual_reconnect() {
+        let mut p = Probe::new(false, true);
+        assert_eq!(p.feed(0, Input::Disconnected), [DropSession]);
+        assert_eq!(p.feed(1000, Input::Tick), [Reconnect { audio: false }]);
+        assert_eq!(
+            p.feed(1100, Input::Reconnected(ready_facts())),
+            [AdoptSession, DrainPlayback]
+        );
+    }
+
+    #[test]
+    fn no_connect_take_while_case_recovery_waits() {
+        let mut p = Probe::new(true, false);
+        assert_eq!(
+            p.feed(100, Input::Reconnected(ready_facts())),
+            [CancelReconnect]
+        );
+    }
+
+    #[test]
+    fn connect_take_keeps_ownership_while_idle() {
+        let mut p = acked_connect_take(false);
+        for ms in [200, 700, 1200] {
+            assert_eq!(p.play(ms, false), []);
+        }
+        p.idle_ticks(1200);
+        assert!(p.core.requested_take && p.core.pending.is_none());
+    }
+
+    #[test]
+    fn connect_take_then_play_sends_no_second_take() {
+        let mut p = acked_connect_take(false);
+        assert_eq!(p.play(200, false), []);
+        p.core.take_lines();
+        assert_eq!(p.play(700, true), [ResumeA2dp]);
+        assert_eq!(
+            count_lines(
+                &p.core.take_lines(),
+                "AUTO playback started; Linux already owns"
+            ),
+            1
+        );
+        assert_eq!(p.play(1200, false), []);
+        assert_eq!(p.play(1700, true), []);
+        // With the transport streaming there is nothing to resume.
+        let mut p = acked_connect_take(false);
+        assert_eq!(p.feed(150, Input::A2dpTransport { active: true }), []);
+        assert_eq!(p.play(200, false), []);
+        assert_eq!(p.play(700, true), []);
+    }
+
+    #[test]
+    fn connect_take_yields_on_live_zero() {
+        let mut p = acked_connect_take(true);
+        assert_eq!(
+            p.feed(200, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway, HoldA2dp(true)]
+        );
+        assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
     }
 }
