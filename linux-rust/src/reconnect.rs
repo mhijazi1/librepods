@@ -231,10 +231,10 @@ pub(crate) fn device_connected(mac: &str) {
 }
 
 /// BlueZ Connected=false for an AirPods MAC: record the drop, and in the
-/// handoff mode watch for a new playback start.
+/// handoff mode watch for a new playback start. A repeat leaves the running
+/// watcher (and its connect) alone.
 pub(crate) fn device_disconnected(mac: &str) {
-    record_drop(mac, now());
-    if utils::load_switching_mode() != SwitchingMode::Handoff {
+    if !record_drop(mac, now()) || utils::load_switching_mode() != SwitchingMode::Handoff {
         return;
     }
     let watched = mac.to_string();
@@ -247,11 +247,11 @@ pub(crate) fn device_disconnected(mac: &str) {
 }
 
 /// Once per Connected cycle: a repeated Connected=false neither counts again
-/// nor clears a marker whose connect is still running.
-fn record_drop(mac: &str, now: Instant) {
+/// nor clears a marker whose connect is still running. Whether it was new.
+fn record_drop(mac: &str, now: Instant) -> bool {
     with_entry(mac, |e| {
         if e.dropped_at.is_some() {
-            return;
+            return false;
         }
         if let Some(up) = e.up_since.take() {
             e.backoff.session_ended(now.saturating_duration_since(up));
@@ -261,7 +261,8 @@ fn record_drop(mac: &str, now: Instant) {
         if e.host_driven == Some(true) {
             e.backoff.dropped(now);
         }
-    });
+        true
+    })
 }
 
 /// A connect for playback at `category` succeeded now.
@@ -1122,17 +1123,17 @@ mod tests {
         device_connected(mac);
         disconnect_reason(mac, Some(REMOTE));
         disconnect_reason(mac, Some(REMOTE));
-        record_drop(mac, now());
-        record_drop(mac, now());
+        assert!(record_drop(mac, now()));
+        assert!(!record_drop(mac, now()));
         assert_eq!(delay(), RECONNECT_BACKOFF_MIN * 2);
         // The drop first: a repeat neither counts nor clears the marker of a
-        // connect still running.
+        // connect still running (nor restarts its watcher).
         with_entry(mac, |e| e.backoff.attempted(now()));
         device_connected(mac);
         record_drop(mac, now());
         set_marker(mac, AUDIO_CATEGORY_MEDIA);
         disconnect_reason(mac, Some(REMOTE));
-        record_drop(mac, now());
+        assert!(!record_drop(mac, now()));
         disconnect_reason(mac, Some(REMOTE));
         assert_eq!(delay(), RECONNECT_BACKOFF_MIN * 4);
         assert_eq!(take_marker(mac), Some(AUDIO_CATEGORY_MEDIA));
