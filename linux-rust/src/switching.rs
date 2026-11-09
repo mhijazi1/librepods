@@ -590,7 +590,11 @@ pub(crate) fn stop_handoff_task(mac: &str) {
 /// At exit: stop every handoff task, then wait, at most
 /// `SHUTDOWN_RELEASE_WAIT`, for the held ones' releases to settle (#294).
 pub(crate) async fn stop_all_handoff_tasks() {
-    let tasks: Vec<_> = HANDOFF_TASKS.lock().unwrap().drain().collect();
+    let tasks: Vec<_> = HANDOFF_TASKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .collect();
     stop_and_settle(tasks.into_iter().map(|(_, task)| task)).await;
 }
 
