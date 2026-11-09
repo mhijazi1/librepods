@@ -815,6 +815,9 @@ pub struct MediaController {
     /// `pause_all_media` calls in flight. Released under `state` together
     /// with the self-pause flag they set; read under `state` by the listener.
     ownership_pauses: Arc<AtomicUsize>,
+    /// Ear-removal and ownership-loss pauses started, so the A2DP resume
+    /// never undoes one (#327).
+    self_pauses: Arc<AtomicUsize>,
     /// The handoff's A2DP hold is on (#264): `activate_a2dp_profile` writes
     /// nothing. Set synchronously by the shell, in emit order.
     a2dp_held: Arc<AtomicBool>,
@@ -831,6 +834,7 @@ impl MediaController {
         MediaController {
             state: Arc::new(Mutex::new(state)),
             ownership_pauses: Arc::new(AtomicUsize::new(0)),
+            self_pauses: Arc::default(),
             a2dp_held: Arc::default(),
             profile_write: Arc::default(),
         }
@@ -1064,6 +1068,22 @@ impl MediaController {
         )
         .map(|(pid,): (u32,)| pid)
         .ok()
+    }
+
+    /// The MPRIS players (KDE Connect's excluded) that report Paused.
+    /// Blocking.
+    fn paused_mpris_players() -> Vec<String> {
+        let Ok(conn) = Connection::new_session() else {
+            return Vec::new();
+        };
+        Self::list_mpris_services(&conn)
+            .into_iter()
+            .filter(|service| {
+                conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5))
+                    .get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+                    .is_ok_and(|s| s == "Paused")
+            })
+            .collect()
     }
 
     fn mpris_playing(conn: &Connection, service: &str) -> bool {
@@ -1478,6 +1498,8 @@ impl MediaController {
         F: FnOnce() -> (Vec<String>, PauseOutcome) + Send + 'static,
     {
         debug!("Pausing playback");
+        // Counted before the pause, so the A2DP resume never sees it uncounted.
+        self.self_pauses.fetch_add(1, Ordering::SeqCst);
 
         let (paused_services, outcome) = tokio::task::spawn_blocking(pause_players).await.unwrap();
 
@@ -1507,6 +1529,8 @@ impl MediaController {
 
         let pending = OwnershipPause::start(&self.ownership_pauses);
         let was_playing = self.state.lock().await.is_playing;
+        // Counted before the pause, so the A2DP resume never sees it uncounted.
+        self.self_pauses.fetch_add(1, Ordering::SeqCst);
         let outcome = tokio::task::spawn_blocking(pause_players).await.unwrap();
 
         let mut state = self.state.lock().await;
@@ -2219,6 +2243,18 @@ impl A2dpResumeIo for MediaController {
                 .await
                 .unwrap_or_default()
         })
+    }
+
+    fn paused(&self) -> BoxFuture<'static, Vec<String>> {
+        Box::pin(async {
+            tokio::task::spawn_blocking(Self::paused_mpris_players)
+                .await
+                .unwrap_or_default()
+        })
+    }
+
+    fn self_pauses(&self) -> usize {
+        self.self_pauses.load(Ordering::SeqCst)
     }
 
     fn transport_active(&self) -> BoxFuture<'static, Option<bool>> {
@@ -3091,6 +3127,24 @@ mod tests {
         let state = controller.state.lock().await;
         assert!(state.i_paused_the_media);
         assert_eq!(state.paused_by_app_services, vec![player.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ear_removal_counts_each_pause_before_it_runs() {
+        use EarDetectionStatus::*;
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.disconnect_when_not_wearing = false;
+        let counts = Arc::new(StdMutex::new(Vec::new()));
+        let (seen, pauses) = (counts.clone(), controller.self_pauses.clone());
+        let pauser = move || {
+            seen.lock().unwrap().push(pauses.load(Ordering::SeqCst));
+            (vec![], PauseOutcome::default())
+        };
+        controller
+            .handle_ear_detection_with(vec![InEar, InEar], vec![OutOfEar, OutOfEar], pauser)
+            .await;
+        // Both buds out pauses twice; each pause sees itself counted.
+        assert_eq!(*counts.lock().unwrap(), vec![1, 2]);
     }
 
     #[tokio::test]
