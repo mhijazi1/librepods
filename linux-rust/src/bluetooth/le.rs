@@ -127,10 +127,12 @@ fn rpa_lookup(
     devices: &HashMap<String, DeviceData>,
 ) -> Option<(String, Option<[u8; 16]>)> {
     devices.iter().find_map(|(mac, data)| {
-        let Some(DeviceInformation::AirPods(info)) = &data.information else {
+        let (DeviceType::AirPods, Some(DeviceInformation::AirPods(info))) =
+            (&data.type_, &data.information)
+        else {
             return None;
         };
-        let irk = key16(&info.le_keys.irk).filter(|_| data.type_ == DeviceType::AirPods)?;
+        let irk = key16(&info.le_keys.irk)?;
         debug!("Verifying RPA {} for AirPods MAC {}", addr, mac);
         verify_rpa(addr, &irk).then(|| (mac.clone(), key16(&info.le_keys.enc_key)))
     })
