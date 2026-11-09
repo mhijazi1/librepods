@@ -7,6 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::bluetooth::aacp::{
     BatteryComponent, BatteryInfo, BatteryStatus, ControlCommandIdentifiers,
 };
+use crate::bluetooth::le::ble_tray_entry;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::window::merge_battery_entry;
 use crate::utils::get_app_settings_path;
@@ -26,6 +27,9 @@ pub struct MyTray {
     /// last LE advert with a case reading, or the last AACP report with a known
     /// case level (#461).
     pub case_owner: Option<String>,
+    /// The AirPods MAC the tray shows: the last one to connect. Battery reports
+    /// from other AirPods are ignored once it is set (#464).
+    pub device: Option<String>,
     pub connected: bool,
     pub listening_mode: Option<u8>,
     pub allow_off_option: Option<u8>,
@@ -62,13 +66,41 @@ impl MyTray {
         }
     }
 
+    /// Whether `mac` is not the tray's device. Nothing is filtered before the
+    /// first connect (#461).
+    fn is_other_device(&self, mac: &str) -> bool {
+        self.device.as_deref().is_some_and(|d| d != mac)
+    }
+
     /// `apply_battery` for an AACP report from the AirPods `mac`: a known
-    /// (non-Disconnected) case level now belongs to `mac` (#461).
+    /// (non-Disconnected) case level now belongs to `mac` (#461). Ignored when
+    /// `mac` is not the tray's device (#464).
     pub fn apply_aacp_battery(&mut self, mac: &str, infos: &[BatteryInfo]) {
+        if self.is_other_device(mac) {
+            return;
+        }
         self.apply_battery(infos);
         if infos.iter().any(|b| {
             b.component == BatteryComponent::Case && b.status != BatteryStatus::Disconnected
         }) {
+            self.case_owner = Some(mac.to_string());
+        }
+    }
+
+    /// Applies the raw left/right/case bytes of an LE advert from the AirPods
+    /// `mac` through `ble_tray_entry`; a case reading (not `0xff`) now belongs to
+    /// `mac`. Ignored when `mac` is not the tray's device (#464).
+    pub fn apply_le_battery(&mut self, mac: &str, left: u8, right: u8, case: u8) {
+        if self.is_other_device(mac) {
+            return;
+        }
+        (self.battery_l, self.battery_l_status) =
+            ble_tray_entry(self.battery_l, self.battery_l_status, left);
+        (self.battery_r, self.battery_r_status) =
+            ble_tray_entry(self.battery_r, self.battery_r_status, right);
+        (self.battery_c, self.battery_c_status) =
+            ble_tray_entry(self.battery_c, self.battery_c_status, case);
+        if case != 0xff {
             self.case_owner = Some(mac.to_string());
         }
     }
@@ -79,6 +111,7 @@ impl MyTray {
     /// tray never shows another AirPods' case.
     pub fn connect_reset(&mut self, mac: &str) {
         self.connected = true;
+        self.device = Some(mac.to_string());
         self.battery_headphone = None;
         self.battery_headphone_status = None;
         self.battery_l = None;
@@ -560,5 +593,127 @@ mod tests {
         tray.apply_aacp_battery(A, &[b(Case, 0, Disconnected)]);
         assert_eq!(tray.battery_c, Some(90));
         assert!(tray.tool_tip().description.contains("C: 90%"));
+    }
+
+    /// A and B connected, B (the last to connect) the tray's device, with B's
+    /// report applied.
+    fn tray_showing_b() -> MyTray {
+        let mut tray = MyTray::default();
+        tray.connect_reset(A);
+        tray.connect_reset(B);
+        tray.apply_aacp_battery(
+            B,
+            &[
+                b(Left, 80, NotCharging),
+                b(Right, 70, NotCharging),
+                b(Case, 60, NotCharging),
+            ],
+        );
+        tray
+    }
+
+    type Fields = ([Option<u8>; 4], [Option<BatteryStatus>; 4], Option<String>);
+
+    /// The eight battery fields and the case owner.
+    fn fields(t: &MyTray) -> Fields {
+        (
+            [t.battery_l, t.battery_r, t.battery_c, t.battery_headphone],
+            [
+                t.battery_l_status,
+                t.battery_r_status,
+                t.battery_c_status,
+                t.battery_headphone_status,
+            ],
+            t.case_owner.clone(),
+        )
+    }
+
+    #[test]
+    fn tray_ignores_other_airpods_aacp_battery() {
+        let mut tray = tray_showing_b();
+        let before = fields(&tray);
+        tray.apply_aacp_battery(
+            A,
+            &[
+                b(Left, 10, Charging),
+                b(Right, 20, Charging),
+                b(Case, 30, Charging),
+                b(Headphone, 40, Charging),
+            ],
+        );
+        assert_eq!(fields(&tray), before);
+    }
+
+    #[test]
+    fn tray_ignores_other_airpods_le_battery() {
+        let mut tray = tray_showing_b();
+        let before = fields(&tray);
+        tray.apply_le_battery(A, 0x0a, 0x94, 0x1e);
+        assert_eq!(fields(&tray), before);
+    }
+
+    #[test]
+    fn tray_device_battery_still_applies() {
+        let mut tray = tray_showing_b();
+        tray.apply_aacp_battery(B, &[b(Left, 50, Charging)]);
+        assert_eq!(tray.battery_l, Some(50));
+        assert_eq!(tray.battery_l_status, Some(Charging));
+        tray.apply_le_battery(B, 0x2a, 0x2b, 0x2c);
+        assert_eq!(tray.battery_l, Some(42));
+        assert_eq!(tray.battery_r, Some(43));
+        assert_eq!(tray.battery_c, Some(44));
+        assert_eq!(tray.case_owner.as_deref(), Some(B));
+    }
+
+    #[test]
+    fn tray_never_shows_other_airpods_case() {
+        let assert_not_a_case = |t: &MyTray| {
+            assert!(!t.tool_tip().description.contains("C: 90%"));
+            assert_ne!(t.case_owner.as_deref(), Some(A));
+        };
+        let mut tray = MyTray::default();
+        tray.connect_reset(A);
+        tray.connect_reset(B);
+        tray.apply_aacp_battery(B, &connect_report());
+        assert_not_a_case(&tray);
+        tray.apply_aacp_battery(A, &[b(Case, 90, NotCharging)]);
+        assert_not_a_case(&tray);
+        // B disconnects (the tray is not told) and reconnects.
+        tray.connect_reset(B);
+        assert_not_a_case(&tray);
+        tray.apply_aacp_battery(B, &connect_report());
+        assert_not_a_case(&tray);
+    }
+
+    #[test]
+    fn tray_before_connect_takes_any_le_battery() {
+        let mut tray = MyTray::default();
+        tray.apply_le_battery(A, 80, 70, 0x5a);
+        assert_eq!(tray.battery_l, Some(80));
+        assert_eq!(tray.battery_r, Some(70));
+        assert_eq!(tray.battery_c, Some(90));
+        assert_eq!(tray.case_owner.as_deref(), Some(A));
+        tray.connect_reset(A);
+        tray.apply_aacp_battery(A, &connect_report());
+        assert!(tray.tool_tip().description.contains("C: 90%"));
+    }
+
+    #[test]
+    fn tray_le_case_reading_records_owner() {
+        let mut tray = tray_with_ble_case(Some(B));
+        tray.apply_le_battery(A, 0xff, 0xff, 0x85);
+        assert_eq!(tray.battery_c, Some(5));
+        assert_eq!(tray.battery_c_status, Some(Charging));
+        assert_eq!(tray.case_owner.as_deref(), Some(A));
+    }
+
+    #[test]
+    fn tray_le_case_0xff_keeps_owner_and_case() {
+        let mut tray = tray_with_ble_case(Some(B));
+        tray.apply_le_battery(A, 80, 70, 0xff);
+        assert_eq!(tray.battery_l, Some(80));
+        assert_eq!(tray.battery_c, Some(90));
+        assert_eq!(tray.battery_c_status, Some(NotCharging));
+        assert_eq!(tray.case_owner.as_deref(), Some(B));
     }
 }

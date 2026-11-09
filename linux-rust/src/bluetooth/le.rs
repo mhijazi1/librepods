@@ -192,7 +192,7 @@ impl UnmatchedRpas {
 /// lid closes). The byte is mapped to an update and the keep/replace decision is left
 /// to `merge_battery_entry`, so a `0xff` never clears a known non-Disconnected level.
 /// When the result is Disconnected the level is `None`, as the tray had before.
-fn ble_tray_entry(
+pub(crate) fn ble_tray_entry(
     prev_level: Option<u8>,
     prev_status: Option<BatteryStatus>,
     raw: u8,
@@ -380,31 +380,17 @@ pub async fn start_le_monitor(
                                             (case_byte & 0x7F, (case_byte & 0x80) != 0)
                                         };
 
-                                        if let Some(handle) = &tray_handle_clone {
+                                        if let Some(handle) = &tray_handle_clone
+                                            && let Some(mac) = matched_airpods_mac.as_deref()
+                                        {
                                             handle
                                                 .update(|tray: &mut MyTray| {
-                                                    (tray.battery_l, tray.battery_l_status) =
-                                                        ble_tray_entry(
-                                                            tray.battery_l,
-                                                            tray.battery_l_status,
-                                                            left_byte as u8,
-                                                        );
-                                                    (tray.battery_r, tray.battery_r_status) =
-                                                        ble_tray_entry(
-                                                            tray.battery_r,
-                                                            tray.battery_r_status,
-                                                            right_byte as u8,
-                                                        );
-                                                    (tray.battery_c, tray.battery_c_status) =
-                                                        ble_tray_entry(
-                                                            tray.battery_c,
-                                                            tray.battery_c_status,
-                                                            case_byte as u8,
-                                                        );
-                                                    if case_byte != 0xff {
-                                                        tray.case_owner =
-                                                            matched_airpods_mac.clone();
-                                                    }
+                                                    tray.apply_le_battery(
+                                                        mac,
+                                                        left_byte as u8,
+                                                        right_byte as u8,
+                                                        case_byte as u8,
+                                                    )
                                                 })
                                                 .await;
                                         }
