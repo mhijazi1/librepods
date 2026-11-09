@@ -12,6 +12,7 @@
 //! `spawn_transport_poller`, which only reads BlueZ's `MediaTransport1.State`
 //! (never `Acquire`: the fd would go to LibrePods instead of PipeWire).
 
+use crate::stream_monitor::PlaybackState;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use futures::FutureExt;
@@ -274,6 +275,16 @@ pub(crate) trait A2dpResumeIo: Send + Sync {
     fn audible(&self) -> BoxFuture<'static, bool>;
     /// The MPRIS players that are Playing.
     fn playing(&self) -> BoxFuture<'static, Vec<String>>;
+    /// The MPRIS players that are Playing and whose bus owner PID (None
+    /// when the bus can't tell) `own` accepts. The default (`playing`,
+    /// unfiltered) is a test seam for fakes; the production I/O must
+    /// override it.
+    fn playing_owned(
+        &self,
+        _own: Box<dyn Fn(Option<u32>) -> bool + Send>,
+    ) -> BoxFuture<'static, Vec<String>> {
+        self.playing()
+    }
     /// A fresh read of whether the AirPods' A2DP transport is active; None
     /// when unknown. The default (idle) is a test seam for fakes; the
     /// production I/O must override it.
@@ -296,11 +307,13 @@ pub(crate) trait A2dpResumeIo: Send + Sync {
 /// queued before it, #40), starting no kick or cycle that can't end before
 /// `until`. `cancel` firing (or its sender dropping) stops it between steps,
 /// including during a step's audio check; during the wait for `routed`, it
-/// or `until` ends the run with no action. The players Playing at the take
+/// or `until` ends the run with no action. The take's players
+/// (`take_candidates` of `streams`, the stream monitor's state at the take)
 /// are read before the route; beside the chain, `replay_self_pauses` plays
 /// those that pause themselves after it once (#327).
 pub(crate) async fn run(
     io: impl A2dpResumeIo,
+    streams: PlaybackState,
     until: Instant,
     cancel: oneshot::Receiver<()>,
     routed: impl Future<Output = ()>,
@@ -317,7 +330,7 @@ pub(crate) async fn run(
             info!("A2DP resume: cancelled before the default sink route ended");
             return;
         }
-        read = futures::future::join(io.playing(), routed) => read,
+        read = futures::future::join(take_candidates(&io, streams), routed) => read,
         _ = tokio::time::sleep_until(until.into()) => (Vec::new(), until),
     };
     // The route and the deadline can both be ready at one poll.
@@ -397,6 +410,20 @@ pub(crate) async fn run(
         }
     };
     futures::join!(chained, watch);
+}
+
+/// The take's players (#361): the Playing ones whose bus owner PID owns a
+/// live stream in `streams` (`PlaybackState::live_or_unknown`), so a remote
+/// such as Spotify Connect is never paused or played; every Playing one,
+/// with no owner lookup, while live presence is unknown.
+fn take_candidates(
+    io: &impl A2dpResumeIo,
+    streams: PlaybackState,
+) -> BoxFuture<'static, Vec<String>> {
+    if streams.live.is_none() {
+        return io.playing();
+    }
+    io.playing_owned(Box::new(move |owner| streams.live_or_unknown(owner)))
 }
 
 /// Tokio's clock, so tests can pause it; the same as std's otherwise.
@@ -1130,6 +1157,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         run(
             io,
+            PlaybackState::default(),
             start.into_std() + A2DP_RESUME_WINDOW,
             cancelled,
             std::future::ready(()),
@@ -1193,7 +1221,10 @@ mod tests {
             acted: acted.clone(),
         };
         let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
-        (acted, tokio::spawn(run(io, until, cancel, routed)))
+        (
+            acted,
+            tokio::spawn(run(io, PlaybackState::default(), until, cancel, routed)),
+        )
     }
 
     #[tokio::test(start_paused = true)]
@@ -1256,9 +1287,10 @@ mod tests {
             acted: acted.clone(),
         };
         let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
-        let mut chain = std::pin::pin!(run(io, until, cancelled, async {
-            let _ = route.await;
-        }));
+        let mut chain =
+            std::pin::pin!(run(io, PlaybackState::default(), until, cancelled, async {
+                let _ = route.await;
+            }));
         assert!(futures::poll!(&mut chain).is_pending());
         // The window passes and the route ends before the run is polled
         // again, so both are ready at once.
@@ -1318,7 +1350,11 @@ mod tests {
         };
         let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
         let ready = std::future::ready(());
-        (acted, reads, tokio::spawn(run(io, until, cancel, ready)))
+        (
+            acted,
+            reads,
+            tokio::spawn(run(io, PlaybackState::default(), until, cancel, ready)),
+        )
     }
 
     fn reads(n: &AtomicUsize) -> usize {
@@ -1421,7 +1457,14 @@ mod tests {
         let (issued, acted) = (Arc::clone(&io.issued), Arc::clone(&io.acted));
         let (_cancel, cancelled) = oneshot::channel();
         let until = start.into_std() + A2DP_RESUME_WINDOW;
-        run(io, until, cancelled, std::future::ready(())).await;
+        run(
+            io,
+            PlaybackState::default(),
+            until,
+            cancelled,
+            std::future::ready(()),
+        )
+        .await;
         // The read issued at 1850 ms is back idle at 2020 ms, after the
         // nudge time: it reads again at once, and only that read nudges.
         assert_eq!(
@@ -1655,7 +1698,14 @@ mod tests {
         };
         let acted = Arc::clone(&io.acted);
         let until = now.into_std() + A2DP_RESUME_WINDOW;
-        run(io, until, cancel, tokio::time::sleep_until(routed_at)).await;
+        run(
+            io,
+            PlaybackState::default(),
+            until,
+            cancel,
+            tokio::time::sleep_until(routed_at),
+        )
+        .await;
         let acted = acted.lock().unwrap();
         acted
             .iter()
@@ -1781,7 +1831,13 @@ mod tests {
             let (cancel, cancelled) = oneshot::channel();
             let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
             let ready = std::future::ready(());
-            let run = tokio::spawn(run(io.clone(), until, cancelled, ready));
+            let run = tokio::spawn(run(
+                io.clone(),
+                PlaybackState::default(),
+                until,
+                cancelled,
+                ready,
+            ));
             // During P's Play.
             tokio::time::sleep(ms(100)).await;
             if cancel_it {
@@ -1804,7 +1860,14 @@ mod tests {
         let io = TwoIo::new([2750, 2900]);
         let (_cancel, cancelled) = oneshot::channel();
         let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
-        run(io.clone(), until, cancelled, std::future::ready(())).await;
+        run(
+            io.clone(),
+            PlaybackState::default(),
+            until,
+            cancelled,
+            std::future::ready(()),
+        )
+        .await;
         assert_eq!(
             *io.acted.lock().unwrap(),
             [(2750, Play(P.into())), (3750, Play(Q.into()))]
@@ -1944,6 +2007,171 @@ mod tests {
         })
         .await;
         assert_eq!(acted, [(250, Play(Q.into()))]);
+    }
+
+    /// R's bus owner lookup fails.
+    const R: &str = "org.mpris.MediaPlayer2.vlc";
+    /// P owns PID 1's live stream; Q, a remote (Spotify Connect), is owned
+    /// by PID 2, which has none.
+    const OWNERS: [(&str, Option<u32>); 3] = [(P, Some(1)), (Q, Some(2)), (R, None)];
+
+    /// The stream monitor's state with `pids` live; None is unknown.
+    fn live(pids: Option<&[u32]>) -> PlaybackState {
+        PlaybackState {
+            live: pids.map(|pids| pids.iter().copied().collect()),
+            ..PlaybackState::default()
+        }
+    }
+
+    /// `owners` Playing at the take, which the route ends at once. Q pauses
+    /// itself at 50 ms, before any action; the chain's Pause or ProfileCycle
+    /// pauses a player, a Play plays it. The transport reads unknown, audio
+    /// is silent.
+    #[derive(Clone)]
+    struct OwnIo {
+        owners: Vec<(&'static str, Option<u32>)>,
+        start: tokio::time::Instant,
+        acted: Arc<StdMutex<Vec<Action>>>,
+    }
+
+    impl OwnIo {
+        fn new(owners: &[(&'static str, Option<u32>)]) -> Self {
+            OwnIo {
+                owners: owners.to_vec(),
+                start: tokio::time::Instant::now(),
+                acted: Arc::default(),
+            }
+        }
+
+        fn plays(&self, player: &str) -> bool {
+            let self_paused = player == Q && self.start.elapsed() >= ms(50);
+            self.acted
+                .lock()
+                .unwrap()
+                .iter()
+                .fold(!self_paused, |plays, action| match action {
+                    Pause(p) if p == player => false,
+                    Play(p) if p == player => true,
+                    ProfileCycle => false,
+                    _ => plays,
+                })
+        }
+
+        /// The players whose playing is `plays` and whose owner `own` accepts.
+        fn listing(&self, plays: bool, own: impl Fn(Option<u32>) -> bool) -> Vec<String> {
+            self.owners
+                .iter()
+                .filter(|(p, owner)| self.plays(p) == plays && own(*owner))
+                .map(|(p, _)| p.to_string())
+                .collect()
+        }
+    }
+
+    impl A2dpResumeIo for OwnIo {
+        fn act(&self, action: Action) -> BoxFuture<'static, ()> {
+            self.acted.lock().unwrap().push(action);
+            Box::pin(async {})
+        }
+
+        fn audible(&self) -> BoxFuture<'static, bool> {
+            Box::pin(async { false })
+        }
+
+        fn playing(&self) -> BoxFuture<'static, Vec<String>> {
+            let playing = self.listing(true, |_| true);
+            Box::pin(async { playing })
+        }
+
+        fn playing_owned(
+            &self,
+            own: Box<dyn Fn(Option<u32>) -> bool + Send>,
+        ) -> BoxFuture<'static, Vec<String>> {
+            let playing = self.listing(true, own);
+            Box::pin(async { playing })
+        }
+
+        fn transport_active(&self) -> BoxFuture<'static, Option<bool>> {
+            Box::pin(async { None })
+        }
+
+        fn paused(&self) -> BoxFuture<'static, Vec<String>> {
+            let paused = self.listing(false, |_| true);
+            Box::pin(async { paused })
+        }
+    }
+
+    async fn take_candidates_of(pids: Option<&[u32]>) -> Vec<String> {
+        take_candidates(&OwnIo::new(&OWNERS), live(pids)).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_candidates_keep_owners_of_a_live_stream() {
+        // Q owns no live stream; R's failed owner lookup owns nothing.
+        assert_eq!(take_candidates_of(Some(&[1])).await, [P]);
+        assert_eq!(take_candidates_of(Some(&[1, 2])).await, [P, Q]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_candidates_keep_every_player_while_live_is_unknown() {
+        assert_eq!(take_candidates_of(None).await, [P, Q, R]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_candidates_none_without_a_live_stream() {
+        assert_eq!(take_candidates_of(Some(&[])).await, [] as [&str; 0]);
+    }
+
+    /// Run the chain on P and Q with `streams` taken at the take; its actions.
+    async fn own_take(streams: PlaybackState) -> Vec<Action> {
+        let io = OwnIo::new(&OWNERS[..2]);
+        let (_cancel, cancelled) = oneshot::channel();
+        let until = tokio::time::Instant::now().into_std() + A2DP_RESUME_WINDOW;
+        run(
+            io.clone(),
+            streams,
+            until,
+            cancelled,
+            std::future::ready(()),
+        )
+        .await;
+        io.acted.lock().unwrap().clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_with_a_live_stream_acts_only_on_its_owner() {
+        // Q, a remote, is never paused or played, not even after pausing
+        // itself within the guard. A snapshot taken before Spotify corks at
+        // the route (#330) still kicks P.
+        let (monitor, streams) = tokio::sync::watch::channel(live(Some(&[1])));
+        let snapshot = streams.borrow().clone();
+        monitor.send(live(Some(&[]))).unwrap();
+        assert_eq!(
+            own_take(snapshot).await,
+            [
+                Pause(P.into()),
+                Play(P.into()),
+                ProfileCycle,
+                Play(P.into())
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_with_unknown_live_presence_acts_on_every_player() {
+        assert_eq!(
+            own_take(PlaybackState::default()).await,
+            [
+                // The watch's Play for Q's self-pause.
+                Play(Q.into()),
+                Pause(P.into()),
+                Pause(Q.into()),
+                Play(P.into()),
+                Play(Q.into()),
+                ProfileCycle,
+                Play(P.into()),
+                Play(Q.into()),
+            ]
+        );
     }
 
     #[test]

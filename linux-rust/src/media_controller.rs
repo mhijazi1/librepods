@@ -1052,6 +1052,20 @@ impl MediaController {
         Self::mpris_players_with_status("Playing")
     }
 
+    /// `playing_mpris_players` whose bus owner PID (None when the bus can't
+    /// tell) `own` accepts. Blocking.
+    fn playing_mpris_players_owned(own: &dyn Fn(Option<u32>) -> bool) -> Vec<String> {
+        let Ok(conn) = Connection::new_session() else {
+            return Vec::new();
+        };
+        Self::list_mpris_services(&conn)
+            .into_iter()
+            .filter(|service| {
+                Self::mpris_playing(&conn, service) && own(Self::bus_owner_pid(&conn, service))
+            })
+            .collect()
+    }
+
     /// The bus owner PID of each MPRIS player (KDE Connect's excluded) that
     /// reports Playing; None where the bus can't tell. Blocking.
     pub(crate) fn playing_mpris_owners() -> Vec<Option<u32>> {
@@ -2311,6 +2325,17 @@ impl A2dpResumeIo for MediaController {
     fn playing(&self) -> BoxFuture<'static, Vec<String>> {
         Box::pin(async {
             tokio::task::spawn_blocking(Self::playing_mpris_players)
+                .await
+                .unwrap_or_default()
+        })
+    }
+
+    fn playing_owned(
+        &self,
+        own: Box<dyn Fn(Option<u32>) -> bool + Send>,
+    ) -> BoxFuture<'static, Vec<String>> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || Self::playing_mpris_players_owned(&*own))
                 .await
                 .unwrap_or_default()
         })
