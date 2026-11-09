@@ -5106,6 +5106,20 @@ mod tests {
     }
 
     #[test]
+    fn ear_resume_after_late_stop_does_not_take() {
+        // Linux's player already plays at the baseline while the remote owns.
+        let mut p = remote_playing(Some(MEDIA));
+        p.feed(30, Input::Auto);
+        assert_eq!(p.play_category(40, MEDIA), []);
+        p.feed(100, Input::EarState(vec![InEar, OutOfEar]));
+        p.feed(200, Input::EarState(vec![InEar, InEar]));
+        // The removal's pause is polled after the reinsertion.
+        assert_eq!(p.play_category(300, IDLE), []);
+        assert_eq!(p.play_category(800, MEDIA), []);
+        assert!(p.core.take_lines().contains(&EAR_RESUMED.to_string()));
+    }
+
+    #[test]
     fn ear_resume_grace_covers_poll() {
         assert!(
             EAR_RESUME_GRACE
