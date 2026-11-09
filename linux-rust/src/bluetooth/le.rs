@@ -57,7 +57,19 @@ fn lock(retry: &Mutex<ConnectRetry>) -> MutexGuard<'_, ConnectRetry> {
     retry.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The connect slot for `mac`, if none is in flight and its retry spacing is over.
+/// The guard is taken first, so a failure recorded before the last holder dropped it is seen.
+fn try_start(
+    retry: &Mutex<ConnectRetry>,
+    mac: &str,
+    now: Instant,
+) -> Option<crate::reconnect::ConnectGuard> {
+    let guard = crate::reconnect::ConnectGuard::try_new(mac)?;
+    lock(retry).ready(mac, now).then_some(guard)
+}
+
 // bluetoothctl, as bluer's connect doesn't work here.
+// Duplicates reconnect.rs's `Bluez::connect` (#417).
 async fn le_connect(mac: &str) -> ConnectOutcome {
     let command = tokio::process::Command::new("bluetoothctl")
         .arg("connect")
@@ -275,14 +287,8 @@ pub async fn start_le_monitor(
                                                     "Auto-connect is disabled for {}, not attempting to connect.",
                                                     mac
                                                 );
-                                            } else if !lock(&retry_clone).ready(mac, Instant::now())
-                                            {
-                                                debug!(
-                                                    "Last connect to {} failed, retrying later.",
-                                                    mac
-                                                );
                                             } else if let Some(_connect_guard) =
-                                                crate::reconnect::ConnectGuard::try_new(mac)
+                                                try_start(&retry_clone, mac, Instant::now())
                                             {
                                                 // One connect at a time with the playback reconnect (#307).
                                                 info!(
@@ -297,7 +303,7 @@ pub async fn start_le_monitor(
                                                 );
                                             } else {
                                                 info!(
-                                                    "A connect to {} is already in flight, skipping.",
+                                                    "A connect to {} is in flight or failed recently, skipping.",
                                                     mac
                                                 );
                                             }
@@ -542,6 +548,25 @@ mod tests {
         // A success clears the spacing an earlier failure left.
         retry.finished(MAC, ConnectOutcome::Connected, t0);
         assert!(retry.ready(MAC, t0 + ms));
+    }
+
+    #[test]
+    fn le_connect_slot_failure_seen_by_next_guard_holder() {
+        // Unique: ConnectGuard's in-flight set is process-wide.
+        const RACE_MAC: &str = "AA:BB:CC:DD:EE:01";
+        let retry = Mutex::new(ConnectRetry::default());
+        let t0 = Instant::now();
+
+        // A connect fails while holding the guard, recording before the guard drops.
+        let guard = try_start(&retry, RACE_MAC, t0).unwrap();
+        assert!(try_start(&retry, RACE_MAC, t0).is_none());
+        lock(&retry).finished(RACE_MAC, ConnectOutcome::Failed, t0);
+        drop(guard);
+
+        // A racing advert that takes the free guard still sees the spacing, and frees the guard.
+        assert!(try_start(&retry, RACE_MAC, t0).is_none());
+        drop(crate::reconnect::ConnectGuard::try_new(RACE_MAC).unwrap());
+        assert!(try_start(&retry, RACE_MAC, t0 + LE_CONNECT_RETRY).is_some());
     }
 
     #[test]
