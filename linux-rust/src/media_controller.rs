@@ -550,7 +550,7 @@ where
 {
     info!("No AirPods card: asking BlueZ to ConnectProfile A2DP Sink");
     // shortcut: a ConnectProfile cut here can still finish in BlueZ after
-    // `profile_write` is released, so a later hold may miss its card (#TBD).
+    // `profile_write` is released, so a later hold may miss its card (#316).
     let cause = match tokio::time::timeout(A2DP_CONNECT_TIMEOUT, connect()).await {
         Ok(Ok(())) => {
             let attempts = A2DP_CONNECT_LOOKUP_ATTEMPTS;
