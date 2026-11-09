@@ -4,7 +4,7 @@ use crate::bluetooth::aacp::{
 use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::handoff_log;
 use crate::media_controller::{
-    CaseRecovery, MediaController, TakeoverAction, TakeoverInputs, TakeoverTrigger,
+    A2DP_SINK, CaseRecovery, MediaController, TakeoverAction, TakeoverInputs, TakeoverTrigger,
     decide_takeover, routing_snapshot_of,
 };
 use crate::switching::{
@@ -19,7 +19,6 @@ type ControlSession = (AACPManager, tokio::sync::mpsc::UnboundedReceiver<AACPEve
 /// A reconnect attempt's session and its init backlog.
 type Reconnection = (ControlSession, InitBacklog);
 
-const A2DP_SINK: uuid::Uuid = uuid::Uuid::from_u128(0x0000110b00001000800000805f9b34fb);
 /// How long the reconnect task waits for the echo of its last "not owning".
 const INIT_ECHO_WAIT: Duration = Duration::from_secs(1);
 
