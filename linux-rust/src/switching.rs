@@ -662,7 +662,7 @@ impl Shell {
                     // The core opened its hold window at `now`.
                     let until = now + a2dp_resume::A2DP_RESUME_WINDOW;
                     // Now: a player's stream may cork at the route (#330).
-                    let streams = self.play_rx.streams.borrow().clone();
+                    let streams = self.play_rx.streams();
                     tokio::spawn(self.media.resume_a2dp(streams, until, cancelled));
                 }
                 Command::RouteToAirPods => self.media.route_default_sink(SinkEvent::Take),
