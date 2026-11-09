@@ -545,28 +545,46 @@ where
     None
 }
 
+/// An Ok A2DP connect reply, told when its re-lookup finds the card (#391).
+trait CardFound {
+    fn card_found(self);
+}
+
+impl CardFound for () {
+    fn card_found(self) {}
+}
+
+/// `spawn_a2dp_connect`'s reply: dropped unsent when no lookup found the card.
+impl CardFound for tokio::sync::oneshot::Sender<()> {
+    fn card_found(self) {
+        let _ = self.send(());
+    }
+}
+
 /// Ask BlueZ for the A2DP profile once, cut at `A2DP_CONNECT_TIMEOUT`, then
 /// look for the card it brings with `A2DP_CONNECT_LOOKUP_ATTEMPTS` tries of
 /// `find`. `None` after one `warn!` naming the cause (#310), or one `debug!`
 /// when the AirPods were not connected, so nothing was asked (#320).
-async fn connect_a2dp_then_find<T, C, CFut, F, FFut, S, SFut>(
+async fn connect_a2dp_then_find<T, A, C, CFut, F, FFut, S, SFut>(
     connect: C,
     find: F,
     sleep: S,
 ) -> Option<T>
 where
+    A: CardFound,
     C: FnOnce() -> CFut,
-    CFut: Future<Output = Result<(), String>>,
+    CFut: Future<Output = Result<A, String>>,
     F: FnMut() -> FFut,
     FFut: Future<Output = Option<T>>,
     S: FnMut(Duration) -> SFut,
     SFut: Future<Output = ()>,
 {
     let cause = match tokio::time::timeout(A2DP_CONNECT_TIMEOUT, connect()).await {
-        Ok(Ok(())) => {
+        Ok(Ok(reply)) => {
             let attempts = A2DP_CONNECT_LOOKUP_ATTEMPTS;
             let found = retry_card_lookup_with(attempts, CARD_LOOKUP_INTERVAL, find, sleep).await;
             if found.is_some() {
+                reply.card_found();
                 return found;
             }
             "still no AirPods card".to_string()
@@ -2002,7 +2020,10 @@ impl MediaController {
 
     /// `connect_a2dp_profile` on `mac` through `spawn_a2dp_connect`, with the
     /// production card read and write.
-    fn connect_a2dp_profile_spawned(&self, mac: &str) -> impl Future<Output = Result<(), String>> {
+    fn connect_a2dp_profile_spawned(
+        &self,
+        mac: &str,
+    ) -> impl Future<Output = Result<tokio::sync::oneshot::Sender<()>, String>> {
         let read_mac = mac.to_string();
         let (reply, _) = self.spawn_a2dp_connect(
             connect_a2dp_profile(mac.to_string()),
@@ -2014,17 +2035,20 @@ impl MediaController {
 
     /// Run `connect` in its own task, so neither `A2DP_CONNECT_TIMEOUT` nor
     /// the activation deadline drops the ConnectProfile (#316); the returned
-    /// future waits for its reply. An Ok reply that wait never took, landing
-    /// under the hold, gets the hold's locked write on the card `read` finds
-    /// in `A2DP_CONNECT_LOOKUP_ATTEMPTS` tries. The connect, the wait for
-    /// `profile_write` and the reads stop at `A2DP_LATE_CONNECT_BOUND`.
+    /// future waits for its reply. An Ok reply whose card no lookup found
+    /// (never taken, or its re-lookup ended empty or was cut, #391), with the
+    /// hold set by then or within `A2DP_CONNECT_LOOKUP_ATTEMPTS` intervals,
+    /// gets the hold's locked write on the card `read` finds in
+    /// `A2DP_CONNECT_LOOKUP_ATTEMPTS` tries. The connect, the waits for the
+    /// waiter, the flag and `profile_write`, and the reads stop at
+    /// `A2DP_LATE_CONNECT_BOUND`.
     fn spawn_a2dp_connect<C, R, RFut, W, WFut>(
         &self,
         connect: C,
         read: R,
         write: W,
     ) -> (
-        impl Future<Output = Result<(), String>>,
+        impl Future<Output = Result<tokio::sync::oneshot::Sender<()>, String>>,
         tokio::task::JoinHandle<()>,
     )
     where
@@ -2042,14 +2066,25 @@ impl MediaController {
                 return;
             };
             let ok = reply.is_ok();
-            // The waiter acks the reply it takes: a reply sent into a waiter
-            // dropped before taking it is late too.
-            let (ack, taken) = tokio::sync::oneshot::channel();
-            let _ = tx.send((reply, ack));
-            if taken.await.is_ok() || !ok || !controller.a2dp_held.load(Ordering::SeqCst) {
+            // The waiter sends on `found` once its re-lookup finds the card. A
+            // reply never taken, or a re-lookup ended empty or cut, drops it.
+            let (found_tx, found) = tokio::sync::oneshot::channel();
+            let _ = tx.send(reply.map(|()| found_tx));
+            if !ok || !matches!(before_deadline(deadline, || found).await, Ok(Err(_))) {
                 return;
             }
-            info!("A2DP profile connect replied after its wait was cut: holding its card");
+            // A hold set soon after still gets the card; only the flag is read.
+            let window = CARD_LOOKUP_INTERVAL.saturating_mul(A2DP_CONNECT_LOOKUP_ATTEMPTS);
+            let held = async {
+                while !controller.a2dp_held.load(Ordering::SeqCst) {
+                    tokio::time::sleep(CARD_LOOKUP_INTERVAL).await;
+                }
+            };
+            let watch_end = deadline.min(Instant::now() + window);
+            if tokio::time::timeout_at(watch_end, held).await.is_err() {
+                return;
+            }
+            info!("A2DP profile connect's card was not found by its wait: holding it");
             // The hold calls `find` right after it takes `profile_write`.
             let locked = AtomicBool::new(false);
             let find = || {
@@ -2081,9 +2116,8 @@ impl MediaController {
             }
         });
         let reply = async move {
-            let (reply, ack) = rx.await.map_err(|_| "connect task ended".to_string())?;
-            let _ = ack.send(());
-            reply
+            rx.await
+                .unwrap_or_else(|_| Err("connect task ended".to_string()))
         };
         (reply, task)
     }
@@ -5325,7 +5359,7 @@ mod tests {
         took: Duration,
         found: impl Fn(&MediaController) + Send + 'static,
     ) -> (
-        impl Future<Output = Result<(), String>>,
+        impl Future<Output = Result<tokio::sync::oneshot::Sender<()>, String>>,
         tokio::task::JoinHandle<()>,
         Arc<AtomicUsize>,
         Writes,
@@ -5537,6 +5571,150 @@ mod tests {
         .await;
         assert_eq!((found, connects.get()), (Some(7), 1));
         task.await.unwrap();
+        assert_eq!(
+            (reads.load(Ordering::SeqCst), writes.lock().unwrap().len()),
+            (0, 0)
+        );
+    }
+
+    const IN_TIME: Duration = Duration::from_secs(1);
+
+    #[tokio::test(start_paused = true)]
+    async fn in_time_connect_empty_lookup_is_held() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let (reply, task, reads, writes) = spawn_late(&controller, IN_TIME, |_| {});
+        let finds = std::cell::Cell::new(0);
+        let none = connect_a2dp_then_find(
+            || reply,
+            || {
+                finds.set(finds.get() + 1);
+                async { None::<u32> }
+            },
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!((none, finds.get()), (None, A2DP_CONNECT_LOOKUP_ATTEMPTS));
+        task.await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(*writes.lock().unwrap(), [(3, "off".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_time_connect_cut_lookup_is_held() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (reply, task, _, writes) = spawn_late(&controller, IN_TIME, |_| {});
+        // The reply is taken at 1 s; the deadline cuts its re-lookup at 2 s.
+        let cut_at = Duration::from_secs(2);
+        let finds = std::cell::Cell::new(0);
+        let start = Instant::now();
+        let outcome = controller
+            .activate_a2dp_profile_with(
+                start + cut_at,
+                || async { None },
+                || {
+                    connect_a2dp_then_find(
+                        || reply,
+                        || {
+                            finds.set(finds.get() + 1);
+                            async { None }
+                        },
+                        tokio::time::sleep,
+                    )
+                },
+                || async { true },
+                |_| async { ProfileChoice::Activate("a2dp-sink".to_string()) },
+                |_, _| async { panic!("activation wrote") },
+            )
+            .await;
+        assert_eq!((outcome, start.elapsed()), (Err(DeadlineExceeded), cut_at));
+        assert!((1..A2DP_CONNECT_LOOKUP_ATTEMPTS).contains(&finds.get()));
+        controller.set_a2dp_held(true);
+        task.await.unwrap();
+        assert_eq!(*writes.lock().unwrap(), [(3, "off".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_time_connect_unheld_empty_lookup_has_no_late_hold() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (reply, task, reads, writes) = spawn_late(&controller, IN_TIME, |_| {});
+        let start = Instant::now();
+        let none = connect_a2dp_then_find(|| reply, || async { None::<u32> }, tokio::time::sleep);
+        assert_eq!(none.await, None);
+        task.await.unwrap();
+        // The flag is watched for the window after the re-lookup, no longer.
+        let lookup = card_lookup_max_wait(A2DP_CONNECT_LOOKUP_ATTEMPTS);
+        let window = CARD_LOOKUP_INTERVAL * A2DP_CONNECT_LOOKUP_ATTEMPTS;
+        assert_eq!(start.elapsed(), IN_TIME + lookup + window);
+        assert_eq!(
+            (reads.load(Ordering::SeqCst), writes.lock().unwrap().len()),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_time_connect_err_reply_has_no_late_hold() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let (reads, writes) = (Arc::new(AtomicUsize::new(0)), Writes::default());
+        let (r, w) = (reads.clone(), writes.clone());
+        let (reply, task) = controller.spawn_a2dp_connect(
+            async { Err("refused".to_string()) },
+            move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                async { Some(card_on("a2dp-sink")) }
+            },
+            move |index, profile| {
+                w.lock().unwrap().push((index, profile));
+                async { true }
+            },
+        );
+        let none = connect_a2dp_then_find(|| reply, || async { None::<u32> }, tokio::time::sleep);
+        assert_eq!(none.await, None);
+        task.await.unwrap();
+        assert_eq!(
+            (reads.load(Ordering::SeqCst), writes.lock().unwrap().len()),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_hold_set_after_reply_is_held() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (reply, task, reads, writes) = spawn_late(&controller, LATE, |_| {});
+        let start = Instant::now();
+        let none = connect_a2dp_then_find(|| reply, || async { None::<u32> }, tokio::time::sleep);
+        assert_eq!(none.await, None);
+        // The late reply lands with the flag clear; the hold is set 0.5 s on.
+        tokio::time::sleep_until(start + LATE + Duration::from_millis(500)).await;
+        assert!(!task.is_finished());
+        assert!(controller.profile_write.try_lock().is_ok());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        controller.set_a2dp_held(true);
+        task.await.unwrap();
+        assert_eq!(*writes.lock().unwrap(), [(3, "off".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_stuck_waiter_ends_at_bound() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let (reply, task, reads, writes) = spawn_late(&controller, IN_TIME, |_| {});
+        // The waiter takes the reply, then its re-lookup never ends.
+        let pending = std::future::pending::<Option<u32>>;
+        let stuck = connect_a2dp_then_find(|| reply, pending, tokio::time::sleep);
+        let check = async {
+            tokio::time::sleep(2 * IN_TIME).await;
+            // Waiting for the found signal, without `profile_write`.
+            assert!(!task.is_finished());
+            assert!(controller.profile_write.try_lock().is_ok());
+            tokio::time::sleep(A2DP_LATE_CONNECT_BOUND).await;
+            assert!(task.is_finished());
+        };
+        tokio::select! {
+            _ = stuck => panic!("the stuck re-lookup ended"),
+            _ = check => {}
+        }
         assert_eq!(
             (reads.load(Ordering::SeqCst), writes.lock().unwrap().len()),
             (0, 0)
