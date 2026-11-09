@@ -1049,37 +1049,36 @@ impl MediaController {
     /// The MPRIS players (KDE Connect's excluded) that report Playing.
     /// Blocking.
     fn playing_mpris_players() -> Vec<String> {
-        let Ok(conn) = Connection::new_session() else {
-            return Vec::new();
-        };
-        Self::list_mpris_services(&conn)
-            .into_iter()
-            .filter(|service| Self::mpris_playing(&conn, service))
-            .collect()
+        Self::mpris_players_with_status("Playing")
     }
 
     /// The MPRIS players (KDE Connect's excluded) that report Paused.
     /// Blocking.
     fn paused_mpris_players() -> Vec<String> {
+        Self::mpris_players_with_status("Paused")
+    }
+
+    fn mpris_playing(conn: &Connection, service: &str) -> bool {
+        Self::mpris_status_is(conn, service, "Playing")
+    }
+
+    /// The MPRIS players (KDE Connect's excluded) that report `status`;
+    /// empty without a session bus. Blocking.
+    fn mpris_players_with_status(status: &str) -> Vec<String> {
         let Ok(conn) = Connection::new_session() else {
             return Vec::new();
         };
         Self::list_mpris_services(&conn)
             .into_iter()
-            .filter(|service| {
-                conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5))
-                    .get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                    .is_ok_and(|s| s == "Paused")
-            })
+            .filter(|service| Self::mpris_status_is(&conn, service, status))
             .collect()
     }
 
-    fn mpris_playing(conn: &Connection, service: &str) -> bool {
-        let proxy = conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-        proxy
+    /// Whether `service` reports `status`; a failed read is false.
+    fn mpris_status_is(conn: &Connection, service: &str, status: &str) -> bool {
+        conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5))
             .get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-            .map(|s| s == "Playing")
-            .unwrap_or(false)
+            .is_ok_and(|s| s == status)
     }
 
     fn is_kdeconnect_service(service: &str) -> bool {
