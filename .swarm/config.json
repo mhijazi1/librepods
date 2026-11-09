@@ -8,6 +8,7 @@
   },
   "lanes": {
     "max": 8,
-    "dir": "../librepods-lanes"
+    "dir": "../librepods-lanes",
+    "cpus": "1-7,9-15"
   }
 }
