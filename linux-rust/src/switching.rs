@@ -2446,7 +2446,7 @@ mod tests {
     async fn production_media_delivers_ear_resumes() {
         let (outer, media) = share_media(
             MediaController::new(String::new(), LOCAL.to_string()),
-            Arc::new(media_controller::PauseOutcome::default),
+            Arc::new(|_: &dyn Fn(Option<u32>) -> bool| media_controller::PauseOutcome::default()),
         );
         let mut ear_rx = media.ear_resumes();
         use EarDetectionStatus::{InEar, OutOfEar};
