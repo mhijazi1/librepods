@@ -8,6 +8,7 @@
   },
   "lanes": {
     "max": 8,
-    "dir": "../librepods-lanes"
+    "dir": "../librepods-lanes",
+    "frozen": "M1 hardware investigations (mo, 2026-11-08): no new lanes until the M1 spikes are done"
   }
 }
