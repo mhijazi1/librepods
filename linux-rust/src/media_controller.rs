@@ -417,6 +417,12 @@ const NOT_CONNECTED: &str = "AirPods not connected";
 /// Longest the A2DP profile connect may take (the handoff probe's value).
 const A2DP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Longest a connect cut by `A2DP_CONNECT_TIMEOUT` or the activation deadline
+/// is followed for a late reply (#316): bluer's 120 s D-Bus reply timeout,
+/// then the card re-lookup, with slack for the sound-server queries. Assumes
+/// BlueZ brings no card after bluer's timeout. A write started runs to its end.
+const A2DP_LATE_CONNECT_BOUND: Duration = Duration::from_secs(150);
+
 /// Card lookups after the A2DP profile connect: the card can trail BlueZ's
 /// reply. 1.75 s of sleeps keeps `a2dp_activation_worst_case_wait` <= 15 s.
 const A2DP_CONNECT_LOOKUP_ATTEMPTS: u32 = 8;
@@ -556,9 +562,6 @@ where
     S: FnMut(Duration) -> SFut,
     SFut: Future<Output = ()>,
 {
-    // shortcut: a ConnectProfile cut here can outlive `profile_write` (#316):
-    // it can still finish in BlueZ after the lock is released, so a later
-    // hold may miss its card.
     let cause = match tokio::time::timeout(A2DP_CONNECT_TIMEOUT, connect()).await {
         Ok(Ok(())) => {
             let attempts = A2DP_CONNECT_LOOKUP_ATTEMPTS;
@@ -581,7 +584,7 @@ where
 
 /// BlueZ `Device1.ConnectProfile(A2DP_SINK)` on the AirPods `mac`, only while
 /// BlueZ reports them connected. Unbounded: callers cut it.
-async fn connect_a2dp_profile(mac: &str) -> Result<(), String> {
+async fn connect_a2dp_profile(mac: String) -> Result<(), String> {
     let address = mac.parse::<bluer::Address>().map_err(|e| e.to_string())?;
     let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
     let device = session
@@ -594,6 +597,20 @@ async fn connect_a2dp_profile(mac: &str) -> Result<(), String> {
         || async { connect_profile_reply(device.connect_profile(&A2DP_SINK).await) },
     )
     .await
+}
+
+/// One read of the AirPods card of `mac`, whole.
+async fn read_card(mac: String) -> Option<pulse::Card> {
+    tokio::task::spawn_blocking(move || {
+        get_card_info_list_sync().into_iter().find(|card| {
+            card.device_string
+                .as_deref()
+                .is_some_and(|d| d.contains(&mac))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// A connect already under way (`InProgress`) or done (`AlreadyConnected`)
@@ -1389,7 +1406,7 @@ impl MediaController {
                 || self.get_audio_device_index(&mac),
                 || {
                     connect_a2dp_then_find(
-                        || connect_a2dp_profile(&mac),
+                        || self.connect_a2dp_profile_spawned(&mac),
                         || find_card_index(mac.clone()),
                         tokio::time::sleep,
                     )
@@ -1893,23 +1910,14 @@ impl MediaController {
             debug!("A2DP hold({hold}): no connected device MAC");
             return;
         }
-        let read = || {
-            let card_mac = mac.clone();
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    get_card_info_list_sync().into_iter().find(|card| {
-                        card.device_string
-                            .as_deref()
-                            .is_some_and(|d| d.contains(&card_mac))
-                    })
-                })
-                .await
-                .ok()
-                .flatten()
-            }
+        let read = || read_card(mac.clone());
+        let connect = || {
+            connect_a2dp_then_find(
+                || self.connect_a2dp_profile_spawned(&mac),
+                read,
+                tokio::time::sleep,
+            )
         };
-        let connect =
-            || connect_a2dp_then_find(|| connect_a2dp_profile(&mac), read, tokio::time::sleep);
         let write =
             |index, profile: String| blocking(move || set_card_profile_sync(index, &profile));
         let preferred = crate::utils::load_preferred_codec();
@@ -1990,6 +1998,94 @@ impl MediaController {
         if !hold {
             wait_for_sink(sink).await;
         }
+    }
+
+    /// `connect_a2dp_profile` on `mac` through `spawn_a2dp_connect`, with the
+    /// production card read and write.
+    fn connect_a2dp_profile_spawned(&self, mac: &str) -> impl Future<Output = Result<(), String>> {
+        let read_mac = mac.to_string();
+        let (reply, _) = self.spawn_a2dp_connect(
+            connect_a2dp_profile(mac.to_string()),
+            move || read_card(read_mac.clone()),
+            |index, profile: String| blocking(move || set_card_profile_sync(index, &profile)),
+        );
+        reply
+    }
+
+    /// Run `connect` in its own task, so neither `A2DP_CONNECT_TIMEOUT` nor
+    /// the activation deadline drops the ConnectProfile (#316); the returned
+    /// future waits for its reply. An Ok reply that wait never took, landing
+    /// under the hold, gets the hold's locked write on the card `read` finds
+    /// in `A2DP_CONNECT_LOOKUP_ATTEMPTS` tries. The connect, the wait for
+    /// `profile_write` and the reads stop at `A2DP_LATE_CONNECT_BOUND`.
+    fn spawn_a2dp_connect<C, R, RFut, W, WFut>(
+        &self,
+        connect: C,
+        read: R,
+        write: W,
+    ) -> (
+        impl Future<Output = Result<(), String>>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        C: Future<Output = Result<(), String>> + Send + 'static,
+        R: FnMut() -> RFut + Send + 'static,
+        RFut: Future<Output = Option<pulse::Card>> + Send,
+        W: FnOnce(u32, String) -> WFut + Send + 'static,
+        WFut: Future<Output = bool> + Send,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let controller = self.clone();
+        let task = tokio::spawn(async move {
+            let deadline = Instant::now() + A2DP_LATE_CONNECT_BOUND;
+            let Ok(reply) = before_deadline(deadline, || connect).await else {
+                return;
+            };
+            let ok = reply.is_ok();
+            // The waiter acks the reply it takes: a reply sent into a waiter
+            // dropped before taking it is late too.
+            let (ack, taken) = tokio::sync::oneshot::channel();
+            let _ = tx.send((reply, ack));
+            if taken.await.is_ok() || !ok || !controller.a2dp_held.load(Ordering::SeqCst) {
+                return;
+            }
+            info!("A2DP profile connect replied after its wait was cut: holding its card");
+            // The hold calls `find` right after it takes `profile_write`.
+            let locked = AtomicBool::new(false);
+            let find = || {
+                locked.store(true, Ordering::SeqCst);
+                async move {
+                    let attempts = A2DP_CONNECT_LOOKUP_ATTEMPTS;
+                    let sleep = tokio::time::sleep;
+                    let lookup =
+                        || retry_card_lookup_with(attempts, CARD_LOOKUP_INTERVAL, read, sleep);
+                    before_deadline(deadline, lookup).await.ok().flatten()
+                }
+            };
+            // A hold never reads `cached` or `preferred`, nor connects or waits.
+            let preferred = crate::utils::PreferredCodec::Aac;
+            let (connect, sink) = (|| async { None }, || async { None });
+            let hold =
+                controller.apply_a2dp_hold_with(true, "", preferred, find, connect, write, sink);
+            // The bound cuts the wait for `profile_write` only: once taken,
+            // `find` is bounded and a write started runs to its end (#264).
+            let lock_wait_cut = async {
+                tokio::time::sleep_until(deadline).await;
+                if locked.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                _ = hold => {}
+                _ = lock_wait_cut => debug!("A2DP late hold: profile_write still busy at the bound"),
+            }
+        });
+        let reply = async move {
+            let (reply, ack) = rx.await.map_err(|_| "connect task ended".to_string())?;
+            let _ = ack.send(());
+            reply
+        };
+        (reply, task)
     }
 
     pub async fn handle_conversational_awareness(&self, status: u8) {
@@ -5216,5 +5312,234 @@ mod tests {
         )
         .await;
         assert_eq!((found, finds.get()), (Some(7), 3));
+    }
+
+    type Writes = Arc<std::sync::Mutex<Vec<(u32, String)>>>;
+
+    /// `spawn_a2dp_connect` whose connect replies Ok after `took` and whose
+    /// card read finds the card on `a2dp-sink` from its second look on,
+    /// running `found` there. Returns the wait, the task, the reads and the
+    /// writes.
+    fn spawn_late(
+        controller: &MediaController,
+        took: Duration,
+        found: impl Fn(&MediaController) + Send + 'static,
+    ) -> (
+        impl Future<Output = Result<(), String>>,
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+        Writes,
+    ) {
+        let (reads, writes) = (Arc::new(AtomicUsize::new(0)), Writes::default());
+        let (c, r, w) = (controller.clone(), reads.clone(), writes.clone());
+        let (reply, task) = controller.spawn_a2dp_connect(
+            async move {
+                tokio::time::sleep(took).await;
+                Ok(())
+            },
+            move || {
+                let card = (r.fetch_add(1, Ordering::SeqCst) >= 1).then(|| card_on("a2dp-sink"));
+                if card.is_some() {
+                    found(&c);
+                }
+                async move { card }
+            },
+            move |index, profile| {
+                w.lock().unwrap().push((index, profile));
+                async { true }
+            },
+        );
+        (reply, task, reads, writes)
+    }
+
+    const LATE: Duration = Duration::from_secs(30);
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_card_is_held() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (reply, task, reads, writes) = spawn_late(&controller, LATE, |_| {});
+        let start = Instant::now();
+        // A release with no card connects; its wait is cut at the timeout.
+        controller
+            .apply_a2dp_hold_with(
+                false,
+                "",
+                PreferredCodec::Aac,
+                || async { None },
+                || connect_a2dp_then_find(|| reply, || async { None }, tokio::time::sleep),
+                |_, _| async { panic!("release wrote") },
+                || async { None },
+            )
+            .await;
+        assert_eq!(start.elapsed(), A2DP_CONNECT_TIMEOUT);
+        assert!(controller.profile_write.try_lock().is_ok());
+        // The hold starts before the late reply and finds no card.
+        controller.set_a2dp_held(true);
+        controller
+            .apply_a2dp_hold_with(
+                true,
+                "",
+                PreferredCodec::Aac,
+                || async { None },
+                || async { None },
+                |_, _| async { panic!("hold wrote") },
+                || async { None },
+            )
+            .await;
+        assert!(start.elapsed() < LATE);
+        assert!(controller.profile_write.try_lock().is_ok());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        task.await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(*writes.lock().unwrap(), [(3, "off".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_after_deadline_cut_is_held() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (reply, task, _, writes) = spawn_late(&controller, LATE, |_| {});
+        // The deadline cuts the connect's wait before its timeout.
+        let cut_at = Duration::from_secs(2);
+        assert!(cut_at < A2DP_CONNECT_TIMEOUT);
+        let start = Instant::now();
+        let outcome = controller
+            .activate_a2dp_profile_with(
+                start + cut_at,
+                || async { None },
+                || connect_a2dp_then_find(|| reply, || async { None }, tokio::time::sleep),
+                || async { true },
+                |_| async { ProfileChoice::Activate("a2dp-sink".to_string()) },
+                |_, _| async { panic!("activation wrote") },
+            )
+            .await;
+        assert_eq!((outcome, start.elapsed()), (Err(DeadlineExceeded), cut_at));
+        controller.set_a2dp_held(true);
+        task.await.unwrap();
+        assert_eq!(*writes.lock().unwrap(), [(3, "off".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_reply_dropped_untaken_is_held() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let (reply, task, _, writes) = spawn_late(&controller, Duration::ZERO, |_| {});
+        // The reply is sent, then its waiter is dropped before taking it.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(reply);
+        task.await.unwrap();
+        assert_eq!(*writes.lock().unwrap(), [(3, "off".to_string())]);
+    }
+
+    /// A connect whose wait is cut at the timeout, with the hold `held`.
+    async fn cut_connect(
+        held: bool,
+        found: impl Fn(&MediaController) + Send + 'static,
+    ) -> (usize, Writes) {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(held);
+        let (reply, task, reads, writes) = spawn_late(&controller, LATE, found);
+        let none = connect_a2dp_then_find(|| reply, || async { None::<u32> }, tokio::time::sleep);
+        assert_eq!(none.await, None);
+        task.await.unwrap();
+        (reads.load(Ordering::SeqCst), writes)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_card_unheld_is_left_alone() {
+        // Clear when the late reply lands: nothing read, nothing written.
+        let (reads, writes) = cut_connect(false, |_| {}).await;
+        assert_eq!((reads, writes.lock().unwrap().len()), (0, 0));
+        // Cleared after the read that finds the card, before the write (#267).
+        let (reads, writes) = cut_connect(true, |c| c.set_a2dp_held(false)).await;
+        assert_eq!((reads, writes.lock().unwrap().len()), (2, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_task_ends_at_bound() {
+        let bluer_timeout = Duration::from_secs(120);
+        let lookup = card_lookup_max_wait(A2DP_CONNECT_LOOKUP_ATTEMPTS);
+        assert!(A2DP_LATE_CONNECT_BOUND >= bluer_timeout + lookup);
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let never = Duration::from_secs(3600);
+        let (reply, task, reads, writes) = spawn_late(&controller, never, |_| {});
+        let none = connect_a2dp_then_find(|| reply, || async { None::<u32> }, tokio::time::sleep);
+        assert_eq!(none.await, None);
+        tokio::time::sleep(A2DP_LATE_CONNECT_BOUND).await;
+        assert!(task.is_finished());
+        assert_eq!(
+            (reads.load(Ordering::SeqCst), writes.lock().unwrap().len()),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_lock_wait_ends_at_bound() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let write_lock = controller.profile_write.lock().await;
+        let (reply, task, reads, writes) = spawn_late(&controller, LATE, |_| {});
+        let none = connect_a2dp_then_find(|| reply, || async { None::<u32> }, tokio::time::sleep);
+        assert_eq!(none.await, None);
+        // The Ok reply lands under the hold while `profile_write` is busy.
+        tokio::time::sleep(LATE).await;
+        assert!(!task.is_finished());
+        tokio::time::sleep(A2DP_LATE_CONNECT_BOUND).await;
+        assert!(task.is_finished());
+        drop(write_lock);
+        assert_eq!(
+            (reads.load(Ordering::SeqCst), writes.lock().unwrap().len()),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_write_started_runs_past_bound() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let done = Arc::new(AtomicBool::new(false));
+        let written = done.clone();
+        let (reply, task) = controller.spawn_a2dp_connect(
+            async {
+                tokio::time::sleep(LATE).await;
+                Ok(())
+            },
+            || async { Some(card_on("a2dp-sink")) },
+            move |_, _| async move {
+                tokio::time::sleep(A2DP_LATE_CONNECT_BOUND).await;
+                written.store(true, Ordering::SeqCst);
+                true
+            },
+        );
+        let none = connect_a2dp_then_find(|| reply, || async { None::<u32> }, tokio::time::sleep);
+        assert_eq!(none.await, None);
+        // Past the bound the write still runs, under `profile_write`.
+        tokio::time::sleep(A2DP_LATE_CONNECT_BOUND).await;
+        assert!(controller.profile_write.try_lock().is_err());
+        task.await.unwrap();
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_time_connect_has_no_late_hold() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let (reply, task, reads, writes) = spawn_late(&controller, Duration::from_secs(1), |_| {});
+        let connects = std::cell::Cell::new(0);
+        let found = connect_a2dp_then_find(
+            || {
+                connects.set(connects.get() + 1);
+                reply
+            },
+            || async { Some(7) },
+            tokio::time::sleep,
+        )
+        .await;
+        assert_eq!((found, connects.get()), (Some(7), 1));
+        task.await.unwrap();
+        assert_eq!(
+            (reads.load(Ordering::SeqCst), writes.lock().unwrap().len()),
+            (0, 0)
+        );
     }
 }
