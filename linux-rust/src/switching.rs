@@ -28,8 +28,8 @@ use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers,
     ControlCommandIdentifiers as Control,
 };
-use crate::default_sink::{DefaultSinkRouter, SinkEvent};
-use crate::handoff::{Command, Handoff, Input, SessionFacts};
+use crate::default_sink::{DefaultSinkRouter, SinkEvent, UnparkTo};
+use crate::handoff::{Command, Handoff, Input, Park, SessionFacts};
 use crate::handoff_log;
 use crate::media_controller::{
     self, AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_STREAM, MediaController,
@@ -743,6 +743,8 @@ struct Shell {
     relay_category: bool,
     /// Whether the last `HoldA2dp` held (#264); released on drop (#294).
     held: bool,
+    /// Whether the last park route parked (#311); unparked on drop.
+    parked: bool,
     /// Where the drop sends its release's settle.
     released: Option<oneshot::Sender<BoxFuture<'static, ()>>>,
 }
@@ -753,9 +755,16 @@ impl Drop for Shell {
     fn drop(&mut self) {
         if self.held {
             self.media.hold_a2dp(false);
-            if let Some(released) = self.released.take() {
-                let _ = released.send(self.media.hold_settled());
-            }
+        }
+        // After the release, so the default never stays the park sink.
+        if self.parked {
+            self.media
+                .route_default_sink(SinkEvent::Unpark(UnparkTo::Local));
+        }
+        if (self.held || self.parked)
+            && let Some(released) = self.released.take()
+        {
+            let _ = released.send(self.media.hold_settled());
         }
     }
 }
@@ -888,7 +897,19 @@ async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
     for line in core.take_lines() {
         shell.log(&line);
     }
-    shell.execute(now, commands).await
+    let end = shell.execute(now, commands).await;
+    // After the step's commands, on the same queue, so a park follows its
+    // hold and an unpark follows the ACK's release and route (#311).
+    let park = core.park();
+    if (park == Park::Parked) != shell.parked {
+        shell.parked = park == Park::Parked;
+        shell.media.route_default_sink(match park {
+            Park::Parked => SinkEvent::Park,
+            Park::AirPods => SinkEvent::Unpark(UnparkTo::AirPods),
+            Park::Local | Park::FallenBack => SinkEvent::Unpark(UnparkTo::Local),
+        });
+    }
+    end
 }
 
 async fn on_event(core: &mut Handoff, shell: &mut Shell, event: AACPEvent) -> bool {
@@ -1003,6 +1024,7 @@ async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     .with_last_owner_linux(last_owner_linux(&shell.mac))
     .with_default_sink_routing(true)
     .with_a2dp_hold(true)
+    .with_park_sink(true)
     .with_category_relay(shell.relay_category);
     let start = if let Some((category, requested)) = take_category {
         core = core
@@ -1283,6 +1305,7 @@ impl Switching {
                     connect_mode: self.connect_mode,
                     relay_category: self.relay_category,
                     held: false,
+                    parked: false,
                     released: None,
                 };
                 spawn_handoff_task(&HANDOFF_TASKS, self.airpods_mac, shell);
@@ -1503,6 +1526,8 @@ mod tests {
         /// While set, `hold_settled` waits for one `gate` permit (#294).
         gated: AtomicBool,
         gate: Notify,
+        /// Record the park routes (#311) too.
+        parks: AtomicBool,
     }
 
     /// Records the media actions instead of touching D-Bus or PipeWire. The
@@ -1545,6 +1570,13 @@ mod tests {
         }
 
         fn route_default_sink(&self, event: SinkEvent) {
+            // Recorded only for the tests that opt in, so the others'
+            // sequences stay as they were before the park (#311).
+            if matches!(event, SinkEvent::Park | SinkEvent::Unpark(_))
+                && !self.records.parks.load(Ordering::SeqCst)
+            {
+                return;
+            }
             self.records.routes.lock().unwrap().push(event);
         }
 
@@ -3220,6 +3252,7 @@ mod tests {
             connect_mode: ConnectMode::default(),
             relay_category: false,
             held: false,
+            parked: false,
             released: None,
         }
     }
@@ -6458,5 +6491,130 @@ mod tests {
         assert!(registry.lock().unwrap().tasks.is_empty());
         first.records.gate.notify_one();
         exit.await;
+    }
+
+    // #311: the park sink.
+
+    /// A handoff task on a `no_source_session` that records its park
+    /// routes, past its startup.
+    async fn park_task(
+        mac: &str,
+        rx: &mut mpsc::Receiver<Vec<u8>>,
+        manager: &AACPManager,
+    ) -> Harness {
+        let h = Harness::start(SwitchingMode::Handoff, mac, manager).await;
+        h.records.parks.store(true, Ordering::SeqCst);
+        expect_startup(&h, rx).await;
+        h
+    }
+
+    /// Another host's request answered while Linux is idle: held, then
+    /// parked.
+    async fn park_after_remote_request(h: &Harness, rx: &mut mpsc::Receiver<Vec<u8>>) {
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        assert_eq!(next_packet(rx).await, expected_owns(0).await);
+        // Its ACK, so a later play edge can take.
+        h.emit_queued(owns(0)).await;
+        wait_until("the park", || h.sink_events().ends_with(&[SinkEvent::Park])).await;
+        use SinkEvent::{Hold, Park};
+        assert_eq!(h.sink_events(), [Hold(false), Hold(true), Park]);
+    }
+
+    #[tokio::test]
+    async fn park_take_while_parked_unparks_to_airpods_after_the_route() {
+        let mac = "5A:00:00:00:11:01";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let h = park_task(mac, &mut rx, &manager).await;
+        park_after_remote_request(&h, &mut rx).await;
+        h.play(false).await;
+        h.play(true).await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        h.emit(owns(1));
+        wait_until("the unpark", || h.sink_events().len() == 6).await;
+        use SinkEvent::{Hold, Park, Take, Unpark};
+        assert_eq!(
+            h.sink_events(),
+            [
+                Hold(false),
+                Hold(true),
+                Park,
+                Hold(false),
+                Take,
+                Unpark(UnparkTo::AirPods)
+            ]
+        );
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn park_yield_while_playing_parks_on_the_idle_sample() {
+        let mac = "5A:00:00:00:11:02";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let h = park_task(mac, &mut rx, &manager).await;
+        expect_take(&h, &mut rx).await;
+        h.emit(owns(1));
+        wait_until("the take's route", || !h.routes().is_empty()).await;
+        h.emit(AACPEvent::OwnershipToFalseRequest);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        wait_until("the hold", || {
+            h.sink_events().contains(&SinkEvent::Hold(true))
+        })
+        .await;
+        tokio::time::sleep(SETTLE).await;
+        use SinkEvent::{Hold, Park, Take, Yield};
+        // Still playing: no park yet.
+        assert_eq!(h.sink_events(), [Hold(false), Take, Yield, Hold(true)]);
+        h.play(false).await;
+        wait_until("the park", || h.sink_events().len() == 5).await;
+        assert_eq!(
+            h.sink_events(),
+            [Hold(false), Take, Yield, Hold(true), Park]
+        );
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn park_task_stop_while_parked_unparks_after_the_release() {
+        let mac = "5A:00:00:00:11:03";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let h = park_task(mac, &mut rx, &manager).await;
+        park_after_remote_request(&h, &mut rx).await;
+        let task = handoff_task(mac).expect("task");
+        stop_handoff_task(mac);
+        let events = after_stop(&h, task).await;
+        assert!(
+            events.ends_with(&[SinkEvent::Hold(false), SinkEvent::Unpark(UnparkTo::Local)]),
+            "{events:?}"
+        );
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    }
+
+    /// #88 on the park sink: a worthy stream with no MPRIS player, which
+    /// follows the default to the park sink, passes the peak gate and gets
+    /// its 201 take request after the minimum.
+    #[tokio::test]
+    async fn park_peak_stream_on_the_park_sink_takes() {
+        let mac = "5A:00:00:00:11:04";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let streams = LiveStreams::default();
+        let h =
+            Harness::start_streams(mac, &manager, Vec::new, streams.clone(), STREAM_TEST_MIN).await;
+        h.records.parks.store(true, Ordering::SeqCst);
+        expect_startup(&h, &mut rx).await;
+        streams.settle().await;
+        park_after_remote_request(&h, &mut rx).await;
+
+        let started = Instant::now();
+        streams.set(vec![music(51)]);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert!(started.elapsed() >= STREAM_TEST_MIN);
+        // Still parked while the take waits for its ACK.
+        assert_eq!(
+            h.sink_events().last(),
+            Some(&SinkEvent::Park),
+            "{:?}",
+            h.sink_events()
+        );
+        stop_handoff_task(mac);
     }
 }

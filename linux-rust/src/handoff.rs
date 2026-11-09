@@ -32,6 +32,10 @@ pub(crate) const LATE_ACK_WINDOW: Duration = Duration::from_secs(10);
 pub(crate) const EAR_RESUME_GRACE: Duration = Duration::from_secs(3);
 const EAR_RESUMED: &str =
     "AUTO playback resumed by ear detection while another host owns; not taking";
+/// How long parked playback waits for its take's ACK after a play edge
+/// before it falls back to the local output (#311), as the Mac's
+/// `RouteToSpeaker … in 2.00s`.
+pub(crate) const PARK_TIMEOUT: Duration = Duration::from_secs(2);
 /// First reconnect delay after a disconnect or a successful reconnect.
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 /// Reconnect backoff cap.
@@ -230,6 +234,22 @@ pub(crate) enum Command {
     Fail(&'static str),
 }
 
+/// Where new playback goes while another host owns (#311); the shell routes
+/// the changes to the default sink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Park {
+    /// Not parked: the default sink is the local one (or the AirPods').
+    Local,
+    /// Not parked since a take's ACK sent the parked playback to the
+    /// AirPods.
+    AirPods,
+    /// The silent park sink is the default.
+    Parked,
+    /// No ACK within `PARK_TIMEOUT`: the local sink is the default until
+    /// the next take's ACK or the hold's end.
+    FallenBack,
+}
+
 /// Why an ownership request was sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cause {
@@ -349,6 +369,11 @@ pub(crate) struct Handoff {
     remote_owns: bool,
     /// The last `HoldA2dp` emitted; None until a session start emits one.
     held: Option<bool>,
+    /// Report the park state (#311).
+    park_sink: bool,
+    park: Park,
+    /// While parked: `PARK_TIMEOUT` after the last play edge.
+    park_until: Option<Instant>,
     /// Linux's audio category in the last playback sample since the
     /// baseline (#272). A local fact: a reset keeps it.
     category: u32,
@@ -413,6 +438,9 @@ impl Handoff {
             a2dp_hold: false,
             remote_owns: false,
             held: None,
+            park_sink: false,
+            park: Park::Local,
+            park_until: None,
             category: AUDIO_CATEGORY_IDLE,
             relays: HashMap::new(),
             category_relay: false,
@@ -434,6 +462,19 @@ impl Handoff {
     pub(crate) fn with_a2dp_hold(mut self, enabled: bool) -> Self {
         self.a2dp_hold = enabled;
         self
+    }
+
+    /// Park new playback while the A2DP hold is on (#311), reported by
+    /// `park`; off by default.
+    pub(crate) fn with_park_sink(mut self, enabled: bool) -> Self {
+        self.park_sink = enabled;
+        self
+    }
+
+    /// Where new playback goes (#311); always `Local` without
+    /// `with_park_sink`.
+    pub(crate) fn park(&self) -> Park {
+        self.park
     }
 
     /// Route the default sink to the AirPods on a take's ACK and away on
@@ -529,7 +570,27 @@ impl Handoff {
         {
             self.finish_quit(now, &mut out);
         }
+        self.update_park();
         out
+    }
+
+    /// Park once the hold is on, Linux plays nothing and has no call; end a
+    /// park or a fallback when the hold ends (#311). A take's ACK has
+    /// already unparked to the AirPods.
+    fn update_park(&mut self) {
+        let held = self.held == Some(true);
+        let idle = self.category <= AUDIO_CATEGORY_IDLE && !self.local_call;
+        self.park = match self.park {
+            Park::Parked | Park::FallenBack if !held => Park::Local,
+            Park::Local | Park::AirPods if self.park_sink && held && idle => {
+                self.say("PARK new playback waits on the silent park sink while another host owns");
+                Park::Parked
+            }
+            park => park,
+        };
+        if self.park != Park::Parked {
+            self.park_until = None;
+        }
     }
 
     fn say(&mut self, line: impl Into<String>) {
@@ -840,6 +901,11 @@ impl Handoff {
         // already played when #324's take connected.
         let resume_deferred = (fresh_play || (playing && previous.is_none()))
             && std::mem::take(&mut self.resume_deferred);
+        // Every play edge while parked, taken or skipped, gets its ACK or
+        // falls back within `PARK_TIMEOUT` (#311).
+        if self.park == Park::Parked && (fresh_play || (playing && previous.is_none())) {
+            self.park_until = Some(now + PARK_TIMEOUT);
+        }
         if !self.automatic {
             return;
         }
@@ -1045,6 +1111,10 @@ impl Handoff {
         self.hold_if_remote_source(out);
         // The take holds unless the reconcile just released it.
         let held = pending.desired && self.live() && self.requested_take && self.pending.is_none();
+        // Parked playback follows the default to the AirPods (#311).
+        if held && matches!(self.park, Park::Parked | Park::FallenBack) {
+            self.park = Park::AirPods;
+        }
         // Before the resume, so its audible check finds the stream on the
         // AirPods sink (#40).
         if held && self.default_sink_routing {
@@ -1296,6 +1366,10 @@ impl Handoff {
     }
 
     fn tick(&mut self, now: Instant, out: &mut Vec<Command>) {
+        if self.park == Park::Parked && self.park_until.is_some_and(|end| now >= end) {
+            self.park = Park::FallenBack;
+            self.say("PARK no ACK within the park timeout; new playback goes to the local output");
+        }
         if !self.connected
             && !self.reconnecting
             && self.recovery != CaseRecovery::WaitingForPlayback
@@ -6350,5 +6424,197 @@ mod tests {
         // The core's own category is the aggregate: 301 is no rise.
         let out = p.play_source(200, AUDIO_CATEGORY_MEDIA, None);
         assert!(!out.contains(&SendOwnership(true)), "{out:?}");
+    }
+
+    // #311: the park sink.
+
+    /// `hold_ready(true)` with the park on.
+    fn park_ready() -> Probe {
+        let mut p = hold_ready(true);
+        p.core = p.core.with_park_sink(true);
+        assert_eq!(p.core.park(), Park::Local);
+        p
+    }
+
+    /// `park_ready`, held by another host's request while idle: parked.
+    fn parked() -> Probe {
+        let mut p = park_ready();
+        assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+        assert_eq!(p.core.park(), Park::Parked);
+        p
+    }
+
+    /// Ticks up to `ms` - 1 keep the park; the one at `ms` falls back.
+    fn park_falls_back_at(p: &mut Probe, ms: u64) {
+        for at in (ms - 200..ms).step_by(100) {
+            assert_eq!(p.feed(at, Input::Tick), []);
+            assert_eq!(p.core.park(), Park::Parked, "{at}");
+        }
+        assert_eq!(p.feed(ms - 1, Input::Tick), []);
+        assert_eq!(p.core.park(), Park::Parked);
+        assert_eq!(p.feed(ms, Input::Tick), []);
+        assert_eq!(p.core.park(), Park::FallenBack);
+    }
+
+    #[test]
+    fn park_yield_while_playing_waits_for_an_idle_sample() {
+        let mut p = park_ready();
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), [RouteToAirPods]);
+        assert_eq!(
+            p.feed(1100, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway, HoldA2dp(true)]
+        );
+        // A game that can't pause keeps playing on the local output.
+        assert_eq!(p.core.park(), Park::Local);
+        assert_eq!(p.play(1500, true), []);
+        assert_eq!(p.core.park(), Park::Local);
+        assert_eq!(p.play(2000, false), []);
+        assert_eq!(p.core.park(), Park::Parked);
+    }
+
+    #[test]
+    fn park_waits_for_the_local_call_to_end() {
+        let mut p = park_ready();
+        assert_eq!(p.feed(50, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+        assert_eq!(p.core.park(), Park::Local);
+        assert_eq!(p.feed(200, Input::LocalCall(false)), [AdvertiseCall(false)]);
+        assert_eq!(p.core.park(), Park::Parked);
+    }
+
+    #[test]
+    fn park_never_without_park_sink() {
+        let mut p = hold_ready(true);
+        assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+        assert_eq!(p.play(500, true), [SendOwnership(true)]);
+        for ms in (600..10_000).step_by(100) {
+            p.feed(ms, Input::Tick);
+            assert_eq!(p.core.park(), Park::Local, "{ms}");
+        }
+    }
+
+    #[test]
+    fn park_take_request_falls_back_at_the_timeout() {
+        let mut p = parked();
+        assert_eq!(p.play(1000, true), [SendOwnership(true)]);
+        assert_eq!(p.feed(2800, Input::Tick), []);
+        assert_eq!(p.core.park(), Park::Parked, "1.8 s");
+        park_falls_back_at(&mut p, 3000);
+        // The fallback stays through a stop: no new park until the hold ends.
+        assert_eq!(p.play(3500, false), []);
+        assert_eq!(p.core.park(), Park::FallenBack);
+    }
+
+    #[test]
+    fn park_category_skip_falls_back_at_the_timeout() {
+        let mut p = park_ready();
+        assert_eq!(p.feed(100, remote_media()), [HoldA2dp(true)]);
+        assert_eq!(p.core.park(), Park::Parked);
+        assert_eq!(p.play(1000, true), []);
+        assert!(
+            p.core
+                .take_lines()
+                .iter()
+                .any(|l| l.starts_with("AUTO takeover skipped: the audio source's category"))
+        );
+        park_falls_back_at(&mut p, 3000);
+    }
+
+    #[test]
+    fn park_connect_mode_skip_falls_back_at_the_timeout() {
+        let mut p = parked();
+        p.core.connect_mode = ConnectMode::WhenLastConnected;
+        assert_eq!(p.play(1000, true), []);
+        assert!(p.core.take_lines().iter().any(|l| l == CONNECT_MODE_SKIP));
+        park_falls_back_at(&mut p, 3000);
+    }
+
+    #[test]
+    fn park_every_play_edge_restarts_the_timeout() {
+        let mut p = parked();
+        p.core.connect_mode = ConnectMode::WhenLastConnected;
+        assert_eq!(p.play(1000, true), []);
+        assert_eq!(p.play(1500, false), []);
+        assert_eq!(p.play(2000, true), []);
+        assert_eq!(p.feed(3000, Input::Tick), []);
+        assert_eq!(p.core.park(), Park::Parked, "the first edge's deadline");
+        park_falls_back_at(&mut p, 4000);
+    }
+
+    #[test]
+    fn park_ack_unparks_to_the_airpods_with_the_route() {
+        let mut p = parked();
+        assert_eq!(p.feed(200, idle_transport()), []);
+        assert_eq!(p.play(1000, true), [SendOwnership(true)]);
+        assert_eq!(
+            p.feed(1500, Input::Ownership(vec![1])),
+            [HoldA2dp(false), RouteToAirPods, ResumeA2dp]
+        );
+        assert_eq!(p.core.park(), Park::AirPods);
+        // A later yield parks again once Linux is idle.
+        assert_eq!(p.play(2000, false), []);
+        assert_eq!(
+            p.feed(2500, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway, HoldA2dp(true)]
+        );
+        assert_eq!(p.core.park(), Park::Parked);
+    }
+
+    #[test]
+    fn park_ack_after_the_fallback_unparks_to_the_airpods() {
+        let mut p = parked();
+        assert_eq!(p.play(1000, true), [SendOwnership(true)]);
+        park_falls_back_at(&mut p, 3000);
+        assert_eq!(
+            p.feed(3500, Input::Ownership(vec![1])),
+            [HoldA2dp(false), RouteToAirPods]
+        );
+        assert_eq!(p.core.park(), Park::AirPods);
+    }
+
+    #[test]
+    fn park_refusal_falls_back_at_the_timeout() {
+        let mut p = parked();
+        assert_eq!(p.play(1000, true), [SendOwnership(true)]);
+        assert_eq!(
+            p.feed(1200, Input::Ownership(vec![0])),
+            [PauseMedia, RouteAway]
+        );
+        park_falls_back_at(&mut p, 3000);
+    }
+
+    #[test]
+    fn park_disconnected_unparks_to_local() {
+        let mut p = parked();
+        assert_eq!(
+            p.feed(200, Input::Disconnected),
+            [HoldA2dp(false), DropSession]
+        );
+        assert_eq!(p.core.park(), Park::Local);
+        // So does a fallback.
+        let mut p = parked();
+        assert_eq!(p.play(1000, true), [SendOwnership(true)]);
+        park_falls_back_at(&mut p, 3000);
+        p.feed(3100, Input::Disconnected);
+        assert_eq!(p.core.park(), Park::Local);
+    }
+
+    #[test]
+    fn park_quit_unparks_to_local() {
+        let mut p = parked();
+        assert_eq!(p.feed(200, Input::Quit), [HoldA2dp(false), Exit]);
+        assert_eq!(p.core.park(), Park::Local);
+    }
+
+    #[test]
+    fn park_only_linux_listed_unparks_to_local() {
+        let mut p = parked();
+        let only_linux = Input::ConnectedDevices {
+            old: two_hosts(),
+            new: vec![host(LOCAL)],
+        };
+        assert_eq!(p.feed(200, only_linux), [HoldA2dp(false)]);
+        assert_eq!(p.core.park(), Park::Local);
     }
 }
