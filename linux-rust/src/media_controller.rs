@@ -1170,8 +1170,6 @@ impl MediaController {
             } else if !old_all_out {
                 debug!("Pausing media as buds are not fully in ear");
                 let was_playing = self.state.lock().await.is_playing;
-                // Counted before the pause, so the A2DP resume never sees it uncounted.
-                self.self_pauses.fetch_add(1, Ordering::SeqCst);
                 let outcome = self.pause_with(pause_players).await;
                 self.state.lock().await.i_paused_the_media |=
                     removal_self_paused || marks_self_pause(outcome, was_playing);
@@ -1453,6 +1451,8 @@ impl MediaController {
         F: FnOnce() -> (Vec<String>, PauseOutcome) + Send + 'static,
     {
         debug!("Pausing playback");
+        // Counted before the pause, so the A2DP resume never sees it uncounted.
+        self.self_pauses.fetch_add(1, Ordering::SeqCst);
 
         let (paused_services, outcome) = tokio::task::spawn_blocking(pause_players).await.unwrap();
 
@@ -3069,6 +3069,24 @@ mod tests {
         let state = controller.state.lock().await;
         assert!(state.i_paused_the_media);
         assert_eq!(state.paused_by_app_services, vec![player.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ear_removal_counts_each_pause_before_it_runs() {
+        use EarDetectionStatus::*;
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.disconnect_when_not_wearing = false;
+        let counts = Arc::new(StdMutex::new(Vec::new()));
+        let (seen, pauses) = (counts.clone(), controller.self_pauses.clone());
+        let pauser = move || {
+            seen.lock().unwrap().push(pauses.load(Ordering::SeqCst));
+            (vec![], PauseOutcome::default())
+        };
+        controller
+            .handle_ear_detection_with(vec![InEar, InEar], vec![OutOfEar, OutOfEar], pauser)
+            .await;
+        // Both buds out pauses twice; each pause sees itself counted.
+        assert_eq!(*counts.lock().unwrap(), vec![1, 2]);
     }
 
     #[tokio::test]
