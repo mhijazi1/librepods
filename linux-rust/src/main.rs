@@ -345,6 +345,8 @@ async fn async_main(
             return true;
         };
         let proxy = conn.with_proxy("org.bluez", path, std::time::Duration::from_millis(5000));
+        // shortcut: a failed UUIDs/Address read on Connected=true returns before
+        // reconnect::device_connected, so the next drop's record_drop is a no-op (#408)
         let Ok(uuids) = proxy.get::<Vec<String>>("org.bluez.Device1", "UUIDs") else {
             return true;
         };
