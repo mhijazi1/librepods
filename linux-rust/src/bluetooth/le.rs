@@ -18,8 +18,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Bounds one auto-connect, like the watcher's connect in reconnect.rs.
-const LE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The least spacing before a failed auto-connect to the same AirPods is retried.
 const LE_CONNECT_RETRY: Duration = crate::reconnect::RECONNECT_BACKOFF_MIN;
 
@@ -69,34 +67,29 @@ fn try_start(
 }
 
 // bluetoothctl, as bluer's connect doesn't work here.
-// Duplicates reconnect.rs's `Bluez::connect` (#417).
 async fn le_connect(mac: &str) -> ConnectOutcome {
-    let command = tokio::process::Command::new("bluetoothctl")
-        .arg("connect")
-        .arg(mac)
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(LE_CONNECT_TIMEOUT, command).await {
-        Ok(Ok(output)) if output.status.success() => {
+    use crate::reconnect::Bluetoothctl;
+    match crate::reconnect::bluetoothctl_connect(mac).await {
+        Bluetoothctl::Connected => {
             info!("Successfully connected to AirPods {}", mac);
             ConnectOutcome::Connected
         }
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        Bluetoothctl::Failed { stderr, .. } => {
             info!("Failed to connect to AirPods {}: {}", mac, stderr);
             ConnectOutcome::Failed
         }
-        Ok(Err(e)) => {
+        Bluetoothctl::SpawnError(e) => {
             info!(
                 "Failed to execute bluetoothctl to connect to AirPods {}: {}",
                 mac, e
             );
             ConnectOutcome::SpawnError
         }
-        Err(_elapsed) => {
+        Bluetoothctl::TimedOut => {
             info!(
                 "bluetoothctl connect to AirPods {} timed out after {:?}",
-                mac, LE_CONNECT_TIMEOUT
+                mac,
+                crate::reconnect::CONNECT_TIMEOUT
             );
             ConnectOutcome::TimedOut
         }

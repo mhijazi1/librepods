@@ -38,7 +38,7 @@ pub(crate) const RECONNECT_TAKE_WINDOW: Duration = Duration::from_secs(15);
 /// How long that task waits for hosts, ears and an audio source.
 pub(crate) const ROUTING_READY_WAIT: Duration = Duration::from_secs(5);
 /// Bounds one `bluetoothctl connect`, so the guard le.rs shares is released.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// BlueZ's `Device1.Disconnected` reason: only `Remote` is host-driven.
 pub(crate) fn drop_cause(reason: Option<&str>) -> bool {
@@ -396,6 +396,47 @@ impl Drop for ConnectGuard {
     }
 }
 
+/// How one `bluetoothctl connect` ended.
+pub(crate) enum Bluetoothctl {
+    Connected,
+    Failed { stdout: String, stderr: String },
+    SpawnError(std::io::Error),
+    TimedOut,
+}
+
+/// `bluetoothctl connect <mac>`, bounded by `CONNECT_TIMEOUT`; bluer's connect
+/// doesn't work here. Shared by the watcher and le.rs's auto-connect.
+pub(crate) async fn bluetoothctl_connect(mac: &str) -> Bluetoothctl {
+    let command = tokio::process::Command::new("bluetoothctl")
+        .arg("connect")
+        .arg(mac)
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(CONNECT_TIMEOUT, command).await {
+        Ok(Ok(output)) if output.status.success() => Bluetoothctl::Connected,
+        Ok(Ok(output)) => Bluetoothctl::Failed {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Ok(Err(e)) => Bluetoothctl::SpawnError(e),
+        Err(_elapsed) => Bluetoothctl::TimedOut,
+    }
+}
+
+/// `Bluez::connect`'s result for one `bluetoothctl connect`.
+fn bluetoothctl_result(outcome: Bluetoothctl) -> Result<(), String> {
+    match outcome {
+        Bluetoothctl::Connected => Ok(()),
+        Bluetoothctl::Failed { stdout, stderr } => {
+            Err(format!("{} {}", stdout.trim(), stderr.trim())
+                .trim()
+                .to_string())
+        }
+        Bluetoothctl::SpawnError(e) => Err(format!("failed to run bluetoothctl: {e}")),
+        Bluetoothctl::TimedOut => Err("bluetoothctl connect timed out".to_string()),
+    }
+}
+
 /// The watcher's playback samples: Linux's audio category.
 pub(crate) trait Samples: Send + 'static {
     fn next(&mut self) -> impl Future<Output = Option<u32>> + Send;
@@ -441,25 +482,8 @@ impl Connector for Bluez {
         .unwrap_or(false)
     }
 
-    // bluetoothctl, like le.rs: bluer's connect doesn't work there.
     async fn connect(&self, mac: &str) -> Result<(), String> {
-        let command = tokio::process::Command::new("bluetoothctl")
-            .arg("connect")
-            .arg(mac)
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(CONNECT_TIMEOUT, command)
-            .await
-            .map_err(|_| "bluetoothctl connect timed out".to_string())?
-            .map_err(|e| format!("failed to run bluetoothctl: {e}"))?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("{} {}", stdout.trim(), stderr.trim())
-            .trim()
-            .to_string())
+        bluetoothctl_result(bluetoothctl_connect(mac).await)
     }
 
     fn mode(&self, _: &str) -> SwitchingMode {
@@ -634,6 +658,59 @@ mod tests {
 
     fn waits(facts: Facts) -> bool {
         matches!(decide(&facts), Decision::Wait(_))
+    }
+
+    fn failed(stdout: &str, stderr: &str) -> Bluetoothctl {
+        Bluetoothctl::Failed {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    #[test]
+    fn reconnect_bluetoothctl_connected_is_ok() {
+        assert_eq!(bluetoothctl_result(Bluetoothctl::Connected), Ok(()));
+    }
+
+    #[test]
+    fn reconnect_bluetoothctl_timed_out() {
+        assert_eq!(
+            bluetoothctl_result(Bluetoothctl::TimedOut),
+            Err("bluetoothctl connect timed out".to_string())
+        );
+    }
+
+    #[test]
+    fn reconnect_bluetoothctl_spawn_error() {
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        assert_eq!(
+            bluetoothctl_result(Bluetoothctl::SpawnError(e)),
+            Err("failed to run bluetoothctl: no such file".to_string())
+        );
+    }
+
+    #[test]
+    fn reconnect_bluetoothctl_failed_joins_trimmed_streams() {
+        assert_eq!(
+            bluetoothctl_result(failed(" Attempting to connect\n", "\nFailed to connect \n")),
+            Err("Attempting to connect Failed to connect".to_string())
+        );
+    }
+
+    #[test]
+    fn reconnect_bluetoothctl_failed_empty_stdout() {
+        assert_eq!(
+            bluetoothctl_result(failed("", "Device not available\n")),
+            Err("Device not available".to_string())
+        );
+    }
+
+    #[test]
+    fn reconnect_bluetoothctl_failed_empty_stderr() {
+        assert_eq!(
+            bluetoothctl_result(failed("Failed to connect\n", "")),
+            Err("Failed to connect".to_string())
+        );
     }
 
     #[test]
