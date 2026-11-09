@@ -474,8 +474,8 @@ async fn replay_self_pauses(
     // A read due by the guard's end may run into the next interval, and see
     // a pause made after the guard.
     let read_end = guard_end + SELF_PAUSE_READ;
-    // LibrePods counts a pause before making it, so the counts are read
-    // after the Paused read that might see it.
+    // LibrePods counts a pause before making it, so the plays loop reads
+    // the counts after the Paused read that might see it.
     let cannot_play = || {
         let (started, done) = pause_counts(io);
         started != done || (started, done) != pauses || clock() + PLAY_EDGE_MARGIN >= until
@@ -1705,7 +1705,7 @@ mod tests {
 
         fn self_pauses_done(&self) -> usize {
             let unfinished = self.take.unfinished.is_some_and(|at| !self.past(at));
-            self.self_pauses() - usize::from(unfinished)
+            self.self_pauses().saturating_sub(usize::from(unfinished))
         }
     }
 
@@ -2035,9 +2035,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn in_flight_librepods_pause_at_the_take_is_never_undone() {
         // Q pauses at 100 ms, the 250 ms read sees it; the ear-removal pause
-        // in flight at the take finishes at 200 ms (a), or never (b).
-        for unfinished in [ms(200), Duration::MAX] {
+        // in flight at the take finishes at 200 ms, or never. With a 100 ms
+        // route it has finished by the first read: counts (1, 1) against the
+        // take's (1, 0).
+        for (route, unfinished) in [(ms(0), ms(200)), (ms(0), Duration::MAX), (ms(100), ms(0))] {
             let acted = take(Take {
+                route,
                 count: 1,
                 unfinished: Some(unfinished),
                 ..self_paused(&[100])
@@ -2045,7 +2048,7 @@ mod tests {
             .await;
             assert!(
                 !acted.iter().any(|(_, a)| matches!(a, Play(_))),
-                "{unfinished:?}: {acted:?}"
+                "{route:?} {unfinished:?}: {acted:?}"
             );
         }
     }
