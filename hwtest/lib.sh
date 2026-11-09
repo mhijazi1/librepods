@@ -295,7 +295,7 @@ quiesce() {
   done
   return 1
 }
-owner_now() { grep 'OwnsConnection, value' "$OUT/app.log" | tail -1 | sed -n 's/.*value: \(..\).*/\1/p' | sed 's/01/linux/; s/00/other/'; }
+owner_now() { grep 'Received Control Command: OwnsConnection, value' "$OUT/app.log" | tail -1 | sed -n 's/.*value: \(..\).*/\1/p' | sed 's/01/linux/; s/00/other/'; }
 
 # ---------- the Mac ----------
 mac_ssh() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$MAC_SSH" "$@"; }
