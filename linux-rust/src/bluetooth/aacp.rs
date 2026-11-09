@@ -1219,20 +1219,24 @@ fn opack_write_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(bytes);
 }
 
-// Unsigned integer: 0x08+n for 0..=39, then 0x30 <u8>, 0x31 <u16 LE> and
-// 0x32 <u32 LE>.
+// Non-negative integer. OPACK ints are signed (Apple reads `30 c9` as -55):
+// 0x08+n for 0..=39, then the narrowest of 0x30 <i8>, 0x31 <i16 LE>,
+// 0x32 <i32 LE> and 0x33 <i64 LE>.
 fn opack_write_uint(out: &mut Vec<u8>, n: u32) {
     if n <= 39 {
         out.push(0x08 + n as u8);
-    } else if n <= 0xFF {
+    } else if let Ok(n) = i8::try_from(n) {
         out.push(0x30);
-        out.push(n as u8);
-    } else if n <= 0xFFFF {
+        out.extend_from_slice(&n.to_le_bytes());
+    } else if let Ok(n) = i16::try_from(n) {
         out.push(0x31);
-        out.extend_from_slice(&(n as u16).to_le_bytes());
-    } else {
+        out.extend_from_slice(&n.to_le_bytes());
+    } else if let Ok(n) = i32::try_from(n) {
         out.push(0x32);
         out.extend_from_slice(&n.to_le_bytes());
+    } else {
+        out.push(0x33);
+        out.extend_from_slice(&i64::from(n).to_le_bytes());
     }
 }
 
@@ -1723,9 +1727,18 @@ fn opack_read(buf: &[u8], pos: usize) -> Option<(Opack<'_>, usize)> {
     match tag {
         0x01 | 0x02 | 0xA0..=0xBF => Some((Opack::Other, pos + 1)),
         0x08..=0x2F => Some((Opack::Uint(u32::from(tag - 0x08)), pos + 1)),
-        0x30..=0x32 => {
+        0x30..=0x33 => {
+            // Signed LE int: start from the sign fill, then shift in each byte.
             let width = 1 << (tag - 0x30);
-            Some((Opack::Uint(le(pos + 1, width)?), pos + 1 + width))
+            let bytes = buf.get(pos + 1..pos + 1 + width)?;
+            let fill = i64::from(bytes[width - 1] as i8 >> 7);
+            let n = bytes
+                .iter()
+                .rev()
+                .fold(fill, |n, &b| (n << 8) | i64::from(b));
+            // A negative or over-u32 category/score is never valid.
+            let value = u32::try_from(n).map_or(Opack::Other, Opack::Uint);
+            Some((value, pos + 1 + width))
         }
         0x40..=0x60 => string(pos + 1, u32::from(tag - 0x40)),
         0x61..=0x64 => {
@@ -2198,9 +2211,9 @@ mod tests {
     fn golden_encode_media_information_category_201() {
         let packet = encode_media_information_category(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, 201)
             .expect("encode_media_information_category");
-        // "...Category" then OPACK u8 201.
+        // "...Category" then OPACK i16 201, as Apple's own relay sends it.
         assert!(
-            packet.ends_with(&[0x6f, 0x72, 0x79, 0x30, 0xc9]),
+            packet.ends_with(&[0x6f, 0x72, 0x79, 0x31, 0xc9, 0x00]),
             "{packet:02x?}"
         );
         assert_eq!(
@@ -2339,15 +2352,13 @@ mod tests {
 
     #[test]
     fn opack_value_writer_boundaries() {
-        // Ints: 0x08+n up to 39, then 0x30 <u8>, 0x31 <u16 LE>, 0x32 <u32 LE>.
-        assert_eq!(opack_uint(0), [0x08]);
-        assert_eq!(opack_uint(39), [0x2F]);
-        assert_eq!(opack_uint(40), [0x30, 0x28]);
+        // Ints: 0x08+n up to 39, then signed 0x30 <i8>, 0x31 <i16 LE>,
+        // 0x32 <i32 LE>, 0x33 <i64 LE>.
+        for (n, bytes) in OPACK_INT_CASES {
+            assert_eq!(opack_uint(*n), *bytes, "{n}");
+        }
         assert_eq!(opack_uint(46), [0x30, 0x2E]);
-        assert_eq!(opack_uint(255), [0x30, 0xFF]);
         assert_eq!(opack_uint(256), [0x31, 0x00, 0x01]);
-        assert_eq!(opack_uint(301), [0x31, 0x2D, 0x01]);
-        assert_eq!(opack_uint(65535), [0x31, 0xFF, 0xFF]);
         assert_eq!(opack_uint(65536), [0x32, 0x00, 0x00, 0x01, 0x00]);
         assert_eq!(opack_uint(952696833), [0x32, 0x01, 0x00, 0xC9, 0x38]);
 
@@ -2368,6 +2379,66 @@ mod tests {
         let mut t = Vec::new();
         opack_write_true(&mut t);
         assert_eq!(t, [0x01]);
+    }
+
+    // Each signed-width boundary and Apple's categories, with their bytes.
+    const OPACK_INT_CASES: &[(u32, &[u8])] = &[
+        (0, &[0x08]),
+        (39, &[0x2F]),
+        (40, &[0x30, 0x28]),
+        (127, &[0x30, 0x7F]),
+        (128, &[0x31, 0x80, 0x00]),
+        (201, &[0x31, 0xC9, 0x00]),
+        (255, &[0x31, 0xFF, 0x00]),
+        (301, &[0x31, 0x2D, 0x01]),
+        (501, &[0x31, 0xF5, 0x01]),
+        (32767, &[0x31, 0xFF, 0x7F]),
+        (32768, &[0x32, 0x00, 0x80, 0x00, 0x00]),
+        (65535, &[0x32, 0xFF, 0xFF, 0x00, 0x00]),
+        (2147483647, &[0x32, 0xFF, 0xFF, 0xFF, 0x7F]),
+        (
+            2147483648,
+            &[0x33, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00],
+        ),
+        (
+            4294967295,
+            &[0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00],
+        ),
+    ];
+
+    #[test]
+    fn opack_read_int_round_trip() {
+        for (n, bytes) in OPACK_INT_CASES {
+            let enc = opack_uint(*n);
+            assert!(
+                matches!(opack_read(&enc, 0), Some((Opack::Uint(m), end)) if m == *n && end == bytes.len()),
+                "{n}"
+            );
+            assert_eq!(opack_walk(&enc, 0), Ok(enc.len()), "{n}");
+        }
+    }
+
+    #[test]
+    fn opack_read_signed_ints() {
+        let uint = |bytes: &[u8]| match opack_read(bytes, 0) {
+            Some((Opack::Uint(n), end)) => Some((Some(n), end)),
+            Some((_, end)) => Some((None, end)),
+            None => None,
+        };
+        assert_eq!(uint(&[0x31, 0xC9, 0x00]), Some((Some(201), 3)));
+        assert_eq!(uint(&[0x30, 0x7F]), Some((Some(127), 2)));
+        // Negative values are not categories: -55, -1 (i32) and -1 (i64).
+        assert_eq!(uint(&[0x30, 0xC9]), Some((None, 2)));
+        assert_eq!(uint(&[0x32, 0xFF, 0xFF, 0xFF, 0xFF]), Some((None, 5)));
+        assert_eq!(
+            uint(&[0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Some((None, 9))
+        );
+        // Above u32::MAX: valid OPACK, not a category.
+        assert_eq!(uint(&[0x33, 0, 0, 0, 0, 1, 0, 0, 0]), Some((None, 9)));
+        // Truncated ints.
+        assert_eq!(uint(&[0x31, 0xC9]), None);
+        assert_eq!(uint(&[0x33, 0, 0, 0, 0, 0, 0, 0]), None);
     }
 
     #[test]
@@ -2588,7 +2659,7 @@ mod tests {
 
     // Test-only OPACK walker. Returns the offset just past the object that
     // starts at `pos`, or an error for an unknown tag or a truncated value.
-    // Handles bools 0x01/0x02, ints 0x08-0x2F and 0x30/0x31/0x32, strings
+    // Handles bools 0x01/0x02, ints 0x08-0x2F and 0x30-0x33, strings
     // 0x40-0x60, 0x61 <u8 len>, 0x62 <u16 len>, 0x63 <u24 len> and 0x64 <u32
     // len>, back-references 0xA0-0xBF and dicts
     // 0xE0-0xEE (0xEF: until 0x03). Dict keys must be strings.
@@ -2625,6 +2696,7 @@ mod tests {
             0x30 => take(pos + 1, 1),
             0x31 => take(pos + 1, 2),
             0x32 => take(pos + 1, 4),
+            0x33 => take(pos + 1, 8),
             0x40..=0x60 => string(pos + 1, (tag - 0x40) as usize),
             0x61 => {
                 let n = *buf
