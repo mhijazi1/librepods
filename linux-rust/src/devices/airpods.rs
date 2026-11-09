@@ -13,7 +13,6 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
@@ -79,23 +78,15 @@ impl AirPodsDevice {
                 .await;
         }
 
-        info!("Sending handshake");
-        if let Err(e) = aacp_manager.send_handshake().await {
-            error!("Failed to send handshake to AirPods device: {}", e);
-        }
+        // Attach before initialize(): it returns only after the first
+        // ConnectedDevices/EarDetection report is stored, and those reports
+        // must still become events (#286). They queue until dispatch_events.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stored_battery = aacp_manager.attach_event_channel(tx).await;
 
-        sleep(Duration::from_millis(300)).await;
-
-        info!("Setting feature flags");
-        if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
-            error!("Failed to set feature flags: {}", e);
-        }
-
-        sleep(Duration::from_millis(300)).await;
-
-        info!("Requesting notifications");
-        if let Err(e) = aacp_manager.send_notification_request().await {
-            error!("Failed to request notifications: {}", e);
+        info!("Initializing AACP session");
+        if let Err(e) = aacp_manager.initialize().await {
+            error!("Failed to initialize AACP session: {}", e);
         }
 
         info!("sending some packet");
@@ -153,22 +144,21 @@ impl AirPodsDevice {
         let (media_controller, handoff_media) =
             device_media(mac_address.to_string(), local_mac.clone());
         let mc_clone = media_controller.clone();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let stored_battery = aacp_manager.attach_event_channel(tx).await;
         if let Some(handle) = &tray_handle {
             handle
                 .update(|tray: &mut MyTray| tray.command_tx = Some(command_tx.clone()))
                 .await;
         }
 
-        // A BATTERY_INFO answering the notification request above can land
-        // before the channel was attached; its event is then lost and the
-        // tray and desktop export would stay empty until the next change
-        // (#75). Seed both from the stored report through the same paths as
-        // the event arm, before dispatch_events starts the handlers, so every
-        // queued event is applied after the seed. The window seeds itself
+        // The channel is attached before initialize() sends any request, but
+        // a BATTERY_INFO that arrives between connect() and the attach is
+        // stored without an event, and the tray and desktop export would stay
+        // empty until the next change (#75). Seed both from the stored report
+        // (the snapshot attach_event_channel returned above) through the same
+        // paths as the event arm, before dispatch_events starts the handlers,
+        // so every queued event is applied after the seed. The window seeds itself
         // from state.battery_info. attach_event_channel takes the snapshot
         // under the same lock that attaches the channel (#92), so each report
         // is either in the seed (before the attach) or queued (after), never
