@@ -419,8 +419,10 @@ const A2DP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Longest a connect cut by `A2DP_CONNECT_TIMEOUT` or the activation deadline
 /// is followed for a late reply (#316): bluer's 120 s D-Bus reply timeout,
-/// then the card re-lookup, with slack for the sound-server queries. Assumes
-/// BlueZ brings no card after bluer's timeout. A write started runs to its end.
+/// the found-signal wait (the waiter's card re-lookup), the `a2dp_held` flag
+/// watch window, then the held re-lookup, with slack for the sound-server
+/// queries. Assumes BlueZ brings no card after bluer's timeout. A write
+/// started runs to its end.
 const A2DP_LATE_CONNECT_BOUND: Duration = Duration::from_secs(150);
 
 /// Card lookups after the A2DP profile connect: the card can trail BlueZ's
@@ -5563,7 +5565,9 @@ mod tests {
     async fn late_connect_task_ends_at_bound() {
         let bluer_timeout = Duration::from_secs(120);
         let lookup = card_lookup_max_wait(A2DP_CONNECT_LOOKUP_ATTEMPTS);
-        assert!(A2DP_LATE_CONNECT_BOUND >= bluer_timeout + lookup);
+        let flag_window = CARD_LOOKUP_INTERVAL * A2DP_CONNECT_LOOKUP_ATTEMPTS;
+        // Reply, then the waiter's re-lookup (found), flag watch, held re-lookup.
+        assert!(A2DP_LATE_CONNECT_BOUND >= bluer_timeout + lookup + flag_window + lookup);
         let controller = MediaController::new(String::new(), String::new());
         controller.set_a2dp_held(true);
         let never = Duration::from_secs(3600);
