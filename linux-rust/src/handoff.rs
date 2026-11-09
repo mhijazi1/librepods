@@ -308,6 +308,10 @@ pub(crate) struct Handoff {
     /// clears it.
     resume_deferred: bool,
     recovery: CaseRecovery,
+    /// The highest category of the plays that asked for the case reconnect
+    /// (#421): a new source's own, else the aggregate. A withdrawal and the
+    /// reconnect clear it.
+    requested_category: Option<u32>,
     case_closed: bool,
     /// Playback stopped while a take was pending: its ACK defers the A2DP
     /// resume.
@@ -391,6 +395,7 @@ impl Handoff {
             } else {
                 CaseRecovery::WaitingForPlayback
             },
+            requested_category: None,
             case_closed: false,
             stop_during_take: false,
             play_during_release: None,
@@ -760,7 +765,7 @@ impl Handoff {
                 if self.pending.is_some() {
                     self.say("WAIT ownership request pending");
                 } else {
-                    match self.decide_take(TakeoverTrigger::Manual).action {
+                    match self.decide_take(TakeoverTrigger::Manual, self.category).action {
                         TakeoverAction::TakeOver => {
                             self.request(now, true, Cause::User, out);
                             self.say("REQUEST owner=linux");
@@ -816,10 +821,9 @@ impl Handoff {
         // start (#272), unless Linux already holds one.
         let rose = previous == Some(true) && category > last_category && !self.requested_take;
         // A new source behind playback is a fresh request at its own
-        // category, not the aggregate's (#96); case recovery keeps edges only.
-        let behind = new_source.filter(|_| {
-            previous == Some(true) && playing && !rose && !self.requested_take && self.connected
-        });
+        // category, not the aggregate's (#96), also for case recovery (#421).
+        let behind = new_source
+            .filter(|_| previous == Some(true) && playing && !rose && !self.requested_take);
         let fresh_play = (previous == Some(false) && playing) || rose || behind.is_some();
         // Stop edges also count a take sent for playback before the
         // baseline: a stop during a reconnect take defers its resume (#205).
@@ -834,7 +838,12 @@ impl Handoff {
         }
         if !self.connected {
             self.recovery.playback(fresh_play, stopped);
+            if self.recovery == CaseRecovery::WaitingForPlayback {
+                self.requested_category = None;
+            }
             if fresh_play && self.recovery == CaseRecovery::PlaybackRequested {
+                let requested = Some(behind.unwrap_or(category));
+                self.requested_category = self.requested_category.max(requested);
                 self.retry_at = now;
                 self.say("AUTO new playback requested reconnection after case closure");
             }
@@ -1232,8 +1241,14 @@ impl Handoff {
         if self.automatic {
             self.announce(out);
         }
+        // The take asks at the play that requested it, capped at the
+        // aggregate (#421); a #307 core carries none.
+        let category = self
+            .requested_category
+            .take()
+            .map_or(self.category, |c| c.min(self.category));
         let took = match self
-            .decide_take(TakeoverTrigger::ReconnectedForPlayback)
+            .decide_take(TakeoverTrigger::ReconnectedForPlayback, category)
             .action
         {
             // Like an ordinary reconnect: no take, nothing pending.
@@ -1434,12 +1449,13 @@ impl Handoff {
             && !(self.local_call && self.requested_take)
     }
 
-    fn decide_take(&self, trigger: TakeoverTrigger) -> TakeoverDecision {
-        decide_takeover(TakeoverInputs::handoff(
-            trigger,
-            self.routing(),
-            self.recovery,
-        ))
+    /// A take's decision, Linux asking at `local_category`.
+    fn decide_take(&self, trigger: TakeoverTrigger, local_category: u32) -> TakeoverDecision {
+        let routing = RoutingSnapshot {
+            local_category,
+            ..self.routing()
+        };
+        decide_takeover(TakeoverInputs::handoff(trigger, routing, self.recovery))
     }
 
     /// A session start or reconnect may take from an idle other host, as the
@@ -5112,20 +5128,123 @@ mod tests {
         p.idle_ticks(2000);
     }
 
-    /// #96 leaves case recovery to edges: while disconnected with the case
-    /// closed, a new source behind playback requests no reconnection; a
-    /// rise does.
+    /// #421: while disconnected with the case closed, a new source behind
+    /// playback is new playback and requests the reconnection.
     #[test]
-    fn fresh_source_behind_playback_keeps_case_recovery() {
+    fn fresh_source_behind_playback_requests_case_reconnect() {
         let mut p = Probe::new(true, false);
         assert_eq!(p.play_category(10, STREAM), []);
-        assert_eq!(p.play_source(500, STREAM, Some(STREAM)), []);
         assert_eq!(p.core.take_lines(), Vec::<String>::new());
-        assert_eq!(p.play_source(1000, MEDIA, Some(MEDIA)), []);
+        assert_eq!(p.play_source(500, STREAM, Some(STREAM)), []);
         assert_eq!(
             p.core.take_lines(),
             ["AUTO new playback requested reconnection after case closure"]
         );
+        assert_eq!(p.feed(600, Input::Tick), [Reconnect { audio: true }]);
+    }
+
+    /// `Probe::ready` with the case closed, then disconnected at 100.
+    fn case_closed_disconnected() -> Probe {
+        let mut p = Probe::ready();
+        p.feed(20, Input::EarState(vec![InCase, InCase]));
+        assert_eq!(p.feed(100, Input::Disconnected), [DropSession]);
+        p.core.take_lines();
+        p
+    }
+
+    /// `ready_facts` with the other host playing media (301).
+    fn remote_media_facts() -> SessionFacts {
+        SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Media)),
+            ..ready_facts()
+        }
+    }
+
+    /// From `case_closed_disconnected`, the playback samples
+    /// `(category, new_source)` from 200 ms on, then the reconnect they
+    /// requested with `facts`: its commands and lines.
+    fn requested_reconnect(
+        samples: &[(u32, Option<u32>)],
+        facts: SessionFacts,
+    ) -> (Vec<Command>, Vec<String>) {
+        let mut p = case_closed_disconnected();
+        let mut ms = 200;
+        for &(category, new_source) in samples {
+            assert_eq!(p.play_source(ms, category, new_source), []);
+            ms += 500;
+        }
+        assert_eq!(p.feed(ms, Input::Tick), [Reconnect { audio: true }]);
+        p.core.take_lines();
+        let out = p.feed(ms + 100, Input::Reconnected(facts));
+        (out, p.core.take_lines())
+    }
+
+    /// #421 with #96 c4: the reconnect take compares at the behind source's
+    /// category, not the aggregate's.
+    #[test]
+    fn case_reconnect_takes_at_behind_source_category() {
+        let blocked =
+            "AUTO reconnected; takeover blocked by remote activity, wear, or missing host state";
+        // The aggregate falls to the stream source's 201, or stays at 301
+        // with the 201 source behind it.
+        for samples in [
+            [(MEDIA, None), (STREAM, Some(STREAM))],
+            [(MEDIA, None), (MEDIA, Some(STREAM))],
+        ] {
+            let (out, lines) = requested_reconnect(&samples, remote_media_facts());
+            assert_eq!(out, [AdoptSession, Announce, DrainPlayback], "{samples:?}");
+            assert!(lines.contains(&blocked.into()), "{lines:?}");
+            assert_eq!(
+                requested_reconnect(&samples, ready_facts()).0,
+                [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
+            );
+        }
+    }
+
+    /// #421: a start or rise counts as the aggregate, the highest request
+    /// wins, the aggregate caps it, and a withdrawal forgets it.
+    #[test]
+    fn case_reconnect_category_follows_requests() {
+        let takes = |samples: &[(u32, Option<u32>)]| {
+            requested_reconnect(samples, remote_media_facts())
+                .0
+                .contains(&SendOwnership(true))
+        };
+        // (a) A rise to 301 after a 201 source asked.
+        assert!(takes(&[
+            (STREAM, None),
+            (STREAM, Some(STREAM)),
+            (MEDIA, None)
+        ]));
+        // (b) A 301 source asked, then the aggregate fell to 201.
+        assert!(!takes(&[
+            (MEDIA, None),
+            (MEDIA, Some(MEDIA)),
+            (STREAM, None)
+        ]));
+        // (c) A 201 source asked, the stop withdrew it, a 301 start asked.
+        assert!(takes(&[
+            (STREAM, None),
+            (STREAM, Some(STREAM)),
+            (IDLE, None),
+            (MEDIA, None)
+        ]));
+        // (d) A 301 start asked, then a 201 source: the higher request wins.
+        assert!(takes(&[(IDLE, None), (MEDIA, None), (MEDIA, Some(STREAM))]));
+    }
+
+    /// #421: steady playback while disconnected requests nothing.
+    #[test]
+    fn steady_playback_while_case_closed_requests_nothing() {
+        let mut p = case_closed_disconnected();
+        for ms in (200..5000).step_by(500) {
+            assert_eq!(p.play_category(ms, STREAM), []);
+            assert_eq!(p.play_source(ms + 250, STREAM, None), []);
+        }
+        assert_eq!(p.core.take_lines(), Vec::<String>::new());
+        for ms in (5000..=70_000).step_by(100) {
+            assert_eq!(p.feed(ms, Input::Tick), [], "{ms}");
+        }
     }
 
     /// #96: a new stream behind MPRIS during Auto's pending release is

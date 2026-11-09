@@ -67,9 +67,9 @@ pub(crate) enum CaseRecovery {
 }
 
 impl CaseRecovery {
-    /// Advance on a playback poll taken while disconnected: a new
-    /// stopped-to-playing playback requests the reconnection, and a stop
-    /// before it completes withdraws the request.
+    /// Advance on a playback poll taken while disconnected: new playback
+    /// (a start, a rise, or a new source behind playback, #272/#421) requests
+    /// the reconnection, and a stop before it completes withdraws the request.
     pub(crate) fn playback(&mut self, fresh_play: bool, stopped: bool) {
         match (*self, fresh_play, stopped) {
             (Self::WaitingForPlayback, true, _) => *self = Self::PlaybackRequested,
