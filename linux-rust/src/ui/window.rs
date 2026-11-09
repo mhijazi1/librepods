@@ -76,6 +76,16 @@ fn merge_battery(prev: &[BatteryInfo], update: &[BatteryInfo]) -> Vec<BatteryInf
     merged
 }
 
+/// The battery an AirPods tab starts with on connect: the case entry remembered at
+/// its last disconnect merged with the AACP report, so a Disconnected case in the
+/// report keeps the remembered level (#461).
+fn connect_seed(last_case: Option<&BatteryInfo>, aacp: &[BatteryInfo]) -> Vec<BatteryInfo> {
+    merge_battery(
+        last_case.map(std::slice::from_ref).unwrap_or_default(),
+        aacp,
+    )
+}
+
 /// Text for one battery level in the window. `None` means the level is not known.
 fn battery_level_label(level: Option<u8>) -> String {
     match level {
@@ -270,6 +280,9 @@ pub struct App {
     bluetooth_state: BluetoothState,
     paired_devices: HashMap<String, Address>,
     device_states: HashMap<String, DeviceState>,
+    /// Each AirPods' last known (non-Disconnected) case entry, kept across a
+    /// disconnect for the next connect's seed (#461).
+    last_case: HashMap<String, BatteryInfo>,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     pending_add_device: Option<(String, Address)>,
     device_type_state: combo_box::State<DeviceType>,
@@ -422,6 +435,7 @@ impl App {
                 bluetooth_state,
                 paired_devices: HashMap::new(),
                 device_states,
+                last_case: HashMap::new(),
                 pending_add_device: None,
                 device_type_state: combo_box::State::new(vec![DeviceType::Nothing]),
                 selected_device_type: None,
@@ -590,7 +604,7 @@ impl App {
                                 self.switching_mode = crate::utils::load_switching_mode();
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
-                                    battery: state.battery_info.clone(),
+                                    battery: connect_seed(self.last_case.get(&mac), &state.battery_info),
                                     noise_control_mode: state.control_command_status_list.iter().find_map(|status| {
                                         if status.identifier == ControlCommandIdentifiers::ListeningMode {
                                             status.value.first().map(AirPodsNoiseControlMode::from_byte)
@@ -658,7 +672,14 @@ impl App {
                             .connected_devices
                             .retain(|device| device != &mac);
 
-                        self.device_states.remove(&mac);
+                        if let Some(DeviceState::AirPods(state)) = self.device_states.remove(&mac)
+                            && let Some(case) = state.battery.into_iter().find(|b| {
+                                b.component == BatteryComponent::Case
+                                    && b.status != BatteryStatus::Disconnected
+                            })
+                        {
+                            self.last_case.insert(mac.clone(), case);
+                        }
 
                         if matches!(&self.selected_tab, Tab::Device(selected_mac) if selected_mac == &mac)
                         {
@@ -2077,6 +2098,32 @@ mod tests {
         assert_eq!(
             battery_tab_label(&[]),
             "\u{1018E5} -- \u{1018E8} -- \u{100E6C} --"
+        );
+    }
+
+    /// The connect AACP report of AirPods with both buds out of the case.
+    fn connect_report() -> Vec<BatteryInfo> {
+        vec![
+            info(BatteryComponent::Left, 80, BatteryStatus::NotCharging),
+            info(BatteryComponent::Right, 70, BatteryStatus::NotCharging),
+            case_disconnected(0),
+        ]
+    }
+
+    #[test]
+    fn connect_seed_reconnect_keeps_remembered_case() {
+        let last = info(BatteryComponent::Case, 90, BatteryStatus::NotCharging);
+        assert_eq!(
+            battery_tab_label(&connect_seed(Some(&last), &connect_report())),
+            "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} 90%"
+        );
+    }
+
+    #[test]
+    fn connect_seed_without_remembered_case_shows_dashes() {
+        assert_eq!(
+            battery_tab_label(&connect_seed(None, &connect_report())),
+            "\u{1018E5} 80% \u{1018E8} 70% \u{100E6C} --"
         );
     }
 
