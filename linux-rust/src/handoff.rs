@@ -765,7 +765,7 @@ impl Handoff {
                 if self.pending.is_some() {
                     self.say("WAIT ownership request pending");
                 } else {
-                    match self.decide_take(TakeoverTrigger::Manual).action {
+                    match self.decide_take(TakeoverTrigger::Manual, self.category).action {
                         TakeoverAction::TakeOver => {
                             self.request(now, true, Cause::User, out);
                             self.say("REQUEST owner=linux");
@@ -1243,19 +1243,14 @@ impl Handoff {
         }
         // The take asks at the play that requested it, capped at the
         // aggregate (#421); a #307 core carries none.
-        let routing = RoutingSnapshot {
-            local_category: self
-                .requested_category
-                .take()
-                .map_or(self.category, |c| c.min(self.category)),
-            ..self.routing()
-        };
-        let inputs = TakeoverInputs::handoff(
-            TakeoverTrigger::ReconnectedForPlayback,
-            routing,
-            self.recovery,
-        );
-        let took = match decide_takeover(inputs).action {
+        let category = self
+            .requested_category
+            .take()
+            .map_or(self.category, |c| c.min(self.category));
+        let took = match self
+            .decide_take(TakeoverTrigger::ReconnectedForPlayback, category)
+            .action
+        {
             // Like an ordinary reconnect: no take, nothing pending.
             TakeoverAction::TakeOver if !self.auto_take_allowed() => {
                 self.say(CONNECT_MODE_SKIP);
@@ -1454,12 +1449,13 @@ impl Handoff {
             && !(self.local_call && self.requested_take)
     }
 
-    fn decide_take(&self, trigger: TakeoverTrigger) -> TakeoverDecision {
-        decide_takeover(TakeoverInputs::handoff(
-            trigger,
-            self.routing(),
-            self.recovery,
-        ))
+    /// A take's decision, Linux asking at `local_category`.
+    fn decide_take(&self, trigger: TakeoverTrigger, local_category: u32) -> TakeoverDecision {
+        let routing = RoutingSnapshot {
+            local_category,
+            ..self.routing()
+        };
+        decide_takeover(TakeoverInputs::handoff(trigger, routing, self.recovery))
     }
 
     /// A session start or reconnect may take from an idle other host, as the
@@ -5233,6 +5229,8 @@ mod tests {
             (IDLE, None),
             (MEDIA, None)
         ]));
+        // (d) A 301 start asked, then a 201 source: the higher request wins.
+        assert!(takes(&[(IDLE, None), (MEDIA, None), (MEDIA, Some(STREAM))]));
     }
 
     /// #421: steady playback while disconnected requests nothing.
