@@ -2586,6 +2586,25 @@ mod tests {
         stop_handoff_task(mac);
     }
 
+    /// The task's DropSession reports whether the case was closed (#307).
+    #[tokio::test]
+    async fn drop_session_reports_case_closed() {
+        for (mac, ears, closed) in [
+            ("5A:00:00:00:07:0C", EarDetectionStatus::InCase, true),
+            ("5A:00:00:00:07:0D", EarDetectionStatus::OutOfEar, false),
+        ] {
+            reconnect::case_closed_at_drop(mac, !closed);
+            let (manager, mut rx, _tx) = ready_session().await;
+            let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+            let task = handoff_task(mac).expect("handoff task");
+            expect_startup(&h, &mut rx).await;
+            h.emit_queued(wear(ears)).await;
+            manager.disconnect().await;
+            wait_until("the task to end", || task.is_finished()).await;
+            assert_eq!(reconnect::closed_at_drop(mac), closed, "{mac}");
+        }
+    }
+
     #[tokio::test]
     async fn handoff_not_stalled_by_slow_device_handler() {
         let mac = "5A:00:00:00:00:08";

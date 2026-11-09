@@ -196,6 +196,11 @@ pub(crate) fn case_closed_at_drop(mac: &str, closed: bool) {
     with_entry(mac, |e| e.case_closed = closed);
 }
 
+#[cfg(test)]
+pub(crate) fn closed_at_drop(mac: &str) -> bool {
+    with_entry(mac, |e| e.case_closed)
+}
+
 /// BlueZ Connected=true for an AirPods MAC: a running watcher stops at its
 /// next sample, unless its own connect is waiting for the handoff task.
 pub(crate) fn device_connected(mac: &str) {
@@ -389,8 +394,7 @@ pub(crate) async fn watch(mac: String, mut samples: impl Samples, io: impl Conne
         let last = previous.replace(playing);
         if connected_for_playback {
             // The marker is for playback that still plays.
-            if !playing {
-                with_entry(&mac, |e| e.marker = None);
+            if !playing && with_entry(&mac, |e| e.marker.take()).is_some() {
                 io.log(&mac, "playback stopped before the handoff task took");
             }
             if !playing || !marker_live(&mac) {
