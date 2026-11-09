@@ -8,9 +8,11 @@ use crate::media_controller::{
     decide_takeover, routing_snapshot_of,
 };
 use crate::switching::{
-    PlaybackSamples, advertise_call, announce, event_input, session_facts, spawn_playback_poller,
+    NOT_PAUSING, PlaybackSamples, advertise_call, announce, event_input, pause_own_players,
+    session_facts, spawn_playback_poller,
 };
 use bluer::Address;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -276,7 +278,15 @@ impl Io {
                     let sent = advertise_call(&self.manager, &self.local, in_call).await;
                     self.tolerate_lost_session(sent).await?
                 }
-                Command::PauseMedia => self.media.pause_all_media().await,
+                Command::PauseMedia => {
+                    let pause = Arc::new(MediaController::pause_playing_mpris_players);
+                    if !pause_own_players(&self.media, pause, self.play_rx.streams()).await {
+                        println!("{NOT_PAUSING}");
+                        if let Some(log) = &self.log {
+                            log.line(&self.address.to_string(), NOT_PAUSING);
+                        }
+                    }
+                }
                 Command::ConnectA2dp => {
                     let device = self.adapter.device(self.address)?;
                     device.connect_profile(&A2DP_SINK).await?;
