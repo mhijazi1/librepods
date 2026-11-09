@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -824,6 +824,9 @@ pub struct MediaController {
     /// Serializes activation's last hold check + write with the hold's
     /// read + write, so a write in flight can't undo a hold (#264).
     profile_write: Arc<Mutex<()>>,
+    /// Where each reinsertion's ear-detection resume is reported (#313);
+    /// the last subscriber wins.
+    ear_resumes: Arc<StdMutex<Option<mpsc::UnboundedSender<bool>>>>,
 }
 
 impl MediaController {
@@ -837,6 +840,21 @@ impl MediaController {
             self_pauses: Arc::default(),
             a2dp_held: Arc::default(),
             profile_write: Arc::default(),
+            ear_resumes: Arc::default(),
+        }
+    }
+
+    /// Receive, for each reinsertion ear detection handles, whether its
+    /// resume played any player (#313). Replaces an earlier subscriber.
+    pub(crate) fn subscribe_ear_resumes(&self) -> mpsc::UnboundedReceiver<bool> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.ear_resumes.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        rx
+    }
+
+    fn report_ear_resume(&self, resumed: bool) {
+        if let Some(tx) = &*self.ear_resumes.lock().unwrap_or_else(|e| e.into_inner()) {
+            let _ = tx.send(resumed);
         }
     }
 
@@ -1105,6 +1123,11 @@ impl MediaController {
         let old_all_out = old_in_ear_data.iter().all(|&b| !b);
         let new_has_at_least_one_in = new_in_ear_data.iter().any(|&b| b);
         let new_all_out = new_in_ear_data.iter().all(|&b| !b);
+        // A bud put back after a reading: report its resume once (#313).
+        let count = |d: &[bool]| d.iter().filter(|&&b| b).count();
+        let reinserted =
+            !old_statuses.is_empty() && count(&new_in_ear_data) > count(&old_in_ear_data);
+        let mut resumed = 0;
 
         debug!(
             "Computed states: in_ear={}, old_all_out={}, new_has_at_least_one_in={}, new_all_out={}",
@@ -1115,6 +1138,9 @@ impl MediaController {
             let state = self.state.lock().await;
             if !state.ear_detection_enabled {
                 debug!("Ear detection disabled, skipping");
+                if reinserted {
+                    self.report_ear_resume(false);
+                }
                 return;
             }
         }
@@ -1182,7 +1208,7 @@ impl MediaController {
             debug!("Ear data changed, checking resume/pause logic");
             if in_ear {
                 debug!("Resuming media as buds are in ear");
-                self.resume().await;
+                resumed = self.resume().await;
                 self.state.lock().await.i_paused_the_media = false;
             } else if !old_all_out {
                 debug!("Pausing media as buds are not fully in ear");
@@ -1192,9 +1218,12 @@ impl MediaController {
                     removal_self_paused || marks_self_pause(outcome, was_playing);
             } else {
                 debug!("Playing media");
-                self.resume().await;
+                resumed = self.resume().await;
                 self.state.lock().await.i_paused_the_media = false;
             }
+        }
+        if reinserted {
+            self.report_ear_resume(resumed > 0);
         }
 
         {
@@ -1558,28 +1587,29 @@ impl MediaController {
         (paused_services, outcome)
     }
 
-    async fn resume(&self) {
+    /// Play the players ear detection paused; returns how many played.
+    async fn resume(&self) -> usize {
+        self.resume_with(|service| Self::mpris_call(service, "Play"))
+            .await
+    }
+
+    /// `resume` with the blocking MPRIS Play injected.
+    async fn resume_with<P>(&self, play: P) -> usize
+    where
+        P: Fn(&str) -> bool + Send + 'static,
+    {
         debug!("Resuming playback");
         let services = self.state.lock().await.paused_by_app_services.clone();
 
         if services.is_empty() {
             debug!("No services to resume");
-            return;
+            return 0;
         }
 
         let resumed_count = tokio::task::spawn_blocking(move || {
-            let conn = match Connection::new_session() {
-                Ok(c) => c,
-                Err(_) => return 0,
-            };
             let mut resumed_count = 0;
             for service in services {
-                let proxy =
-                    conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-                if proxy
-                    .method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Play", ())
-                    .is_ok()
-                {
+                if play(&service) {
                     info!("Resumed playback for: {}", service);
                     resumed_count += 1;
                 } else {
@@ -1597,6 +1627,7 @@ impl MediaController {
         } else {
             error!("Failed to resume any media players via DBus");
         }
+        resumed_count
     }
 
     pub async fn next_track(&self) {
@@ -3010,6 +3041,73 @@ mod tests {
         assert!(state.i_paused_the_media);
         assert!(state.is_playing);
         assert_eq!(state.device_index, None);
+    }
+
+    /// #313: `old` -> `new` with a subscriber; nothing paused, so no D-Bus.
+    /// Returns the controller too, so its sender stays alive.
+    async fn ear_reports(
+        enabled: bool,
+        old: Vec<EarDetectionStatus>,
+        new: Vec<EarDetectionStatus>,
+    ) -> (MediaController, mpsc::UnboundedReceiver<bool>) {
+        let controller = MediaController::new(String::new(), String::new());
+        {
+            let mut state = controller.state.lock().await;
+            state.ear_detection_enabled = enabled;
+            state.disconnect_when_not_wearing = false;
+        }
+        let rx = controller.subscribe_ear_resumes();
+        controller
+            .handle_ear_detection_with(old, new, || (vec![], PauseOutcome::default()))
+            .await;
+        (controller, rx)
+    }
+
+    #[tokio::test]
+    async fn ear_reinsertion_reports_nothing_resumed() {
+        use EarDetectionStatus::*;
+        for enabled in [true, false] {
+            let (_c, mut rx) =
+                ear_reports(enabled, vec![InEar, OutOfEar], vec![InEar, InEar]).await;
+            assert_eq!(rx.try_recv(), Ok(false), "{enabled}");
+            assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        }
+    }
+
+    #[tokio::test]
+    async fn ear_no_report_without_reinsertion() {
+        use EarDetectionStatus::*;
+        for (old, new) in [
+            (vec![InEar, InEar], vec![InEar, OutOfEar]),
+            (vec![], vec![InEar, InEar]),
+            (vec![InEar, OutOfEar], vec![InEar, OutOfEar]),
+        ] {
+            let (_c, mut rx) = ear_reports(true, old.clone(), new).await;
+            assert_eq!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty),
+                "{old:?}"
+            );
+        }
+    }
+
+    /// `resume_with` over `paused`, Play succeeding for `ok`: the count and
+    /// the list left.
+    async fn resume_paused(paused: &[&str], ok: &'static [&'static str]) -> (usize, Vec<String>) {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.state.lock().await.paused_by_app_services =
+            paused.iter().map(|s| s.to_string()).collect();
+        let n = controller.resume_with(|s| ok.contains(&s)).await;
+        let left = controller.state.lock().await.paused_by_app_services.clone();
+        (n, left)
+    }
+
+    #[tokio::test]
+    async fn resume_with_counts_played() {
+        assert_eq!(resume_paused(&[], &["a"]).await, (0, vec![]));
+        assert_eq!(resume_paused(&["a", "b"], &["a"]).await, (1, vec![]));
+        let kept = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(resume_paused(&["a", "b"], &[]).await, (0, kept));
     }
 
     /// Both buds in ear, then `new`, with the blocking pause injected: its
