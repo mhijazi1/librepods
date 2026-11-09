@@ -5209,7 +5209,6 @@ mod tests {
     /// card read finds the card on `a2dp-sink` from its second look on,
     /// running `found` there. Returns the wait, the task, the reads and the
     /// writes.
-    #[allow(clippy::type_complexity)]
     fn spawn_late(
         controller: &MediaController,
         took: Duration,
@@ -5304,6 +5303,18 @@ mod tests {
             .await;
         assert_eq!((outcome, start.elapsed()), (Err(DeadlineExceeded), cut_at));
         controller.set_a2dp_held(true);
+        task.await.unwrap();
+        assert_eq!(*writes.lock().unwrap(), [(3, "off".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_connect_reply_dropped_untaken_is_held() {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(true);
+        let (reply, task, _, writes) = spawn_late(&controller, Duration::ZERO, |_| {});
+        // The reply is sent, then its waiter is dropped before taking it.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(reply);
         task.await.unwrap();
         assert_eq!(*writes.lock().unwrap(), [(3, "off".to_string())]);
     }
