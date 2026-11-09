@@ -2034,15 +2034,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn in_flight_librepods_pause_at_the_take_is_never_undone() {
-        // Q pauses at 100 ms, the 250 ms read sees it; the ear-removal pause
-        // in flight at the take finishes at 200 ms, or never. With a 100 ms
-        // route it has finished by the first read: counts (1, 1) against the
-        // take's (1, 0).
+        // The ear-removal pause in flight at the take finishes at 200 ms, or
+        // never; with a 100 ms route it has finished by the route: counts
+        // (1, 1) against the take's (1, 0). So at the first (0 ms) tick a
+        // pause is in flight or the counts moved: the read loop stops, no
+        // Paused read runs, and no Play can follow.
         for (route, unfinished) in [(ms(0), ms(200)), (ms(0), Duration::MAX), (ms(100), ms(0))] {
+            let calls = Arc::default();
             let acted = take(Take {
                 route,
                 count: 1,
                 unfinished: Some(unfinished),
+                paused_calls: Arc::clone(&calls),
                 ..self_paused(&[100])
             })
             .await;
@@ -2050,6 +2053,7 @@ mod tests {
                 !acted.iter().any(|(_, a)| matches!(a, Play(_))),
                 "{route:?} {unfinished:?}: {acted:?}"
             );
+            assert_eq!(*calls.lock().unwrap(), [], "{route:?} {unfinished:?}");
         }
     }
 
