@@ -35,7 +35,8 @@ const TRANSPORT_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// Between the chain's fresh transport reads while they read idle: after a
 /// take from a streaming iPhone, PipeWire starts the transport about 0.8 s
 /// after the ACK (#305). All reads end by `TRANSPORT_START_WAIT` +
-/// `TRANSPORT_READ_TIMEOUT` from the chain's start.
+/// `TRANSPORT_READ_TIMEOUT` from the chain's start (`read_end`): an idle
+/// read back from then on is unknown and never nudges.
 const TRANSPORT_REREAD: Duration = Duration::from_millis(100);
 /// From the sink's suspend to its resume.
 const NUDGE_GAP: Duration = Duration::from_millis(500);
@@ -180,9 +181,10 @@ impl Chain {
     /// Run the step due at `now`: its actions, or None once the chain is
     /// over. `transport` (the fresh read issued at `issued`: active, idle or
     /// unknown) matters only when `reads_transport()`: active ends the chain;
-    /// idle issued from `nudge_at` on suspends the sink (`run` bounds each
-    /// read by `read_end`); idle issued earlier and back before `read_end`
-    /// reads again `TRANSPORT_REREAD` later, or at `nudge_at` if sooner;
+    /// idle issued from `nudge_at` on and back before `read_end` suspends the
+    /// sink (`run` bounds each read by `read_end`; idle back from `read_end`
+    /// on is unknown and never nudges); idle issued earlier and back before
+    /// `read_end` reads again `TRANSPORT_REREAD` later, or at `nudge_at` if sooner;
     /// anything else goes straight to the audible check, never stopping a
     /// transport that may carry audio. `audible` matters only when
     /// `senses()`, and ends the chain there; `playing` only when
@@ -221,7 +223,9 @@ impl Chain {
                 Some(true) => return None,
                 // Judged by its issue time: a read issued before `nudge_at`
                 // may have raced PipeWire's own start, however late it is back.
-                Some(false) if issued >= self.nudge_at => {
+                // One back from `read_end` on is unknown (#331), even if
+                // `timeout_at` let it win over its deadline.
+                Some(false) if issued >= self.nudge_at && now < self.read_end => {
                     (vec![Action::SuspendSink(true)], Stage::Suspended, NUDGE_GAP)
                 }
                 Some(false) if now < self.read_end => {
@@ -885,6 +889,21 @@ mod tests {
     }
 
     #[test]
+    fn idle_read_back_at_read_end_never_nudges() {
+        // #331: a read issued from the nudge time on but back idle at the
+        // read window's end is unknown.
+        let t0 = Instant::now();
+        let mut chain = Chain::new(t0, t0 + A2DP_RESUME_WINDOW, players(&[P]));
+        let (issued, read_end) = (chain.nudge_at, chain.read_end);
+        assert_eq!(
+            chain.step(issued, read_end, Some(false), false, &[]),
+            Some(vec![])
+        );
+        assert!(!chain.reads_transport());
+        assert_eq!(chain.due(), read_end + NUDGE_GAP + AUDIBLE_WAIT);
+    }
+
+    #[test]
     fn audible_after_nudge_stops_there() {
         let steps = drive(&[P], |_| (true, players(&[P])));
         assert_eq!(
@@ -1142,9 +1161,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn slow_player_reads_skip_a_kick_past_the_window() {
         // A hung MPRIS app: the reads end at 5 s, then at 12 s, past the
-        // window, where the kick's stop would be released at once.
+        // window, where the kick's stop would be released at once. The
+        // first transport read, at 5 s, is past the read window: no nudge.
         let (acted, _) = run_with_reads_of(|_| Duration::from_secs(5)).await;
-        assert_eq!(acted, [SuspendSink(true), SuspendSink(false)]);
+        assert_eq!(acted, []);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1375,6 +1395,22 @@ mod tests {
         chain.await.unwrap();
         assert_eq!(*acted.lock().unwrap(), []);
         assert_eq!(reads(&n), 11);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_read_back_with_the_read_end_deadline_never_nudges() {
+        // Instant idle reads from 500 ms, then the 16th, issued at
+        // TRANSPORT_START_WAIT, is back idle exactly at the read window's
+        // end: `timeout_at` polls it before its deadline, so it returns
+        // Some(false) there (#375).
+        let (_cancel, cancelled) = oneshot::channel();
+        let (acted, n, chain) = spawn_with_transport(
+            |n| read_after(if n < 15 { 0 } else { 500 }, false),
+            cancelled,
+        );
+        chain.await.unwrap();
+        assert_kicked_without_nudge(&acted.lock().unwrap());
+        assert_eq!(reads(&n), 16);
     }
 
     /// Resume I/O on tokio's clock: silent, `P` Playing, each transport read
