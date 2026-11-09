@@ -684,7 +684,8 @@ impl Shell {
                 Command::Reconnect { audio } => {
                     info!("Handoff: reconnect (audio={audio}) left to the app lifecycle")
                 }
-                Command::AdoptSession => info!("Handoff: no reconnect session to adopt"),
+                // Only a reconnect-for-playback start feeds Reconnected (#307).
+                Command::AdoptSession => info!("Handoff: adopted the reconnected session"),
                 Command::CancelReconnect => info!("Handoff: no reconnect to cancel"),
                 Command::DrainPlayback => self.play_rx.drain(),
                 Command::Exit => return true,
