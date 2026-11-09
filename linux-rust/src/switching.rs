@@ -2802,6 +2802,30 @@ mod tests {
         assert!(!not_pausing(mac), "{:#?}", traced(mac));
     }
 
+    /// #328: a Playing player whose only own stream is muted pauses on the
+    /// yield, its PID from the stream monitor's own filter.
+    #[tokio::test]
+    async fn yield_pause_pauses_muted_local_player() {
+        let mac = "5A:00:00:00:03:0B";
+        let mut muted = StreamProps {
+            muted: true,
+            ..music(1)
+        };
+        muted.props.insert(
+            "application.process.id".to_string(),
+            FIREFOX_PID.to_string(),
+        );
+        let pids: Vec<u32> = stream_monitor::live_stream_pids(&[muted], |_| None)
+            .into_iter()
+            .collect();
+        let firefox = [Some(FIREFOX_PID)];
+        assert_eq!(
+            yield_pause(mac, &firefox, Some(&pids)).await,
+            (firefox.to_vec(), true)
+        );
+        assert!(!not_pausing(mac), "{:#?}", traced(mac));
+    }
+
     /// #329: a Connect remote and a player whose owner lookup failed beside
     /// Firefox's live stream: only Firefox pauses. Another app's live
     /// stream pauses nobody.
@@ -4044,18 +4068,21 @@ mod tests {
     }
 
     /// #302: Linux's category over every (mpris, live, counted), the live
-    /// input from the stream monitor's live filter over a music stream
-    /// (live, baseline or not: the filter has none) or over a corked, a
-    /// muted and an event stream (not live).
+    /// input from the stream monitor's MPRIS filter (`live_stream_pids`)
+    /// over the player's music stream, muted or not (live, #328), or over a
+    /// corked and an event stream (not live).
     #[test]
     fn local_category_needs_live_stream_for_mpris() {
+        let live_listing = [
+            music(1),
+            StreamProps {
+                muted: true,
+                ..music(1)
+            },
+        ];
         let not_live = [
             StreamProps {
                 corked: true,
-                ..music(1)
-            },
-            StreamProps {
-                muted: true,
                 ..music(1)
             },
             event_sound(1),
@@ -4075,13 +4102,10 @@ mod tests {
             (false, false, true, stream),
             (false, false, false, idle),
         ] {
-            let listings = if live {
-                vec![music(1)]
-            } else {
-                not_live.to_vec()
-            };
+            let listings = if live { &live_listing } else { &not_live };
             for s in listings {
-                let filtered = !stream_monitor::live_streams(&[s.clone()]).is_empty();
+                let filtered =
+                    stream_monitor::live_stream_pids(&[s.clone()], |_| None).contains(&PLAYER_PID);
                 assert_eq!(
                     local_category(mpris, filtered, counted),
                     category,
@@ -4684,6 +4708,33 @@ mod tests {
             };
             assert_eq!(case(&[]), NO_TAKE);
             assert_eq!(case(&[music(1)]), [vec![SendOwnership(true)]]);
+        }
+
+        /// #328: a Playing player whose only stream is its own muted one
+        /// (by flag or at every channel's `Volume::MUTED`) takes from the
+        /// iPhone at 301, as the Mac does with Music at volume 0. The same
+        /// stream of another process takes nothing.
+        #[test]
+        fn mpris_with_muted_own_stream_takes() {
+            let case = |stream: &StreamProps, pid: u32| {
+                let mut stream = stream.clone();
+                stream
+                    .props
+                    .insert("application.process.id".to_string(), pid.to_string());
+                let mut p = remote_owns();
+                p.event(true, &[stream]);
+                p.takes()
+            };
+            let muted = StreamProps {
+                muted: true,
+                ..music(1)
+            };
+            for stream in [muted, tab(false, Volume::MUTED)] {
+                assert!(stream.muted, "{stream:?}");
+                let takes = case(&stream, PLAYER_PID);
+                assert_eq!(takes, [vec![SendOwnership(true)]], "{stream:?}");
+                assert_eq!(case(&stream, PLAYER_PID + 1), NO_TAKE, "{stream:?}");
+            }
         }
 
         /// #302: MPRIS with a live stream needs no peak debounce: the take
