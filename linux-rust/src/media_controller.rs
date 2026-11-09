@@ -1019,6 +1019,36 @@ impl MediaController {
             .collect()
     }
 
+    /// The bus owner PID of each MPRIS player (KDE Connect's excluded) that
+    /// reports Playing; None where the bus can't tell. Blocking.
+    pub(crate) fn playing_mpris_owners() -> Vec<Option<u32>> {
+        let Ok(conn) = Connection::new_session() else {
+            return Vec::new();
+        };
+        Self::list_mpris_services(&conn)
+            .iter()
+            .filter(|service| Self::mpris_playing(&conn, service))
+            .map(|service| Self::bus_owner_pid(&conn, service))
+            .collect()
+    }
+
+    /// The PID of the process owning bus name `service`; None when the bus
+    /// can't tell.
+    fn bus_owner_pid(conn: &Connection, service: &str) -> Option<u32> {
+        conn.with_proxy(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            Duration::from_secs(5),
+        )
+        .method_call(
+            "org.freedesktop.DBus",
+            "GetConnectionUnixProcessID",
+            (service,),
+        )
+        .map(|(pid,): (u32,)| pid)
+        .ok()
+    }
+
     fn mpris_playing(conn: &Connection, service: &str) -> bool {
         let proxy = conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
         proxy
@@ -1446,13 +1476,13 @@ impl MediaController {
     }
 
     pub async fn pause_all_media(&self) {
-        self.pause_all_media_with(Self::pause_playing_mpris_players)
+        self.pause_all_media_with(|| Self::pause_playing_mpris_players(&|_| true))
             .await;
     }
 
     /// `pause_all_media` with the D-Bus side injected, so the self-pause
     /// marking can be tested without a session bus.
-    pub(crate) async fn pause_all_media_with<F>(&self, pause_players: F)
+    pub(crate) async fn pause_all_media_with<F>(&self, pause_players: F) -> PauseOutcome
     where
         F: FnOnce() -> PauseOutcome + Send + 'static,
     {
@@ -1477,16 +1507,24 @@ impl MediaController {
         } else {
             debug!("No playing media players found to pause");
         }
+        outcome
     }
 
-    /// Pause every MPRIS player that reports `Playing`. Blocking: run it on a
-    /// blocking thread.
-    pub(crate) fn pause_playing_mpris_players() -> PauseOutcome {
-        Self::pause_mpris_players().1
+    /// Pause every MPRIS player that reports `Playing` and whose bus owner
+    /// PID (None when the bus can't tell) `own` accepts. Blocking: run it on
+    /// a blocking thread.
+    pub(crate) fn pause_playing_mpris_players(own: &dyn Fn(Option<u32>) -> bool) -> PauseOutcome {
+        Self::pause_mpris_players_owned(own).1
+    }
+
+    /// Pause every MPRIS player that reports `Playing`, also returning the
+    /// paused services.
+    fn pause_mpris_players() -> (Vec<String>, PauseOutcome) {
+        Self::pause_mpris_players_owned(&|_| true)
     }
 
     /// `pause_playing_mpris_players`, also returning the paused services.
-    fn pause_mpris_players() -> (Vec<String>, PauseOutcome) {
+    fn pause_mpris_players_owned(own: &dyn Fn(Option<u32>) -> bool) -> (Vec<String>, PauseOutcome) {
         let mut paused_services = Vec::new();
         let mut outcome = PauseOutcome::default();
         let Ok(conn) = Connection::new_session() else {
@@ -1500,6 +1538,7 @@ impl MediaController {
             if let Ok(playback_status) =
                 proxy.get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
                 && playback_status == "Playing"
+                && own(Self::bus_owner_pid(&conn, &service))
             {
                 if proxy
                     .method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Pause", ())
@@ -3233,7 +3272,7 @@ mod tests {
                     let _ = release_rx.recv();
                     pauser()
                 })
-                .await
+                .await;
         });
         started_rx.await.unwrap();
         (task, release_tx)

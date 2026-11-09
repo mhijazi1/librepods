@@ -361,21 +361,89 @@ impl PlaybackTracker {
 pub(crate) type Sample = (Vec<StreamProps>, HashMap<u32, f32>);
 
 /// What the stream monitor publishes.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PlaybackState {
     /// A stream counts as playing (`PlaybackTracker`).
     pub(crate) counted: bool,
-    /// The last successful listing had a live stream (`live_streams`,
-    /// baseline included, no peak gate); None before the first one (#302).
-    pub(crate) live: Option<bool>,
+    /// The PIDs owning a live stream in the last successful listing
+    /// (`live_stream_pids`); None before the first one (#302).
+    pub(crate) live: Option<HashSet<u32>>,
 }
 
 impl PlaybackState {
-    /// `live`, unknown counting as live: before the first successful
-    /// listing (a stalled sound server, #83) MPRIS plays as before #302.
-    pub(crate) fn live_or_unknown(&self) -> bool {
-        self.live.unwrap_or(true)
+    /// Whether the MPRIS player whose bus owner is `owner` plays locally:
+    /// it owns a live stream (#329), unknown counting as live: before the
+    /// first successful listing (a stalled sound server, #83) every player
+    /// plays as before #302. A failed owner lookup (None) owns nothing.
+    pub(crate) fn live_or_unknown(&self, owner: Option<u32>) -> bool {
+        self.live
+            .as_ref()
+            .is_none_or(|pids| owner.is_some_and(|pid| pids.contains(&pid)))
     }
+}
+
+/// The key of a stream's or a client's process id.
+const PROCESS_ID: &str = "application.process.id";
+
+/// How many ancestors of a live stream's process own it too (#329).
+const OWNER_DEPTH: usize = 16;
+
+/// The PIDs that own a live stream (`live_streams`): each one's process id
+/// (`PROCESS_ID`; a stream without one owns nothing) and its ancestors by
+/// `ppid`, at most `OWNER_DEPTH` of them, stopping at PID 1, an unknown
+/// parent or a repeat. An MPRIS player owns a live stream iff its bus owner
+/// is in the set: the stream's process or a bounded ancestor of it.
+pub(crate) fn live_stream_pids(
+    streams: &[StreamProps],
+    ppid: impl Fn(u32) -> Option<u32>,
+) -> HashSet<u32> {
+    let live = live_streams(streams);
+    let mut pids = HashSet::new();
+    for stream in streams.iter().filter(|s| live.contains(&s.index)) {
+        let mut next = stream_pid(&stream.props, None);
+        for _ in 0..=OWNER_DEPTH {
+            match next {
+                Some(pid) if pid > 1 && pids.insert(pid) => next = ppid(pid),
+                _ => break,
+            }
+        }
+    }
+    pids
+}
+
+/// The process a sink input plays for: its own `PROCESS_ID`, else its
+/// client's, else the client's `pipewire.sec.pid`. Native PipeWire streams
+/// (mpv, pw-cat) set it on their client only; a pulse-protocol client's
+/// `pipewire.sec.pid` is pipewire-pulse's own, hence last.
+fn stream_pid(
+    stream: &BTreeMap<String, String>,
+    client: Option<&BTreeMap<String, String>>,
+) -> Option<u32> {
+    let pid = |props: &BTreeMap<String, String>, key: &str| props.get(key)?.trim().parse().ok();
+    pid(stream, PROCESS_ID).or_else(|| {
+        let client = client?;
+        pid(client, PROCESS_ID).or_else(|| pid(client, "pipewire.sec.pid"))
+    })
+}
+
+/// A sink input's properties with `PROCESS_ID` set to its `stream_pid`,
+/// so the stream carries the process id it inherits from its client.
+fn with_client_pid(
+    mut props: BTreeMap<String, String>,
+    client: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    if let Some(pid) = stream_pid(&props, client) {
+        props.insert(PROCESS_ID.to_string(), pid.to_string());
+    }
+    props
+}
+
+/// `pid`'s parent from `/proc/<pid>/stat`; None if it is gone or unreadable.
+fn proc_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name may hold spaces and parentheses: skip past its last ')'.
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Sample `source` and `peaks` every `interval` with a `PlaybackTracker`
@@ -425,13 +493,15 @@ where
                 (rebaseline.clone(), observed.clone(), tx.clone());
             let sampled = tokio::task::spawn_blocking(move || {
                 if let Some(sample) = tracker.sample(&mut source, &mut peaks) {
+                    // Read from /proc before the lock, which a step may wait on.
+                    let live = live_stream_pids(&sample.0, proc_ppid);
                     let mut request = rebaseline.lock().unwrap_or_else(PoisonError::into_inner);
                     let now = Instant::now();
                     tracker.observe_sample(now, request.take(), &sample);
                     observed(now);
                     let state = PlaybackState {
                         counted: tracker.playing,
-                        live: Some(!live_streams(&sample.0).is_empty()),
+                        live: Some(live),
                     };
                     if *publish.borrow() != state {
                         publish.send_replace(state);
@@ -606,12 +676,23 @@ fn list_reusing<C, T>(
     result
 }
 
-/// Every sink input on `connection`.
+/// Every sink input on `connection`, each with the process id it inherits
+/// from its client (`with_client_pid`). The clients are listed only when a
+/// sink input has no process id of its own.
 fn sink_inputs(connection: &mut pulse::RawConnection) -> io::Result<Vec<StreamProps>> {
     let inputs = connection.sink_inputs(None)?;
+    let clients = if inputs.iter().all(|i| stream_pid(&i.props, None).is_some()) {
+        Vec::new()
+    } else {
+        connection.clients()?
+    };
     Ok(inputs
         .into_iter()
-        .map(|i| playback_stream_props(i.index, i.props, i.corked, i.mute, &i.volume))
+        .map(|i| {
+            let client = clients.iter().find(|c| Some(c.index) == i.client);
+            let props = with_client_pid(i.props, client.map(|c| &c.props));
+            playback_stream_props(i.index, props, i.corked, i.mute, &i.volume)
+        })
         .collect())
 }
 
@@ -1913,7 +1994,10 @@ mod tests {
     /// off once the stream corks.
     #[tokio::test]
     async fn spawned_stream_playback_publishes_live_baseline_stream() {
-        let source = FakePlayback::new(vec![Ok(vec![music(1)])]);
+        // No such process, so /proc names no parent.
+        const PID: u32 = 99_999_999;
+        let player = with_pid(music(1), PID);
+        let source = FakePlayback::new(vec![Ok(vec![player.clone()])]);
         let script = source.script.clone();
         let mut rx = spawn_stream_playback(
             source,
@@ -1924,17 +2008,15 @@ mod tests {
             |_| (),
         );
         assert_eq!(rx.borrow().live, None);
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            rx.wait_for(|s| s.live == Some(true)),
-        )
-        .await
-        .expect("live baseline stream")
-        .expect("monitor running");
+        let owned = Some(HashSet::from([PID]));
+        tokio::time::timeout(Duration::from_secs(3), rx.wait_for(|s| s.live == owned))
+            .await
+            .expect("live baseline stream")
+            .expect("monitor running");
         script
             .lock()
             .unwrap()
-            .extend([timed_out(), timed_out(), Ok(vec![music(1)])]);
+            .extend([timed_out(), timed_out(), Ok(vec![player.clone()])]);
         // Past the minimum and the failed listings: no change at all.
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(script.lock().unwrap().is_empty());
@@ -1943,18 +2025,162 @@ mod tests {
             *rx.borrow(),
             PlaybackState {
                 counted: false,
-                live: Some(true)
+                live: owned
             }
         );
-        script.lock().unwrap().push_back(Ok(vec![corked_music(1)]));
+        let corked = StreamProps {
+            corked: true,
+            ..player
+        };
+        script.lock().unwrap().push_back(Ok(vec![corked]));
         tokio::time::timeout(
             Duration::from_secs(3),
-            rx.wait_for(|s| s.live == Some(false)),
+            rx.wait_for(|s| s.live == Some(HashSet::new())),
         )
         .await
         .expect("corked stream not live")
         .expect("monitor running");
         assert!(!rx.borrow().counted);
+    }
+
+    /// `stream` with `PROCESS_ID` set to `pid`.
+    fn with_pid(mut stream: StreamProps, pid: u32) -> StreamProps {
+        stream.props.insert(PROCESS_ID.to_string(), pid.to_string());
+        stream
+    }
+
+    /// A pulse client's properties.
+    fn client(props: &[(&str, &str)]) -> BTreeMap<String, String> {
+        props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The MPRIS player's bus owner in the own-stream tests.
+    const OWNER: u32 = 1000;
+
+    /// Whether the player owned by `owner` owns a live stream of the
+    /// listing `streams`, each with its client's properties, with the
+    /// parents `ppids` (child, parent) as `/proc` would give them.
+    fn owns(
+        owner: Option<u32>,
+        streams: &[(StreamProps, Option<BTreeMap<String, String>>)],
+        ppids: &[(u32, u32)],
+    ) -> bool {
+        let streams: Vec<StreamProps> = streams
+            .iter()
+            .map(|(stream, client)| StreamProps {
+                props: with_client_pid(stream.props.clone(), client.as_ref()),
+                ..stream.clone()
+            })
+            .collect();
+        let ppid = |pid| ppids.iter().find(|&&(c, _)| c == pid).map(|&(_, p)| p);
+        let state = PlaybackState {
+            counted: false,
+            live: Some(live_stream_pids(&streams, ppid)),
+        };
+        state.live_or_unknown(owner)
+    }
+
+    /// (a) A remote-control player beside an unrelated `pw-play` stream.
+    #[test]
+    fn own_stream_unrelated_pw_play_not_matched() {
+        let pw_play = sink_input(
+            1,
+            &[
+                ("application.name", "pw-play"),
+                ("media.role", "music"),
+                (PROCESS_ID, "2000"),
+            ],
+            false,
+        );
+        assert!(!owns(Some(OWNER), &[(pw_play, None)], &[(2000, 1)]));
+    }
+
+    /// (b) The stream's own process id is the owner.
+    #[test]
+    fn own_stream_same_pid_matched() {
+        assert!(owns(Some(OWNER), &[(with_pid(music(1), OWNER), None)], &[]));
+    }
+
+    /// (c) mpv or pw-cat: no process id on the stream, the owner's on its
+    /// client; the client's process id wins over its `pipewire.sec.pid`
+    /// (pipewire-pulse's own).
+    #[test]
+    fn own_stream_client_pid_matched() {
+        let native = client(&[(PROCESS_ID, "1000")]);
+        assert!(owns(Some(OWNER), &[(music(1), Some(native))], &[]));
+        let pulse = client(&[(PROCESS_ID, "1000"), ("pipewire.sec.pid", "3000")]);
+        assert!(owns(Some(OWNER), &[(music(1), Some(pulse))], &[]));
+        // With no process id anywhere else, `pipewire.sec.pid` is it.
+        let sec = client(&[("pipewire.sec.pid", "1000")]);
+        assert!(owns(Some(OWNER), &[(music(1), Some(sec))], &[]));
+        let pipewire_pulse = client(&[("pipewire.sec.pid", "3000")]);
+        assert!(!owns(Some(OWNER), &[(music(1), Some(pipewire_pulse))], &[]));
+    }
+
+    /// (d) A stream of the owner's grandchild (a browser's audio process).
+    #[test]
+    fn own_stream_grandchild_matched() {
+        let stream = with_pid(music(1), 1002);
+        let ppids = [(1002, 1001), (1001, OWNER), (OWNER, 1)];
+        assert!(owns(Some(OWNER), &[(stream, None)], &ppids));
+    }
+
+    /// (e) A sibling's stream is not the owner's, and a cycle in the
+    /// parents ends without matching.
+    #[test]
+    fn own_stream_sibling_and_cycle_not_matched() {
+        let sibling = with_pid(music(1), 1003);
+        let ppids = [(1003, 999), (OWNER, 999), (999, 1)];
+        assert!(!owns(Some(OWNER), &[(sibling, None)], &ppids));
+        let looped = with_pid(music(1), 1004);
+        let cycle = [(1004, 1005), (1005, 1004)];
+        assert!(!owns(Some(OWNER), &[(looped, None)], &cycle));
+    }
+
+    /// The ancestors walked stop at `OWNER_DEPTH`.
+    #[test]
+    fn own_stream_ancestry_is_bounded() {
+        let chain: Vec<(u32, u32)> = (0..20).map(|i| (2000 + i, 2001 + i)).collect();
+        let stream = [(with_pid(music(1), 2000), None)];
+        let depth = OWNER_DEPTH as u32;
+        assert!(owns(Some(2000 + depth), &stream, &chain));
+        assert!(!owns(Some(2001 + depth), &stream, &chain));
+    }
+
+    /// (f) The owner's corked, muted or event stream is not live.
+    #[test]
+    fn own_stream_not_live_not_matched() {
+        for stream in [corked_music(1), muted_music(1), event_sound(1)] {
+            let stream = with_pid(stream, OWNER);
+            assert!(
+                !owns(Some(OWNER), &[(stream.clone(), None)], &[]),
+                "{stream:?}"
+            );
+        }
+    }
+
+    /// (c4) A failed owner lookup owns nothing once a listing is known, and
+    /// plays while it is not; a live stream with no process id by any key
+    /// is nobody's.
+    #[test]
+    fn own_stream_live_or_unknown_failed_lookup_and_no_pid() {
+        let stream = with_pid(music(1), OWNER);
+        assert!(!owns(None, &[(stream, None)], &[]));
+        assert!(PlaybackState::default().live_or_unknown(None));
+        assert!(PlaybackState::default().live_or_unknown(Some(OWNER)));
+        let anonymous = client(&[("application.name", "mpv")]);
+        assert!(!owns(Some(OWNER), &[(music(1), Some(anonymous))], &[]));
+        assert!(!owns(Some(OWNER), &[(music(1), None)], &[]));
+    }
+
+    #[test]
+    fn own_stream_proc_ppid_reads_this_process() {
+        let parent = proc_ppid(std::process::id()).expect("this process's parent");
+        assert_eq!(parent, std::os::unix::process::parent_id());
+        assert_eq!(proc_ppid(99_999_999), None);
     }
 
     /// A sound server slow to answer once: the first listing (the baseline)
