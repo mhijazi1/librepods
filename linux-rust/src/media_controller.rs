@@ -108,15 +108,30 @@ pub(crate) struct RoutingSnapshot {
     pub(crate) audio: Option<AudioSourceType>,
     /// The reported audio source is this machine.
     pub(crate) audio_from_local: bool,
+    /// Linux's audio category (#272).
+    pub(crate) local_category: u32,
+    /// The latest category the reported audio source's host relayed this
+    /// session (#272); None without a relay from it.
+    pub(crate) remote_category: Option<u32>,
 }
 
+/// Audio categories of the media-information relays (#272, captures from
+/// #74 and #257): idle, a non-MPRIS stream, MPRIS media. A call is
+/// `AUDIO_CATEGORY_CALL` (501).
+pub(crate) const AUDIO_CATEGORY_IDLE: u32 = 100;
+pub(crate) const AUDIO_CATEGORY_STREAM: u32 = 201;
+pub(crate) const AUDIO_CATEGORY_MEDIA: u32 = 301;
+
 /// Copy the routing facts out of the AACP fields. Pure and decision-free so
-/// the handoff core can feed it from its own event mirror.
+/// the handoff core can feed it from its own event mirror. `relays` maps a
+/// host's address to the category it last relayed.
 pub(crate) fn routing_snapshot(
     has_session: bool,
     hosts: &[ConnectedDevice],
     ears: &[EarDetectionStatus],
     audio: Option<&AudioSource>,
+    relays: &HashMap<String, u32>,
+    local_category: u32,
     local: &str,
 ) -> RoutingSnapshot {
     RoutingSnapshot {
@@ -127,17 +142,22 @@ pub(crate) fn routing_snapshot(
         bud_in_ear: ears.contains(&EarDetectionStatus::InEar),
         audio: audio.map(|a| a.r#type),
         audio_from_local: audio.is_some_and(|a| a.mac == local),
+        local_category,
+        remote_category: audio.and_then(|a| relays.get(&a.mac)).copied(),
     }
 }
 
-/// `routing_snapshot` of a locked AACP state. Callers drop the guard before
-/// any await.
+/// `routing_snapshot` of a locked AACP state, with no relays and an idle
+/// local category (the probe's manual take ignores both). Callers drop the
+/// guard before any await.
 pub(crate) fn routing_snapshot_of(state: &AACPManagerState, local: &str) -> RoutingSnapshot {
     routing_snapshot(
         state.sender.is_some(),
         &state.connected_devices,
         &state.ear_detection_status,
         state.audio_source.as_ref(),
+        &HashMap::new(),
+        AUDIO_CATEGORY_IDLE,
         local,
     )
 }
@@ -204,8 +224,11 @@ pub(crate) enum TakeoverSkip {
     /// host (Linux alone, Linux absent, or no host list).
     NoRemoteHost,
     /// #841: the audio source is not confirmed idle or local media (a remote
-    /// call or remote media, unknown activity, or no report).
+    /// call, unknown activity, or no report; remote media for a manual take).
     AudioNotIdle,
+    /// #272: an automatic take found the audio-source host's category (its
+    /// relay, else derived from the report) above Linux's, as macOS skips.
+    RemoteCategoryHigher { local: u32, remote: u32 },
     /// Legacy listener: an ownership-loss pause is still running, so it has
     /// not yet decided whether the players coming back are its own doing.
     OwnPausePending,
@@ -316,7 +339,11 @@ pub(crate) fn marks_self_pause(outcome: PauseOutcome, was_playing: bool) -> bool
 
 /// The #841 guards, in order: case recovery, live session, Linux plus a
 /// remote host (this machine and at least one other device, so 2, 3, 4...
-/// hosts), audio source idle or local media.
+/// hosts), audio source idle or local media. Automatic takes compare audio
+/// categories instead of that last guard (#272): they take when Linux's is
+/// at least the source host's, its relay if it sent one this session, else
+/// 100 for an idle report and 301 for media. A call or unknown source, or no
+/// report, still blocks every take.
 fn handoff_block(trigger: TakeoverTrigger, guards: HandoffGuards) -> Option<TakeoverSkip> {
     let recovery_allows = match trigger {
         TakeoverTrigger::ReconnectedForPlayback => {
@@ -332,9 +359,22 @@ fn handoff_block(trigger: TakeoverTrigger, guards: HandoffGuards) -> Option<Take
     } else if routing.host_count < 2 || !routing.local_host || !routing.remote_host {
         Some(TakeoverSkip::NoRemoteHost)
     } else {
+        use AudioSourceType::{Media, None as Idle};
         match routing.audio {
-            Some(AudioSourceType::None) => None,
-            Some(AudioSourceType::Media) if routing.audio_from_local => None,
+            Some(Media) if routing.audio_from_local => None,
+            Some(Idle) if trigger == TakeoverTrigger::Manual => None,
+            Some(source @ (Idle | Media)) if trigger != TakeoverTrigger::Manual => {
+                let reported = if source == Media {
+                    AUDIO_CATEGORY_MEDIA
+                } else {
+                    AUDIO_CATEGORY_IDLE
+                };
+                let (local, remote) = (
+                    routing.local_category,
+                    routing.remote_category.unwrap_or(reported),
+                );
+                (local < remote).then_some(TakeoverSkip::RemoteCategoryHigher { local, remote })
+            }
             _ => Some(TakeoverSkip::AudioNotIdle),
         }
     }
@@ -789,7 +829,8 @@ impl MediaController {
                     TakeoverSkip::AwaitingNewPlayback
                     | TakeoverSkip::NoSession
                     | TakeoverSkip::NoRemoteHost
-                    | TakeoverSkip::AudioNotIdle => {}
+                    | TakeoverSkip::AudioNotIdle
+                    | TakeoverSkip::RemoteCategoryHigher { .. } => {}
                 }
                 continue;
             }
@@ -2292,7 +2333,7 @@ mod tests {
     const REMOTE_3: &str = "13:14:15:16:17:18";
 
     /// Routing copied from a real `ConnectedDevice` list `macs`, with a live
-    /// session, a bud in an ear and idle audio.
+    /// session, a bud in an ear, idle audio and a local stream (201).
     fn routing_with_hosts(macs: &[&str]) -> RoutingSnapshot {
         let hosts: Vec<ConnectedDevice> = macs
             .iter()
@@ -2312,6 +2353,8 @@ mod tests {
             &hosts,
             &[EarDetectionStatus::InEar, EarDetectionStatus::OutOfEar],
             Some(&idle),
+            &HashMap::new(),
+            AUDIO_CATEGORY_STREAM,
             LOCAL,
         )
     }
@@ -2474,7 +2517,10 @@ mod tests {
                     audio_from_local: false,
                     ..ready_routing()
                 },
-                TakeoverSkip::AudioNotIdle,
+                TakeoverSkip::RemoteCategoryHigher {
+                    local: AUDIO_CATEGORY_STREAM,
+                    remote: AUDIO_CATEGORY_MEDIA,
+                },
             ),
             (
                 RoutingSnapshot {
@@ -2608,6 +2654,131 @@ mod tests {
             ..TakeoverInputs::handoff(Manual, ready_routing(), Immediate)
         };
         assert_eq!(decide_takeover(manual).action, TakeoverAction::TakeOver);
+    }
+
+    /// Routing with Linux plus REMOTE and REMOTE_2, worn, the audio source
+    /// `audio` reported by `source` (None: no report), these relays, and
+    /// Linux at `local`.
+    fn category_routing(
+        local: u32,
+        audio: Option<(&str, AudioSourceType)>,
+        relays: &[(&str, u32)],
+    ) -> RoutingSnapshot {
+        let hosts = [LOCAL, REMOTE, REMOTE_2].map(|mac| ConnectedDevice {
+            mac: mac.to_string(),
+            info1: 0,
+            info2: 0,
+            r#type: None,
+        });
+        let audio = audio.map(|(mac, r#type)| AudioSource {
+            mac: mac.to_string(),
+            r#type,
+        });
+        let relays = relays.iter().map(|&(h, c)| (h.to_string(), c)).collect();
+        routing_snapshot(
+            true,
+            &hosts,
+            &[EarDetectionStatus::InEar; 2],
+            audio.as_ref(),
+            &relays,
+            local,
+            LOCAL,
+        )
+    }
+
+    #[test]
+    fn category_takeover_table() {
+        use AudioSourceType::{Call, Media, Unknown};
+        const IDLE: u32 = AUDIO_CATEGORY_IDLE;
+        const STREAM: u32 = AUDIO_CATEGORY_STREAM;
+        const MEDIA: u32 = AUDIO_CATEGORY_MEDIA;
+        const CALL: u32 = crate::bluetooth::aacp::AUDIO_CATEGORY_CALL;
+        let take = TakeoverAction::TakeOver;
+        let higher = |local, remote| {
+            TakeoverAction::Skip(TakeoverSkip::RemoteCategoryHigher { local, remote })
+        };
+        let not_idle = TakeoverAction::Skip(TakeoverSkip::AudioNotIdle);
+        let none = AudioSourceType::None;
+        // H = REMOTE is the audio source; G = REMOTE_2 is another host.
+        let h = REMOTE;
+        let g = REMOTE_2;
+        let table: [(u32, Option<(&str, AudioSourceType)>, &[(&str, u32)], _); 15] = [
+            (MEDIA, Some((h, Media)), &[], take),
+            (STREAM, Some((h, Media)), &[], higher(STREAM, MEDIA)),
+            (STREAM, Some((h, none)), &[], take),
+            (MEDIA, Some((h, none)), &[], take),
+            (STREAM, Some(("00:00:00:00:00:00", none)), &[], take),
+            (STREAM, Some((h, Media)), &[(h, STREAM)], take),
+            // #280 addendum: the relay beats a stale media report.
+            (STREAM, Some((h, Media)), &[(h, IDLE)], take),
+            (MEDIA, Some((h, Media)), &[(h, IDLE)], take),
+            (MEDIA, Some((h, Media)), &[(h, CALL)], higher(MEDIA, CALL)),
+            (MEDIA, Some((h, none)), &[(h, CALL)], higher(MEDIA, CALL)),
+            (MEDIA, Some((h, Call)), &[], not_idle),
+            (MEDIA, Some((h, Call)), &[(h, IDLE)], not_idle),
+            (MEDIA, Some((h, Unknown)), &[], not_idle),
+            (MEDIA, None, &[], not_idle),
+            // A relay from a host that is not the audio source changes nothing.
+            (
+                STREAM,
+                Some((h, Media)),
+                &[(g, IDLE)],
+                higher(STREAM, MEDIA),
+            ),
+        ];
+        for (local, audio, relays, expected) in table {
+            let routing = category_routing(local, audio, relays);
+            let poll = TakeoverInputs {
+                handoff: guards(routing),
+                ..takeover_inputs()
+            };
+            assert_eq!(
+                decide_takeover(poll).action,
+                expected,
+                "poll {local} {audio:?} {relays:?}"
+            );
+            let reconnect = TakeoverInputs::handoff(
+                TakeoverTrigger::ReconnectedForPlayback,
+                routing,
+                CaseRecovery::PlaybackRequested,
+            );
+            assert_eq!(
+                decide_takeover(reconnect).action,
+                expected,
+                "reconnect {local} {audio:?} {relays:?}"
+            );
+        }
+        // Local media is never remote activity, whatever the categories.
+        let local_media = category_routing(IDLE, Some((LOCAL, Media)), &[(LOCAL, MEDIA)]);
+        assert_eq!(
+            decide_takeover(TakeoverInputs {
+                handoff: guards(local_media),
+                ..takeover_inputs()
+            })
+            .action,
+            take
+        );
+        // A manual take keeps the #841 guard: idle report or local media.
+        let manual = |routing| {
+            decide_takeover(TakeoverInputs::handoff(
+                TakeoverTrigger::Manual,
+                routing,
+                CaseRecovery::Immediate,
+            ))
+            .action
+        };
+        assert_eq!(
+            manual(category_routing(IDLE, Some((h, none)), &[(h, CALL)])),
+            take
+        );
+        assert_eq!(
+            manual(category_routing(MEDIA, Some((h, Media)), &[(h, IDLE)])),
+            not_idle
+        );
+        assert_eq!(
+            manual(category_routing(IDLE, Some((LOCAL, Media)), &[])),
+            take
+        );
     }
 
     #[test]

@@ -60,12 +60,13 @@ For installation and detailed info, see the [Linux README](/linux/README.md).
 
 #### Automatic switching
 
-While an iPhone or Mac owns the AirPods, Linux takes them only for players
-that report playback over MPRIS (most browsers, Spotify, mpv with an MPRIS
-plugin, ...). Apps without MPRIS (games, plain mpv, many Electron apps) can't
-take them: Linux's A2DP stream stays idle until Linux owns the AirPods, so
-there is no audio to detect. Follow-up:
-[#198](https://github.com/mhijazi1/librepods/issues/198).
+Linux takes the AirPods from an iPhone or Mac the way macOS does, by audio
+category ([#272](https://github.com/mhijazi1/librepods/issues/272)). A player
+that reports playback over MPRIS (most browsers, Spotify, mpv with an MPRIS
+plugin, ...) takes them from an idle owner or from one playing media. A player
+without MPRIS (games, plain mpv, many Electron apps) takes them from an idle
+owner, but not from one playing media: it plays on the next sink instead.
+Neither takes them from an owner in a call.
 
 #### Desktop battery (BlueZ BatteryProvider)
 

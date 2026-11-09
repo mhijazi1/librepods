@@ -11,10 +11,12 @@
 use crate::a2dp_resume::A2DP_RESUME_WINDOW;
 use crate::bluetooth::aacp::{AudioSource, ConnectedDevice, EarDetectionStatus};
 use crate::media_controller::{
-    CaseRecovery, HandoffGuards, RoutingSnapshot, TakeoverAction, TakeoverDecision, TakeoverInputs,
-    TakeoverSkip, TakeoverTrigger, case_closed_after, decide_takeover, routing_snapshot,
+    AUDIO_CATEGORY_IDLE, CaseRecovery, HandoffGuards, RoutingSnapshot, TakeoverAction,
+    TakeoverDecision, TakeoverInputs, TakeoverSkip, TakeoverTrigger, case_closed_after,
+    decide_takeover, routing_snapshot,
 };
 use crate::utils::ConnectMode;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// How long an ownership request may wait for its acknowledgement.
@@ -55,8 +57,11 @@ pub(crate) struct SessionFacts {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Input {
-    /// A playback poll: whether any local player was playing at `sampled_at`.
-    Playback { sampled_at: Instant, playing: bool },
+    /// A playback poll: Linux's audio category at `sampled_at` (#272): 301
+    /// while an MPRIS player plays, else 201 for a counted stream, else 100.
+    /// Above 100 is playing. A rise (100 to 201 or 301, 201 to 301) asks for
+    /// a take; only a fall to 100 is a stop.
+    Playback { sampled_at: Instant, category: u32 },
     /// Wear report (AACP ear detection).
     EarState(Vec<EarDetectionStatus>),
     /// Audio source report.
@@ -150,6 +155,10 @@ pub(crate) enum Input {
     /// local fact: the last report is kept. With no report yet, a take never
     /// resumes A2DP.
     A2dpTransport { active: bool },
+    /// `host` relayed its audio category (#272). The latest per host counts
+    /// for automatic takes until the session ends. Its own variant: no other
+    /// input carries a per-host fact.
+    MediaInformation { host: String, category: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +169,9 @@ pub(crate) enum Command {
     Announce,
     /// Tell the connected remote hosts whether Linux is in a call (#11).
     AdvertiseCall(bool),
+    /// Relay Linux's audio category to the connected remote hosts (#272).
+    /// Only with `with_category_relay(true)`.
+    RelayCategory(u32),
     /// Pause local players.
     PauseMedia,
     /// Connect the A2DP sink profile.
@@ -313,6 +325,13 @@ pub(crate) struct Handoff {
     remote_owns: bool,
     /// The last `HoldA2dp` emitted; None until a session start emits one.
     held: Option<bool>,
+    /// Linux's audio category in the last playback sample since the
+    /// baseline (#272). A local fact: a reset keeps it.
+    category: u32,
+    /// The category each host last relayed this session (#272).
+    relays: HashMap<String, u32>,
+    /// Emit `RelayCategory` (#272).
+    category_relay: bool,
 }
 
 impl Handoff {
@@ -361,7 +380,17 @@ impl Handoff {
             a2dp_hold: false,
             remote_owns: false,
             held: None,
+            category: AUDIO_CATEGORY_IDLE,
+            relays: HashMap::new(),
+            category_relay: false,
         }
+    }
+
+    /// Relay Linux's audio category to the other hosts in automatic mode
+    /// (#272); off by default.
+    pub(crate) fn with_category_relay(mut self, enabled: bool) -> Self {
+        self.category_relay = enabled;
+        self
     }
 
     /// Hold the AirPods card `off` while another host owns them (#264); off
@@ -437,8 +466,8 @@ impl Handoff {
         match input {
             Input::Playback {
                 sampled_at,
-                playing,
-            } => self.playback(now, sampled_at, playing, out),
+                category,
+            } => self.playback(now, sampled_at, category, out),
             Input::EarState(ears) => {
                 self.case_closed = case_closed_after(&ears, self.case_closed);
                 self.ears = ears;
@@ -652,6 +681,9 @@ impl Handoff {
             Input::LocalCall(in_call) => self.local_call(now, in_call, out),
             Input::Tick => self.tick(now, out),
             Input::A2dpTransport { active } => self.a2dp_active = Some(active),
+            Input::MediaInformation { host, category } => {
+                self.relays.insert(host, category);
+            }
         }
     }
 
@@ -659,15 +691,20 @@ impl Handoff {
         &mut self,
         now: Instant,
         sampled_at: Instant,
-        playing: bool,
+        category: u32,
         out: &mut Vec<Command>,
     ) {
         if sampled_at < self.playback_baseline_at {
             return;
         }
+        let playing = category > AUDIO_CATEGORY_IDLE;
         let previous = self.was_playing.replace(playing);
+        let last_category = std::mem::replace(&mut self.category, category);
         let assumed_playing = std::mem::take(&mut self.take_assumes_playing);
-        let fresh_play = previous == Some(false) && playing;
+        // A rise while already playing (201 to 301) asks for a take like a
+        // start (#272), unless Linux already holds one.
+        let rose = previous == Some(true) && category > last_category && !self.requested_take;
+        let fresh_play = (previous == Some(false) && playing) || rose;
         // Release edges also count a take sent for playback before the
         // baseline: the stop after a reconnect take must not be lost.
         let stopped =
@@ -689,6 +726,10 @@ impl Handoff {
         if self.quitting || self.session_lost {
             return;
         }
+        // A local call's 501 wins; its end relays the category (#272).
+        if self.category_relay && category != last_category && !self.local_call {
+            out.push(Command::RelayCategory(category));
+        }
         let resuming = self.requested_take && self.resume_until.is_some();
         match self.pending {
             // A track change's gap: the stop's release was still held. Linux
@@ -699,7 +740,7 @@ impl Handoff {
                     self.resume_if_idle(now, out);
                 }
             }
-            None => match self.decide_poll(previous, playing).action {
+            None => match self.decide_poll(previous.map(|p| p && !rose), playing).action {
                 // The resume chain's kick, or its Play after the profile
                 // cycle: Linux already owns the AirPods.
                 TakeoverAction::TakeOver if resuming => {
@@ -733,6 +774,10 @@ impl Handoff {
                         }
                     }
                 }
+                TakeoverAction::Skip(TakeoverSkip::RemoteCategoryHigher { local, remote }) => self
+                    .say(format!(
+                        "AUTO takeover skipped: the audio source's category {remote} is above Linux's {local}"
+                    )),
                 TakeoverAction::Skip(_) => self
                     .say("AUTO takeover blocked by remote activity, wear, or missing host state"),
             },
@@ -1050,6 +1095,7 @@ impl Handoff {
         self.release_at = None;
         self.hosts.clear();
         self.snapshot_hosts.clear();
+        self.relays.clear();
         self.ears.clear();
         self.audio = None;
         self.owner = None;
@@ -1075,6 +1121,8 @@ impl Handoff {
         self.session_lost = false;
         self.snapshot_hosts = facts.hosts.clone();
         self.hosts = facts.hosts;
+        // Relays belong to the session that carried them.
+        self.relays.clear();
         self.ears = facts.ears;
         self.audio = facts.audio;
         self.owner = facts.owner;
@@ -1243,6 +1291,10 @@ impl Handoff {
             return;
         }
         self.say("CALL ended on Linux");
+        // The call's 501 replaced the category the other hosts had (#272).
+        if self.category_relay && self.category != AUDIO_CATEGORY_IDLE {
+            out.push(Command::RelayCategory(self.category));
+        }
         // A stop seen during the call (or while its take was settling) was
         // held for it; release now if playback is still stopped. A pending
         // request settles through `reconcile` as usual.
@@ -1264,6 +1316,8 @@ impl Handoff {
             &self.hosts,
             &self.ears,
             self.audio.as_ref(),
+            &self.relays,
+            self.category,
             &self.local,
         )
     }
@@ -1408,13 +1462,18 @@ mod tests {
             self.feed(ms, Input::Tick)
         }
 
+        /// A sample at `ms`; `playing` is a counted stream (201).
         fn play(&mut self, ms: u64, playing: bool) -> Vec<Command> {
+            self.play_category(ms, if playing { STREAM } else { IDLE })
+        }
+
+        fn play_category(&mut self, ms: u64, category: u32) -> Vec<Command> {
             let sampled_at = self.at(ms);
             self.feed(
                 ms,
                 Input::Playback {
                     sampled_at,
-                    playing,
+                    category,
                 },
             )
         }
@@ -4756,5 +4815,171 @@ mod tests {
                 assert_eq!(p.play(ms, false), [], "{ms}");
             }
         }
+    }
+
+    // #272: audio categories.
+    const IDLE: u32 = AUDIO_CATEGORY_IDLE;
+    const STREAM: u32 = crate::media_controller::AUDIO_CATEGORY_STREAM;
+    const MEDIA: u32 = crate::media_controller::AUDIO_CATEGORY_MEDIA;
+
+    fn relay(host: &str, category: u32) -> Input {
+        Input::MediaInformation {
+            host: host.to_string(),
+            category,
+        }
+    }
+
+    /// `Probe::ready` with REMOTE reported playing media, and its relay of
+    /// `relayed` if any.
+    fn remote_playing(relayed: Option<u32>) -> Probe {
+        let mut p = Probe::ready();
+        assert_eq!(p.feed(20, remote_media()), []);
+        if let Some(category) = relayed {
+            assert_eq!(p.feed(30, relay(REMOTE, category)), []);
+        }
+        p.core.take_lines();
+        p
+    }
+
+    #[test]
+    fn category_rises_are_fresh_requests() {
+        // 100 -> 201 and 100 -> 301 take from an idle owner.
+        for category in [STREAM, MEDIA] {
+            let mut p = Probe::ready();
+            assert_eq!(
+                p.play_category(500, category),
+                [SendOwnership(true)],
+                "{category}"
+            );
+        }
+        // Against a media owner a stream is skipped; MPRIS (201 -> 301) takes.
+        let mut p = remote_playing(None);
+        assert_eq!(p.play_category(500, STREAM), []);
+        assert_eq!(
+            p.core.take_lines(),
+            ["AUTO takeover skipped: the audio source's category 301 is above Linux's 201"]
+        );
+        assert_eq!(p.play_category(1000, STREAM), []);
+        assert_eq!(p.play_category(1500, MEDIA), [SendOwnership(true)]);
+        assert_eq!(p.play_category(2000, MEDIA), []);
+    }
+
+    #[test]
+    fn category_rise_while_holding_the_take_sends_nothing() {
+        let mut p = Probe::ready();
+        assert_eq!(p.play_category(500, STREAM), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play_category(1000, MEDIA), []);
+    }
+
+    #[test]
+    fn category_fall_to_stream_is_no_stop() {
+        let mut p = Probe::ready();
+        assert_eq!(p.play_category(500, MEDIA), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        // 301 -> 201: no release, no hold armed, however long it lasts.
+        assert_eq!(p.play_category(1000, STREAM), []);
+        assert_eq!(p.core.release_at, None);
+        assert_eq!(p.feed(1000 + 2 * HOLD_MS, Input::Tick), []);
+        // 201 -> 100 arms the #205 release hold.
+        let stop = 1500 + 2 * HOLD_MS;
+        assert_eq!(p.play_category(stop, IDLE), []);
+        assert!(p.core.release_at.is_some());
+        assert_eq!(p.hold_ends(stop), [SendOwnership(false)]);
+    }
+
+    #[test]
+    fn category_relay_beats_stale_report() {
+        // REMOTE's relay of 100 beats its media report: a stream takes.
+        let mut p = remote_playing(Some(IDLE));
+        assert_eq!(p.play_category(500, STREAM), [SendOwnership(true)]);
+        // Another host's relay does not stand for REMOTE's.
+        let mut p = remote_playing(None);
+        assert_eq!(p.feed(40, relay(REMOTE_2, IDLE)), []);
+        assert_eq!(p.play_category(500, STREAM), []);
+    }
+
+    #[test]
+    fn category_relays_cleared_on_disconnect_and_session_restart() {
+        let mut p = remote_playing(Some(IDLE));
+        p.feed(40, Input::Disconnected);
+        assert!(p.core.relays.is_empty());
+        // A relay fed after the drop is gone once the next session starts.
+        p.feed(50, relay(REMOTE, IDLE));
+        assert_eq!(p.feed(1100, Input::Tick), [Reconnect { audio: true }]);
+        p.feed(
+            1200,
+            Input::Reconnected(SessionFacts {
+                audio: Some(source(REMOTE, AudioSourceType::Media)),
+                ..ready_facts()
+            }),
+        );
+        assert!(p.core.relays.is_empty());
+        // So the media report blocks a stream again.
+        assert_eq!(p.play_category(1300, IDLE), []);
+        assert_eq!(p.play_category(1500, STREAM), []);
+    }
+
+    /// `Probe::ready`, relaying its category.
+    fn relaying() -> Probe {
+        let mut p = Probe::ready();
+        p.core.category_relay = true;
+        p
+    }
+
+    #[test]
+    fn category_relay_each_change_in_automatic_mode() {
+        let mut p = relaying();
+        assert_eq!(
+            p.play_category(500, STREAM),
+            [RelayCategory(STREAM), SendOwnership(true)]
+        );
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play_category(1000, STREAM), []);
+        assert_eq!(p.play_category(1500, MEDIA), [RelayCategory(MEDIA)]);
+        assert_eq!(p.play_category(2000, IDLE), [RelayCategory(IDLE)]);
+        // Relayed whether or not Linux wins.
+        let mut p = remote_playing(None);
+        p.core.category_relay = true;
+        assert_eq!(p.play_category(500, STREAM), [RelayCategory(STREAM)]);
+    }
+
+    #[test]
+    fn category_relay_none_in_manual_mode() {
+        let mut p = relaying();
+        p.feed(100, Input::Manual);
+        for (ms, category) in [(500, STREAM), (1000, MEDIA), (1500, IDLE)] {
+            assert_eq!(p.play_category(ms, category), [], "{category}");
+        }
+    }
+
+    #[test]
+    fn category_relay_none_during_a_call() {
+        let mut p = relaying();
+        assert_eq!(p.feed(100, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play_category(500, STREAM), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(p.play_category(1000, MEDIA), []);
+        assert_eq!(p.play_category(1500, IDLE), []);
+    }
+
+    #[test]
+    fn category_relay_once_at_call_end_unless_idle() {
+        let mut p = relaying();
+        assert_eq!(p.feed(100, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(p.play_category(500, MEDIA), [SendOwnership(true)]);
+        assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+        assert_eq!(
+            p.feed(1000, Input::LocalCall(false)),
+            [AdvertiseCall(false), RelayCategory(MEDIA)]
+        );
+        assert_eq!(p.play_category(1500, MEDIA), []);
+        // Idle when the call ends: only the call's own advert.
+        let mut p = relaying();
+        assert_eq!(p.feed(100, Input::LocalCall(true)), [AdvertiseCall(true)]);
+        assert_eq!(
+            p.feed(1000, Input::LocalCall(false)),
+            [AdvertiseCall(false)]
+        );
     }
 }
