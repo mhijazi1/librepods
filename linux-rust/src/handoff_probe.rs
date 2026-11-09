@@ -153,24 +153,13 @@ async fn connect_control(address: Address) -> Result<ControlSession> {
 }
 
 async fn wait_routing_ready(manager: &AACPManager) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let state = manager.state.lock().await;
-            if state.sender.is_none() {
-                return Err("AirPods disconnected during initialization".into());
-            }
-            let ready = !state.connected_devices.is_empty()
-                && !state.ear_detection_status.is_empty()
-                && state.audio_source.is_some();
-            drop(state);
-            if ready {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .map_err(|_| "AirPods did not provide fresh routing and wear state")?
+    if crate::reconnect::routing_ready(manager).await {
+        return Ok(());
+    }
+    if manager.state.lock().await.sender.is_none() {
+        return Err("AirPods disconnected during initialization".into());
+    }
+    Err("AirPods did not provide fresh routing and wear state".into())
 }
 
 /// Whether a manual take would go ahead now, by the single takeover policy.
@@ -675,7 +664,10 @@ mod tests {
             .await;
         wait_routing_ready(&manager).await.unwrap();
         manager.disconnect().await;
-        assert!(wait_routing_ready(&manager).await.is_err());
+        assert_eq!(
+            wait_routing_ready(&manager).await.unwrap_err().to_string(),
+            "AirPods disconnected during initialization"
+        );
     }
 
     #[tokio::test]

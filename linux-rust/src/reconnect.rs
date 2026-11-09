@@ -330,7 +330,7 @@ pub(crate) fn playback_stopped(mac: &str) -> bool {
 }
 
 /// Whether the session reports hosts, ears and an audio source within
-/// `ROUTING_READY_WAIT`, as the probe's `wait_routing_ready`.
+/// `ROUTING_READY_WAIT`. The probe's `wait_routing_ready` delegates here.
 pub(crate) async fn routing_ready(manager: &AACPManager) -> bool {
     tokio::time::timeout(ROUTING_READY_WAIT, async {
         loop {
