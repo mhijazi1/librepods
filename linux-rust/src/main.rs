@@ -344,15 +344,23 @@ async fn async_main(
         let Some(is_connected) = connected_var.0.as_ref().as_u64() else {
             return true;
         };
-        let proxy = conn.with_proxy("org.bluez", path, std::time::Duration::from_millis(5000));
-        // shortcut: a failed UUIDs/Address read skips reconnect::device_connected (#408)
-        // and the next drop's record_drop is then a no-op.
+        let proxy = conn.with_proxy("org.bluez", &path, std::time::Duration::from_millis(5000));
+        // Without the reset, a dropped AirPods' next drop goes unrecorded.
+        let read_failed = || {
+            if is_connected != 0
+                && let Some(mac) = reconnect::mac_from_path(&path)
+            {
+                reconnect::device_connected_if_dropped(&mac);
+            }
+        };
         let Ok(uuids) = proxy.get::<Vec<String>>("org.bluez.Device1", "UUIDs") else {
+            read_failed();
             return true;
         };
         let target_uuid = "74ec2172-0bad-4d01-8f77-997b2be0722a";
 
         let Ok(addr_str) = proxy.get::<String>("org.bluez.Device1", "Address") else {
+            read_failed();
             return true;
         };
         let Ok(addr) = addr_str.parse::<Address>() else {
@@ -434,10 +442,7 @@ async fn async_main(
     // Older BlueZ never sends it, and a drop with no reason never reconnects.
     let reasons = MatchRule::new_signal("org.bluez.Device1", "Disconnected");
     conn.add_match(reasons, |_: (), _, msg| {
-        if let Some(mac) = msg.path().and_then(|path| {
-            path.rsplit_once("/dev_")
-                .map(|(_, dev)| dev.replace('_', ":"))
-        }) {
+        if let Some(mac) = msg.path().and_then(|path| reconnect::mac_from_path(&path)) {
             reconnect::disconnect_reason(&mac, msg.get1::<String>().as_deref());
         }
         true
