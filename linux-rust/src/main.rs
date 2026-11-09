@@ -207,6 +207,7 @@ async fn async_main(
             battery_r_status: None,
             battery_c: None,
             battery_c_status: None,
+            case_owner: None,
             connected: false,
             listening_mode: None,
             allow_off_option: None,

@@ -402,6 +402,10 @@ pub async fn start_le_monitor(
                                                             tray.battery_c_status,
                                                             case_byte as u8,
                                                         );
+                                                    if case_byte != 0xff {
+                                                        tray.case_owner =
+                                                            matched_airpods_mac.clone();
+                                                    }
                                                 })
                                                 .await;
                                         }
