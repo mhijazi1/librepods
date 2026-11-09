@@ -464,11 +464,12 @@ fn proc_ppid(pid: u32) -> Option<u32> {
 /// Each sample is timed when the listing and levels return. Sampling runs on
 /// the blocking pool in its own task, so a sound server that never answers
 /// stalls only this state, never the caller, and only until its connect or
-/// listing times out (`pulse::CONNECT_TIMEOUT`, then `pulse::OPERATION_TIMEOUT`
-/// for the sink inputs and again for their clients; the last state is kept). Putting the core's reset time in `rebaseline`
-/// asks the tracker to re-baseline at it (`PlaybackTracker::rebaseline`)
-/// before it observes the next listing to return, even one already in
-/// flight (#90).
+/// listing times out (`pulse::CONNECT_TIMEOUT`, then
+/// `pulse::OPERATION_TIMEOUT` for the sink inputs and again for their
+/// clients; the last state is kept). Putting the core's reset time in
+/// `rebaseline` asks the tracker to re-baseline at it
+/// (`PlaybackTracker::rebaseline`) before it observes the next listing to
+/// return, even one already in flight (#90).
 ///
 /// `rebaseline`'s lock is the serialization point with the core's step
 /// (`switching::PlaybackSamples::handle`): once the listing and the
