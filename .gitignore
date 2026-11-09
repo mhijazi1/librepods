@@ -675,3 +675,7 @@ result-*
 .cargo-target/
 .swarm/project-cache.json
 .swarm/lane-claim
+
+# hardware harness (hwtest/): local config and run output
+hwtest/hwtest.env
+hwtest/out/
