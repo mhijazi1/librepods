@@ -539,13 +539,17 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Option<String>>,
 {
-    tokio::time::timeout(HOLD_RELEASE_WAIT, async {
+    let found = tokio::time::timeout(HOLD_RELEASE_WAIT, async {
         while sink().await.is_none() {
             tokio::time::sleep(CARD_LOOKUP_INTERVAL).await;
         }
     })
     .await
-    .is_ok()
+    .is_ok();
+    if !found {
+        info!("A2DP hold released; no AirPods sink within {HOLD_RELEASE_WAIT:?}");
+    }
+    found
 }
 
 /// Make sure the card offers an A2DP profile: check once, then wait up to
@@ -1213,8 +1217,7 @@ impl MediaController {
             return Ok(());
         }
 
-        // shortcut: no hold check before `recover`, which can restart
-        // WirePlumber after a hold started (#288).
+        // shortcut: no hold check before `recover` (WirePlumber restart) (#288).
         if !before_deadline(deadline, recover).await? {
             if Instant::now() >= deadline {
                 return Err(DeadlineExceeded);
@@ -1629,6 +1632,14 @@ impl MediaController {
         };
         let Some(profile) = profile else {
             debug!("A2DP hold({hold}): card profile {active:?} left as is");
+            // An activation in the gap after the flag cleared already turned
+            // A2DP on: a current release still waits for the sink, so a
+            // queued Take finds it.
+            let a2dp_on = active.is_some_and(|p| p.starts_with("a2dp"));
+            if !hold && a2dp_on && !self.a2dp_held.load(Ordering::SeqCst) {
+                drop(write_lock);
+                wait_for_sink(sink).await;
+            }
             return;
         };
         // Checked right before the write: the opposite hold may have been
@@ -1645,8 +1656,8 @@ impl MediaController {
             return;
         }
         info!("A2DP hold({hold}): card set to {profile}");
-        if !hold && !wait_for_sink(sink).await {
-            info!("A2DP hold released; no AirPods sink within {HOLD_RELEASE_WAIT:?}");
+        if !hold {
+            wait_for_sink(sink).await;
         }
     }
 
@@ -3932,6 +3943,60 @@ mod tests {
         let none = Vec::<String>::new();
         assert_eq!(apply_hold(true, |c| c.set_a2dp_held(false)).await, none);
         assert_eq!(apply_hold(false, |c| c.set_a2dp_held(true)).await, none);
+    }
+
+    /// A release whose card read finds `active` (an activation won the gap
+    /// since the flag cleared) and whose sink appears on the third look,
+    /// with the flag `held` at the read. Returns the writes and the time.
+    async fn release_on(active: &str, held: bool) -> (Vec<String>, Duration) {
+        let controller = MediaController::new(String::new(), String::new());
+        controller.set_a2dp_held(held);
+        let sets = std::cell::RefCell::new(Vec::new());
+        let card = pulse::Card {
+            index: 3,
+            name: None,
+            device_string: None,
+            profiles: profiles(&["off", "a2dp-sink"]),
+            active_profile: Some(active.into()),
+        };
+        let looks = std::cell::Cell::new(0);
+        let sink = || {
+            looks.set(looks.get() + 1);
+            let found = looks.get() == 3;
+            async move { found.then(|| "bluez_output.AA".to_string()) }
+        };
+        let write = |_, profile| {
+            sets.borrow_mut().push(profile);
+            async { true }
+        };
+        let start = Instant::now();
+        controller
+            .apply_a2dp_hold_with(
+                false,
+                "",
+                PreferredCodec::Aac,
+                || async { Some(card) },
+                write,
+                sink,
+            )
+            .await;
+        (sets.into_inner(), start.elapsed())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_release_wait_on_a_card_already_on_a2dp() {
+        let none = Vec::<String>::new();
+        let wait = 2 * CARD_LOOKUP_INTERVAL;
+        assert_eq!(release_on("a2dp-sink", false).await, (none.clone(), wait));
+        // Twins: superseded by a new hold, or a call profile: no wait.
+        assert_eq!(
+            release_on("a2dp-sink", true).await,
+            (none.clone(), Duration::ZERO)
+        );
+        assert_eq!(
+            release_on("headset-head-unit", false).await,
+            (none, Duration::ZERO)
+        );
     }
 
     /// An activation's write is in flight (stalled on a gate, like a pulse

@@ -475,9 +475,8 @@ impl Handoff {
                     self.announce(out);
                 }
                 self.hosts = new;
-                // The other host left: nothing to hold A2DP for (#264). An
-                // empty list is no evidence of that.
-                if !self.hosts.is_empty() && self.hosts.iter().all(|d| d.mac == self.local) {
+                // The other host left: nothing to hold A2DP for (#264).
+                if self.only_local_listed() {
                     self.remote_owns = false;
                     self.sync_hold(false, out);
                 }
@@ -973,11 +972,17 @@ impl Handoff {
     /// emitted. Before a session start has emitted one, only `start` does,
     /// so the start also restores a card an earlier run left `off`.
     fn sync_hold(&mut self, start: bool, out: &mut Vec<Command>) {
-        let want = self.remote_owns && !self.quitting;
+        let want = self.remote_owns && !self.quitting && !self.only_local_listed();
         if self.a2dp_hold && (start || self.held.is_some()) && self.held != Some(want) {
             self.held = Some(want);
             out.push(Command::HoldA2dp(want));
         }
+    }
+
+    /// The AirPods list only Linux: no other host to hold A2DP for. An empty
+    /// list is no evidence of that.
+    fn only_local_listed(&self) -> bool {
+        !self.hosts.is_empty() && self.hosts.iter().all(|d| d.mac == self.local)
     }
 
     /// The pending request settled (acknowledged or timed out): act on a
@@ -4599,6 +4604,39 @@ mod tests {
             holds(&p.feed(600, Input::Ownership(vec![1]))),
             [HoldA2dp(false)]
         );
+    }
+
+    /// Held, a remote source seen, a take acknowledged, then the AirPods
+    /// list only Linux.
+    fn retaken_alone() -> Probe {
+        let mut p = held();
+        let mut all = p.feed(150, remote_media());
+        all.extend(p.play(500, true));
+        all.extend(p.feed(600, Input::Ownership(vec![1])));
+        assert_eq!(holds(&all), [HoldA2dp(false)]);
+        let only_linux = Input::ConnectedDevices {
+            old: two_hosts(),
+            new: vec![host(LOCAL)],
+        };
+        assert_eq!(p.feed(700, only_linux), []);
+        p
+    }
+
+    #[test]
+    fn hold_not_resumed_after_the_other_host_left() {
+        // A stop release and its ACK [0].
+        let mut p = retaken_alone();
+        let mut all = p.play(1000, false);
+        all.extend(p.hold_ends(1000));
+        all.extend(p.feed(1100, Input::Ownership(vec![0])));
+        // An unsolicited [0] (the `None if was_linux` branch).
+        let mut q = retaken_alone();
+        all.extend(q.feed(1000, Input::Ownership(vec![0])));
+        all.extend(q.play(1100, true));
+        for ms in (1200..20_000).step_by(1000) {
+            all.extend(q.feed(ms, Input::Tick));
+        }
+        assert_eq!(holds(&all), []);
     }
 
     /// The c1/c2 sequences of the tests above; every command, in order.
