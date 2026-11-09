@@ -202,6 +202,18 @@ pub async fn start_le_monitor(
                                             if auto_connect {
                                                 let real_address =
                                                     Address::from_str(&addr_str).unwrap();
+                                                // One connect at a time with the playback reconnect (#307).
+                                                let Some(_connect_guard) =
+                                                    crate::reconnect::ConnectGuard::try_new(
+                                                        matched_airpods_mac.as_ref().unwrap(),
+                                                    )
+                                                else {
+                                                    info!(
+                                                        "Reconnect for playback is connecting to {}, skipping.",
+                                                        matched_airpods_mac.as_ref().unwrap()
+                                                    );
+                                                    continue;
+                                                };
                                                 let mut cm = connecting_macs_clone.lock().await;
                                                 if cm.contains(&real_address) {
                                                     info!(

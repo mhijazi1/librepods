@@ -442,6 +442,19 @@ impl Handoff {
         self.last_owner_linux
     }
 
+    /// Start as a reconnect made for new playback (#307): the next
+    /// `Input::Reconnected` takes through
+    /// `TakeoverTrigger::ReconnectedForPlayback`.
+    pub(crate) fn with_playback_requested(mut self) -> Self {
+        self.recovery = CaseRecovery::PlaybackRequested;
+        self
+    }
+
+    /// Both buds were last reported in the case (#307).
+    pub(crate) fn case_closed(&self) -> bool {
+        self.case_closed
+    }
+
     #[cfg(test)]
     pub(crate) fn ear_reports_due(&self) -> u32 {
         self.ear_reports_due
@@ -1803,6 +1816,37 @@ mod tests {
             p.feed(2300, Input::Reconnected(ready_facts())),
             [AdoptSession, Announce, DrainPlayback]
         );
+    }
+
+    #[test]
+    fn with_playback_requested_takes_on_reconnected() {
+        let mut p = Probe::new(true, false);
+        p.core = p.core.with_playback_requested();
+        assert_eq!(
+            p.feed(100, Input::Reconnected(ready_facts())),
+            [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
+        );
+        assert!(
+            p.core
+                .take_lines()
+                .contains(&"AUTO reconnected for new playback; requested Linux ownership".into())
+        );
+        // Without it, the same reconnect takes nothing.
+        let mut p = Probe::new(true, false);
+        assert_eq!(
+            p.feed(100, Input::Reconnected(ready_facts())),
+            [CancelReconnect]
+        );
+    }
+
+    #[test]
+    fn case_closed_follows_wear() {
+        let mut p = Probe::ready();
+        assert!(!p.core.case_closed());
+        p.feed(20, Input::EarState(vec![InCase, InCase]));
+        assert!(p.core.case_closed());
+        p.feed(30, Input::EarState(vec![InEar, InCase]));
+        assert!(!p.core.case_closed());
     }
 
     #[test]
