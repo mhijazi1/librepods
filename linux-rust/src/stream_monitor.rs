@@ -13,10 +13,9 @@
 //! `switching::spawn_playback_poller`, which combines it with MPRIS. Tests
 //! use fake sources, so no sound server is needed.
 //!
-//! Limit (#197): this stream path (`PlaybackTracker` and the peak gate) can't
-//! take the AirPods from an Apple owner: their A2DP transport stays idle, so
-//! the peak gate only sees silence and only MPRIS takes from an Apple owner
-//! (follow-up spike #198).
+//! Takeover (#272): as on macOS, a counted stream (audio category 201) takes
+//! the AirPods from an idle owner but not from one playing media (301); it
+//! then plays on the next sink, where #264's A2DP hold sends it.
 
 use crate::call_detect::{
     StreamDirection, StreamProps, airpods_card_profile, call_active, is_takeover_worthy,

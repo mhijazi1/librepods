@@ -31,7 +31,9 @@ use crate::bluetooth::aacp::{
 use crate::default_sink::{DefaultSinkRouter, SinkEvent};
 use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::handoff_log;
-use crate::media_controller::{self, MediaController};
+use crate::media_controller::{
+    self, AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_STREAM, MediaController,
+};
 use crate::stream_monitor::{
     self, CallSamples, MIN_STREAM_PLAYBACK, PeakSource, PlaybackSource, PulsePeaks,
     PulsePlaybackStreams,
@@ -59,17 +61,16 @@ type EventTx = mpsc::UnboundedSender<AACPEvent>;
 /// A request to the event router to forward everything still in the primary
 /// queue; answered once it has.
 type FlushRequest = oneshot::Sender<()>;
-/// Playback samples: whether any local MPRIS player was playing, or a
-/// takeover-worthy audio stream had been playing for the minimum duration,
-/// at the instant.
+/// Playback samples: Linux's audio category at the instant (#272), from
+/// `local_category`.
 pub(crate) struct PlaybackSamples {
-    rx: mpsc::Receiver<(Instant, bool)>,
+    rx: mpsc::Receiver<(Instant, u32)>,
     /// Asks the stream monitor to re-baseline at the core's reset (#90).
     rebaseline: Arc<StdMutex<Option<Instant>>>,
 }
 
 impl PlaybackSamples {
-    pub(crate) async fn recv(&mut self) -> Option<(Instant, bool)> {
+    pub(crate) async fn recv(&mut self) -> Option<(Instant, u32)> {
         self.rx.recv().await
     }
 
@@ -228,8 +229,8 @@ pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
 /// `spawn_playback_poller` with its sources, minimum stream duration and
 /// interval injected, and the stream monitor's `observed` hook. Every
 /// `interval` it samples `mpris` on the blocking pool and sends
-/// `(sampled_at, mpris || streams)`, where `streams` is the latest state of
-/// the stream monitor over `streams` and `peaks`. The stream monitor
+/// `(sampled_at, local_category(mpris, streams))`, where `streams` is the
+/// latest state of the stream monitor over `streams` and `peaks`. The stream monitor
 /// samples in its own task (`stream_monitor::spawn_stream_playback`), so a
 /// sound server that never answers leaves the stream state as it was but
 /// never holds up the MPRIS samples. Only edges reach the handoff core
@@ -270,14 +271,26 @@ where
             let mpris_playing = tokio::task::spawn_blocking(move || mpris())
                 .await
                 .unwrap_or(false);
-            let playing = mpris_playing || *streams.borrow();
-            if play_tx.send((sampled_at, playing)).await.is_err() {
+            let category = local_category(mpris_playing, *streams.borrow());
+            if play_tx.send((sampled_at, category)).await.is_err() {
                 break;
             }
             tokio::time::sleep(interval).await;
         }
     });
     PlaybackSamples { rx, rebaseline }
+}
+
+/// Linux's audio category (#272): an MPRIS player playing is media (301),
+/// else a counted stream is 201, else idle (100).
+fn local_category(mpris_playing: bool, stream_playing: bool) -> u32 {
+    if mpris_playing {
+        AUDIO_CATEGORY_MEDIA
+    } else if stream_playing {
+        AUDIO_CATEGORY_STREAM
+    } else {
+        AUDIO_CATEGORY_IDLE
+    }
 }
 
 /// Copy a session's routing, wear and ownership state for the core. The
@@ -325,6 +338,9 @@ pub(crate) fn event_input(event: AACPEvent) -> Option<Input> {
         AACPEvent::EarDetection(_, new) => Some(Input::EarState(new)),
         AACPEvent::AudioSource(source) => Some(Input::AudioSource(source)),
         AACPEvent::OwnershipToFalseRequest => Some(Input::RemoteOwnershipRequest),
+        AACPEvent::MediaInformation { host, category } => {
+            Some(Input::MediaInformation { host, category })
+        }
         _ => None,
     }
 }
@@ -363,6 +379,22 @@ pub(crate) async fn advertise_call(
                 .send_media_information_new_device(local, &peer.mac)
                 .await?;
         }
+    }
+    Ok(())
+}
+
+/// Relay Linux's audio category to every connected remote host (the core's
+/// `RelayCategory`, #272).
+async fn relay_category(
+    manager: &AACPManager,
+    local: &str,
+    category: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let peers = manager.state.lock().await.connected_devices.clone();
+    for peer in peers.iter().filter(|d| d.mac != local) {
+        manager
+            .send_media_information_category(local, &peer.mac, category)
+            .await?;
     }
     Ok(())
 }
@@ -480,6 +512,8 @@ struct Shell {
     lines: Option<LineSink>,
     /// The device's "Connect to this computer" (#16).
     connect_mode: ConnectMode,
+    /// Relay Linux's audio category to the other hosts (#272).
+    relay_category: bool,
 }
 
 /// Receives each line the handoff core emits, in order, right after it is
@@ -525,6 +559,11 @@ impl Shell {
                 Command::AdvertiseCall(in_call) => {
                     if let Err(e) = advertise_call(&self.manager, &self.local, in_call).await {
                         error!("Handoff: failed to advertise call state {in_call}: {e}");
+                    }
+                }
+                Command::RelayCategory(category) => {
+                    if let Err(e) = relay_category(&self.manager, &self.local, category).await {
+                        error!("Handoff: failed to relay audio category {category}: {e}");
                     }
                 }
                 Command::PauseMedia => {
@@ -663,7 +702,8 @@ async fn run_handoff(mut shell: Shell) {
         .with_connect_mode(shell.connect_mode)
         .with_last_owner_linux(last_owner_linux(&shell.mac))
         .with_default_sink_routing(true)
-        .with_a2dp_hold(true);
+        .with_a2dp_hold(true)
+        .with_category_relay(shell.relay_category);
     for input in seed_inputs(facts) {
         if step(&mut core, &mut shell, input).await {
             return;
@@ -702,9 +742,9 @@ async fn run_handoff(mut shell: Shell) {
                     true
                 }
             },
-            Some((sampled_at, playing)) = shell.play_rx.recv() => {
+            Some((sampled_at, category)) = shell.play_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
-                    || step(&mut core, &mut shell, Input::Playback { sampled_at, playing }).await
+                    || step(&mut core, &mut shell, Input::Playback { sampled_at, category }).await
             }
             Some((_, in_call)) = shell.call_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
@@ -748,6 +788,9 @@ pub(crate) struct Switching {
     /// The A2DP transport poller (#200) for the handoff task; `start` sets
     /// it in the handoff mode, `start_with_calls` sets none.
     a2dp: Option<mpsc::Receiver<bool>>,
+    /// Relay Linux's audio category (#272); `start` sets it,
+    /// `start_with_calls` leaves it off.
+    relay_category: bool,
 }
 
 enum Policy {
@@ -793,6 +836,7 @@ impl Switching {
                 .await
                 .with_connect_mode(utils::load_connect_mode(&mac));
         switching.a2dp = handoff.then(|| a2dp_resume::spawn_transport_poller(&mac));
+        switching.relay_category = true;
         match log {
             Some(log) => switching.with_line_sink(log.sink(mac)),
             None => switching,
@@ -849,6 +893,7 @@ impl Switching {
             lines: None,
             connect_mode: ConnectMode::default(),
             a2dp: None,
+            relay_category: false,
         }
     }
 
@@ -911,6 +956,7 @@ impl Switching {
                     resume: None,
                     lines: self.lines,
                     connect_mode: self.connect_mode,
+                    relay_category: self.relay_category,
                 };
                 spawn_handoff_task(self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
@@ -1381,7 +1427,7 @@ mod tests {
     /// then fed through `dispatch_events` from the manager's event channel.
     struct Harness {
         records: Arc<Records>,
-        play_tx: mpsc::Sender<(Instant, bool)>,
+        play_tx: mpsc::Sender<(Instant, u32)>,
         playback_started: Arc<AtomicBool>,
         /// The injected call monitor's sender (no sound server in tests).
         call_tx: mpsc::Sender<(Instant, bool)>,
@@ -1414,7 +1460,7 @@ mod tests {
 
         /// The sender `play` uses and the playback samples it feeds.
         fn play_channel() -> (
-            mpsc::Sender<(Instant, bool)>,
+            mpsc::Sender<(Instant, u32)>,
             impl FnOnce() -> PlaybackSamples,
         ) {
             let (play_tx, play_rx) = mpsc::channel(8);
@@ -1533,7 +1579,7 @@ mod tests {
             records: Arc<Records>,
             handler: Arc<DeviceHandler>,
             (play_tx, playback): (
-                mpsc::Sender<(Instant, bool)>,
+                mpsc::Sender<(Instant, u32)>,
                 impl FnOnce() -> PlaybackSamples,
             ),
             connect_mode: ConnectMode,
@@ -1629,9 +1675,14 @@ mod tests {
             let _ = self.a2dp_tx.send(active).await;
         }
 
+        /// A sample from an MPRIS player (301) playing, or idle (100).
         async fn play(&self, playing: bool) {
+            self.play_category(local_category(playing, false)).await;
+        }
+
+        async fn play_category(&self, category: u32) {
             // A closed channel (no handoff task) drops the sample.
-            let _ = self.play_tx.send((Instant::now(), playing)).await;
+            let _ = self.play_tx.send((Instant::now(), category)).await;
         }
 
         fn pauses(&self) -> usize {
@@ -2036,8 +2087,14 @@ mod tests {
             ]))
             .unwrap();
         events.send(owns(0)).unwrap();
-        play_tx.send((Instant::now(), false)).await.unwrap();
-        play_tx.send((Instant::now(), true)).await.unwrap();
+        play_tx
+            .send((Instant::now(), AUDIO_CATEGORY_IDLE))
+            .await
+            .unwrap();
+        play_tx
+            .send((Instant::now(), AUDIO_CATEGORY_MEDIA))
+            .await
+            .unwrap();
         wait_until("the take", || {
             logged().contains("requested Linux ownership")
         })
@@ -2826,12 +2883,13 @@ mod tests {
         sink_input(index, "event")
     }
 
-    /// The next playback sample.
+    /// The next playback sample, as playing (above idle) or not.
     async fn next_sample(rx: &mut PlaybackSamples) -> (Instant, bool) {
-        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        let (sampled_at, category) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .expect("expected a playback sample")
-            .expect("poller running")
+            .expect("poller running");
+        (sampled_at, category > AUDIO_CATEGORY_IDLE)
     }
 
     /// Read samples until one says `playing`, for at most 3 s; returns its
@@ -3547,6 +3605,113 @@ mod tests {
         preexisting_stream_case("5A:00:00:00:00:10", true).await;
     }
 
+    /// Read samples until one has `category`, for at most 3 s.
+    async fn category_until(rx: &mut PlaybackSamples, category: u32) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while rx.recv().await.expect("poller running").1 != category {}
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no category {category} sample"));
+    }
+
+    #[tokio::test]
+    async fn category_poller_reports_media_stream_and_idle() {
+        let mpris = Arc::new(AtomicBool::new(false));
+        let reads = mpris.clone();
+        let streams = LiveStreams::default();
+        let mut rx = spawn_playback_poller_with(
+            move || reads.load(Ordering::SeqCst),
+            streams.clone(),
+            AllAudible,
+            STREAM_TEST_MIN,
+            STREAM_TEST_POLL,
+            |_| (),
+        );
+        assert_eq!(
+            rx.recv().await.expect("poller running").1,
+            AUDIO_CATEGORY_IDLE
+        );
+        streams.settle().await;
+        streams.set(vec![music(61)]);
+        category_until(&mut rx, AUDIO_CATEGORY_STREAM).await;
+        mpris.store(true, Ordering::SeqCst);
+        category_until(&mut rx, AUDIO_CATEGORY_MEDIA).await;
+        mpris.store(false, Ordering::SeqCst);
+        category_until(&mut rx, AUDIO_CATEGORY_STREAM).await;
+        // An event sound never counts.
+        streams.set(vec![event_sound(62)]);
+        category_until(&mut rx, AUDIO_CATEGORY_IDLE).await;
+    }
+
+    /// The owner plays media and relays 301: a counted stream (201) takes
+    /// nothing, an MPRIS player (301) takes once.
+    #[tokio::test]
+    async fn category_stream_against_relayed_media_waits_for_mpris() {
+        let mac = "5A:00:00:00:02:72";
+        let (manager, mut rx, _tx) = ready_session().await;
+        let mpris = Arc::new(AtomicBool::new(false));
+        let reads = mpris.clone();
+        let streams = LiveStreams::default();
+        let h = Harness::start_streams(
+            mac,
+            &manager,
+            move || reads.load(Ordering::SeqCst),
+            streams.clone(),
+            STREAM_TEST_MIN,
+        )
+        .await;
+        expect_startup(&h, &mut rx).await;
+        h.emit_queued(owns(0)).await;
+        h.emit_queued(AACPEvent::AudioSource(AudioSource {
+            mac: REMOTE.to_string(),
+            r#type: AudioSourceType::Media,
+        }))
+        .await;
+        h.emit_queued(AACPEvent::MediaInformation {
+            host: REMOTE.to_string(),
+            category: AUDIO_CATEGORY_MEDIA,
+        })
+        .await;
+        streams.settle().await;
+
+        streams.set(vec![music(71)]);
+        wait_until("the category skip", || {
+            traced(mac)
+                .iter()
+                .any(|l| l.starts_with("AUTO takeover skipped: the audio source's category 301"))
+        })
+        .await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+        mpris.store(true, Ordering::SeqCst);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn category_relay_reaches_each_remote_host() {
+        let (manager, mut rx, _tx) = ready_session().await;
+        manager
+            .state
+            .lock()
+            .await
+            .connected_devices
+            .push(host(SECOND_REMOTE));
+        relay_category(&manager, LOCAL, AUDIO_CATEGORY_STREAM)
+            .await
+            .expect("relay");
+        for remote in [REMOTE, SECOND_REMOTE] {
+            let expected = reference(|m| async move {
+                m.send_media_information_category(LOCAL, remote, AUDIO_CATEGORY_STREAM)
+                    .await
+            })
+            .await;
+            assert_eq!(rx.try_recv().expect("a relay"), expected, "{remote}");
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
     /// #20: the non-events of upstream #724's reports never take the AirPods
     /// or pause anything. Each runs through the real stream tracker and core
     /// at injected times, with a counterfactual twin that does take.
@@ -3581,8 +3746,8 @@ mod tests {
         }
 
         /// The core fed as the default path feeds it: each playback sample
-        /// is MPRIS `||` the real `PlaybackTracker`'s state, as
-        /// `spawn_playback_poller_with` combines them.
+        /// is `local_category` of MPRIS and the real `PlaybackTracker`'s
+        /// state, as `spawn_playback_poller_with` combines them.
         struct Pipeline {
             core: Handoff,
             tracker: PlaybackTracker,
@@ -3641,12 +3806,12 @@ mod tests {
                 if let Some(playing) = self.tracker.observe_levels(now, streams, |_| level) {
                     self.streams_playing = playing;
                 }
-                let playing = mpris || self.streams_playing;
+                let category = local_category(mpris, self.streams_playing);
                 self.feed(
                     ms,
                     Input::Playback {
                         sampled_at: now,
-                        playing,
+                        category,
                     },
                 )
             }

@@ -327,6 +327,7 @@ impl Io {
                 }
                 // The probe never enables the A2DP hold.
                 Command::HoldA2dp(_) => println!("A2DP hold is not run by the probe"),
+                Command::RelayCategory(_) => println!("category relay is not run by the probe"),
                 Command::Exit => return Ok(true),
                 Command::Fail(reason) => return Err(reason.into()),
             }
@@ -483,9 +484,9 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
                     break;
                 }
             }
-            Some((sampled_at, playing)) = io.play_rx.recv() => {
+            Some((sampled_at, category)) = io.play_rx.recv() => {
                 if sync_session(&mut core, &mut io).await?
-                    || step(&mut core, &mut io, Input::Playback { sampled_at, playing }).await?
+                    || step(&mut core, &mut io, Input::Playback { sampled_at, category }).await?
                 {
                     break;
                 }
@@ -590,6 +591,8 @@ mod tests {
             bud_in_ear: true,
             audio: Some(AudioSourceType::None),
             audio_from_local: false,
+            local_category: crate::media_controller::AUDIO_CATEGORY_MEDIA,
+            remote_category: None,
         };
         let inputs =
             TakeoverInputs::handoff(TakeoverTrigger::ReconnectedForPlayback, routing, recovery);

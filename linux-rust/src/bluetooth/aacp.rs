@@ -331,6 +331,12 @@ pub enum AACPEvent {
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
     StemPress(StemPressType, StemPressBudType),
+    /// A host relayed its audio category in a media-information message
+    /// (#272).
+    MediaInformation {
+        host: String,
+        category: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -919,6 +925,15 @@ impl AACPManager {
                         let _ = tx.send(AACPEvent::OwnershipToFalseRequest);
                     }
                 }
+                if let Some(info) = parse_media_information(payload)
+                    && let Some(category) = info.category
+                {
+                    let host = info.host().to_string();
+                    info!("Received media information: {host} audio category {category}");
+                    if let Some(ref tx) = self.state.lock().await.event_tx {
+                        let _ = tx.send(AACPEvent::MediaInformation { host, category });
+                    }
+                }
             }
             opcodes::EQ_DATA => {
                 debug!("Received EQ Data");
@@ -1070,6 +1085,20 @@ impl AACPManager {
         self.send_data_packet(&encode_media_information_call(
             self_mac_address,
             target_mac_address,
+        )?)
+        .await
+    }
+
+    pub async fn send_media_information_category(
+        &self,
+        self_mac_address: &str,
+        target_mac_address: &str,
+        category: u32,
+    ) -> Result<()> {
+        self.send_data_packet(&encode_media_information_category(
+            self_mac_address,
+            target_mac_address,
+            category,
         )?)
         .await
     }
@@ -1339,6 +1368,17 @@ pub(crate) fn encode_media_information_call(
     smart_routing_packet(target_mac_address, &dict)
 }
 
+// Media information that relays Linux's audio category to another host, as
+// the Mac relays its own (#272).
+pub(crate) fn encode_media_information_category(
+    self_mac_address: &str,
+    target_mac_address: &str,
+    category: u32,
+) -> std::io::Result<Vec<u8>> {
+    let dict = media_information_body("Unknown", false, self_mac_address, "Mac", category);
+    smart_routing_packet(target_mac_address, &dict)
+}
+
 pub(crate) fn encode_hijack_request(target_mac_address: &str) -> std::io::Result<Vec<u8>> {
     let mut dict = Vec::with_capacity(97);
     opack_write_dict_header(&mut dict, 5);
@@ -1585,6 +1625,115 @@ pub(crate) fn parse_smart_routing_response(payload: &[u8]) -> Option<SmartRoutin
         text,
         set_ownership_to_false,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MediaInformation {
+    /// The header's sender address.
+    pub sender: String,
+    /// The dict's `btAddress`, upper case; None if missing or not an address.
+    pub bt_address: Option<String>,
+    /// The dict's `otherDeviceAudioCategory`.
+    pub category: Option<u32>,
+}
+
+impl MediaInformation {
+    /// The relaying host: `btAddress`, unless missing or all-zero (Apple
+    /// zeroes it in some relays), else the header's sender.
+    pub fn host(&self) -> &str {
+        self.bt_address
+            .as_deref()
+            .filter(|a| *a != "00:00:00:00:00:00")
+            .unwrap_or(&self.sender)
+    }
+}
+
+// SMART_ROUTING_RESP (0x11) carrying a media-information dict (#272). Header
+// as inferred from logs, mirroring `smart_routing_packet`: opcode echo (2),
+// sender address reversed (6), u16 LE length, 0x01, then the OPACK dict at
+// payload[11]. None without a dict there. A field whose value is missing,
+// truncated, a back-reference or behind an unknown tag is None.
+pub(crate) fn parse_media_information(payload: &[u8]) -> Option<MediaInformation> {
+    let tag = *payload.get(11)?;
+    if !(0xE0..=0xEF).contains(&tag) {
+        return None;
+    }
+    let sender = &payload[2..8];
+    let mut info = MediaInformation {
+        sender: format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            sender[5], sender[4], sender[3], sender[2], sender[1], sender[0]
+        ),
+        bt_address: None,
+        category: None,
+    };
+    // 0xEF (until 0x03) stops at the terminator, which reads as no value.
+    let count = if tag == 0xEF {
+        usize::MAX
+    } else {
+        usize::from(tag - 0xE0)
+    };
+    let mut pos = 12;
+    for _ in 0..count {
+        let Some((Opack::Str(key), next)) = opack_read(payload, pos) else {
+            break;
+        };
+        let Some((value, next)) = opack_read(payload, next) else {
+            break;
+        };
+        pos = next;
+        match (key, value) {
+            ("btAddress", Opack::Str(address)) => {
+                info.bt_address = parse_mac(address).map(|_| address.to_ascii_uppercase())
+            }
+            ("otherDeviceAudioCategory", Opack::Uint(n)) => info.category = Some(n),
+            _ => {}
+        }
+    }
+    Some(info)
+}
+
+// One OPACK value as `parse_media_information` reads it.
+enum Opack<'a> {
+    Str(&'a str),
+    Uint(u32),
+    /// A bool, a back-reference or a non-UTF-8 string.
+    Other,
+}
+
+// The OPACK value at `pos` and the offset past it; None for a truncated
+// value or a tag whose length is unknown (the writers' subset above, plus
+// bools and back-references).
+fn opack_read(buf: &[u8], pos: usize) -> Option<(Opack<'_>, usize)> {
+    let tag = *buf.get(pos)?;
+    let le = |start: usize, width: usize| {
+        let bytes = buf.get(start..start.checked_add(width)?)?;
+        Some(
+            bytes
+                .iter()
+                .rev()
+                .fold(0u32, |n, &b| (n << 8) | u32::from(b)),
+        )
+    };
+    let string = |start: usize, len: u32| {
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        let value = std::str::from_utf8(buf.get(start..end)?).map_or(Opack::Other, Opack::Str);
+        Some((value, end))
+    };
+    match tag {
+        0x01 | 0x02 | 0xA0..=0xBF => Some((Opack::Other, pos + 1)),
+        0x08..=0x2F => Some((Opack::Uint(u32::from(tag - 0x08)), pos + 1)),
+        0x30..=0x32 => {
+            let width = 1 << (tag - 0x30);
+            Some((Opack::Uint(le(pos + 1, width)?), pos + 1 + width))
+        }
+        0x40..=0x60 => string(pos + 1, u32::from(tag - 0x40)),
+        0x61..=0x64 => {
+            let width = usize::from(tag - 0x60);
+            string(pos + 1 + width, le(pos + 1, width)?)
+        }
+        _ => None,
+    }
 }
 
 async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
@@ -2042,6 +2191,21 @@ mod tests {
             encode_media_information_new_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
                 .expect("encode_media_information_new_device"),
             without_header(GOLDEN_MEDIA_INFORMATION_NEW_DEVICE)
+        );
+    }
+
+    #[test]
+    fn golden_encode_media_information_category_201() {
+        let packet = encode_media_information_category(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, 201)
+            .expect("encode_media_information_category");
+        // "...Category" then OPACK u8 201.
+        assert!(
+            packet.ends_with(&[0x6f, 0x72, 0x79, 0x30, 0xc9]),
+            "{packet:02x?}"
+        );
+        assert_eq!(
+            packet[11..],
+            media_information_body("Unknown", false, GOLDEN_SELF_MAC, "Mac", 201)[..]
         );
     }
 
@@ -2564,6 +2728,11 @@ mod tests {
                     .expect("media_information_call"),
             ),
             (
+                "media_information_category",
+                encode_media_information_category(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, 201)
+                    .expect("media_information_category"),
+            ),
+            (
                 "add_tipi_device",
                 encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
                     .expect("add_tipi_device"),
@@ -2938,6 +3107,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    const RELAY_SENDER: &str = "A1:B2:C3:D4:E5:F6";
+
+    /// `dict` as a 0x11 payload from `RELAY_SENDER`: the smart-routing
+    /// header with the response opcode.
+    fn media_information_payload(dict: &[u8]) -> Vec<u8> {
+        let mut payload = smart_routing_packet(RELAY_SENDER, dict).expect("frame");
+        payload[0] = opcodes::SMART_ROUTING_RESP;
+        payload
+    }
+
+    #[test]
+    fn parse_media_information_apple_captures() {
+        for (capture, category) in [
+            (APPLE_MEDIA_INFORMATION_UNKNOWN_NO_100, 100),
+            (APPLE_MEDIA_INFORMATION_UNKNOWN_YES_100, 100),
+            (APPLE_MEDIA_INFORMATION_INSTAGRAM_NO_301, 301),
+            (APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301, 301),
+            (APPLE_MEDIA_INFORMATION_CALL_YES_501, 501),
+        ] {
+            let info = parse_media_information(&media_information_payload(&capture_bytes(capture)))
+                .expect("a dict");
+            assert_eq!(
+                info,
+                MediaInformation {
+                    sender: RELAY_SENDER.to_string(),
+                    bt_address: Some(APPLE_BT_ADDRESS.to_string()),
+                    category: Some(category),
+                },
+                "{capture}"
+            );
+            // The captures' btAddress is all-zero: the host is the sender.
+            assert_eq!(info.host(), RELAY_SENDER);
+        }
+    }
+
+    #[test]
+    fn parse_media_information_linux_201_names_its_bt_address() {
+        let dict = media_information_body("Unknown", false, "aa:bb:cc:dd:ee:ff", "Mac", 201);
+        let info = parse_media_information(&media_information_payload(&dict)).expect("a dict");
+        assert_eq!(info.bt_address.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(info.category, Some(201));
+        assert_eq!(info.host(), "AA:BB:CC:DD:EE:FF");
+        // An all-zero btAddress falls back to the header's sender.
+        let dict = media_information_body("Unknown", false, APPLE_BT_ADDRESS, "Mac", 201);
+        let info = parse_media_information(&media_information_payload(&dict)).expect("a dict");
+        assert_eq!(info.host(), RELAY_SENDER);
+    }
+
+    #[test]
+    fn parse_media_information_truncation_sweep() {
+        let payload =
+            media_information_payload(&capture_bytes(APPLE_MEDIA_INFORMATION_INSTAGRAM_YES_301));
+        for n in 0..payload.len() {
+            let info = parse_media_information(&payload[..n]);
+            // The category is the dict's last value: any cut loses it.
+            assert_eq!(info.and_then(|i| i.category), None, "n = {n}");
+        }
+        assert_eq!(
+            parse_media_information(&payload).and_then(|i| i.category),
+            Some(301)
+        );
+    }
+
+    #[test]
+    fn parse_media_information_unknown_tags_and_references() {
+        // An unknown tag (0x70) before the category ends the walk.
+        let mut dict = vec![0xE2];
+        opack_write_str(&mut dict, "mystery");
+        dict.push(0x70);
+        opack_write_str(&mut dict, "otherDeviceAudioCategory");
+        opack_write_uint(&mut dict, 301);
+        let info = parse_media_information(&media_information_payload(&dict)).expect("a dict");
+        assert_eq!(info.category, None);
+        // A back-reference is skipped, and gives no category itself.
+        let mut dict = vec![0xE2];
+        opack_write_str(&mut dict, "remotescore");
+        opack_write_ref(&mut dict, 5);
+        opack_write_str(&mut dict, "otherDeviceAudioCategory");
+        opack_write_ref(&mut dict, 5);
+        let info = parse_media_information(&media_information_payload(&dict)).expect("a dict");
+        assert_eq!(info.category, None);
+        // A terminated dict (0xEF ... 0x03) reads like a counted one.
+        let mut dict = capture_bytes(APPLE_MEDIA_INFORMATION_UNKNOWN_NO_100);
+        dict[0] = 0xEF;
+        dict.push(0x03);
+        let info = parse_media_information(&media_information_payload(&dict)).expect("a dict");
+        assert_eq!(info.category, Some(100));
+        // No dict: the SetOwnershipToFalse text payload.
+        assert_eq!(parse_media_information(SMART_ROUTING_PAYLOAD), None);
     }
 
     #[test]
