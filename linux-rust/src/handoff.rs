@@ -706,14 +706,19 @@ impl Handoff {
                 // Queued replays are fed before REPL input, so the #79 exemption can end here.
                 self.snapshot_hosts.clear();
                 let take = self.connect_take_allowed();
+                // The AirPods already report Linux (an app restart while it
+                // owned): keep them as an idle take (#324), so hold nothing.
+                let keep = take && self.owner.as_deref() == Some(&[1]);
+                if keep {
+                    self.remote_owns = false;
+                }
                 // A session start: restores a card an earlier run left `off`
                 // (#264); before ConnectA2dp, which the hold blocks.
                 self.sync_hold(true, out);
                 out.push(Command::ConnectA2dp);
-                if take && self.owner.as_deref() == Some(&[1]) {
-                    // The AirPods already report Linux (an app restart while
-                    // it owned): keep them as an idle take (#324).
+                if keep {
                     self.requested_take = true;
+                    self.last_owner_linux = true;
                     self.routed_away = false;
                     self.resume_deferred = true;
                     if self.default_sink_routing {
@@ -5858,6 +5863,23 @@ mod tests {
         );
         assert_eq!(p.play(61_500, false), []);
         assert_eq!(p.play(62_000, true), []);
+        // A remote media report after the [1] cleared the last owner and
+        // asks for the hold; its relay of 100 still lets Linux keep the
+        // AirPods, so it is the last owner again and holds nothing.
+        let mut p = Probe::new(false, true);
+        p.core.a2dp_hold = true;
+        p.routing(linux());
+        p.feed(
+            1,
+            Input::AudioSource(source(REMOTE, AudioSourceType::Media)),
+        );
+        p.feed(2, relay(REMOTE, IDLE));
+        assert!(!p.core.last_owner_linux);
+        assert_eq!(
+            p.feed(10, Input::Auto),
+            [HoldA2dp(false), ConnectA2dp, Announce, DrainPlayback]
+        );
+        assert!(p.core.requested_take && p.core.last_owner_linux);
         // c1's conditions fail (no bud in): today's tracked release (#54).
         let (p, auto) = session_start(
             SessionFacts {

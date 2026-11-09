@@ -896,7 +896,8 @@ async fn run_handoff(mut shell: Shell) {
             return;
         }
     }
-    // The core's own automatic startup: A2DP, "not owning", announce.
+    // The core's own automatic startup: A2DP, "not owning" (or the connect
+    // take from an idle other host, #324), announce.
     if !for_playback && step(&mut core, &mut shell, Input::Auto).await {
         return;
     }
