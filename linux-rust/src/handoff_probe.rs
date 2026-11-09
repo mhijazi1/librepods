@@ -117,6 +117,16 @@ fn adoption_inputs(backlog: InitBacklog) -> Vec<Input> {
     inputs
 }
 
+/// During a reconnect take, drop the backlog's OwnsConnection reports: the
+/// facts cut, under the state guard that stores them, already holds their
+/// last value, and a stale [1] would ack the take early (#360).
+fn skip_backlog_ownership(mut inputs: Vec<Input>, take_pending: bool) -> Vec<Input> {
+    if take_pending {
+        inputs.retain(|input| !matches!(input, Input::Ownership(_)));
+    }
+    inputs
+}
+
 async fn connect_control(address: Address) -> Result<ControlSession> {
     let mut manager = AACPManager::new();
     let (tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -425,7 +435,8 @@ async fn sync_session(core: &mut Handoff, io: &mut Io) -> Result<bool> {
 /// boundary, before any later event of that session (#49). Ok(true) when the
 /// probe should stop.
 async fn feed_adopted(core: &mut Handoff, io: &mut Io) -> Result<bool> {
-    for input in std::mem::take(&mut io.adopted) {
+    let adopted = std::mem::take(&mut io.adopted);
+    for input in skip_backlog_ownership(adopted, core.reconnect_take_pending()) {
         if mark_session_lost(core, io).await? || step(core, io, input).await? {
             return Ok(true);
         }
@@ -1146,9 +1157,9 @@ mod tests {
     }
 
     /// An automatic core whose session dropped with the case closed, then
-    /// reconnected for new playback with `facts`, took ownership and adopted
-    /// `inputs`, ending the backlog. Returns the core and the reconnect time.
-    fn reconnect_take_core(facts: SessionFacts, inputs: Vec<Input>) -> (Handoff, Instant) {
+    /// reconnected for new playback with `facts` and took ownership. Returns
+    /// the core and the time after the reconnect.
+    fn reconnect_take_started(facts: SessionFacts) -> (Handoff, Instant) {
         use crate::media_controller::{AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_STREAM};
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -1177,10 +1188,23 @@ mod tests {
             "{commands:?}"
         );
         core.take_lines();
+        (core, at(1300))
+    }
+
+    /// `reconnect_take_started`, then adopted `inputs`, which end the
+    /// backlog without acking or yielding the take.
+    fn reconnect_take_core(facts: SessionFacts, inputs: Vec<Input>) -> (Handoff, Instant) {
+        let (mut core, at) = reconnect_take_started(facts);
         for input in inputs {
-            assert_eq!(core.handle(at(1300), input), []);
+            assert_eq!(core.handle(at, input), []);
         }
         let lines = core.take_lines();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("ACK owner=") || l.starts_with("YIELD")),
+            "{lines:?}"
+        );
         assert!(
             lines
                 .last()
@@ -1188,7 +1212,134 @@ mod tests {
                 .starts_with("BACKLOG drained; the reconnect take"),
             "{lines:?}"
         );
-        (core, at(1300))
+        (core, at)
+    }
+
+    /// A live [1] after the backlog acks the still pending take once.
+    fn live_owner_acks_take(core: &mut Handoff, at: Instant) {
+        let commands = core.handle(at, Input::Ownership(vec![1]));
+        assert!(!commands.contains(&Command::PauseMedia), "{commands:?}");
+        let lines = core.take_lines();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("ACK owner="))
+                .collect::<Vec<_>>(),
+            ["ACK owner=linux elapsed_ms=100"],
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.starts_with("YIELD")), "{lines:?}");
+    }
+
+    /// #360: a stale [1] then the release echo [0] in a drained backlog
+    /// neither ack nor yield the reconnect take.
+    #[test]
+    fn reconnect_take_ignores_backlog_owner_1_then_echo() {
+        let backlog = InitBacklog {
+            events: vec![hosts_event(), owns_event(1), owns_event(0)],
+            drained: true,
+        };
+        let inputs = skip_backlog_ownership(adoption_inputs(backlog), true);
+        let (mut core, at) = reconnect_take_core(ready_facts(vec![0]), inputs);
+        live_owner_acks_take(&mut core, at);
+    }
+
+    /// #360 end to end: the cached and queued [1], then the release echo [0];
+    /// the facts cut already holds [0], so the dropped reports change nothing.
+    #[tokio::test]
+    async fn reconnect_take_drops_backlog_owner_reports_held_by_facts() {
+        let manager = AACPManager::new();
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        manager.set_event_channel(tx).await;
+        manager.receive_packet(&hosts_packet(&[L_MAC, R_MAC])).await;
+        manager.receive_packet(&[4, 0, 4, 0, 6, 0, 0, 0]).await;
+        manager
+            .receive_packet(&[4, 0, 4, 0, 0x0e, 0, 0, 0, 0, 0, 0, 0, 0])
+            .await;
+        manager.receive_packet(&OWNS_1_PACKET).await;
+        let mut session = (manager, events);
+        let (returned, after) = tokio::sync::oneshot::channel::<()>();
+        let send = async {
+            returned.send(()).unwrap();
+            Ok::<(), std::io::Error>(())
+        };
+        let echo = async {
+            after.await.unwrap();
+            session.0.receive_packet(&OWNS_0_PACKET).await;
+        };
+        let (backlog, ()) =
+            tokio::join!(collect_init_backlog(&session.0, &mut session.1, send), echo);
+        let backlog = backlog.unwrap();
+        assert!(backlog.drained);
+        let ((_session, backlog), facts) = cut_facts(session, backlog).await;
+        assert_eq!(facts.owner, Some(vec![0]));
+        let names = named(&backlog.events);
+        let owns = |value| {
+            names
+                .iter()
+                .position(|n| *n == named(&[owns_event(value)])[0])
+        };
+        assert!(owns(1).is_some() && owns(1) < owns(0), "{names:?}");
+        let inputs = skip_backlog_ownership(adoption_inputs(backlog), true);
+        let (mut core, at) = reconnect_take_core(facts, inputs);
+        live_owner_acks_take(&mut core, at);
+    }
+
+    /// #360 without a boundary (echo timeout): the queued [1] is dropped, the
+    /// late live echo is stale (#43), and the live [1] acks the take once.
+    #[test]
+    fn reconnect_take_echo_timeout_acks_on_live_owner_1() {
+        let backlog = InitBacklog {
+            events: vec![hosts_event(), owns_event(1)],
+            drained: false,
+        };
+        let inputs = skip_backlog_ownership(adoption_inputs(backlog), true);
+        let (mut core, at) = reconnect_take_started(ready_facts(vec![1]));
+        for input in inputs {
+            assert_eq!(core.handle(at, input), []);
+        }
+        assert_eq!(core.handle(at, Input::Ownership(vec![0])), []);
+        let lines = core.take_lines();
+        assert!(
+            lines.iter().any(|l| l.starts_with("OWNER stale")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("ACK owner=") || l.starts_with("YIELD")),
+            "{lines:?}"
+        );
+        live_owner_acks_take(&mut core, at);
+    }
+
+    /// #360 Q5: only a pending reconnect take drops the backlog's Ownership
+    /// inputs; everything else, and the boundary last, is kept in order.
+    #[test]
+    fn skip_backlog_ownership_only_during_reconnect_take() {
+        let inputs = adoption_inputs(InitBacklog {
+            events: vec![
+                hosts_event(),
+                owns_event(1),
+                AACPEvent::OwnershipToFalseRequest,
+                owns_event(0),
+            ],
+            drained: true,
+        });
+        assert!(inputs.contains(&Input::Ownership(vec![1])));
+        assert_eq!(skip_backlog_ownership(inputs.clone(), false), inputs);
+        let kept = skip_backlog_ownership(inputs, true);
+        assert_eq!(
+            kept,
+            [
+                Input::ConnectedDevices {
+                    old: Vec::new(),
+                    new: vec![core_device(CORE_LOCAL), core_device(CORE_REMOTE)],
+                },
+                Input::RemoteOwnershipRequest,
+                Input::InitBacklogDrained,
+            ]
+        );
     }
 
     /// #290: the AirPods report OwnsConnection only on a real change (#159),
