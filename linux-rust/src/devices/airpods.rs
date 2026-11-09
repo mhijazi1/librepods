@@ -64,9 +64,10 @@ impl AirPodsDevice {
 
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(handle) = &tray_handle {
-            let tx = command_tx.clone();
             handle
-                .update(|tray: &mut MyTray| tray.connect_device(&mac_address.to_string(), tx))
+                .update(|tray: &mut MyTray| {
+                    tray.connect_device(&mac_address.to_string(), command_tx.clone())
+                })
                 .await;
         }
 

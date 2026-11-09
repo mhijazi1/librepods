@@ -931,9 +931,17 @@ mod tests {
         let _rx_b = connect(&mut tray, B);
         tray.device_disconnected(B);
         assert_eq!(tray.conversation_detect_enabled, Some(false));
-        // The menu's Conversation Detection toggle, as it runs on activate.
-        let mac = tray.device.clone().unwrap();
-        tray.apply_conversation_detect(&mac, true);
+        // Toggle through the menu's Conversation Detection item.
+        let toggle = tray
+            .menu()
+            .into_iter()
+            .find_map(|item| match item {
+                ksni::MenuItem::Checkmark(c) => Some(c.activate),
+                _ => None,
+            })
+            .unwrap();
+        toggle(&mut tray);
+        assert_eq!(tray.conversation_detect_enabled, Some(true));
         let _rx_b = connect(&mut tray, B);
         tray.device_disconnected(B);
         assert_eq!(tray.conversation_detect_enabled, Some(true));
