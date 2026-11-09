@@ -130,8 +130,15 @@ pub(crate) trait MediaActions: Send + Sync {
     /// fires or its sender is dropped (checked between steps). It starts no
     /// kick or profile cycle whose Play can't be due before `until`. It
     /// first waits for the default sink routes enqueued before it; a cancel
-    /// or `until` during that wait ends it with no action.
-    fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()>;
+    /// or `until` during that wait ends it with no action. Its players are
+    /// those Playing at the take that `streams`, the stream monitor's state
+    /// then, says play locally (#361).
+    fn resume_a2dp(
+        &self,
+        streams: PlaybackState,
+        until: Instant,
+        cancel: oneshot::Receiver<()>,
+    ) -> BoxFuture<'static, ()>;
     /// Enqueue a default sink route (#40); never waits for the sound server.
     fn route_default_sink(&self, event: SinkEvent);
     /// Mark the A2DP hold (#264) at once, then enqueue its card write with
@@ -201,11 +208,17 @@ impl MediaActions for ControllerMedia {
         })
     }
 
-    fn resume_a2dp(&self, until: Instant, cancel: oneshot::Receiver<()>) -> BoxFuture<'static, ()> {
+    fn resume_a2dp(
+        &self,
+        streams: PlaybackState,
+        until: Instant,
+        cancel: oneshot::Receiver<()>,
+    ) -> BoxFuture<'static, ()> {
         // Taken now, so it covers the RouteToAirPods enqueued just before.
         let routed = self.sinks.settled();
         Box::pin(a2dp_resume::run(
             self.controller.clone(),
+            streams,
             until,
             cancel,
             routed,
@@ -648,7 +661,9 @@ impl Shell {
                     self.resume = Some(cancel);
                     // The core opened its hold window at `now`.
                     let until = now + a2dp_resume::A2DP_RESUME_WINDOW;
-                    tokio::spawn(self.media.resume_a2dp(until, cancelled));
+                    // Now: a player's stream may cork at the route (#330).
+                    let streams = self.play_rx.streams.borrow().clone();
+                    tokio::spawn(self.media.resume_a2dp(streams, until, cancelled));
                 }
                 Command::RouteToAirPods => self.media.route_default_sink(SinkEvent::Take),
                 Command::RouteAway => self.media.route_default_sink(SinkEvent::Yield),
@@ -1283,6 +1298,7 @@ mod tests {
 
         fn resume_a2dp(
             &self,
+            streams: PlaybackState,
             until: Instant,
             cancel: oneshot::Receiver<()>,
         ) -> BoxFuture<'static, ()> {
@@ -1291,7 +1307,13 @@ mod tests {
             let io = FakeResume {
                 mac: self.mac.clone(),
             };
-            Box::pin(a2dp_resume::run(io, until, cancel, std::future::ready(())))
+            Box::pin(a2dp_resume::run(
+                io,
+                streams,
+                until,
+                cancel,
+                std::future::ready(()),
+            ))
         }
 
         fn route_default_sink(&self, event: SinkEvent) {
