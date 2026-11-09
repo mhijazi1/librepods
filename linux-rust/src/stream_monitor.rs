@@ -391,8 +391,9 @@ const OWNER_DEPTH: usize = 16;
 /// The PIDs that own a live stream (`live_streams`): each one's process id
 /// (`PROCESS_ID`; a stream without one owns nothing) and its ancestors by
 /// `ppid`, at most `OWNER_DEPTH` of them, stopping at PID 1, an unknown
-/// parent or a repeat. An MPRIS player owns a live stream iff its bus owner
-/// is in the set: the stream's process or a bounded ancestor of it.
+/// parent or a repeat within that stream's walk. An MPRIS player owns a
+/// live stream iff its bus owner is in the set: the stream's process or a
+/// bounded ancestor of it.
 pub(crate) fn live_stream_pids(
     streams: &[StreamProps],
     ppid: impl Fn(u32) -> Option<u32>,
@@ -400,13 +401,15 @@ pub(crate) fn live_stream_pids(
     let live = live_streams(streams);
     let mut pids = HashSet::new();
     for stream in streams.iter().filter(|s| live.contains(&s.index)) {
+        let mut walked = HashSet::new();
         let mut next = stream_pid(&stream.props, None);
         for _ in 0..=OWNER_DEPTH {
             match next {
-                Some(pid) if pid > 1 && pids.insert(pid) => next = ppid(pid),
+                Some(pid) if pid > 1 && walked.insert(pid) => next = ppid(pid),
                 _ => break,
             }
         }
+        pids.extend(walked);
     }
     pids
 }
@@ -681,6 +684,8 @@ fn list_reusing<C, T>(
 /// sink input has no process id of its own.
 fn sink_inputs(connection: &mut pulse::RawConnection) -> io::Result<Vec<StreamProps>> {
     let inputs = connection.sink_inputs(None)?;
+    // shortcut: a client-less (module-created) stream has no pid, so the
+    // clients are listed on every poll while one exists (#344).
     let clients = if inputs.iter().all(|i| stream_pid(&i.props, None).is_some()) {
         Vec::new()
     } else {
@@ -2148,6 +2153,22 @@ mod tests {
         let depth = OWNER_DEPTH as u32;
         assert!(owns(Some(2000 + depth), &stream, &chain));
         assert!(!owns(Some(2001 + depth), &stream, &chain));
+    }
+
+    /// One stream's walk cut at `OWNER_DEPTH` doesn't cut another's short:
+    /// the owner, 16 ancestors above 1016 but 17 above 1017, matches in
+    /// either listing order.
+    #[test]
+    fn own_stream_walks_are_independent_of_order() {
+        let chain: Vec<(u32, u32)> = (1001..=1017).map(|pid| (pid, pid - 1)).collect();
+        let (deep, shallow) = (with_pid(music(1), 1017), with_pid(music(2), 1016));
+        let orders = [
+            [(deep.clone(), None), (shallow.clone(), None)],
+            [(shallow, None), (deep, None)],
+        ];
+        for streams in &orders {
+            assert!(owns(Some(OWNER), streams, &chain));
+        }
     }
 
     /// (f) The owner's corked, muted or event stream is not live.
