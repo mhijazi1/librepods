@@ -10,7 +10,7 @@ use super::{Events, FlushRequest, TICK};
 use crate::a2dp_resume;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers as Control};
 use crate::default_sink::{SinkEvent, UnparkTo};
-use crate::handoff::{Command, Handoff, Input, Park};
+use crate::handoff::{Command, Handoff, Input, Park, local_inputs};
 use crate::notifications::{self, Notice, Notifier};
 use crate::reconnect;
 use crate::stream_monitor::CallSamples;
@@ -386,7 +386,8 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     .with_a2dp_hold(true)
     .with_park_sink(true)
     .with_category_relay(shell.relay_category)
-    .with_notifications(true);
+    .with_notifications(true)
+    .with_take_back_after_call(crate::utils::load_take_back_after_call(&shell.mac));
     let start = if let Some((category, requested)) = take_category {
         core = core
             .with_playback_requested()
@@ -457,9 +458,12 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::Playback { sampled_at, category, new_source }).await
             }
-            Some((_, in_call)) = shell.call_rx.recv() => {
-                sync_session(&mut core, &mut shell).await
-                    || step(&mut core, &mut shell, Input::LocalCall(in_call)).await
+            Some((_, state)) = shell.call_rx.recv() => {
+                sync_session(&mut core, &mut shell).await || {
+                    let [call, mic] = local_inputs(state);
+                    step(&mut core, &mut shell, call).await
+                        || step(&mut core, &mut shell, mic).await
+                }
             }
             Some(active) = shell.a2dp_rx.recv() => {
                 sync_session(&mut core, &mut shell).await

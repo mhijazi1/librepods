@@ -23,7 +23,10 @@ mod ownership;
 mod park;
 mod playback;
 mod session;
+mod take_back;
 mod timers;
+
+pub(crate) use calls::local_inputs;
 
 /// How long an ownership request may wait for its acknowledgement.
 pub(crate) const ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -189,6 +192,11 @@ pub(crate) enum Input {
     /// otherwise it is only recorded. A repeat is a no-op. The state
     /// survives `Disconnected`: it is a local fact, not a session one.
     LocalCall(bool),
+    /// Whether Linux uses the AirPods' mic without a call (#505): the card
+    /// on a head-unit profile. Holds the AirPods as `LocalCall` does, but
+    /// relays audio category 200 instead of advertising a call; during a
+    /// call it is only recorded.
+    LocalMic(bool),
     /// REPL `quit`, end of input, SIGINT or SIGTERM.
     Quit,
     /// Periodic tick: reconnect backoff, acknowledgement timeouts and the
@@ -354,6 +362,8 @@ pub(crate) struct Handoff {
     /// Linux is in a call (#11): keep the AirPods Linux holds or is taking
     /// until it ends.
     local_call: bool,
+    /// Linux uses the mic without a call (#505): held like a call.
+    local_mic: bool,
     /// Last `Input::A2dpTransport` report; None until one arrives.
     a2dp_active: Option<bool>,
     /// The A2DP resume Linux's take owes, put off until Linux plays. Set by
@@ -453,6 +463,8 @@ pub(crate) struct Handoff {
     /// An Undo clicked while a release was pending: it runs once nothing
     /// is (#17).
     undo_waiting: Option<u64>,
+    /// Taking the AirPods back after a remote call (#14).
+    take_back: take_back::TakeBack,
 }
 
 impl Handoff {
@@ -475,6 +487,7 @@ impl Handoff {
             reconnect_take_pending: false,
             timed_out_release: None,
             local_call: false,
+            local_mic: false,
             a2dp_active: None,
             resume_deferred: false,
             recovery: if connected {
@@ -518,6 +531,7 @@ impl Handoff {
             undo_taker: None,
             last_yield: 0,
             undo_waiting: None,
+            take_back: take_back::TakeBack::default(),
         }
     }
 
@@ -660,9 +674,10 @@ impl Handoff {
         let disconnected = input == Input::Disconnected;
         self.apply(now, input, &mut out);
         self.settle_connect(now, owns, &mut out);
+        self.take_back(now, owns, &mut out);
         // Linux has the AirPods again (a take of this step's, the connect
-        // wait's included), or the session is gone: a later Undo answers
-        // nothing (#17).
+        // wait's and the take-back's included), or the session is gone: a
+        // later Undo answers nothing (#17).
         if owns || disconnected || out.contains(&Command::SendOwnership(true)) {
             self.undo_taker = None;
         }
@@ -690,7 +705,7 @@ impl Handoff {
     fn update_park(&mut self) {
         let held = self.held == Some(true);
         let known = self.streams_known && self.sampled_known;
-        let idle = known && self.category <= AUDIO_CATEGORY_IDLE && !self.local_call;
+        let idle = known && self.category <= AUDIO_CATEGORY_IDLE && !self.call_or_mic();
         self.park = match self.park {
             Park::Parked | Park::FallenBack if !held => Park::Local,
             Park::Parked if self.baseline_playing || !known => {
@@ -810,7 +825,7 @@ impl Handoff {
                 // remote release already paused when it was sent. A
                 // local call refuses (below) any release but a remote one, so
                 // the release still settles for the call (#11).
-                let call_holds = self.local_call && self.requested_take;
+                let call_holds = self.call_or_mic() && self.requested_take;
                 if let Some(p) = self
                     .pending
                     .as_mut()
@@ -848,7 +863,7 @@ impl Handoff {
                 // Linux holds or is taking the AirPods for a call: keep them
                 // whatever the other host plays (#11). A release Linux
                 // already sent (above) is not taken back.
-                if self.local_call && self.requested_take {
+                if self.call_or_mic() && self.requested_take {
                     self.say("REMOTE requested ownership; refused during a local call");
                     return;
                 }
@@ -864,6 +879,9 @@ impl Handoff {
                     self.hold_for_remote(out);
                     return;
                 }
+                if self.requested_take || self.owner.as_deref() == Some(&[1]) {
+                    self.take_back.yielded(now);
+                }
                 self.say("REMOTE requested ownership; yielding");
                 self.request(now, false, Cause::Remote, out);
                 self.hold_for_remote(out);
@@ -876,7 +894,10 @@ impl Handoff {
                     self.say("SESSION lost; finishing its queued events before disconnecting");
                 }
             }
-            Input::Disconnected => self.disconnected(now, out),
+            Input::Disconnected => {
+                self.take_back.clear();
+                self.disconnected(now, out);
+            }
             Input::Reconnected(facts) => self.reconnected(now, facts, out),
             Input::ReconnectFailed(error) => {
                 self.reconnecting = false;
@@ -964,9 +985,11 @@ impl Handoff {
                 self.sync_hold(false, out);
             }
             Input::LocalCall(in_call) => self.local_call(in_call, out),
+            Input::LocalMic(on) => self.local_mic(on, out),
             Input::Tick => self.tick(now, out),
             Input::A2dpTransport { active } => self.a2dp_active = Some(active),
             Input::MediaInformation { host, category } => {
+                self.take_back.relay(now, &host, category);
                 self.relays.insert(host, category);
             }
             Input::Undo(id) => self.undo(now, id, out),

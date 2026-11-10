@@ -65,8 +65,12 @@ impl Handoff {
         }
         let mut deferred = false;
         // A local call's 501 wins; its end relays the category (#272).
-        if self.category_relay && category != last_category && !self.local_call {
-            out.push(Command::RelayCategory(category));
+        // During mic use only a change of the relayed value is sent (#505).
+        if self.category_relay
+            && self.relayed(category) != self.relayed(last_category)
+            && !self.local_call
+        {
+            out.push(Command::RelayCategory(self.relayed(category)));
         }
         // A release whose ACK timed out left the ownership unknown: retake.
         let owning = self.requested_take
@@ -227,7 +231,7 @@ impl Handoff {
         use crate::bluetooth::aacp::AudioSourceType::{Call, Media};
         source.mac != self.local
             && matches!(source.r#type, Media | Call)
-            && !(self.local_call && self.requested_take)
+            && !(self.call_or_mic() && self.requested_take)
     }
 
     /// A take's decision, Linux asking at `local_category`.

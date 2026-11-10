@@ -219,6 +219,8 @@ struct DeviceHandler {
     /// While blocked, hold this outer MediaController mutex, as the
     /// device's ear detection holds it across `handle_ear_detection`.
     hold: Option<Arc<Mutex<MediaController>>>,
+    /// Harness setup, not handler behavior: the core relays categories (#505).
+    relay_category: bool,
 }
 
 impl DeviceHandler {
@@ -386,7 +388,7 @@ struct Harness {
     play_tx: mpsc::Sender<(Instant, u32, Option<u32>)>,
     playback_started: Arc<AtomicBool>,
     /// The injected call monitor's sender (no sound server in tests).
-    call_tx: mpsc::Sender<(Instant, bool)>,
+    call_tx: mpsc::Sender<(Instant, crate::call_detect::CallState)>,
     /// The injected A2DP transport poller's sender (no BlueZ in tests).
     a2dp_tx: mpsc::Sender<bool>,
     /// Undo clicks by yield id, as the desktop notifier sends them (#17).
@@ -591,6 +593,7 @@ impl Harness {
         switching.notifier = Arc::new(move |notice: crate::notifications::Notice| {
             posted.lock().unwrap().push(notice)
         });
+        switching.relay_category = handler.relay_category;
         switching.dispatch_events(events_rx, handler.clone().handle());
         Harness {
             records,
@@ -634,7 +637,12 @@ impl Harness {
 
     /// A call state change from the call monitor.
     async fn call(&self, in_call: bool) {
-        let _ = self.call_tx.send((Instant::now(), in_call)).await;
+        self.call_state(in_call.into()).await;
+    }
+
+    /// A call monitor state, mic use included (#505).
+    async fn call_state(&self, state: crate::call_detect::CallState) {
+        let _ = self.call_tx.send((Instant::now(), state)).await;
     }
 
     /// An A2DP transport state from the transport poller.
@@ -954,4 +962,55 @@ async fn router_parked_task(
 
 fn default_sink(sinks: &FakeSinks) -> String {
     sinks.default.lock().unwrap().clone()
+}
+
+/// #505: the shell's call branch feeds mic use to the core.
+mod t505 {
+    use super::*;
+    use crate::call_detect::CallState;
+    use crate::media_controller::AUDIO_CATEGORY_MIC;
+
+    async fn expected_category(category: u32) -> Vec<u8> {
+        reference(|m| async move {
+            m.send_media_information_category(LOCAL, REMOTE, category)
+                .await
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn mic_use_relays_200_on_the_wire() {
+        let mac = "5A:00:00:00:05:05";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let (records, media) = Harness::fake_media(mac);
+        let handler = DeviceHandler {
+            relay_category: true,
+            ..Default::default()
+        };
+        let h = Harness::start_wired(
+            SwitchingMode::Handoff,
+            mac,
+            &manager,
+            media,
+            records,
+            Arc::new(handler),
+        )
+        .await;
+        expect_startup(&h, &mut rx).await;
+
+        h.call_state(CallState::Mic).await;
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_category(AUDIO_CATEGORY_MIC).await
+        );
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        h.call_state(CallState::Idle).await;
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_category(AUDIO_CATEGORY_IDLE).await
+        );
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+        stop_handoff_task(mac);
+    }
 }

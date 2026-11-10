@@ -325,3 +325,238 @@ fn call_end_at_idle_keeps_ownership() {
     assert_eq!(p.feed(20, Input::LocalCall(true)), [AdvertiseCall(true)]);
     assert_eq!(p.feed(30, Input::LocalCall(false)), [AdvertiseCall(false)]);
 }
+
+// #505: mic use without a call relays category 200 and holds like a call.
+
+const MIC: u32 = crate::media_controller::AUDIO_CATEGORY_MIC;
+
+use crate::call_detect::CallState;
+
+/// Only the category relays in `out`.
+fn relays_in(out: Vec<Command>) -> Vec<Command> {
+    out.into_iter()
+        .filter(|c| matches!(c, RelayCategory(_)))
+        .collect()
+}
+
+#[test]
+fn mic_use_relays_200_not_a_call() {
+    let mut p = relaying();
+    p.core.take_lines();
+    assert_eq!(p.feed(100, Input::LocalMic(true)), [RelayCategory(MIC)]);
+    assert_eq!(
+        p.core.take_lines(),
+        ["MIC in use on Linux; keeping the AirPods Linux holds until it ends"]
+    );
+    assert_eq!(p.feed(200, Input::LocalMic(true)), []);
+    // Its end relays the idle category: no AdvertiseCall(false) clears it.
+    assert_eq!(p.feed(300, Input::LocalMic(false)), [RelayCategory(IDLE)]);
+    assert_eq!(p.core.take_lines(), ["MIC use ended on Linux"]);
+    assert_eq!(p.feed(400, Input::LocalMic(false)), []);
+
+    // Without the category relay nothing is sent.
+    let mut p = Probe::ready();
+    assert_eq!(p.feed(100, Input::LocalMic(true)), []);
+    assert_eq!(p.feed(200, Input::LocalMic(false)), []);
+}
+
+#[test]
+fn mic_use_recorded_without_live_session() {
+    // Manual mode records mic use; going automatic relays it after the
+    // announcement. Buds out: the connect take (#324) is not under test.
+    let mut p = Probe::new(false, true);
+    p.core.category_relay = true;
+    p.routing(unworn_facts());
+    assert_eq!(p.feed(100, Input::LocalMic(true)), []);
+    assert_eq!(
+        p.feed(200, Input::Auto),
+        [
+            ConnectA2dp,
+            SendOwnership(false),
+            Announce,
+            RelayCategory(MIC),
+            DrainPlayback
+        ]
+    );
+
+    // Changes while disconnected only record; the reconnect's
+    // announcement relays the mic use again.
+    let mut p = relaying();
+    assert_eq!(p.feed(100, Input::LocalMic(true)), [RelayCategory(MIC)]);
+    assert_eq!(p.feed(200, Input::Disconnected), [DropSession]);
+    assert_eq!(p.feed(250, Input::LocalMic(false)), []);
+    assert_eq!(p.feed(260, Input::LocalMic(true)), []);
+    assert_eq!(p.feed(1300, Input::Tick), [Reconnect { audio: true }]);
+    assert_eq!(
+        p.feed(1400, Input::Reconnected(ready_facts())),
+        [
+            AdoptSession,
+            Announce,
+            RelayCategory(MIC),
+            SendOwnership(true),
+            DrainPlayback
+        ]
+    );
+}
+
+#[test]
+fn mic_use_announce_relays_200() {
+    let mut p = relaying();
+    assert_eq!(p.feed(100, Input::LocalMic(true)), [RelayCategory(MIC)]);
+    assert_eq!(
+        p.feed(200, report(&[L, R], &[L, R, R2])),
+        [Announce, RelayCategory(MIC)]
+    );
+}
+
+#[test]
+fn mic_use_refuses_remote_request() {
+    // An iPhone starts media and asks for the AirPods during mic use.
+    let mut p = acked_auto_take();
+    assert_eq!(p.feed(1050, Input::LocalMic(true)), []);
+    p.core.take_lines();
+    assert_eq!(
+        p.feed(
+            1100,
+            Input::AudioSource(source(REMOTE, AudioSourceType::Media))
+        ),
+        []
+    );
+    // The remote source isn't counted as taken: Linux stays the last owner.
+    assert!(p.core.last_owner_linux());
+    assert_eq!(p.feed(1200, Input::RemoteOwnershipRequest), []);
+    assert_eq!(
+        p.core.take_lines(),
+        ["REMOTE requested ownership; refused during a local call"]
+    );
+    // Its end restores the policy: the next request yields.
+    assert_eq!(p.feed(1300, Input::LocalMic(false)), []);
+    assert_eq!(
+        p.feed(1400, Input::RemoteOwnershipRequest),
+        [PauseMedia, SendOwnership(false)]
+    );
+}
+
+#[test]
+fn take_ack_during_mic_use_does_not_resume() {
+    // The card is on HFP: the idle A2DP transport says nothing.
+    let mut p = Probe::ready();
+    assert_eq!(p.feed(20, idle_transport()), []);
+    assert_eq!(p.play(500, true), [SendOwnership(true)]);
+    assert_eq!(p.feed(550, Input::LocalMic(true)), []);
+    assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+
+    // Without mic use the same ACK resumes.
+    let mut p = Probe::ready();
+    assert_eq!(p.feed(20, idle_transport()), []);
+    assert_eq!(p.play(500, true), [SendOwnership(true)]);
+    assert_eq!(p.feed(600, Input::Ownership(vec![1])), [ResumeA2dp]);
+}
+
+#[test]
+fn mic_use_with_playback_relays_higher_category() {
+    let mut p = relaying();
+    assert_eq!(p.feed(100, Input::LocalMic(true)), [RelayCategory(MIC)]);
+    assert_eq!(relays_in(p.play(500, true)), [RelayCategory(STREAM)]);
+    assert_eq!(
+        relays_in(p.play_category(800, MEDIA)),
+        [RelayCategory(MEDIA)]
+    );
+    // A stop falls back to the mic's 200, not idle.
+    assert_eq!(relays_in(p.play(1000, false)), [RelayCategory(MIC)]);
+    assert_eq!(relays_in(p.play(1500, false)), []);
+    assert_eq!(p.feed(1600, Input::LocalMic(false)), [RelayCategory(IDLE)]);
+
+    // Mic use starting during playback relays the higher category.
+    let mut p = relaying();
+    assert_eq!(
+        relays_in(p.play_category(500, MEDIA)),
+        [RelayCategory(MEDIA)]
+    );
+    assert_eq!(p.feed(600, Input::LocalMic(true)), [RelayCategory(MEDIA)]);
+    assert_eq!(p.feed(700, Input::LocalMic(false)), [RelayCategory(MEDIA)]);
+}
+
+#[test]
+fn local_inputs_call_wins_over_mic_use() {
+    let mut p = relaying();
+    let mut state = |ms: u64, state: CallState| -> Vec<Command> {
+        local_inputs(state)
+            .into_iter()
+            .flat_map(|input| p.feed(ms, input))
+            .collect()
+    };
+    assert_eq!(state(100, CallState::Mic), [RelayCategory(MIC)]);
+    assert_eq!(state(200, CallState::Call), [AdvertiseCall(true)]);
+    assert_eq!(
+        state(300, CallState::Mic),
+        [AdvertiseCall(false), RelayCategory(MIC)]
+    );
+    assert_eq!(state(400, CallState::Idle), [RelayCategory(IDLE)]);
+}
+
+/// As `park::park_ready` (#311): the hold and the park sink on, an idle
+/// sample with the streams known.
+fn park_on() -> Probe {
+    let mut p = hold_ready(true);
+    p.core = p.core.with_park_sink(true);
+    p.core.set_streams(true, false);
+    assert_eq!(p.play(20, false), []);
+    p
+}
+
+/// Feed each input of `local_inputs(state)` at `ms`; the park stays local
+/// after every one.
+fn switch_keeps_park(p: &mut Probe, ms: u64, state: CallState) -> Vec<Command> {
+    let mut out = Vec::new();
+    for input in local_inputs(state) {
+        out.extend(p.feed(ms, input.clone()));
+        assert_eq!(p.core.park(), Park::Local, "after {input:?}");
+    }
+    out
+}
+
+/// Both hold ends: idle again parks.
+fn idle_parks(p: &mut Probe, ms: u64) {
+    for input in local_inputs(CallState::Idle) {
+        p.feed(ms, input);
+    }
+    assert_eq!(p.core.park(), Park::Parked);
+}
+
+#[test]
+fn park_waits_for_mic_use_to_end() {
+    // As `park_waits_for_the_local_call_to_end` (#311).
+    let mut p = park_on();
+    assert_eq!(p.feed(50, Input::LocalMic(true)), []);
+    assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+    assert_eq!(p.core.park(), Park::Local);
+    assert_eq!(p.feed(200, Input::LocalMic(false)), []);
+    assert_eq!(p.core.park(), Park::Parked);
+}
+
+#[test]
+fn call_to_mic_keeps_park_hold() {
+    let mut p = park_on();
+    assert_eq!(p.feed(50, Input::LocalCall(true)), [AdvertiseCall(true)]);
+    assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+    assert_eq!(p.core.park(), Park::Local);
+    assert_eq!(
+        switch_keeps_park(&mut p, 200, CallState::Mic),
+        [AdvertiseCall(false)]
+    );
+    idle_parks(&mut p, 300);
+}
+
+#[test]
+fn mic_to_call_keeps_park_hold() {
+    let mut p = park_on();
+    assert_eq!(p.feed(50, Input::LocalMic(true)), []);
+    assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+    assert_eq!(p.core.park(), Park::Local);
+    assert_eq!(
+        switch_keeps_park(&mut p, 200, CallState::Call),
+        [AdvertiseCall(true)]
+    );
+    idle_parks(&mut p, 300);
+}
