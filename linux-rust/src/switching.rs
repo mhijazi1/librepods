@@ -146,10 +146,7 @@ impl Switching {
         switching.a2dp = handoff.then(|| a2dp_resume::spawn_transport_poller(&mac));
         switching.relay_category = true;
         let (undo, undo_rx) = mpsc::unbounded_channel();
-        switching.notifier = Arc::new(notifications::Desktop {
-            airpods_mac: mac.clone(),
-            undo,
-        });
+        switching.notifier = Arc::new(notifications::Desktop::new(mac.clone(), undo));
         switching.notifications = utils::load_switching_notifications();
         switching.undo = Some(undo_rx);
         match log {

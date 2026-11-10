@@ -8,29 +8,29 @@ use dbus::blocking::Connection;
 use dbus::message::MatchRule;
 use log::warn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// What to post. `MovedTo` carries the taker's name, if known.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Notice {
     MovedTo(Option<String>),
     Connected,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Content {
-    pub(crate) title: String,
-    pub(crate) body: String,
+struct Content {
+    title: String,
+    body: String,
     /// The one action's label, if any.
-    pub(crate) action: Option<&'static str>,
-    pub(crate) expire_ms: i32,
+    action: Option<&'static str>,
+    expire_ms: i32,
 }
 
 /// The notification for `notice` about the AirPods named `airpods`. The
 /// Mac's timeouts: 20 s for its ReverseRoute banner, 4 s for Connected.
-pub(crate) fn content(notice: &Notice, airpods: &str) -> Content {
+fn content(notice: &Notice, airpods: &str) -> Content {
     let title = if airpods.is_empty() {
         "AirPods"
     } else {
@@ -83,19 +83,45 @@ const UNDO_KEY: &str = "undo";
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The desktop's notification server. The title is the AirPods' BlueZ
-/// alias, read when posting (#17 Q13); an Undo click sends on `undo`.
+/// alias, read when posting (#17 Q13); an Undo click sends on `undo`, but
+/// only on the latest "moved to": an older one answers a yield already
+/// replaced.
 pub(crate) struct Desktop {
-    pub(crate) airpods_mac: String,
-    pub(crate) undo: mpsc::UnboundedSender<()>,
+    airpods_mac: String,
+    undo: mpsc::UnboundedSender<()>,
+    latest: Arc<AtomicU64>,
+}
+
+impl Desktop {
+    pub(crate) fn new(airpods_mac: String, undo: mpsc::UnboundedSender<()>) -> Self {
+        Desktop {
+            airpods_mac,
+            undo,
+            latest: Arc::default(),
+        }
+    }
+
+    /// The click handler of a notice posted now: it sends Undo only while
+    /// no later notice was posted.
+    fn on_undo(&self) -> impl Fn() + Send + 'static {
+        let (undo, latest) = (self.undo.clone(), self.latest.clone());
+        let mine = latest.fetch_add(1, Ordering::SeqCst) + 1;
+        move || {
+            if latest.load(Ordering::SeqCst) == mine {
+                let _ = undo.send(());
+            }
+        }
+    }
 }
 
 impl Notifier for Desktop {
     fn post(&self, notice: Notice) {
-        let (mac, undo) = (self.airpods_mac.clone(), self.undo.clone());
+        let mac = self.airpods_mac.clone();
+        let on_undo = self.on_undo();
         tokio::spawn(async move {
             let airpods = alias(&mac).await.unwrap_or_default();
             let content = content(&notice, &airpods);
-            match tokio::task::spawn_blocking(move || show(&content, &undo)).await {
+            match tokio::task::spawn_blocking(move || show(&content, on_undo)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!("Notification not shown: {e}"),
                 Err(e) => warn!("Notification task failed: {e}"),
@@ -110,10 +136,10 @@ async fn alias(mac: &str) -> Option<String> {
     adapter.device(mac.parse().ok()?).ok()?.alias().await.ok()
 }
 
-/// Show `content`; with an action, wait until it is clicked (sending on
-/// `undo`), closed or expired, and close it on expiry so no dead button
+/// Show `content`; with an action, wait until it is clicked (calling
+/// `on_undo`), closed or expired, and close it on expiry so no dead button
 /// stays.
-fn show(content: &Content, undo: &mpsc::UnboundedSender<()>) -> Result<(), dbus::Error> {
+fn show(content: &Content, on_undo: impl Fn() + Send + 'static) -> Result<(), dbus::Error> {
     let bus = Connection::new_session()?;
     let proxy = bus.with_proxy(IFACE, "/org/freedesktop/Notifications", CALL_TIMEOUT);
     let id = Arc::new(AtomicU32::new(0));
@@ -121,12 +147,12 @@ fn show(content: &Content, undo: &mpsc::UnboundedSender<()>) -> Result<(), dbus:
     if content.action.is_some() {
         // Matched before Notify, so an instant click is not missed; the
         // signals queue until `process` runs, after the id is known.
-        let (clicked, finished, undo) = (id.clone(), done.clone(), undo.clone());
+        let (clicked, finished) = (id.clone(), done.clone());
         bus.add_match(
             MatchRule::new_signal(IFACE, "ActionInvoked"),
             move |(n, key): (u32, String), _, _| {
                 if n == clicked.load(Ordering::SeqCst) && key == UNDO_KEY {
-                    let _ = undo.send(());
+                    on_undo();
                     finished.store(true, Ordering::SeqCst);
                 }
                 true
@@ -232,5 +258,17 @@ mod tests {
         post(&fake, true, moved());
         post(&fake, true, Notice::Connected);
         assert_eq!(*posted.lock().unwrap(), [moved(), Notice::Connected]);
+    }
+
+    #[test]
+    fn only_the_latest_notice_sends_undo() {
+        let (undo, mut clicks) = mpsc::unbounded_channel();
+        let desktop = Desktop::new(String::new(), undo);
+        let older = desktop.on_undo();
+        let latest = desktop.on_undo();
+        older();
+        assert!(clicks.try_recv().is_err());
+        latest();
+        assert_eq!(clicks.try_recv(), Ok(()));
     }
 }
