@@ -879,6 +879,8 @@ impl Handoff {
                 } else if self.pending.is_some() {
                     self.say("WAIT ownership request pending");
                 } else if self.owner.as_deref() == Some(&[0]) && !self.requested_take {
+                    // The user released: Auto's wait takes nothing back (#452).
+                    self.connect_until = None;
                     self.say("Ownership already released");
                 } else {
                     self.request(now, false, Cause::User, out);
@@ -1667,7 +1669,11 @@ impl Handoff {
             // owns: the AirPods reply only to a real change (#159, #289). A
             // release already pending covers it: a second "not owning"
             // would get a reply that acknowledges nothing.
+            let grace = self.ear_resume_until;
             self.request(now, false, Cause::Playback, out);
+            // On 84ac699 this went out at Auto, before any reinsertion: a
+            // #313 grace from the wait stays.
+            self.ear_resume_until = grace;
             if self.owner.as_deref() != Some(&[1]) {
                 self.pending = None;
             }
@@ -6758,9 +6764,9 @@ mod tests {
         assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 0);
     }
 
-    #[test]
-    fn connect_window_skipped_play_edge_ends_the_wait() {
-        let mut p = waiting_start(false);
+    /// The hosts, both buds out, a remote Media source with no relay (held
+    /// for it) and an idle sample: the wait goes on.
+    fn unworn_remote_media(p: &mut Probe) {
         let hosts = Input::ConnectedDevices {
             old: Vec::new(),
             new: two_hosts(),
@@ -6770,6 +6776,12 @@ mod tests {
         assert_eq!(p.feed(110, out), []);
         assert_eq!(p.feed(120, remote_source(AudioSourceType::Media)), []);
         assert_eq!(p.play(130, false), []);
+    }
+
+    #[test]
+    fn connect_window_skipped_play_edge_ends_the_wait() {
+        let mut p = waiting_start(false);
+        unworn_remote_media(&mut p);
         assert_eq!(p.feed(140, Input::EarState(vec![InEar, InEar])), []);
         assert_eq!(p.feed(145, Input::EarResume { resumed: true }), []);
         assert!(p.core.ear_resume_until.is_some());
@@ -6778,6 +6790,34 @@ mod tests {
         assert_eq!(p.play(150, true), [SendOwnership(false)]);
         assert!(p.core.pending.is_none());
         assert_eq!(p.feed(160, relay(REMOTE, IDLE)), []);
+        // The release keeps the #313 grace: the next edge is skipped too.
+        assert_eq!(p.play(170, false), []);
+        assert_eq!(p.play_category(180, MEDIA), []);
+        assert_eq!(p.feed(10 + WINDOW_MS, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 0);
+    }
+
+    #[test]
+    fn connect_window_deadline_keeps_the_ear_resume_grace() {
+        let mut p = waiting_start(false);
+        unworn_remote_media(&mut p);
+        assert_eq!(p.feed(1950, Input::EarState(vec![InEar, InEar])), []);
+        assert_eq!(p.feed(1955, Input::EarResume { resumed: true }), []);
+        // Auto's release at the deadline, as on 84ac699 at Auto, and the
+        // #313 grace stays: the edge inside it takes nothing.
+        assert_eq!(p.feed(10 + WINDOW_MS, Input::Tick), [SendOwnership(false)]);
+        assert!(p.core.ear_resume_until.is_some());
+        assert_eq!(p.play_category(2100, MEDIA), []);
+        assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 0);
+    }
+
+    #[test]
+    fn connect_window_ends_on_a_release_already_given() {
+        let mut p = waiting_start(false);
+        assert_eq!(p.feed(30, Input::Ownership(vec![0])), []);
+        assert_eq!(p.feed(40, Input::Release), []);
+        hosts_and_ears(&mut p);
+        assert_eq!(p.feed(120, Input::AudioSource(idle())), []);
         assert_eq!(p.feed(10 + WINDOW_MS, Input::Tick), []);
         assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 0);
     }

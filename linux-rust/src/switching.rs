@@ -2949,6 +2949,9 @@ mod tests {
         })
         .await;
         // With no routing reports its decision waits (#452): nothing is sent.
+        // Auto's release at the deadline isn't asserted here: the core runs
+        // on std `Instant` and this test on paused tokio time. The core's
+        // `assert_no_connect_take` with `waits` (handoff.rs) covers it.
         h.play(true).await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         let trace = traced(mac);
