@@ -7034,6 +7034,43 @@ mod tests {
     }
 
     #[test]
+    fn connect_window_deferred_edge_skips_in_the_ear_resume_grace() {
+        let mut p = waiting_start(false);
+        assert_eq!(p.play(30, false), []);
+        assert_eq!(p.feed(40, Input::EarState(vec![OutOfEar, OutOfEar])), []);
+        assert_eq!(p.feed(45, remote_source(AudioSourceType::Media)), []);
+        assert_eq!(p.play(60, true), []);
+        // The buds go back in and the other host resumes (#313).
+        assert_eq!(p.feed(70, Input::EarState(vec![InEar, InEar])), []);
+        assert_eq!(p.feed(75, Input::EarResume { resumed: true }), []);
+        let hosts = Input::ConnectedDevices {
+            old: Vec::new(),
+            new: two_hosts(),
+        };
+        assert_eq!(p.feed(100, hosts), [Announce]);
+        assert_eq!(p.feed(110, relay(REMOTE, IDLE)), [SendOwnership(false)]);
+        assert_eq!(count_lines(&p.core.take_lines(), PLAYBACK_TAKE), 0);
+    }
+
+    #[test]
+    fn connect_window_deferred_edge_ends_with_the_wait() {
+        // The user's release ends the wait; the next Auto has no edge.
+        let mut p = waiting_start(false);
+        assert_eq!(p.feed(25, Input::Ownership(vec![0])), []);
+        assert_eq!(p.play(30, false), []);
+        assert_eq!(p.play(60, true), []);
+        assert_eq!(p.feed(70, Input::Release), []);
+        hosts_and_ears(&mut p);
+        assert_eq!(p.feed(120, Input::AudioSource(idle())), []);
+        p.core.take_lines();
+        let auto = p.feed(3000, Input::Auto);
+        assert_eq!(takes(&auto), 1, "{auto:?}");
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, CONNECT_TAKE), 1);
+        assert_eq!(count_lines(&lines, PLAYBACK_TAKE), 0);
+    }
+
+    #[test]
     fn connect_window_edge_skipped_on_reported_state_ends_the_wait() {
         // Both buds reported out.
         let mut p = waiting_start(false);
