@@ -34,7 +34,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex, RwLock};
 
 /// The single per-component battery rule, shared by the window (`merge_battery`) and
-/// the tray (devices/airpods.rs). A Disconnected update (AACP status 0x04, e.g. the
+/// the tray (ui/tray.rs). A Disconnected update (AACP status 0x04, e.g. the
 /// case while the buds are out of it) never replaces a known non-Disconnected
 /// level/status: the previous entry is kept. Otherwise the update wins: a Disconnected
 /// update is stored when nothing (or only Disconnected) is known, and a Charging or
@@ -58,7 +58,7 @@ pub(crate) fn merge_battery_entry(
 /// A component absent from `update` keeps its previous entry. A component present in
 /// both goes through `merge_battery_entry`. A component with no previous entry is
 /// appended.
-fn merge_battery(prev: &[BatteryInfo], update: &[BatteryInfo]) -> Vec<BatteryInfo> {
+pub(crate) fn merge_battery(prev: &[BatteryInfo], update: &[BatteryInfo]) -> Vec<BatteryInfo> {
     let mut merged = prev.to_vec();
     for entry in update {
         match merged.iter_mut().find(|m| m.component == entry.component) {

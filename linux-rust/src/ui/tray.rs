@@ -9,7 +9,7 @@ use crate::bluetooth::aacp::{
 };
 use crate::bluetooth::le::ble_tray_entry;
 use crate::ui::messages::BluetoothUIMessage;
-use crate::ui::window::merge_battery_entry;
+use crate::ui::window::{merge_battery, merge_battery_entry};
 use crate::utils::get_app_settings_path;
 
 type CommandTx = UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>;
@@ -93,7 +93,7 @@ impl MyTray {
     /// `mac` is not the tray's device (#464).
     pub fn apply_aacp_battery(&mut self, mac: &str, infos: &[BatteryInfo]) {
         if let Some(d) = self.stored(mac) {
-            merge_stored_battery(&mut d.battery, infos);
+            d.battery = merge_battery(&d.battery, infos);
         }
         if self.is_other_device(mac) {
             return;
@@ -227,20 +227,6 @@ impl MyTray {
         }
         if !self.is_other_device(mac) {
             self.conversation_detect_enabled = Some(enabled);
-        }
-    }
-}
-
-/// Merges an AACP report into a stored battery list per component through
-/// `merge_battery_entry` (#52); components absent from `infos` keep their entry.
-fn merge_stored_battery(stored: &mut Vec<BatteryInfo>, infos: &[BatteryInfo]) {
-    for b in infos {
-        match stored.iter_mut().find(|s| s.component == b.component) {
-            Some(s) => {
-                (s.level, s.status) =
-                    merge_battery_entry(Some((s.level, s.status)), (b.level, b.status));
-            }
-            None => stored.push(b.clone()),
         }
     }
 }
