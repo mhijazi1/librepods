@@ -8,6 +8,7 @@ use super::poller::{MediaActions, NOT_PAUSING, PlaybackSamples};
 use super::registry::{Pending, last_owner_linux, remember_last_owner_linux};
 use super::{Events, FlushRequest, TICK};
 use crate::a2dp_resume;
+use crate::activity::{self, ActivitySource};
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers as Control};
 use crate::default_sink::{SinkEvent, UnparkTo};
 use crate::handoff::{Command, Handoff, Input, Park, local_inputs};
@@ -63,6 +64,8 @@ pub(super) struct Shell {
     pub(super) notifications: Arc<AtomicBool>,
     /// Undo clicks on "moved to", by yield id.
     pub(super) undo_rx: mpsc::UnboundedReceiver<u64>,
+    /// Linux's activity level for the announced tipi (#13).
+    pub(super) activity: Arc<dyn ActivitySource>,
 }
 
 /// The task's future drops its `Shell` on return, abort and panic alike,
@@ -130,7 +133,9 @@ impl Shell {
                     }
                 }
                 Command::Announce => {
-                    if let Err(e) = announce(&self.manager, &self.local).await {
+                    let fields = activity::current_tipi(&self.activity).await;
+                    info!("Handoff: announcing Linux with {fields:?}");
+                    if let Err(e) = announce(&self.manager, &self.local, fields).await {
                         error!("Handoff: failed to announce Linux to remote hosts: {e}");
                     }
                 }
