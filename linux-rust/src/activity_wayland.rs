@@ -107,7 +107,7 @@ enum Selection {
 fn select_source(display: bool, connected: bool, globals: &[(&str, u32)]) -> Selection {
     let version = |name| globals.iter().find(|g| g.0 == name).map(|g| g.1);
     if !display {
-        return Selection::Logind("no WAYLAND_DISPLAY");
+        return Selection::Logind("no WAYLAND_DISPLAY, or WAYLAND_SOCKET is set");
     }
     if !connected {
         return Selection::Logind("the Wayland connection failed");
