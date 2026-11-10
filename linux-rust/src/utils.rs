@@ -316,6 +316,48 @@ pub fn load_switching_notifications() -> bool {
         .unwrap_or(true)
 }
 
+/// WirePlumber's setting that switches the AirPods to their headset (mic)
+/// profile while something records from them (#12).
+const AUTOSWITCH_KEY: &str = "bluetooth.autoswitch-to-headset-profile";
+
+/// The setting from `wpctl settings <key>`'s stdout (`Value: true`); None
+/// for anything else, an unknown key's `Setting '…' not found` included
+/// (wpctl exits 0 for it).
+pub fn autoswitch_setting(stdout: &str) -> Option<bool> {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Value:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The startup warning, only when the setting is known to be off.
+pub fn autoswitch_warning(setting: Option<bool>) -> Option<String> {
+    (setting == Some(false)).then(|| {
+        format!(
+            "WirePlumber's {AUTOSWITCH_KEY} is off, so the AirPods mic won't switch on when \
+             an app records; turn it on with `wpctl settings --save {AUTOSWITCH_KEY} true`"
+        )
+    })
+}
+
+/// Run `<program> settings <key>` for at most 5 s; None when it can't be
+/// run, times out or prints no value.
+pub async fn read_autoswitch_setting_from(program: &str) -> Option<bool> {
+    let output = tokio::process::Command::new(program)
+        .args(["settings", AUTOSWITCH_KEY])
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), output)
+        .await
+        .ok()?
+        .ok()?;
+    autoswitch_setting(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub async fn read_autoswitch_setting() -> Option<bool> {
+    read_autoswitch_setting_from("wpctl").await
+}
+
 fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let mut swapped_key = *key;
     swapped_key.reverse();
@@ -425,6 +467,34 @@ impl From<MyTheme> for Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autoswitch_setting_parses_wpctl_output() {
+        assert_eq!(autoswitch_setting("Value: true\n"), Some(true));
+        assert_eq!(autoswitch_setting("Value: false\n"), Some(false));
+        assert_eq!(
+            autoswitch_setting("Setting 'no.such.key' not found\n"),
+            None
+        );
+        assert_eq!(autoswitch_setting(""), None);
+    }
+
+    #[test]
+    fn autoswitch_warning_only_when_off() {
+        let warning = autoswitch_warning(Some(false)).unwrap();
+        assert!(warning.contains("bluetooth.autoswitch-to-headset-profile"));
+        assert!(warning.contains("mic"));
+        assert_eq!(autoswitch_warning(Some(true)), None);
+        assert_eq!(autoswitch_warning(None), None);
+    }
+
+    #[tokio::test]
+    async fn autoswitch_read_missing_wpctl_is_none() {
+        assert_eq!(
+            read_autoswitch_setting_from("librepods-no-such-wpctl").await,
+            None
+        );
+    }
 
     #[test]
     fn preferred_codec_profile_order() {
