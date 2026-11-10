@@ -93,7 +93,7 @@ impl MyTray {
     /// `mac` is not the tray's device (#464).
     pub fn apply_aacp_battery(&mut self, mac: &str, infos: &[BatteryInfo]) {
         if let Some(d) = self.stored(mac) {
-            d.battery = infos.to_vec();
+            merge_stored_battery(&mut d.battery, infos);
         }
         if self.is_other_device(mac) {
             return;
@@ -166,8 +166,9 @@ impl MyTray {
 
     /// The AirPods `mac` disconnected. If the tray shows it, the tray moves to
     /// the most recently connected AirPods still connected, restoring its menu
-    /// target, control state and last AACP bud levels (the case follows
-    /// `connect_reset`). With none left the display stays, disconnected.
+    /// target, control state and stored AACP battery. Its case is shown only
+    /// if known; a Disconnected one leaves the case to `connect_reset`. With
+    /// none left the display stays, disconnected.
     pub fn device_disconnected(&mut self, mac: &str) {
         self.devices.retain(|d| d.mac != mac);
         if self.device.as_deref() != Some(mac) {
@@ -179,12 +180,15 @@ impl MyTray {
             return;
         };
         self.connect_reset(&d.mac);
-        let buds: Vec<BatteryInfo> = d
+        // connect_reset made d.mac the case owner, so its known case is shown (#461).
+        let battery: Vec<BatteryInfo> = d
             .battery
             .into_iter()
-            .filter(|b| b.component != BatteryComponent::Case)
+            .filter(|b| {
+                b.component != BatteryComponent::Case || b.status != BatteryStatus::Disconnected
+            })
             .collect();
-        self.apply_battery(&buds);
+        self.apply_battery(&battery);
         self.command_tx = Some(d.command_tx);
         self.listening_mode = d.listening_mode;
         self.allow_off_option = d.allow_off_option;
@@ -223,6 +227,20 @@ impl MyTray {
         }
         if !self.is_other_device(mac) {
             self.conversation_detect_enabled = Some(enabled);
+        }
+    }
+}
+
+/// Merges an AACP report into a stored battery list per component through
+/// `merge_battery_entry` (#52); components absent from `infos` keep their entry.
+fn merge_stored_battery(stored: &mut Vec<BatteryInfo>, infos: &[BatteryInfo]) {
+    for b in infos {
+        match stored.iter_mut().find(|s| s.component == b.component) {
+            Some(s) => {
+                (s.level, s.status) =
+                    merge_battery_entry(Some((s.level, s.status)), (b.level, b.status));
+            }
+            None => stored.push(b.clone()),
         }
     }
 }
@@ -914,10 +932,10 @@ mod tests {
         assert_eq!(tray.battery_l_status, Some(NotCharging));
         assert_eq!(tray.battery_r, Some(65));
         assert_eq!(tray.battery_r_status, Some(Charging));
-        // The case owner was C, not A: connect_reset clears the case.
+        // A's own known case is restored, and A owns it.
         assert_eq!(tray.case_owner.as_deref(), Some(A));
-        assert_eq!(tray.battery_c, None);
-        assert_eq!(tray.battery_c_status, None);
+        assert_eq!(tray.battery_c, Some(90));
+        assert_eq!(tray.battery_c_status, Some(NotCharging));
         menu_send(&tray);
         assert!(rx_a.try_recv().is_ok());
         assert!(rx_c.try_recv().is_err());
@@ -979,6 +997,61 @@ mod tests {
         assert_eq!(tray.device.as_deref(), Some(A));
         assert!(!tray.connected);
         assert!(tray.command_tx.is_none());
+    }
+
+    #[test]
+    fn tray_restore_keeps_known_bud_over_disconnected() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        tray.apply_aacp_battery(A, &[b(Left, 80, NotCharging)]);
+        let _rx_b = connect(&mut tray, B);
+        tray.apply_aacp_battery(A, &[b(Left, 0, Disconnected)]);
+        tray.device_disconnected(B);
+        assert_eq!(tray.device.as_deref(), Some(A));
+        assert_eq!(tray.battery_l, Some(80));
+        assert_eq!(tray.battery_l_status, Some(NotCharging));
+    }
+
+    #[test]
+    fn tray_restore_keeps_components_absent_from_partial_report() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        tray.apply_aacp_battery(A, &[b(Left, 70, NotCharging), b(Right, 60, NotCharging)]);
+        let _rx_b = connect(&mut tray, B);
+        tray.apply_aacp_battery(A, &[b(Right, 55, NotCharging)]);
+        tray.device_disconnected(B);
+        assert_eq!(tray.battery_l, Some(70));
+        assert_eq!(tray.battery_r, Some(55));
+    }
+
+    #[test]
+    fn tray_restore_shows_own_known_case() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        tray.apply_aacp_battery(A, &[b(Case, 90, NotCharging)]);
+        let _rx_c = connect(&mut tray, C);
+        tray.apply_aacp_battery(C, &[b(Case, 40, NotCharging)]);
+        assert_eq!(tray.case_owner.as_deref(), Some(C));
+        tray.apply_aacp_battery(A, &[b(Case, 0, Disconnected)]);
+        tray.device_disconnected(C);
+        assert_eq!(tray.battery_c, Some(90));
+        assert_eq!(tray.battery_c_status, Some(NotCharging));
+        assert_eq!(tray.case_owner.as_deref(), Some(A));
+    }
+
+    #[test]
+    fn tray_restore_disconnected_case_stays_unknown() {
+        let mut tray = MyTray::default();
+        let _rx_a = connect(&mut tray, A);
+        tray.apply_aacp_battery(A, &[b(Left, 80, NotCharging), b(Case, 0, Disconnected)]);
+        let _rx_c = connect(&mut tray, C);
+        tray.apply_aacp_battery(C, &[b(Case, 40, NotCharging)]);
+        tray.device_disconnected(C);
+        assert_eq!(tray.battery_l, Some(80));
+        // `C: ?` (unknown), not A's `C: -` and never C's 40%.
+        assert_eq!(tray.battery_c, None);
+        assert_eq!(tray.battery_c_status, None);
+        assert_eq!(tray.case_owner.as_deref(), Some(A));
     }
 
     #[test]
