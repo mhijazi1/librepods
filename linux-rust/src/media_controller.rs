@@ -120,9 +120,10 @@ pub(crate) struct RoutingSnapshot {
 }
 
 /// Audio categories of the media-information relays (#272, captures from
-/// #74 and #257): idle, a non-MPRIS stream, MPRIS media. A call is
-/// `AUDIO_CATEGORY_CALL` (501).
+/// #74 and #257): idle, mic use without a call (#505), a non-MPRIS stream,
+/// MPRIS media. A call is `AUDIO_CATEGORY_CALL` (501).
 pub(crate) const AUDIO_CATEGORY_IDLE: u32 = 100;
+pub(crate) const AUDIO_CATEGORY_MIC: u32 = 200;
 pub(crate) const AUDIO_CATEGORY_STREAM: u32 = 201;
 pub(crate) const AUDIO_CATEGORY_MEDIA: u32 = 301;
 

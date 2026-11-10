@@ -5,13 +5,13 @@
 //! copies the stream and card state out of the sound server and feeds it
 //! here, so every rule is tested offline.
 //!
-//! A call is either
-//! - a capture stream (a microphone recording) that is not a monitor of a
-//!   sink and whose `media.role` is `Communication` or `phone` (any case),
-//!   as WebRTC browsers, Discord, Zoom and the like tag their call input; or
-//! - the AirPods card on a head-unit (HFP/HSP) profile: PipeWire's
-//!   `headset-head-unit*` or PulseAudio's `headset_head_unit` /
-//!   `handsfree_head_unit`.
+//! A call is a capture stream (a microphone recording) that is not a monitor
+//! of a sink and whose `media.role` is `Communication` or `phone` (any case),
+//! as WebRTC browsers, Discord, Zoom and the like tag their call input, on
+//! any profile. Mic use without a call (#505) is the AirPods card on a
+//! head-unit (HFP/HSP) profile with no call stream: PipeWire's
+//! `headset-head-unit*` or PulseAudio's `headset_head_unit` /
+//! `handsfree_head_unit`.
 //!
 //! It also decides which playback streams (sink inputs) are worth taking the
 //! AirPods for (#10): `is_takeover_worthy`. `stream_monitor::PlaybackTracker`
@@ -100,10 +100,36 @@ pub(crate) fn airpods_card_profile<'a>(
         .and_then(|(_, profile)| profile.as_deref())
 }
 
-/// Whether Linux is in a call: any call stream, or the AirPods card on a
-/// head-unit profile.
-pub(crate) fn call_active(streams: &[StreamProps], airpods_profile: Option<&str>) -> bool {
-    is_call_profile(airpods_profile) || streams.iter().any(is_call_stream)
+/// What Linux uses the AirPods' microphone for (#505).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallState {
+    Idle,
+    /// The card on a head-unit profile with no call stream: the Mac relays
+    /// audio category 200 for it, not a call's 501.
+    Mic,
+    Call,
+}
+
+impl From<bool> for CallState {
+    fn from(in_call: bool) -> Self {
+        if in_call {
+            CallState::Call
+        } else {
+            CallState::Idle
+        }
+    }
+}
+
+/// A call when any stream is a call stream, else mic use when the AirPods
+/// card is on a head-unit profile.
+pub(crate) fn call_state(streams: &[StreamProps], airpods_profile: Option<&str>) -> CallState {
+    if streams.iter().any(is_call_stream) {
+        CallState::Call
+    } else if is_call_profile(airpods_profile) {
+        CallState::Mic
+    } else {
+        CallState::Idle
+    }
 }
 
 /// `media.role` values of media worth taking the AirPods for.
@@ -173,6 +199,7 @@ pub(crate) fn is_own_or_plumbing(props: &BTreeMap<String, String>, own_pid: u32)
 
 #[cfg(test)]
 mod tests {
+    use super::CallState::{Call, Idle, Mic};
     use super::*;
 
     const MAC: &str = "AA:BB:CC:DD:EE:FF";
@@ -218,7 +245,7 @@ mod tests {
         ] {
             let s = capture(&[("media.role", role), ("application.name", "Firefox")]);
             assert!(is_call_stream(&s), "{role}");
-            assert!(call_active(&[s], None), "{role}");
+            assert_eq!(call_state(&[s], None), Call, "{role}");
         }
     }
 
@@ -226,7 +253,7 @@ mod tests {
     fn recorder_without_role_is_not_a_call() {
         let s = capture(&[("application.name", "OBS")]);
         assert!(!is_call_stream(&s));
-        assert!(!call_active(&[s], None));
+        assert_eq!(call_state(&[s], None), Idle);
     }
 
     #[test]
@@ -256,14 +283,17 @@ mod tests {
             let s = capture(&[("media.role", "Communication"), (key, "false")]);
             assert!(is_call_stream(&s), "{key}=false");
         }
-        assert!(!call_active(
-            &[stream(
-                StreamDirection::Capture,
-                &[("media.role", "phone")],
-                true
-            )],
-            None
-        ));
+        assert_eq!(
+            call_state(
+                &[stream(
+                    StreamDirection::Capture,
+                    &[("media.role", "phone")],
+                    true
+                )],
+                None
+            ),
+            Idle
+        );
     }
 
     #[test]
@@ -281,7 +311,7 @@ mod tests {
                 monitor,
             );
             assert!(!is_call_stream(&s), "monitor={monitor}");
-            assert!(!call_active(&[s], None), "monitor={monitor}");
+            assert_eq!(call_state(&[s], None), Idle, "monitor={monitor}");
         }
     }
 
@@ -295,11 +325,12 @@ mod tests {
             false,
         );
         assert!(!is_call_stream(&s));
-        assert!(!call_active(&[s], Some("a2dp-sink")));
+        assert_eq!(call_state(&[s], Some("a2dp-sink")), Idle);
     }
 
     #[test]
-    fn head_unit_profiles_are_calls() {
+    fn head_unit_profiles_are_mic_use() {
+        let call = [capture(&[("media.role", "Communication")])];
         for profile in [
             "headset-head-unit",
             "headset-head-unit-msbc",
@@ -308,7 +339,14 @@ mod tests {
             "handsfree_head_unit",
         ] {
             assert!(is_call_profile(Some(profile)), "{profile}");
-            assert!(call_active(&[], Some(profile)), "{profile}");
+            assert_eq!(call_state(&[], Some(profile)), Mic, "{profile}");
+            assert_eq!(call_state(&call, Some(profile)), Call, "{profile}");
+        }
+        for profile in [Some("a2dp-sink"), Some("off"), Some(""), None] {
+            assert_eq!(call_state(&[], profile), Idle, "{profile:?}");
+        }
+        for profile in [Some("a2dp-sink"), None] {
+            assert_eq!(call_state(&call, profile), Call, "{profile:?}");
         }
     }
 
@@ -323,7 +361,7 @@ mod tests {
             None,
         ] {
             assert!(!is_call_profile(profile), "{profile:?}");
-            assert!(!call_active(&[], profile), "{profile:?}");
+            assert_eq!(call_state(&[], profile), Idle, "{profile:?}");
         }
     }
 
@@ -354,11 +392,11 @@ mod tests {
         ]);
         let profile = airpods_card_profile(&list, MAC);
         assert_eq!(profile, Some("a2dp-sink"));
-        assert!(!call_active(&[], profile));
+        assert_eq!(call_state(&[], profile), Idle);
         // Only the other device's card is present.
         let other = cards(&[("bluez_card.11_22_33_44_55_66", Some("headset-head-unit"))]);
         assert_eq!(airpods_card_profile(&other, MAC), None);
-        assert!(!call_active(&[], airpods_card_profile(&other, MAC)));
+        assert_eq!(call_state(&[], airpods_card_profile(&other, MAC)), Idle);
     }
 
     #[test]
@@ -368,8 +406,8 @@ mod tests {
             stream(StreamDirection::Playback, &[("media.role", "Music")], false),
             capture(&[("media.role", "Communication")]),
         ];
-        assert!(call_active(&streams, Some("a2dp-sink")));
-        assert!(!call_active(&streams[..2], Some("a2dp-sink")));
+        assert_eq!(call_state(&streams, Some("a2dp-sink")), Call);
+        assert_eq!(call_state(&streams[..2], Some("a2dp-sink")), Idle);
     }
 
     #[test]

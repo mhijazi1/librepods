@@ -18,7 +18,7 @@
 //! then plays on the next sink, where #264's A2DP hold sends it.
 
 use crate::call_detect::{
-    StreamDirection, StreamProps, airpods_card_profile, call_active, is_takeover_worthy,
+    CallState, StreamDirection, StreamProps, airpods_card_profile, call_state, is_takeover_worthy,
 };
 use crate::pulse::{self, pulse_error};
 use libpulse_binding::context::{Context, State as ContextState};
@@ -60,8 +60,9 @@ pub(crate) const AUDIBLE_PEAK: f32 = 0.001;
 /// paused game or an idle tab hands the AirPods back soon.
 pub(crate) const SILENCE_HOLD: Duration = Duration::from_secs(5);
 
-/// Call-state changes: whether Linux was in a call at the instant.
-pub(crate) type CallSamples = mpsc::Receiver<(Instant, bool)>;
+/// Call-state changes: whether Linux was in a call, or using the mic, at the
+/// instant.
+pub(crate) type CallSamples = mpsc::Receiver<(Instant, CallState)>;
 
 /// The sound server state call detection needs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -81,18 +82,18 @@ pub(crate) trait StreamSource: Send {
 /// Turns snapshots into call state changes.
 #[derive(Debug, Default)]
 pub(crate) struct CallPoller {
-    last: Option<bool>,
+    last: Option<CallState>,
 }
 
 impl CallPoller {
-    /// Sample `source` once. Some(in_call) only when the call state changed,
+    /// Sample `source` once. Some(state) only when the call state changed,
     /// including the first sample; None when it did not, or when the source
     /// failed (the last state is kept).
     pub(crate) fn poll(
         &mut self,
         source: &mut dyn StreamSource,
         airpods_mac: &str,
-    ) -> Option<bool> {
+    ) -> Option<CallState> {
         let snapshot = match source.snapshot() {
             Ok(snapshot) => snapshot,
             Err(e) => {
@@ -100,15 +101,15 @@ impl CallPoller {
                 return None;
             }
         };
-        let in_call = call_active(
+        let state = call_state(
             &snapshot.streams,
             airpods_card_profile(&snapshot.cards, airpods_mac),
         );
-        if self.last == Some(in_call) {
+        if self.last == Some(state) {
             return None;
         }
-        self.last = Some(in_call);
-        Some(in_call)
+        self.last = Some(state);
+        Some(state)
     }
 }
 
@@ -142,8 +143,8 @@ fn spawn_call_poller_with<S: StreamSource + 'static>(
                 break;
             };
             state = Some((poller, source));
-            if let Some(in_call) = change
-                && tx.send((sampled_at, in_call)).await.is_err()
+            if let Some(state) = change
+                && tx.send((sampled_at, state)).await.is_err()
             {
                 break;
             }
@@ -1160,6 +1161,7 @@ impl PeakSource for AllAudible {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::call_detect::CallState::{Call, Idle, Mic};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -1252,11 +1254,11 @@ mod tests {
     fn poller_reports_first_sample_and_changes_only() {
         let mut source = FakeSource::new(vec![idle(), idle(), in_call(), in_call(), idle()]);
         let mut poller = CallPoller::default();
-        assert_eq!(poller.poll(&mut source, MAC), Some(false));
+        assert_eq!(poller.poll(&mut source, MAC), Some(Idle));
         assert_eq!(poller.poll(&mut source, MAC), None);
-        assert_eq!(poller.poll(&mut source, MAC), Some(true));
+        assert_eq!(poller.poll(&mut source, MAC), Some(Call));
         assert_eq!(poller.poll(&mut source, MAC), None);
-        assert_eq!(poller.poll(&mut source, MAC), Some(false));
+        assert_eq!(poller.poll(&mut source, MAC), Some(Idle));
         assert_eq!(poller.poll(&mut source, MAC), None);
     }
 
@@ -1264,11 +1266,53 @@ mod tests {
     fn poller_first_sample_in_call() {
         let mut source = FakeSource::new(vec![hfp(), in_call()]);
         let mut poller = CallPoller::default();
-        assert_eq!(poller.poll(&mut source, MAC), Some(true));
-        // A different reason for the same state is no change.
+        // The head-unit profile alone is mic use, not a call (#505)...
+        assert_eq!(poller.poll(&mut source, MAC), Some(Mic));
+        // ...and a call stream is a call.
+        assert_eq!(poller.poll(&mut source, MAC), Some(Call));
         assert_eq!(poller.poll(&mut source, MAC), None);
-        // The head-unit profile of another device's card is not a call.
-        assert_eq!(poller.poll(&mut source, "11:22:33:44:55:66"), None);
+        // The head-unit profile of another device's card is neither.
+        let mut source = FakeSource::new(vec![hfp()]);
+        let mut poller = CallPoller::default();
+        assert_eq!(poller.poll(&mut source, "11:22:33:44:55:66"), Some(Idle));
+    }
+
+    #[test]
+    fn poller_reports_mic_use_apart_from_call() {
+        let hfp_call = || {
+            let mut snapshot = hfp()?;
+            snapshot.streams.push(call_stream());
+            Ok(snapshot)
+        };
+        let mut source = FakeSource::new(vec![
+            idle(),
+            idle(),
+            hfp(),
+            hfp(),
+            hfp_call(),
+            hfp_call(),
+            hfp(),
+            idle(),
+        ]);
+        let mut poller = CallPoller::default();
+        let mut polls = Vec::new();
+        for _ in 0..9 {
+            polls.push(poller.poll(&mut source, MAC));
+        }
+        assert_eq!(
+            polls,
+            [
+                Some(Idle),
+                None,
+                Some(Mic),
+                None,
+                Some(Call),
+                None,
+                Some(Mic),
+                Some(Idle),
+                None
+            ]
+        );
     }
 
     #[test]
@@ -1285,13 +1329,13 @@ mod tests {
         let mut poller = CallPoller::default();
         // No state yet: an error reports nothing.
         assert_eq!(poller.poll(&mut source, MAC), None);
-        assert_eq!(poller.poll(&mut source, MAC), Some(true));
+        assert_eq!(poller.poll(&mut source, MAC), Some(Call));
         // Errors neither end nor repeat the call.
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), None);
-        assert_eq!(poller.poll(&mut source, MAC), Some(false));
+        assert_eq!(poller.poll(&mut source, MAC), Some(Idle));
     }
 
     #[test]
@@ -1299,13 +1343,13 @@ mod tests {
         let mut source =
             FakeSource::new(vec![in_call(), timed_out(), timed_out(), in_call(), idle()]);
         let mut poller = CallPoller::default();
-        assert_eq!(poller.poll(&mut source, MAC), Some(true));
+        assert_eq!(poller.poll(&mut source, MAC), Some(Call));
         // Timeouts neither end nor repeat the call...
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), None);
         assert_eq!(poller.poll(&mut source, MAC), None);
         // ...and the next good sample still reports a change.
-        assert_eq!(poller.poll(&mut source, MAC), Some(false));
+        assert_eq!(poller.poll(&mut source, MAC), Some(Idle));
     }
 
     #[test]
@@ -1314,7 +1358,7 @@ mod tests {
         let failed = Err(io::Error::other("PulseAudio card list ended early"));
         let mut source = FakeSource::new(vec![in_call(), failed, in_call()]);
         let mut poller = CallPoller::default();
-        assert_eq!(poller.poll(&mut source, MAC), Some(true));
+        assert_eq!(poller.poll(&mut source, MAC), Some(Call));
         // The failed snapshot does not end the call...
         assert_eq!(poller.poll(&mut source, MAC), None);
         // ...and the next good snapshot, still in the call, is no change.
@@ -1341,7 +1385,7 @@ mod tests {
                 .expect("poller running");
             changes.push(in_call);
         }
-        assert_eq!(changes, [false, true, false]);
+        assert_eq!(changes, [Idle, Call, Idle]);
         // Steady state afterwards: nothing more is sent.
         assert!(
             tokio::time::timeout(Duration::from_millis(100), rx.recv())
@@ -1372,7 +1416,7 @@ mod tests {
             changes.push(in_call);
         }
         // The timeouts reported nothing; the snapshot after them did.
-        assert_eq!(changes, [false, true]);
+        assert_eq!(changes, [Idle, Call]);
         assert!(script.lock().unwrap().is_empty());
         drop(rx);
         tokio::time::sleep(Duration::from_millis(50)).await;

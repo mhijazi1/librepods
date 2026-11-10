@@ -386,7 +386,7 @@ struct Harness {
     play_tx: mpsc::Sender<(Instant, u32, Option<u32>)>,
     playback_started: Arc<AtomicBool>,
     /// The injected call monitor's sender (no sound server in tests).
-    call_tx: mpsc::Sender<(Instant, bool)>,
+    call_tx: mpsc::Sender<(Instant, crate::call_detect::CallState)>,
     /// The injected A2DP transport poller's sender (no BlueZ in tests).
     a2dp_tx: mpsc::Sender<bool>,
     /// The sender given to `set_event_channel`.
@@ -621,7 +621,7 @@ impl Harness {
 
     /// A call state change from the call monitor.
     async fn call(&self, in_call: bool) {
-        let _ = self.call_tx.send((Instant::now(), in_call)).await;
+        let _ = self.call_tx.send((Instant::now(), in_call.into())).await;
     }
 
     /// An A2DP transport state from the transport poller.
