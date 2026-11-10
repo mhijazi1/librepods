@@ -110,7 +110,7 @@ pub(crate) fn call_active(streams: &[StreamProps], airpods_profile: Option<&str>
 const MEDIA_ROLES: [&str; 4] = ["music", "movie", "video", "game"];
 
 /// Properties naming the node a stream is routed to.
-const TARGET_PROPS: [&str; 2] = ["target.object", "node.target"];
+pub(crate) const TARGET_PROPS: [&str; 2] = ["target.object", "node.target"];
 
 /// LibrePods' own `application.name`.
 const OWN_APPLICATION: &str = "LibrePods";
