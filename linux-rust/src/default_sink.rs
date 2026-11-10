@@ -10,8 +10,10 @@
 //! null sink (#311): `ParkWatch` then moves the streams that are not worth a
 //! take to the local sink as they appear.
 
-use crate::call_detect::{StreamDirection, StreamProps, is_takeover_worthy};
-use crate::media_controller::MediaController;
+use crate::call_detect::{
+    StreamDirection, StreamProps, is_own_or_plumbing, is_takeover_worthy, prop_is_true,
+};
+use crate::media_controller::{MediaController, blocking};
 use crate::pulse;
 use futures::future::BoxFuture;
 use libpulse_sys as sys;
@@ -406,11 +408,6 @@ impl DefaultSinkIo for MediaController {
     }
 }
 
-/// `f` on the blocking pool; the default if it panicked.
-async fn blocking<T: Default + Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    tokio::task::spawn_blocking(f).await.unwrap_or_default()
-}
-
 fn set_default_sink_sync(name: &str) -> bool {
     pulse::set_default_sink("LibrePods", name)
 }
@@ -497,11 +494,11 @@ impl ParkIo for pulse::ParkConnection {
     }
 
     fn move_input(&mut self, input: u32, sink: u32) -> bool {
-        self.connection().move_sink_input(input, sink)
+        self.connection().move_sink_input(input, Some(sink))
     }
 
     fn move_to_default(&mut self, input: u32) -> bool {
-        self.connection().move_sink_input_to_default(input)
+        self.connection().move_sink_input(input, None)
     }
 
     fn open_corked(&mut self, key: &str, value: &str) -> Option<u32> {
@@ -607,7 +604,9 @@ impl ParkMover {
             corked: input.corked,
             muted: input.mute,
         };
-        if left_alone(props) || is_takeover_worthy(&stream) {
+        // LibrePods' own streams (its clearers included), plumbing and
+        // monitors are never moved.
+        if is_own_or_plumbing(props, std::process::id()) || is_takeover_worthy(&stream) {
             return;
         }
         let index = input.index;
@@ -615,7 +614,7 @@ impl ParkMover {
         if *moves >= MAX_MOVES {
             return;
         }
-        if is_true(props, "node.dont-reconnect") {
+        if prop_is_true(props, "node.dont-reconnect") {
             *moves = MAX_MOVES;
             return info!("Park: sink input {index} has node.dont-reconnect; not moving it");
         }
@@ -651,27 +650,6 @@ fn reset_key(props: &BTreeMap<String, String>) -> Option<(&'static str, &str)> {
     ["media.role", "application.id", "application.name"]
         .into_iter()
         .find_map(|key| Some((key, props.get(key)?.as_str())))
-}
-
-/// LibrePods' own streams (its clearers included), PipeWire plumbing and
-/// monitor streams: the event path never moves them.
-fn left_alone(props: &BTreeMap<String, String>) -> bool {
-    let get = |key| props.get(key).map(|v| v.trim());
-    let own_pid = std::process::id().to_string();
-    is_true(props, "node.virtual")
-        || is_true(props, "stream.monitor")
-        || ["target.object", "node.target"]
-            .into_iter()
-            .filter_map(get)
-            .any(|target| target.ends_with(".monitor"))
-        || get("application.process.id") == Some(own_pid.as_str())
-        || get("application.name").is_some_and(|name| name.eq_ignore_ascii_case("LibrePods"))
-}
-
-fn is_true(props: &BTreeMap<String, String>, key: &str) -> bool {
-    props
-        .get(key)
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]

@@ -60,7 +60,7 @@ const CALL_PROFILE_PREFIXES: [&str; 3] = [
     "handsfree_head_unit",
 ];
 
-fn prop_is_true(props: &BTreeMap<String, String>, key: &str) -> bool {
+pub(crate) fn prop_is_true(props: &BTreeMap<String, String>, key: &str) -> bool {
     props
         .get(key)
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
@@ -142,34 +142,33 @@ fn is_takeover_worthy_for(stream: &StreamProps, own_pid: u32) -> bool {
         return false;
     }
     let props = &stream.props;
-    if stream.monitor || prop_is_true(props, "stream.monitor") {
-        return false;
-    }
-    // Plumbing (loopback, filter-chain, combine); real clients never set it (#97).
-    if prop_is_true(props, "node.virtual") {
-        return false;
-    }
-    if TARGET_PROPS
-        .iter()
-        .filter_map(|key| prop(props, key))
-        .any(|target| target.ends_with(".monitor"))
-    {
+    if stream.monitor || is_own_or_plumbing(props, own_pid) {
         return false;
     }
     if prop(props, "event.id").is_some() {
         return false;
     }
-    let application = prop(props, "application.name");
-    let own_pid = own_pid.to_string();
-    if prop(props, "application.process.id") == Some(own_pid.as_str())
-        || application.is_some_and(|name| name.eq_ignore_ascii_case(OWN_APPLICATION))
-    {
-        return false;
-    }
     match prop(props, "media.role") {
         Some(role) => MEDIA_ROLES.iter().any(|r| role.eq_ignore_ascii_case(r)),
-        None => application.is_some(),
+        None => prop(props, "application.name").is_some(),
     }
+}
+
+/// Whether a stream's properties show a monitor stream (`stream.monitor`,
+/// or a target ending in `.monitor`), PipeWire plumbing (`node.virtual`) or
+/// one of LibrePods' own streams (process `own_pid`, or `application.name`
+/// LibrePods): never media worth a take, never moved off the park sink.
+pub(crate) fn is_own_or_plumbing(props: &BTreeMap<String, String>, own_pid: u32) -> bool {
+    // Plumbing (loopback, filter-chain, combine); real clients never set it (#97).
+    prop_is_true(props, "node.virtual")
+        || prop_is_true(props, "stream.monitor")
+        || TARGET_PROPS
+            .iter()
+            .filter_map(|key| prop(props, key))
+            .any(|target| target.ends_with(".monitor"))
+        || prop(props, "application.process.id") == Some(own_pid.to_string().as_str())
+        || prop(props, "application.name")
+            .is_some_and(|name| name.eq_ignore_ascii_case(OWN_APPLICATION))
 }
 
 #[cfg(test)]
@@ -600,5 +599,32 @@ mod tests {
             "application.name",
             "OBS"
         )])));
+    }
+
+    #[test]
+    fn own_or_plumbing_streams() {
+        const OWN_PID: u32 = 4242;
+        let own_or_plumbing =
+            |props: &[(&str, &str)]| is_own_or_plumbing(&playback(props).props, OWN_PID);
+        for props in [
+            ("node.virtual", "true"),
+            ("stream.monitor", "true"),
+            ("target.object", "x.monitor"),
+            ("node.target", "x.monitor"),
+            ("application.process.id", "4242"),
+            ("application.name", "librepods"),
+        ] {
+            assert!(own_or_plumbing(&[props]), "{props:?}");
+        }
+        for props in [
+            ("application.name", "Firefox"),
+            ("media.role", "Music"),
+            ("node.target", "  "),
+            ("target.object", ""),
+            ("application.process.id", ""),
+            ("application.name", " "),
+        ] {
+            assert!(!own_or_plumbing(&[props]), "{props:?}");
+        }
     }
 }
