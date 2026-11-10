@@ -30,9 +30,10 @@ struct Content {
     expire_ms: i32,
 }
 
-/// The notification for `notice` about the AirPods named `airpods`. The
-/// Mac's timeouts: 20 s for its ReverseRoute banner, 4 s for Connected.
-fn content(notice: &Notice, airpods: &str) -> Content {
+/// The notification for `notice` about the AirPods named `airpods`, for a
+/// server that reads the body as markup if `markup`. The Mac's timeouts:
+/// 20 s for its ReverseRoute banner, 4 s for Connected.
+fn content(notice: &Notice, airpods: &str, markup: bool) -> Content {
     let title = if airpods.is_empty() {
         "AirPods"
     } else {
@@ -40,19 +41,23 @@ fn content(notice: &Notice, airpods: &str) -> Content {
     }
     .to_string();
     match notice {
-        Notice::MovedTo { taker, .. } => Content {
-            title,
-            // The body may be markup, and the name is the peer's.
-            body: escape(&format!(
+        Notice::MovedTo { taker, .. } => {
+            let body = format!(
                 "moved to {}",
                 taker
                     .as_deref()
                     .filter(|n| !n.is_empty())
                     .unwrap_or("another device")
-            )),
-            action: Some("Undo"),
-            expire_ms: 20_000,
-        },
+            );
+            Content {
+                title,
+                // The name is the peer's; a server without markup shows
+                // entities literally.
+                body: if markup { escape(&body) } else { body },
+                action: Some("Undo"),
+                expire_ms: 20_000,
+            }
+        }
         Notice::Connected => Content {
             title,
             body: "Connected".to_string(),
@@ -120,9 +125,8 @@ impl Notifier for Desktop {
         };
         tokio::spawn(async move {
             let airpods = alias(&mac).await.unwrap_or_default();
-            let content = content(&notice, &airpods);
             let shown = tokio::task::spawn_blocking(move || {
-                Connection::new_session().and_then(|bus| show(&bus, &content, on_undo))
+                Connection::new_session().and_then(|bus| show(&bus, &notice, &airpods, on_undo))
             });
             match shown.await {
                 Ok(Ok(())) => {}
@@ -139,12 +143,13 @@ async fn alias(mac: &str) -> Option<String> {
     adapter.device(mac.parse().ok()?).ok()?.alias().await.ok()
 }
 
-/// Show `content` on `bus`; with an action, wait until it is clicked
-/// (calling `on_undo`), closed or expired, and close it on expiry so no
-/// dead button stays.
+/// Show `notice` about `airpods` on `bus`; with an action, wait until it is
+/// clicked (calling `on_undo`), closed or expired, and close it on expiry
+/// so no dead button stays.
 fn show(
     bus: &Connection,
-    content: &Content,
+    notice: &Notice,
+    airpods: &str,
     on_undo: impl Fn() + Send + 'static,
 ) -> Result<(), dbus::Error> {
     // The server's unique name: only its signals count, so another client
@@ -158,6 +163,13 @@ fn show(
         dbus.method_call("org.freedesktop.DBus", "StartServiceByName", (IFACE, 0u32));
     let (server,): (String,) =
         dbus.method_call("org.freedesktop.DBus", "GetNameOwner", (IFACE,))?;
+    // Escaped unless the server says it shows no markup: the name is the
+    // peer's, so a failed answer must not let it through as markup.
+    let caps: Result<(Vec<String>,), _> = bus
+        .with_proxy(server.as_str(), PATH, CALL_TIMEOUT)
+        .method_call(IFACE, "GetCapabilities", ());
+    let markup = caps.map_or(true, |(caps,)| caps.iter().any(|c| c == "body-markup"));
+    let content = content(notice, airpods, markup);
     // Matched before Notify, so a click that beats its reply is queued; the
     // callbacks run in `process`, once the id is set.
     let id = Arc::new(AtomicU32::new(0));
@@ -257,7 +269,7 @@ mod tests {
     #[test]
     fn moved_to_names_the_taker_with_undo() {
         assert_eq!(
-            content(&moved_to(Some("Mo's iPhone")), "Mo's AirPods Pro"),
+            content(&moved_to(Some("Mo's iPhone")), "Mo's AirPods Pro", true),
             Content {
                 title: "Mo's AirPods Pro".to_string(),
                 body: "moved to Mo's iPhone".to_string(),
@@ -270,25 +282,35 @@ mod tests {
     #[test]
     fn moved_to_falls_back_to_another_device() {
         for taker in [None, Some("")] {
-            let content = content(&moved_to(taker), "Mo's AirPods Pro");
+            let content = content(&moved_to(taker), "Mo's AirPods Pro", true);
             assert_eq!(content.body, "moved to another device");
             assert_eq!(content.action, Some("Undo"));
         }
-        assert_eq!(content(&moved_to(Some("iPhone")), "").title, "AirPods");
+        assert_eq!(
+            content(&moved_to(Some("iPhone")), "", true).title,
+            "AirPods"
+        );
     }
 
     #[test]
     fn moved_to_escapes_the_takers_markup() {
-        let content = content(&moved_to(Some(r#"<a href="x">&"#)), "<b>AirPods</b>");
+        let content = content(&moved_to(Some(r#"<a href="x">&"#)), "<b>AirPods</b>", true);
         assert_eq!(content.body, r#"moved to &lt;a href="x"&gt;&amp;"#);
         // The summary is plain text.
         assert_eq!(content.title, "<b>AirPods</b>");
     }
 
     #[test]
+    fn moved_to_keeps_the_takers_name_plain_without_body_markup() {
+        let body = |markup| content(&moved_to(Some("a & <b> c")), "AirPods", markup).body;
+        assert_eq!(body(true), "moved to a &amp; &lt;b&gt; c");
+        assert_eq!(body(false), "moved to a & <b> c");
+    }
+
+    #[test]
     fn linux_take_is_a_connected_notice() {
         assert_eq!(
-            content(&Notice::Connected, "Mo's AirPods Pro"),
+            content(&Notice::Connected, "Mo's AirPods Pro", true),
             Content {
                 title: "Mo's AirPods Pro".to_string(),
                 body: "Connected".to_string(),
@@ -296,7 +318,7 @@ mod tests {
                 expire_ms: 4_000,
             }
         );
-        assert_eq!(content(&Notice::Connected, "").title, "AirPods");
+        assert_eq!(content(&Notice::Connected, "", true).title, "AirPods");
     }
 
     #[test]
@@ -352,15 +374,21 @@ mod tests {
     impl PrivateBus {
         fn start() -> Self {
             use std::io::BufRead;
-            let dir = std::env::temp_dir().join(format!("librepods-17-bus-{}", std::process::id()));
+            // One per test, as tests run in parallel.
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let name = format!(
+                "librepods-17-bus-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            );
+            let dir = std::env::temp_dir().join(&name);
             std::fs::create_dir_all(&dir).expect("the bus dir");
             let config = dir.join("bus.conf");
             // An abstract socket: no path, so no length limit from a deep TMPDIR.
             std::fs::write(
                 &config,
                 format!(
-                    r#"<busconfig><type>session</type><listen>unix:abstract=librepods-17-{}</listen><auth>EXTERNAL</auth><policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy></busconfig>"#,
-                    std::process::id()
+                    r#"<busconfig><type>session</type><listen>unix:abstract={name}</listen><auth>EXTERNAL</auth><policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy></busconfig>"#
                 ),
             )
             .expect("the bus config");
@@ -394,6 +422,87 @@ mod tests {
         }
     }
 
+    /// Serves one post as `server`, the owner of the notification name:
+    /// answers GetCapabilities with `caps` (an error if `None`), then
+    /// Notify, closes the notice, and returns Notify's body.
+    fn serve_one(server: &Connection, caps: Option<&[&str]>) -> String {
+        let me = server.unique_name().to_string();
+        let mut asked = 0;
+        loop {
+            let call = server
+                .channel()
+                .blocking_pop_message(Duration::from_secs(5))
+                .expect("receive")
+                .expect("a call");
+            let reply = match call.member().as_deref() {
+                Some("GetCapabilities") => {
+                    assert_eq!(call.destination().as_deref(), Some(me.as_str()));
+                    asked += 1;
+                    match caps {
+                        Some(caps) => call.method_return().append1(caps.to_vec()),
+                        None => call.error(&"org.freedesktop.DBus.Error.Failed".into(), c"no"),
+                    }
+                }
+                Some("Notify") => {
+                    assert_eq!(asked, 1, "one GetCapabilities before Notify");
+                    let body: &str = call.read5::<&str, u32, &str, &str, &str>().expect("args").4;
+                    server
+                        .channel()
+                        .send(call.method_return().append1(7u32))
+                        .expect("reply");
+                    let closed = Message::new_signal(PATH, IFACE, "NotificationClosed")
+                        .expect("signal")
+                        .append2(7u32, 2u32);
+                    server.channel().send(closed).expect("close");
+                    server.channel().flush();
+                    return body.to_string();
+                }
+                _ => continue,
+            };
+            server.channel().send(reply).expect("reply");
+        }
+    }
+
+    /// A private bus with a fake server that serves one post per `caps`
+    /// entry and returns the bodies, posting a "moved to" a markup name
+    /// for each.
+    fn post_moved_to_markup(caps: &'static [Option<&'static [&'static str]>]) -> Vec<String> {
+        let bus = PrivateBus::start();
+        let server = bus.connect();
+        server
+            .request_name(IFACE, false, true, true)
+            .expect("the server name");
+        let fake = std::thread::spawn(move || {
+            caps.iter()
+                .map(|caps| serve_one(&server, *caps))
+                .collect::<Vec<_>>()
+        });
+        for _ in caps {
+            let notice = moved_to(Some("name with & < >"));
+            show(&bus.connect(), &notice, "AirPods", || {}).expect("shown");
+        }
+        fake.join().expect("the fake server")
+    }
+
+    #[test]
+    fn notify_body_follows_the_servers_body_markup() {
+        assert_eq!(
+            post_moved_to_markup(&[Some(&["body"]), Some(&["body", "body-markup"])]),
+            [
+                "moved to name with & < >",
+                "moved to name with &amp; &lt; &gt;"
+            ]
+        );
+    }
+
+    #[test]
+    fn notify_body_is_escaped_when_capabilities_fail() {
+        assert_eq!(
+            post_moved_to_markup(&[None]),
+            ["moved to name with &amp; &lt; &gt;"]
+        );
+    }
+
     #[test]
     fn a_click_before_the_notify_reply_still_undoes() {
         let bus = PrivateBus::start();
@@ -409,6 +518,10 @@ mod tests {
                     .blocking_pop_message(Duration::from_secs(5))
                     .expect("receive")
                     .expect("a Notify call");
+                if call.member().as_deref() == Some("GetCapabilities") {
+                    let caps = call.method_return().append1(Vec::<String>::new());
+                    server.channel().send(caps).expect("reply");
+                }
                 if call.member().as_deref() != Some("Notify") {
                     continue;
                 }
@@ -429,7 +542,8 @@ mod tests {
         let started = Instant::now();
         show(
             &bus.connect(),
-            &content(&moved_to(Some("iPhone")), "AirPods"),
+            &moved_to(Some("iPhone")),
+            "AirPods",
             move || undo.store(true, Ordering::SeqCst),
         )
         .expect("shown");
