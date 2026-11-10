@@ -1634,7 +1634,11 @@ impl Handoff {
         let played = self.was_playing == Some(true);
         if take && self.owner.as_deref() == Some(&[1]) {
             // The AirPods already report Linux (an app restart while it
-            // owned): keep them as an idle take (#324).
+            // owned): keep them as an idle take (#324). A remote's hold from
+            // the wait ends as an [1] ACK would end it (#264).
+            self.remote_owns = false;
+            self.ear_resume_until = None;
+            self.sync_hold(false, out);
             self.requested_take = true;
             self.last_owner_linux = true;
             self.routed_away = false;
@@ -6759,6 +6763,26 @@ mod tests {
         assert_eq!(p.feed(130, relay(REMOTE, IDLE)), [SendOwnership(true)]);
         assert_eq!(
             p.feed(200, Input::Ownership(vec![1])),
+            [HoldA2dp(false), RouteToAirPods]
+        );
+        assert_ne!(p.core.park(), Park::Parked);
+        // A cached [1] keeps at the relay, with no ACK to undo the hold.
+        let mut p = Probe::new(false, true);
+        p.core.default_sink_routing = true;
+        p.core.a2dp_hold = true;
+        p.core = p.core.with_park_sink(true);
+        p.core.set_streams(true, false);
+        p.feed(0, Input::Ownership(vec![1]));
+        p.feed(5, idle_transport());
+        p.feed(10, Input::Auto);
+        p.feed(20, Input::InitBacklogDrained);
+        assert_eq!(p.play(30, false), []);
+        hosts_and_ears(&mut p);
+        let media = remote_source(AudioSourceType::Media);
+        assert_eq!(p.feed(120, media), [HoldA2dp(true)]);
+        assert_eq!(p.core.park(), Park::Parked);
+        assert_eq!(
+            p.feed(130, relay(REMOTE, IDLE)),
             [HoldA2dp(false), RouteToAirPods]
         );
         assert_ne!(p.core.park(), Park::Parked);
