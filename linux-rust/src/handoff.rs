@@ -1173,18 +1173,26 @@ impl Handoff {
         self.hold_if_remote_source(out);
         // The take holds unless the reconcile just released it.
         let held = pending.desired && self.live() && self.requested_take && self.pending.is_none();
+        if held {
+            self.route_held_take(out);
+        }
+    }
+
+    /// A held take's audio follows the AirPods: on the take's ACK, and when
+    /// `Auto` keeps an owner [1] (#324).
+    fn route_held_take(&mut self, out: &mut Vec<Command>) {
         // Parked playback follows the default to the AirPods (#311).
-        if held && matches!(self.park, Park::Parked | Park::FallenBack) {
+        if matches!(self.park, Park::Parked | Park::FallenBack) {
             self.park = Park::AirPods;
         }
         // Before the resume, so its audible check finds the stream on the
         // AirPods sink (#40).
-        if held && self.default_sink_routing {
+        if self.default_sink_routing {
             out.push(Command::RouteToAirPods);
         }
         // A stop during the take (#205), or an idle connect take (#324),
         // defers the resume until Linux plays.
-        if held && self.automatic && !self.resume_deferred {
+        if self.automatic && !self.resume_deferred {
             self.resume_if_idle(out);
         }
     }
@@ -1685,20 +1693,13 @@ impl Handoff {
             self.remote_owns = false;
             self.ear_resume_until = None;
             self.sync_hold(false, out);
-            // As the ACK does: parked playback follows the AirPods (#311).
-            if matches!(self.park, Park::Parked | Park::FallenBack) {
-                self.park = Park::AirPods;
-            }
             self.requested_take = true;
             self.last_owner_linux = true;
             self.routed_away = false;
             self.resume_deferred = !played;
-            if self.default_sink_routing {
-                out.push(Command::RouteToAirPods);
-            }
-            if played {
-                self.resume_if_idle(out);
-            }
+            // As the ACK does; only a non-gated (automatic) wait gets here,
+            // so the helper resumes exactly when Linux `played`.
+            self.route_held_take(out);
             self.say("AUTO connected; Linux already owns the AirPods, keeping them");
         } else if take && deferred {
             self.request(now, true, Cause::Playback, out);
