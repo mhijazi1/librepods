@@ -4,14 +4,19 @@ use super::*;
 use crate::call_detect::CallState;
 use crate::media_controller::AUDIO_CATEGORY_MIC;
 
-/// The core's inputs for one call monitor state, the call's first: a call
-/// starts before mic use ends and ends before mic use starts, so its 501 is
-/// never followed by mic use's relay.
+/// The core's inputs for one call monitor state. The new hold comes first,
+/// so a switch between a call and mic use never leaves a step with neither
+/// (it would park, #311): a call starts before mic use ends, and mic use
+/// starts (only recorded during the call) before the call ends, whose end
+/// then relays mic use's category after the call's 501.
 pub(crate) fn local_inputs(state: CallState) -> [Input; 2] {
-    [
-        Input::LocalCall(state == CallState::Call),
-        Input::LocalMic(state == CallState::Mic),
-    ]
+    let call = Input::LocalCall(state == CallState::Call);
+    let mic = Input::LocalMic(state == CallState::Mic);
+    if state == CallState::Mic {
+        [mic, call]
+    } else {
+        [call, mic]
+    }
 }
 
 impl Handoff {

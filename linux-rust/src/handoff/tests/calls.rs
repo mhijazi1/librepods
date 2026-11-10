@@ -330,6 +330,8 @@ fn call_end_at_idle_keeps_ownership() {
 
 const MIC: u32 = crate::media_controller::AUDIO_CATEGORY_MIC;
 
+use crate::call_detect::CallState;
+
 /// Only the category relays in `out`.
 fn relays_in(out: Vec<Command>) -> Vec<Command> {
     out.into_iter()
@@ -477,7 +479,6 @@ fn mic_use_with_playback_relays_higher_category() {
 
 #[test]
 fn local_inputs_call_wins_over_mic_use() {
-    use crate::call_detect::CallState;
     let mut p = relaying();
     let mut state = |ms: u64, state: CallState| -> Vec<Command> {
         local_inputs(state)
@@ -494,16 +495,68 @@ fn local_inputs_call_wins_over_mic_use() {
     assert_eq!(state(400, CallState::Idle), [RelayCategory(IDLE)]);
 }
 
-#[test]
-fn park_waits_for_mic_use_to_end() {
-    // As `park_waits_for_the_local_call_to_end` (#311).
+/// As `park::park_ready` (#311): the hold and the park sink on, an idle
+/// sample with the streams known.
+fn park_on() -> Probe {
     let mut p = hold_ready(true);
     p.core = p.core.with_park_sink(true);
     p.core.set_streams(true, false);
     assert_eq!(p.play(20, false), []);
+    p
+}
+
+/// Feed each input of `local_inputs(state)` at `ms`; the park stays local
+/// after every one.
+fn switch_keeps_park(p: &mut Probe, ms: u64, state: CallState) -> Vec<Command> {
+    let mut out = Vec::new();
+    for input in local_inputs(state) {
+        out.extend(p.feed(ms, input.clone()));
+        assert_eq!(p.core.park(), Park::Local, "after {input:?}");
+    }
+    out
+}
+
+/// Both hold ends: idle again parks.
+fn idle_parks(p: &mut Probe, ms: u64) {
+    for input in local_inputs(CallState::Idle) {
+        p.feed(ms, input);
+    }
+    assert_eq!(p.core.park(), Park::Parked);
+}
+
+#[test]
+fn park_waits_for_mic_use_to_end() {
+    // As `park_waits_for_the_local_call_to_end` (#311).
+    let mut p = park_on();
     assert_eq!(p.feed(50, Input::LocalMic(true)), []);
     assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
     assert_eq!(p.core.park(), Park::Local);
     assert_eq!(p.feed(200, Input::LocalMic(false)), []);
     assert_eq!(p.core.park(), Park::Parked);
+}
+
+#[test]
+fn call_to_mic_keeps_park_hold() {
+    let mut p = park_on();
+    assert_eq!(p.feed(50, Input::LocalCall(true)), [AdvertiseCall(true)]);
+    assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+    assert_eq!(p.core.park(), Park::Local);
+    assert_eq!(
+        switch_keeps_park(&mut p, 200, CallState::Mic),
+        [AdvertiseCall(false)]
+    );
+    idle_parks(&mut p, 300);
+}
+
+#[test]
+fn mic_to_call_keeps_park_hold() {
+    let mut p = park_on();
+    assert_eq!(p.feed(50, Input::LocalMic(true)), []);
+    assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), [HoldA2dp(true)]);
+    assert_eq!(p.core.park(), Park::Local);
+    assert_eq!(
+        switch_keeps_park(&mut p, 200, CallState::Call),
+        [AdvertiseCall(true)]
+    );
+    idle_parks(&mut p, 300);
 }
