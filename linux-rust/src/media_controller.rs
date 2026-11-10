@@ -1186,17 +1186,20 @@ impl MediaController {
             .collect()
     }
 
-    /// The resolved owner (`player_owner`) of each MPRIS player (KDE
-    /// Connect's excluded) that reports Playing; None where the bus can't
-    /// tell. Blocking.
-    pub(crate) fn playing_mpris_owners() -> Vec<Option<u32>> {
+    /// Each MPRIS player (KDE Connect's excluded) that reports Playing, with
+    /// its resolved owner (`player_owner`); None where the bus can't tell.
+    /// Blocking.
+    pub(crate) fn playing_mpris_owners() -> Vec<(String, Option<u32>)> {
         let Ok(conn) = Connection::new_session() else {
             return Vec::new();
         };
         Self::list_mpris_services(&conn)
-            .iter()
+            .into_iter()
             .filter(|service| Self::mpris_playing(&conn, service))
-            .map(|service| Self::owner_pid(&conn, service))
+            .map(|service| {
+                let owner = Self::owner_pid(&conn, &service);
+                (service, owner)
+            })
             .collect()
     }
 
