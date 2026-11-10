@@ -11,7 +11,8 @@
 //! take to the local sink as they appear.
 
 use crate::call_detect::{
-    StreamDirection, StreamProps, is_own_or_plumbing, is_takeover_worthy, prop_is_true,
+    StreamDirection, StreamProps, TARGET_PROPS, is_own_or_plumbing, is_takeover_worthy,
+    prop_is_true,
 };
 use crate::media_controller::{MediaController, blocking};
 use crate::pulse;
@@ -589,7 +590,7 @@ impl ParkMover {
         // Unless it targets another sink of its own.
         let park = self.park.to_string();
         if unlinked
-            && ["target.object", "node.target"]
+            && TARGET_PROPS
                 .into_iter()
                 .filter_map(|key| props.get(key).map(|v| v.trim()))
                 .any(|target| target != PARK_SINK && target != park)
