@@ -69,21 +69,31 @@ pub(crate) fn prop_is_true(props: &BTreeMap<String, String>, key: &str) -> bool 
 /// Whether the stream is call input: a capture stream that is not a monitor
 /// and whose `media.role` is Communication or phone.
 pub(crate) fn is_call_stream(stream: &StreamProps) -> bool {
-    if stream.direction != StreamDirection::Capture {
-        return false;
-    }
-    if stream.monitor || MONITOR_PROPS.iter().any(|k| prop_is_true(&stream.props, k)) {
-        return false;
-    }
-    stream.props.get("media.role").is_some_and(|role| {
-        let role = role.trim();
-        CALL_ROLES.iter().any(|c| role.eq_ignore_ascii_case(c))
-    })
+    is_mic_capture(stream)
+        && stream.props.get("media.role").is_some_and(|role| {
+            let role = role.trim();
+            CALL_ROLES.iter().any(|c| role.eq_ignore_ascii_case(c))
+        })
+}
+
+/// Whether the stream records a microphone: a capture stream that is not a
+/// monitor (the flag or a true `stream.monitor` / `stream.capture.sink`).
+fn is_mic_capture(stream: &StreamProps) -> bool {
+    stream.direction == StreamDirection::Capture
+        && !stream.monitor
+        && !MONITOR_PROPS.iter().any(|k| prop_is_true(&stream.props, k))
 }
 
 /// Whether a card profile is a head-unit (call) profile.
 pub(crate) fn is_call_profile(profile: Option<&str>) -> bool {
     profile.is_some_and(|p| CALL_PROFILE_PREFIXES.iter().any(|pre| p.starts_with(pre)))
+}
+
+/// Whether the AirPods card must stay on its head-unit profile (#12): it is
+/// on one and something records a microphone (corked or not, from any
+/// source), so WirePlumber's autoswitch put it there for that recording.
+pub(crate) fn holds_head_unit(streams: &[StreamProps], airpods_profile: Option<&str>) -> bool {
+    is_call_profile(airpods_profile) && streams.iter().any(is_mic_capture)
 }
 
 /// The active profile of the AirPods card, found by its
@@ -408,6 +418,58 @@ mod tests {
         ];
         assert_eq!(call_state(&streams, Some("a2dp-sink")), Call);
         assert_eq!(call_state(&streams[..2], Some("a2dp-sink")), Idle);
+    }
+
+    #[test]
+    fn holds_head_unit_every_head_unit_name_with_mic() {
+        let mic = [capture(&[("application.name", "OBS")])];
+        for profile in [
+            "headset-head-unit",
+            "headset-head-unit-msbc",
+            "headset-head-unit-cvsd",
+            "headset_head_unit",
+            "handsfree_head_unit",
+        ] {
+            assert!(holds_head_unit(&mic, Some(profile)), "{profile}");
+        }
+        // A corked recording still holds.
+        let corked = StreamProps {
+            corked: true,
+            ..mic[0].clone()
+        };
+        assert!(holds_head_unit(&[corked], Some("headset-head-unit")));
+    }
+
+    #[test]
+    fn holds_head_unit_not_with_only_monitor_captures() {
+        let monitors = [
+            stream(
+                StreamDirection::Capture,
+                &[("application.name", "OBS")],
+                true,
+            ),
+            capture(&[("stream.monitor", "true")]),
+            capture(&[("stream.capture.sink", "TRUE")]),
+        ];
+        assert!(!holds_head_unit(&monitors, Some("headset-head-unit")));
+    }
+
+    #[test]
+    fn holds_head_unit_not_without_capture() {
+        assert!(!holds_head_unit(&[], Some("headset-head-unit")));
+        let playing = [
+            playback(&[("media.role", "Music")]),
+            playback(&[("media.role", "phone")]),
+        ];
+        assert!(!holds_head_unit(&playing, Some("headset-head-unit")));
+    }
+
+    #[test]
+    fn holds_head_unit_not_on_a2dp_off_or_none() {
+        let mic = [capture(&[("application.name", "OBS")])];
+        for profile in [Some("a2dp-sink"), Some("off"), None] {
+            assert!(!holds_head_unit(&mic, profile), "{profile:?}");
+        }
     }
 
     #[test]

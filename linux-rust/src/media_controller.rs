@@ -2,8 +2,11 @@ use crate::a2dp_resume::{A2dpResumeIo, AUDIBLE_SAMPLE, Action};
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use crate::bluetooth::aacp::{AACPManagerState, AudioSource, AudioSourceType, ConnectedDevice};
+use crate::call_detect::{airpods_card_profile, holds_head_unit};
 use crate::pulse;
-use crate::stream_monitor::{AUDIBLE_PEAK, PeakSource, PulsePeaks};
+use crate::stream_monitor::{
+    AUDIBLE_PEAK, AudioSnapshot, PeakSource, PulsePeaks, PulseStreams, StreamSource,
+};
 use dbus::arg::RefArg;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
@@ -1518,6 +1521,7 @@ impl MediaController {
                         tokio::time::sleep,
                     )
                 },
+                || blocking(|| PulseStreams.snapshot().ok()),
                 || {
                     self.recover_a2dp_availability_by(
                         deadline,
@@ -1589,14 +1593,16 @@ impl MediaController {
     /// The activation after the MAC check, every step bounded by `deadline`:
     /// `lookup` is the initial full card lookup, `connect` asks BlueZ for the
     /// A2DP profile and finds the card again when the lookup found none,
+    /// `snapshot` reads the streams and cards (None when that failed),
     /// `recover` makes sure A2DP is offered, `choose` picks the profile and
     /// `set` switches to it. State is written only after a step returns, so a
     /// step cut off writes nothing.
-    async fn activate_a2dp_profile_with<L, LFut, K, KFut, V, VFut, C, CFut, P, PFut>(
+    async fn activate_a2dp_profile_with<L, LFut, K, KFut, S, SFut, V, VFut, C, CFut, P, PFut>(
         &self,
         deadline: Instant,
         lookup: L,
         connect: K,
+        snapshot: S,
         recover: V,
         choose: C,
         set: P,
@@ -1606,6 +1612,8 @@ impl MediaController {
         LFut: Future<Output = Option<u32>>,
         K: FnOnce() -> KFut,
         KFut: Future<Output = Option<u32>>,
+        S: FnOnce() -> SFut,
+        SFut: Future<Output = Option<AudioSnapshot>>,
         V: FnOnce() -> VFut,
         VFut: Future<Output = bool>,
         C: FnOnce(u32) -> CFut,
@@ -1631,6 +1639,17 @@ impl MediaController {
             if index.is_none() {
                 return Ok(());
             }
+        }
+
+        // WirePlumber put the card on head-unit for a recording and switches
+        // back after it: neither restart it nor write a profile now (#12).
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        if before_deadline(deadline, snapshot)
+            .await?
+            .is_some_and(|s| holds_head_unit(&s.streams, airpods_card_profile(&s.cards, &mac)))
+        {
+            debug!("AirPods on a head-unit profile while something records, leaving it");
+            return Ok(());
         }
 
         if !before_deadline(deadline, recover).await? {
@@ -1937,16 +1956,24 @@ impl MediaController {
     pub async fn deactivate_a2dp_profile(&self) {
         self.deactivate_a2dp_profile_with(
             |mac| async move { self.get_audio_device_index(&mac).await },
+            || blocking(|| PulseStreams.snapshot().ok()),
             |index| set_card_profile_sync(index, "off"),
         )
         .await
     }
 
-    /// `lookup` resolves the card by MAC; `set_off` turns the profile off.
-    async fn deactivate_a2dp_profile_with<L, LFut, S>(&self, lookup: L, set_off: S)
-    where
+    /// `lookup` resolves the card by MAC; `snapshot` reads the streams and
+    /// cards (None when that failed); `set_off` turns the profile off.
+    async fn deactivate_a2dp_profile_with<L, LFut, N, NFut, S>(
+        &self,
+        lookup: L,
+        snapshot: N,
+        set_off: S,
+    ) where
         L: FnOnce(String) -> LFut,
         LFut: std::future::Future<Output = Option<u32>>,
+        N: FnOnce() -> NFut,
+        NFut: Future<Output = Option<AudioSnapshot>>,
         S: FnOnce(u32) -> bool + Send + 'static,
     {
         debug!("Entering deactivate_a2dp_profile");
@@ -1971,6 +1998,15 @@ impl MediaController {
                 return;
             }
         };
+
+        // Turning the card off would cut the recording off the mic (#12).
+        if snapshot()
+            .await
+            .is_some_and(|s| holds_head_unit(&s.streams, airpods_card_profile(&s.cards, &mac)))
+        {
+            info!("AirPods on a head-unit profile while something records, not turning them off");
+            return;
+        }
 
         info!("Deactivating A2DP profile for AirPods by setting to off");
 
@@ -4313,6 +4349,7 @@ mod tests {
                     })
                 },
                 || steps.step("connect", Duration::ZERO, None),
+                || async { None },
                 || steps.step("recover", Duration::ZERO, true),
                 |_| steps.step("choose", Duration::ZERO, ProfileChoice::Unavailable),
                 |_, _| steps.step("set", Duration::ZERO, true),
@@ -4350,6 +4387,7 @@ mod tests {
                     })
                 },
                 || steps.step("connect", Duration::ZERO, None),
+                || async { None },
                 || steps.step("recover", Duration::ZERO, true),
                 |_| steps.step("choose", Duration::ZERO, ProfileChoice::Unavailable),
                 |_, _| steps.step("set", Duration::ZERO, true),
@@ -4378,6 +4416,7 @@ mod tests {
                 deadline,
                 || steps.step("lookup", slow_query(), Some(10)),
                 || steps.step("connect", Duration::ZERO, None),
+                || async { None },
                 || {
                     controller.recover_a2dp_availability_by(
                         deadline,
@@ -4486,6 +4525,7 @@ mod tests {
                     deadline,
                     || steps.step("lookup", Duration::ZERO, Some(3)),
                     || steps.step("connect", Duration::ZERO, None),
+                    || async { None },
                     || {
                         controller.recover_a2dp_availability_by(
                             deadline,
@@ -4553,6 +4593,7 @@ mod tests {
                     deadline,
                     || steps.step("lookup", Duration::ZERO, Some(3)),
                     || steps.step("connect", Duration::ZERO, None),
+                    || async { None },
                     || {
                         controller.recover_a2dp_availability_by(
                             deadline,
@@ -4602,6 +4643,7 @@ mod tests {
                             let _ = release_rx.await;
                             None
                         },
+                        || async { None },
                         move |_| {
                             set_called.store(true, std::sync::atomic::Ordering::SeqCst);
                             true
@@ -4627,10 +4669,116 @@ mod tests {
         controller
             .deactivate_a2dp_profile_with(
                 |_| async { panic!("cached index must skip the lookup") },
+                || async { None },
                 move |index| set_tx.send(index).is_ok(),
             )
             .await;
         assert_eq!(set_rx.try_recv(), Ok(7));
+    }
+
+    const RECORDING_MAC: &str = "00:00:00:00:00:12";
+
+    /// A snapshot with the AirPods card on `profile`, and a mic recording
+    /// when `recording`.
+    fn recording_snapshot(profile: &str, recording: bool) -> Option<AudioSnapshot> {
+        let mic = crate::call_detect::StreamProps {
+            direction: crate::call_detect::StreamDirection::Capture,
+            props: [("application.name".to_string(), "OBS".to_string())].into(),
+            monitor: false,
+            index: 12,
+            corked: false,
+            muted: false,
+        };
+        Some(AudioSnapshot {
+            streams: if recording { vec![mic] } else { Vec::new() },
+            cards: vec![(
+                format!("bluez_card.{}", RECORDING_MAC.replace(':', "_")),
+                Some(profile.to_string()),
+            )],
+        })
+    }
+
+    /// Run an activation of card 3 that reads `snapshot`; returns the steps
+    /// and what `set` was called with.
+    async fn activate_with_snapshot(
+        snapshot: Option<AudioSnapshot>,
+    ) -> (Steps, Option<(u32, String)>) {
+        let controller = MediaController::new(RECORDING_MAC.to_string(), String::new());
+        let steps = Steps::default();
+        let set_to = std::cell::RefCell::new(None);
+        let outcome = controller
+            .activate_a2dp_profile_with(
+                Instant::now() + A2DP_ACTIVATION_DEADLINE,
+                || steps.step("lookup", Duration::ZERO, Some(3)),
+                || steps.step("connect", Duration::ZERO, None),
+                || std::future::ready(snapshot),
+                || steps.step("recover", Duration::ZERO, true),
+                |_| {
+                    let choice = ProfileChoice::Activate("a2dp-sink-sbc".to_string());
+                    steps.step("choose", Duration::ZERO, choice)
+                },
+                |idx, profile| {
+                    *set_to.borrow_mut() = Some((idx, profile));
+                    steps.step("set", Duration::ZERO, true)
+                },
+            )
+            .await;
+        assert_eq!(outcome, Ok(()));
+        // The lookup's index is stored either way.
+        assert_eq!(controller.state.try_lock().unwrap().device_index, Some(3));
+        (steps, set_to.into_inner())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_keeps_head_unit_while_recording() {
+        let (steps, set_to) =
+            activate_with_snapshot(recording_snapshot("headset-head-unit", true)).await;
+        assert_eq!(
+            steps.started("recover") + steps.started("choose") + steps.started("set"),
+            0
+        );
+        assert_eq!(set_to, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_switches_stale_head_unit() {
+        let (_, set_to) =
+            activate_with_snapshot(recording_snapshot("headset-head-unit", false)).await;
+        assert_eq!(set_to, Some((3, "a2dp-sink-sbc".to_string())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_proceeds_when_snapshot_fails() {
+        let (steps, set_to) = activate_with_snapshot(None).await;
+        assert_eq!(steps.started("recover"), 1);
+        assert_eq!(set_to, Some((3, "a2dp-sink-sbc".to_string())));
+    }
+
+    /// Deactivate cached card 7 with `snapshot`; whether `set_off` ran.
+    async fn deactivate_with_snapshot(snapshot: Option<AudioSnapshot>) -> Option<u32> {
+        let controller = MediaController::new(RECORDING_MAC.to_string(), String::new());
+        controller.state.lock().await.device_index = Some(7);
+        let (set_tx, set_rx) = std::sync::mpsc::channel();
+        controller
+            .deactivate_a2dp_profile_with(
+                |_| async { panic!("cached index must skip the lookup") },
+                || std::future::ready(snapshot),
+                move |index| set_tx.send(index).is_ok(),
+            )
+            .await;
+        set_rx.try_recv().ok()
+    }
+
+    #[tokio::test]
+    async fn deactivation_keeps_head_unit_while_recording() {
+        let snapshot = recording_snapshot("headset-head-unit-msbc", true);
+        assert_eq!(deactivate_with_snapshot(snapshot).await, None);
+    }
+
+    #[tokio::test]
+    async fn deactivation_turns_off_a2dp_with_capture() {
+        let snapshot = recording_snapshot("a2dp-sink", true);
+        assert_eq!(deactivate_with_snapshot(snapshot).await, Some(7));
     }
 
     use crate::utils::PreferredCodec;
@@ -5043,6 +5191,7 @@ mod tests {
                 deadline,
                 || async { Some(3) },
                 || async { None },
+                || async { None },
                 || async { true },
                 |_| {
                     during(&controller);
@@ -5202,6 +5351,7 @@ mod tests {
             Instant::now() + A2DP_ACTIVATION_DEADLINE,
             || async { Some(3) },
             || async { None },
+            || async { None },
             || async { true },
             |_| async { ProfileChoice::Activate("a2dp-sink".to_string()) },
             // Like `spawn_blocking`: dropping the wait doesn't stop the write.
@@ -5300,6 +5450,7 @@ mod tests {
                         tokio::time::sleep,
                     )
                 },
+                || async { None },
                 || steps.step("recover", Duration::ZERO, true),
                 |_| {
                     let choice = ProfileChoice::Activate("a2dp-sink".to_string());
@@ -5689,6 +5840,7 @@ mod tests {
                 start + cut_at,
                 || async { None },
                 || connect_a2dp_then_find(|| reply, || async { None }, tokio::time::sleep),
+                || async { None },
                 || async { true },
                 |_| async { ProfileChoice::Activate("a2dp-sink".to_string()) },
                 |_, _| async { panic!("activation wrote") },
@@ -5872,6 +6024,7 @@ mod tests {
                         tokio::time::sleep,
                     )
                 },
+                || async { None },
                 || async { true },
                 |_| async { ProfileChoice::Activate("a2dp-sink".to_string()) },
                 |_, _| async { panic!("activation wrote") },

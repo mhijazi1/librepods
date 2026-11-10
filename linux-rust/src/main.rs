@@ -179,6 +179,16 @@ async fn async_main(
         std::process::exit(0);
     });
 
+    // WirePlumber, not LibrePods, puts the AirPods on their mic profile (#12).
+    tokio::spawn(async {
+        let setting = utils::read_autoswitch_setting().await;
+        if let Some(warning) = utils::autoswitch_warning(setting) {
+            warn!("{warning}");
+        } else if setting.is_none() {
+            info!("Could not read WirePlumber's bluetooth.autoswitch-to-headset-profile setting");
+        }
+    });
+
     let mut managed_devices_mac: Vec<String> = Vec::new(); // includes ony non-AirPods. AirPods handled separately.
 
     let devices_path = get_devices_path();
