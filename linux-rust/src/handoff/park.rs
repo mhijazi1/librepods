@@ -23,10 +23,10 @@ impl Handoff {
     }
 
     /// A take that found the transport idle gets its audio back (#200).
-    /// Not during a call: the card is on HFP, so the idle A2DP transport
-    /// says nothing.
+    /// Not during a call or mic use: the card is on HFP, so the idle A2DP
+    /// transport says nothing.
     pub(super) fn resume_if_idle(&mut self, out: &mut Vec<Command>) {
-        if !self.local_call && self.a2dp_active == Some(false) {
+        if !self.call_or_mic() && self.a2dp_active == Some(false) {
             out.push(Command::ResumeA2dp);
             self.say("A2DP transport idle after the take; resuming it");
         }

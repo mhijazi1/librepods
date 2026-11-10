@@ -193,13 +193,15 @@ impl Handoff {
 
     /// Announce Linux to the remote hosts. The announcement carries the idle
     /// media information, so during a call the call is advertised again
-    /// after it (#11), and otherwise a relayed category is re-sent (#299).
+    /// after it (#11), and otherwise a relayed category is re-sent (#299),
+    /// at least mic use's 200 (#505).
     pub(super) fn announce(&self, out: &mut Vec<Command>) {
         out.push(Command::Announce);
+        let category = self.relayed(self.category);
         if self.local_call {
             out.push(Command::AdvertiseCall(true));
-        } else if self.category_relay && self.category != AUDIO_CATEGORY_IDLE {
-            out.push(Command::RelayCategory(self.category));
+        } else if self.category_relay && category != AUDIO_CATEGORY_IDLE {
+            out.push(Command::RelayCategory(category));
         }
     }
 
