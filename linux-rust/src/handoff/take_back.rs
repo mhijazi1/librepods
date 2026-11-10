@@ -58,6 +58,11 @@ impl TakeBack {
             if self.yielded_at.is_some_and(|at| within(at, now)) {
                 self.host = Some(host.to_string());
                 self.ended = None;
+            } else if self.ended.is_some() {
+                // A new call after the recorded one ended took nothing from
+                // Linux: drop the record.
+                self.host = None;
+                self.ended = None;
             }
         } else if category < AUDIO_CATEGORY_CALL {
             // A call that already ended took nothing from a later yield.

@@ -224,6 +224,34 @@ fn a_linux_take_or_a_disconnect_clears_the_record() {
     p.wear_in(4300);
     assert_eq!(p.feed(END, relay(REMOTE, IDLE)), []);
     no_take_until(&mut p, END, END + 2 * window());
+
+    // A Linux take request that settles without an [1]: its ACK times
+    // out, then a release is ACKed [0].
+    let mut p = remote_call(true);
+    assert_eq!(p.feed(3000, Input::Take), [SendOwnership(true)]);
+    no_take_until(&mut p, 3100, 8100);
+    assert_eq!(count_lines(&p.core.take_lines(), "TIMEOUT"), 1);
+    assert_eq!(p.feed(9000, Input::Release), [SendOwnership(false)]);
+    assert_eq!(p.feed(9100, Input::Ownership(vec![0])), [PauseMedia]);
+    assert_eq!(p.feed(END, relay(REMOTE, IDLE)), []);
+    no_take_until(&mut p, END, END + 2 * window());
+}
+
+#[test]
+fn a_new_call_after_the_end_drops_the_record() {
+    // The end relay comes while the policy blocks the take (buds out).
+    let mut p = remote_call(true);
+    assert_eq!(
+        p.feed(29_000, Input::EarState(vec![OutOfEar, OutOfEar])),
+        []
+    );
+    assert_eq!(p.feed(END, relay(REMOTE, IDLE)), []);
+    // A new call, outside the window of Linux's yield, took nothing from it.
+    assert_eq!(p.feed(END + 100, relay(REMOTE, CALL)), []);
+    let worn = p.feed(END + 200, Input::EarState(vec![InEar, InEar]));
+    assert_eq!(takes(&worn), 0, "{worn:?}");
+    assert_eq!(p.feed(END + 1000, relay(REMOTE, IDLE)), []);
+    no_take_until(&mut p, END + 1000, END + 1000 + 2 * window());
 }
 
 #[test]
@@ -252,9 +280,21 @@ fn no_take_back_in_manual_mode_or_with_a_request_pending() {
 
 #[test]
 fn takes_back_in_when_last_connected_mode() {
-    let mut p = acked_auto_take();
-    p.core.connect_mode = WhenLastConnected;
-    enable(&mut p);
+    // `acked_auto_take`, with the mode set when the core is built; Linux
+    // was the last owner, so the playback take goes ahead.
+    let t0 = Instant::now();
+    let mut p = Probe {
+        core: Handoff::new(LOCAL.to_string(), t0, true, true)
+            .with_connect_mode(WhenLastConnected)
+            .with_last_owner_linux(true)
+            .with_take_back_after_call(true),
+        t0,
+        last_ms: 0,
+    };
+    p.routing(ready_facts());
+    assert_eq!(p.play(10, false), []);
+    assert_eq!(p.play(500, true), [SendOwnership(true)]);
+    assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
     assert_eq!(
         p.feed(1100, Input::RemoteOwnershipRequest),
         [PauseMedia, SendOwnership(false)]
