@@ -345,23 +345,38 @@ mod tests {
         assert!(!closed(":1.99"));
     }
 
-    /// A private bus from the dev shell's `dbus-daemon`, killed on drop.
-    struct PrivateBus(std::process::Child, String);
+    /// A private bus from the dev shell's `dbus-daemon`, with its own config
+    /// (no /etc/dbus-1 needed), killed and removed on drop.
+    struct PrivateBus(std::process::Child, String, std::path::PathBuf);
 
     impl PrivateBus {
         fn start() -> Self {
             use std::io::BufRead;
-            let tmpdir = format!("--address=unix:tmpdir={}", std::env::temp_dir().display());
+            let dir = std::env::temp_dir().join(format!("librepods-17-bus-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("the bus dir");
+            let config = dir.join("bus.conf");
+            // An abstract socket: no path, so no length limit from a deep TMPDIR.
+            std::fs::write(
+                &config,
+                format!(
+                    r#"<busconfig><type>session</type><listen>unix:abstract=librepods-17-{}</listen><auth>EXTERNAL</auth><policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy></busconfig>"#,
+                    std::process::id()
+                ),
+            )
+            .expect("the bus config");
             let mut daemon = std::process::Command::new("dbus-daemon")
-                .args(["--session", "--nofork", "--print-address=1", &tmpdir])
+                .arg(format!("--config-file={}", config.display()))
+                .args(["--nofork", "--print-address=1"])
                 .stdout(std::process::Stdio::piped())
                 .spawn()
-                .expect("dbus-daemon (in the dev shell)");
+                .expect("dbus-daemon on PATH (the dev shell has it)");
             let mut address = String::new();
             std::io::BufReader::new(daemon.stdout.take().expect("stdout"))
                 .read_line(&mut address)
                 .expect("the bus address");
-            PrivateBus(daemon, address.trim().to_string())
+            // A daemon that failed to start closes stdout without one.
+            assert!(!address.trim().is_empty(), "dbus-daemon printed no address");
+            PrivateBus(daemon, address.trim().to_string(), dir)
         }
 
         fn connect(&self) -> Connection {
@@ -375,6 +390,7 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+            let _ = std::fs::remove_dir_all(&self.2);
         }
     }
 
