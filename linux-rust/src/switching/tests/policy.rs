@@ -170,6 +170,27 @@ async fn live_connect_mode_without_task_is_ignored() {
     stop_handoff_task(mac);
 }
 
+/// #153: a change while the task waits for its predecessor's release
+/// (#294) reaches the core it then builds: the startup's connect take
+/// (#324) follows the new mode.
+#[tokio::test]
+async fn live_connect_mode_during_the_start_wait_is_applied() {
+    let mac = "5A:01:53:00:00:05";
+    let (first_manager, mut first_rx, _first_tx) = no_source_session().await;
+    let first = Harness::start_connect(ConnectMode::Automatically, mac, &first_manager).await;
+    expect_startup(&first, &mut first_rx).await;
+    first.records.gated.store(true, Ordering::SeqCst);
+
+    let (manager, mut rx, _tx) = ready_session().await;
+    let h = Harness::start_connect(ConnectMode::WhenLastConnected, mac, &manager).await;
+    tokio::time::sleep(SETTLE).await;
+    assert!(rx.try_recv().is_err());
+    set_connect_mode(mac, ConnectMode::Automatically);
+    first.records.gate.notify_one();
+    expect_connect_take(&h, &mut rx).await;
+    stop_handoff_task(mac);
+}
+
 /// #324: the daemon's session start finds the other host idle, so its
 /// first ownership packet is OwnsConnection [1], as the Mac takes when it
 /// connects (spike #325), with no pause; the acknowledged idle take
