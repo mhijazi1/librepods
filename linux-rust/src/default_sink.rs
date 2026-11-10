@@ -21,7 +21,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// The silent null sink new playback waits on while parked (#311).
 pub(crate) const PARK_SINK: &str = "librepods_park";
@@ -167,9 +167,29 @@ async fn run(
     unload_leftover_park(&io).await;
     let mut remembered: Option<String> = None;
     let mut park: Option<Parked> = None;
-    while let Some(event) = events.recv().await {
+    loop {
+        // Only this park's watch can end it: an earlier one's is dropped.
+        let watch_ended = async {
+            match park.as_mut() {
+                Some(parked) => parked.watch.ended().await,
+                None => std::future::pending().await,
+            }
+        };
+        let event = tokio::select! {
+            biased;
+            event = events.recv() => event,
+            () = watch_ended => {
+                // Not a routed event: `applied` doesn't count it.
+                if let Some(parked) = park.take() {
+                    warn!("Default sink: the park's event path failed; unparking to the local sink");
+                    unpark(&io, parked, UnparkTo::Local).await;
+                }
+                continue;
+            }
+        };
+        let Some(event) = event else { break };
         if matches!(event, SinkEvent::Park | SinkEvent::Unpark(_)) {
-            park = apply_park(&io, park, event).await;
+            park = apply_park(&io, park, event, &mut remembered).await;
         } else {
             remembered = match (apply(&io, remembered, event).await, &park) {
                 // A take while parked replaced the park sink: remember the
@@ -195,6 +215,7 @@ async fn apply_park(
     io: &impl DefaultSinkIo,
     park: Option<Parked>,
     event: SinkEvent,
+    remembered: &mut Option<String>,
 ) -> Option<Parked> {
     match (event, park) {
         (SinkEvent::Park, None) => {
@@ -223,7 +244,11 @@ async fn apply_park(
             })
         }
         (SinkEvent::Unpark(to), Some(parked)) => {
-            unpark(io, parked, to).await;
+            if let Some(local) = unpark(io, parked, to).await {
+                // The take before it failed to set the AirPods, so
+                // remembered nothing; a later Yield restores the local sink.
+                remembered.get_or_insert(local);
+            }
             None
         }
         (_, park) => park,
@@ -235,14 +260,16 @@ async fn apply_park(
 /// WirePlumber would keep naming the gone sink as the configured default,
 /// and a re-loaded park sink would win it back (spike #314). Never waits
 /// for the event path, so a slow one never holds the queue (an exit's hold
-/// release) past `SHUTDOWN_RELEASE_WAIT` (#470).
-async fn unpark(io: &impl DefaultSinkIo, parked: Parked, to: UnparkTo) {
+/// release) past `SHUTDOWN_RELEASE_WAIT` (#470). Returns the local sink
+/// when it set the AirPods sink.
+async fn unpark(io: &impl DefaultSinkIo, parked: Parked, to: UnparkTo) -> Option<String> {
     drop(parked.watch);
     let park_default = io.current_default().await.as_deref() == Some(PARK_SINK);
-    let sink = match to {
-        UnparkTo::AirPods => io.airpods_sink().await.unwrap_or(parked.local),
-        UnparkTo::Local => parked.local,
+    let airpods = match to {
+        UnparkTo::AirPods => io.airpods_sink().await,
+        UnparkTo::Local => None,
     };
+    let sink = airpods.clone().unwrap_or_else(|| parked.local.clone());
     let set = park_default && io.set_default(sink.clone()).await;
     if set {
         info!("Default sink: Unpark({to:?}) set {sink}");
@@ -250,6 +277,7 @@ async fn unpark(io: &impl DefaultSinkIo, parked: Parked, to: UnparkTo) {
         warn!("Default sink: Unpark({to:?}) failed to set {sink}");
     }
     unload_park(io, parked.module, park_default && !set).await;
+    (set && airpods.is_some()).then_some(parked.local)
 }
 
 /// Unload the park sink's `module`; with `pin`, make the default the server
@@ -398,6 +426,8 @@ const PARK_POLL: Duration = Duration::from_millis(100);
 pub(crate) struct ParkWatch {
     /// Dropped to stop the thread.
     _stop: Sender<()>,
+    /// Closed once the thread ends: before a stop, only on a failure.
+    ended: oneshot::Receiver<()>,
 }
 
 impl ParkWatch {
@@ -408,16 +438,26 @@ impl ParkWatch {
         local: String,
     ) -> Self {
         let (stop, stopped) = std::sync::mpsc::channel();
+        let (end, ended) = oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("librepods-park".to_string())
-            .spawn(move || match connect() {
-                Ok(mut io) => watch_events(&mut io, &local, stopped),
-                Err(e) => warn!("Park: no event path: {e}"),
+            .spawn(move || {
+                match connect() {
+                    Ok(mut io) => watch_events(&mut io, &local, stopped),
+                    Err(e) => warn!("Park: no event path: {e}"),
+                }
+                drop(end);
             });
         if let Err(e) = spawned {
             warn!("Park: no event path thread: {e}");
         }
-        ParkWatch { _stop: stop }
+        ParkWatch { _stop: stop, ended }
+    }
+
+    /// Resolves once the event path has ended unstopped: it failed. Not
+    /// polled again after that.
+    async fn ended(&mut self) {
+        let _ = (&mut self.ended).await;
     }
 }
 
@@ -796,7 +836,7 @@ pub(crate) mod tests {
 
         fn set_default(&self, name: String) -> BoxFuture<'static, bool> {
             self.sets.lock().unwrap().push(name.clone());
-            let ok = !self.fail.load(Ordering::SeqCst);
+            let ok = !self.fail.load(Ordering::SeqCst) && name != GONE;
             if ok {
                 *self.default.lock().unwrap() = name;
             }
@@ -856,7 +896,13 @@ pub(crate) mod tests {
                     if let Some(gate) = gate {
                         let _ = gate.recv();
                     }
-                    pulse.lock().unwrap().watching = true;
+                    let mut fake = pulse.lock().unwrap();
+                    if fake.fail == Some("connect") {
+                        fake.calls.push("connect failed".to_string());
+                        return Err(io::Error::other("connect failed"));
+                    }
+                    fake.watching = true;
+                    drop(fake);
                     Ok(FakePulseIo(pulse))
                 },
                 local,
@@ -867,6 +913,9 @@ pub(crate) mod tests {
     const PARK_MODULE: u32 = 7;
     /// The default the server picks once the park sink is gone.
     const PICK: &str = "alsa_output.pick";
+    /// A sink that vanished after it was read as the default: `set_default`
+    /// and the event path's lookup fail for it.
+    const GONE: &str = "alsa_output.gone";
     /// Sink indices in `FakePulse`.
     const PARK_INDEX: u32 = 9;
     const DAC_INDEX: u32 = 1;
@@ -883,6 +932,9 @@ pub(crate) mod tests {
         /// When set, the next call named so (`move` or `open`) waits for
         /// the receiver's sender to drop.
         gate: Option<(&'static str, Receiver<()>)>,
+        /// The event path's step that fails: `connect`, `park` (its
+        /// sink lookup) or `next`.
+        fail: Option<&'static str>,
     }
 
     impl FakePulse {
@@ -916,7 +968,12 @@ pub(crate) mod tests {
 
     impl ParkIo for FakePulseIo {
         fn next(&mut self, wait: Duration) -> io::Result<Vec<pulse::SinkInputEvent>> {
-            let events = std::mem::take(&mut self.0.lock().unwrap().queue);
+            let mut pulse = self.0.lock().unwrap();
+            if pulse.fail == Some("next") {
+                return Err(io::Error::other("connection lost"));
+            }
+            let events = std::mem::take(&mut pulse.queue);
+            drop(pulse);
             if events.is_empty() {
                 std::thread::sleep(wait.min(Duration::from_millis(5)));
             }
@@ -925,6 +982,7 @@ pub(crate) mod tests {
 
         fn sink_index(&mut self, name: &str) -> Option<u32> {
             match name {
+                PARK_SINK if self.0.lock().unwrap().fail == Some("park") => None,
                 PARK_SINK => Some(PARK_INDEX),
                 DAC => Some(DAC_INDEX),
                 _ => None,
@@ -1312,6 +1370,103 @@ pub(crate) mod tests {
         assert_eq!(sets, ["load", PARK_SINK, DAC, "unload 7"]);
         assert_explicit_default_before_unload(&sets);
         assert_eq!(sinks.calls(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn park_take_whose_set_failed_then_unpark_remembers_the_local_sink() {
+        let sinks = FakeSinks::new(false);
+        let router = parked_router(&sinks).await;
+        sinks.fail.store(true, Ordering::SeqCst);
+        router.route(Take);
+        settles(router.settled()).await;
+        sinks.fail.store(false, Ordering::SeqCst);
+        router.route(Unpark(ToAirPods));
+        router.route(Yield);
+        settles(router.settled()).await;
+        let sets = sinks.sets();
+        assert_eq!(sets, ["load", PARK_SINK, AIRPODS, AIRPODS, "unload 7", DAC]);
+    }
+
+    /// Park from `local` on a router over `sinks`, then wait for the park
+    /// to end itself (its unload) and return the router.
+    async fn park_until_it_ends(sinks: &FakeSinks, local: &str) -> DefaultSinkRouter {
+        *sinks.default.lock().unwrap() = local.to_string();
+        let router = DefaultSinkRouter::spawn(sinks.clone());
+        router.route(Park);
+        settles(router.settled()).await;
+        let unloaded = || sinks.sets().contains(&"unload 7".to_string());
+        eventually("the park's own unpark", unloaded).await;
+        // The server's pick, if any, is set right after the unload.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        router
+    }
+
+    #[tokio::test]
+    async fn park_event_path_failing_to_connect_unparks_to_local() {
+        let sinks = FakeSinks::new(false);
+        sinks.pulse.lock().unwrap().fail = Some("connect");
+        let _router = park_until_it_ends(&sinks, DAC).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, DAC, "unload 7"]);
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+    }
+
+    #[tokio::test]
+    async fn park_event_path_without_a_sink_unparks() {
+        // No park sink to watch.
+        let sinks = FakeSinks::new(false);
+        sinks.pulse.lock().unwrap().fail = Some("park");
+        let _router = park_until_it_ends(&sinks, DAC).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, DAC, "unload 7"]);
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+        // The local sink vanished after the park read it: the server's
+        // pick is set.
+        let sinks = FakeSinks::new(false);
+        let _router = park_until_it_ends(&sinks, GONE).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, GONE, "unload 7", PICK]);
+        assert_eq!(*sinks.default.lock().unwrap(), PICK);
+    }
+
+    #[tokio::test]
+    async fn park_event_path_lost_after_start_unparks_to_local() {
+        let sinks = FakeSinks::new(false);
+        let router = parked_router(&sinks).await;
+        sinks.pulse.lock().unwrap().fail = Some("next");
+        let unloaded = || sinks.sets().contains(&"unload 7".to_string());
+        eventually("the park's own unpark", unloaded).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, DAC, "unload 7"]);
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+        // The router still routes, and counts only routed events.
+        router.route(Take);
+        settles(router.settled()).await;
+        assert_eq!(sinks.sets().last().map(String::as_str), Some(AIRPODS));
+    }
+
+    #[tokio::test]
+    async fn park_event_path_failure_of_an_earlier_park_leaves_a_new_one() {
+        let sinks = FakeSinks::new(false);
+        let (connect, gate) = std::sync::mpsc::channel::<()>();
+        *sinks.connect.lock().unwrap() = Some(gate);
+        let router = DefaultSinkRouter::spawn(sinks.clone());
+        // The first park's watch still connects when it ends.
+        for event in [Park, Unpark(ToLocal), Park] {
+            router.route(event);
+        }
+        settles(router.settled()).await;
+        eventually("the new park's event path", || sinks.watching()).await;
+        sinks.pulse.lock().unwrap().fail = Some("connect");
+        drop(connect);
+        let failed = || sinks.calls().contains(&"connect failed".to_string());
+        eventually("the old watch's failure", failed).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let sets = sinks.sets();
+        assert_eq!(
+            sets,
+            ["load", PARK_SINK, DAC, "unload 7", "load", PARK_SINK]
+        );
+        assert_eq!(*sinks.default.lock().unwrap(), PARK_SINK);
+        assert!(sinks.watching());
+        drop(router);
     }
 
     #[tokio::test]
