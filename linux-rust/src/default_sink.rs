@@ -202,17 +202,19 @@ async fn run(
         let Some(event) = event else { break };
         if matches!(event, SinkEvent::Park | SinkEvent::Unpark(_)) {
             park = apply_park(&io, &shared, park, event, &mut remembered).await;
-        } else {
-            remembered = match (apply(&io, remembered, event).await, &park) {
-                // A take while parked replaced the park sink: remember the
-                // local sink it replaced in turn. The park in place's, as
-                // this router's hold may be on a park that has since ended.
-                (Some(sink), Some(_)) if sink == PARK_SINK => {
-                    let state = shared.lock().await;
+        } else if event == SinkEvent::Take && park.is_some() {
+            // A take while parked that replaced the park sink remembers the
+            // local sink of the park in place (this router's hold may be on
+            // an ended one), which no holder can end while the lock is held.
+            let state = shared.lock().await;
+            remembered = match apply(&io, remembered, event).await {
+                Some(sink) if sink == PARK_SINK => {
                     state.park.as_ref().map(|parked| parked.local.clone())
                 }
-                (next, _) => next,
+                next => next,
             };
+        } else {
+            remembered = apply(&io, remembered, event).await;
         }
         applied.send_modify(|n| *n += 1);
     }
@@ -254,8 +256,6 @@ pub(crate) struct ParkState {
 /// One router's hold on the shared park.
 struct Held {
     generation: u64,
-    /// The park's local sink.
-    local: String,
     /// The park's watch's `ended`.
     ended: Shared<oneshot::Receiver<()>>,
 }
@@ -267,7 +267,6 @@ impl ParkState {
         self.holders += 1;
         Some(Held {
             generation: self.generation,
-            local: parked.local.clone(),
             ended: parked.watch.ended.clone(),
         })
     }
@@ -330,7 +329,7 @@ async fn apply_park(
             });
             state.hold()
         }
-        (SinkEvent::Unpark(to), Some(held)) => {
+        (SinkEvent::Unpark(to), Some(_)) => {
             state.holders -= 1;
             let local = if state.holders == 0
                 && let Some(parked) = state.park.take()
@@ -343,7 +342,7 @@ async fn apply_park(
             {
                 // Another device is still parked: the park sink stays.
                 info!("Default sink: Unpark(AirPods) set {airpods}; {PARK_SINK} stays");
-                Some(held.local)
+                state.park.as_ref().map(|parked| parked.local.clone())
             } else {
                 None
             };
@@ -1851,6 +1850,35 @@ pub(crate) mod tests {
                 HDMI
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn park_shared_take_reply_pending_keeps_the_parks_local() {
+        let sinks = FakeSinks::new(false);
+        let _a = parked_router(&sinks).await;
+        // Only B's sets wait on the gate; its join sets nothing.
+        let gate = Arc::new(Notify::new());
+        let gated = FakeSinks {
+            gate: Some(gate.clone()),
+            ..sinks.clone()
+        };
+        let b = parked_router(&gated).await;
+        b.route(Take);
+        eventually("B's take to apply", || sinks.sets().len() == 3).await;
+        // The event path fails while the take's reply is pending.
+        sinks.pulse.lock().unwrap().fail = Some("next");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        gate.notify_one();
+        settles(b.settled()).await;
+        let unloaded = || sinks.sets().contains(&"unload 7".to_string());
+        eventually("the park's own unpark", unloaded).await;
+        b.route(Unpark(ToAirPods));
+        b.route(Yield);
+        // A permit for the yield's set.
+        gate.notify_one();
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, "unload 7", DAC]);
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
     }
 
     #[tokio::test]
