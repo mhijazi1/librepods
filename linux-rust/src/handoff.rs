@@ -954,6 +954,10 @@ impl Handoff {
         if self.quitting || self.session_lost {
             return;
         }
+        // A play edge, taken or skipped, ends `Auto`'s wait (#452).
+        if fresh_play {
+            self.connect_until = self.connect_until.map(|_| now);
+        }
         // A local call's 501 wins; its end relays the category (#272).
         if self.category_relay && category != last_category && !self.local_call {
             out.push(Command::RelayCategory(category));
@@ -1639,6 +1643,10 @@ impl Handoff {
             self.remote_owns = false;
             self.ear_resume_until = None;
             self.sync_hold(false, out);
+            // As the ACK does: parked playback follows the AirPods (#311).
+            if matches!(self.park, Park::Parked | Park::FallenBack) {
+                self.park = Park::AirPods;
+            }
             self.requested_take = true;
             self.last_owner_linux = true;
             self.routed_away = false;
@@ -6751,41 +6759,73 @@ mod tests {
     }
 
     #[test]
-    fn connect_window_take_undoes_the_remote_media_hold_and_park() {
-        let mut p = waiting_start(true);
-        p.core = p.core.with_park_sink(true);
+    fn connect_window_skipped_play_edge_ends_the_wait() {
+        let mut p = waiting_start(false);
+        let hosts = Input::ConnectedDevices {
+            old: Vec::new(),
+            new: two_hosts(),
+        };
+        assert_eq!(p.feed(100, hosts), [Announce]);
+        let out = Input::EarState(vec![OutOfEar, OutOfEar]);
+        assert_eq!(p.feed(110, out), []);
+        assert_eq!(p.feed(120, remote_source(AudioSourceType::Media)), []);
+        assert_eq!(p.play(130, false), []);
+        assert_eq!(p.feed(140, Input::EarState(vec![InEar, InEar])), []);
+        assert_eq!(p.feed(145, Input::EarResume { resumed: true }), []);
+        assert!(p.core.ear_resume_until.is_some());
+        // The skipped edge ends the wait with Auto's release, untracked
+        // with the owner unknown (#289).
+        assert_eq!(p.play(150, true), [SendOwnership(false)]);
+        assert!(p.core.pending.is_none());
+        assert_eq!(p.feed(160, relay(REMOTE, IDLE)), []);
+        assert_eq!(p.feed(10 + WINDOW_MS, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 0);
+    }
+
+    /// `p` idle with the streams known and the park sink on gets the hosts,
+    /// ears and a remote Media source with no relay: held and parked.
+    fn park_in_the_wait(p: &mut Probe) {
+        p.core.park_sink = true;
         p.core.set_streams(true, false);
         assert_eq!(p.play(30, false), []);
-        hosts_and_ears(&mut p);
+        hosts_and_ears(p);
         let media = remote_source(AudioSourceType::Media);
         assert_eq!(p.feed(120, media), [HoldA2dp(true)]);
         assert_eq!(p.core.park(), Park::Parked);
+    }
+
+    #[test]
+    fn connect_window_take_undoes_the_remote_media_hold_and_park() {
+        let mut p = waiting_start(true);
+        park_in_the_wait(&mut p);
         assert_eq!(p.feed(130, relay(REMOTE, IDLE)), [SendOwnership(true)]);
         assert_eq!(
             p.feed(200, Input::Ownership(vec![1])),
             [HoldA2dp(false), RouteToAirPods]
         );
-        assert_ne!(p.core.park(), Park::Parked);
+        assert_eq!(p.core.park(), Park::AirPods);
+        // An [1] in the wait keeps, ending the hold and park as an ACK does.
+        let mut p = waiting_start(true);
+        park_in_the_wait(&mut p);
+        assert_eq!(
+            p.feed(130, Input::Ownership(vec![1])),
+            [HoldA2dp(false), RouteToAirPods]
+        );
+        assert_eq!(p.core.park(), Park::AirPods);
         // A cached [1] keeps at the relay, with no ACK to undo the hold.
         let mut p = Probe::new(false, true);
         p.core.default_sink_routing = true;
         p.core.a2dp_hold = true;
-        p.core = p.core.with_park_sink(true);
-        p.core.set_streams(true, false);
         p.feed(0, Input::Ownership(vec![1]));
         p.feed(5, idle_transport());
         p.feed(10, Input::Auto);
         p.feed(20, Input::InitBacklogDrained);
-        assert_eq!(p.play(30, false), []);
-        hosts_and_ears(&mut p);
-        let media = remote_source(AudioSourceType::Media);
-        assert_eq!(p.feed(120, media), [HoldA2dp(true)]);
-        assert_eq!(p.core.park(), Park::Parked);
+        park_in_the_wait(&mut p);
         assert_eq!(
             p.feed(130, relay(REMOTE, IDLE)),
             [HoldA2dp(false), RouteToAirPods]
         );
-        assert_ne!(p.core.park(), Park::Parked);
+        assert_eq!(p.core.park(), Park::AirPods);
     }
 
     #[test]
