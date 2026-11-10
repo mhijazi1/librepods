@@ -391,6 +391,10 @@ struct Harness {
     call_tx: mpsc::Sender<(Instant, crate::call_detect::CallState)>,
     /// The injected A2DP transport poller's sender (no BlueZ in tests).
     a2dp_tx: mpsc::Sender<bool>,
+    /// Undo clicks by yield id, as the desktop notifier sends them (#17).
+    undo_tx: mpsc::UnboundedSender<u64>,
+    /// What the task posted, in order (#17).
+    notices: Arc<StdMutex<Vec<crate::notifications::Notice>>>,
     /// The sender given to `set_event_channel`.
     events: EventTx,
     handler: Arc<DeviceHandler>,
@@ -582,6 +586,13 @@ impl Harness {
         .with_line_sink(sink)
         .with_connect_mode(connect_mode);
         switching.a2dp = Some(a2dp_rx);
+        let (undo_tx, undo_rx) = mpsc::unbounded_channel();
+        switching.undo = Some(undo_rx);
+        let notices = Arc::new(StdMutex::new(Vec::new()));
+        let posted = notices.clone();
+        switching.notifier = Arc::new(move |notice: crate::notifications::Notice| {
+            posted.lock().unwrap().push(notice)
+        });
         switching.relay_category = handler.relay_category;
         switching.dispatch_events(events_rx, handler.clone().handle());
         Harness {
@@ -590,6 +601,8 @@ impl Harness {
             playback_started,
             call_tx,
             a2dp_tx,
+            undo_tx,
+            notices,
             events,
             handler,
         }
@@ -718,6 +731,9 @@ fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
         held: false,
         parked: false,
         released: None,
+        notifier: Arc::new(|_: crate::notifications::Notice| {}),
+        notifications: true,
+        undo_rx: mpsc::unbounded_channel().1,
     }
 }
 

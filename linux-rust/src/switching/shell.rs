@@ -11,6 +11,7 @@ use crate::a2dp_resume;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers as Control};
 use crate::default_sink::{SinkEvent, UnparkTo};
 use crate::handoff::{Command, Handoff, Input, Park, local_inputs};
+use crate::notifications::{self, Notice, Notifier};
 use crate::reconnect;
 use crate::stream_monitor::CallSamples;
 use crate::utils::ConnectMode;
@@ -54,6 +55,12 @@ pub(super) struct Shell {
     pub(super) parked: bool,
     /// Where the drop sends its release's settle.
     pub(super) released: Option<oneshot::Sender<BoxFuture<'static, ()>>>,
+    /// Posts the "moved to" and "Connected" notices (#17).
+    pub(super) notifier: Arc<dyn Notifier>,
+    /// The `switchingNotifications` preference.
+    pub(super) notifications: bool,
+    /// Undo clicks on "moved to", by yield id.
+    pub(super) undo_rx: mpsc::UnboundedReceiver<u64>,
 }
 
 /// The task's future drops its `Shell` on return, abort and panic alike,
@@ -165,6 +172,22 @@ impl Shell {
                 Command::HoldA2dp(hold) => {
                     self.held = hold;
                     self.media.hold_a2dp(hold);
+                }
+                Command::NotifyMovedTo { id, taker } => {
+                    let taker = match taker {
+                        Some(host) => self.manager.host_name(&host).await,
+                        None => None,
+                    };
+                    let notice = Notice::MovedTo { id, taker };
+                    notifications::post(&*self.notifier, self.notifications, notice);
+                }
+                Command::NotifyConnected => {
+                    notifications::post(&*self.notifier, self.notifications, Notice::Connected)
+                }
+                Command::SendHijackReversed(host) => {
+                    if let Err(e) = self.manager.send_hijack_reversed(&host).await {
+                        error!("Handoff: failed to send the reverse request to {host}: {e}");
+                    }
                 }
                 Command::DropSession => {
                     self.resume = None;
@@ -363,6 +386,7 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     .with_a2dp_hold(true)
     .with_park_sink(true)
     .with_category_relay(shell.relay_category)
+    .with_notifications(true)
     .with_take_back_after_call(crate::utils::load_take_back_after_call(&shell.mac));
     let start = if let Some((category, requested)) = take_category {
         core = core
@@ -444,6 +468,10 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
             Some(active) = shell.a2dp_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::A2dpTransport { active }).await
+            }
+            Some(id) = shell.undo_rx.recv() => {
+                sync_session(&mut core, &mut shell).await
+                    || step(&mut core, &mut shell, Input::Undo(id)).await
             }
             _ = tick.tick() => {
                 sync_session(&mut core, &mut shell).await

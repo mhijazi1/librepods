@@ -348,6 +348,13 @@ impl Io {
                 // The probe never enables the A2DP hold.
                 Command::HoldA2dp(_) => println!("A2DP hold is not run by the probe"),
                 Command::RelayCategory(_) => println!("category relay is not run by the probe"),
+                // The probe never enables notifications, so no Undo either.
+                Command::NotifyMovedTo { .. } | Command::NotifyConnected => {
+                    println!("notifications are not posted by the probe")
+                }
+                Command::SendHijackReversed(_) => {
+                    println!("the reverse request is not sent by the probe")
+                }
                 Command::Exit => return Ok(true),
                 Command::Fail(reason) => return Err(reason.into()),
             }

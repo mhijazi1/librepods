@@ -52,6 +52,9 @@ pub(crate) enum TakeoverTrigger {
     Connected,
     /// The user asked for the AirPods (handoff probe `take`).
     Manual,
+    /// The user clicked Undo on "moved to …" (#17): a manual take that may
+    /// take back from a remote media source, as the Mac's Undo does.
+    Undo,
 }
 
 /// #841 case recovery: after the buds were put in the case, Linux does not
@@ -409,7 +412,8 @@ fn proc_comms() -> impl Iterator<Item = (u32, String)> {
 /// hosts), audio source idle or local media. Automatic takes compare audio
 /// categories instead of that last guard (#272): they take when Linux's is
 /// at least the source host's, its relay if it sent one this session, else
-/// 100 for an idle report and 301 for media. A call or unknown source, or no
+/// 100 for an idle report and 301 for media. Undo takes back from remote
+/// media whatever the categories (#17). A call or unknown source, or no
 /// report, still blocks every take.
 fn handoff_block(trigger: TakeoverTrigger, guards: HandoffGuards) -> Option<TakeoverSkip> {
     let recovery_allows = match trigger {
@@ -430,6 +434,7 @@ fn handoff_block(trigger: TakeoverTrigger, guards: HandoffGuards) -> Option<Take
         match routing.audio {
             Some(Media) if routing.audio_from_local => None,
             Some(Idle) if trigger == TakeoverTrigger::Manual => None,
+            Some(Media) if trigger == TakeoverTrigger::Undo => None,
             Some(source @ (Idle | Media)) if trigger != TakeoverTrigger::Manual => {
                 let reported = if source == Media {
                     AUDIO_CATEGORY_MEDIA
@@ -3400,6 +3405,66 @@ mod tests {
         };
         assert_eq!(
             connected(not_worn, Immediate),
+            skip(TakeoverSkip::NoBudInEar)
+        );
+    }
+
+    #[test]
+    fn undo_trigger_allows_remote_media_only() {
+        // #17: Undo takes back from remote media; everything else still
+        // blocks it as it blocks a manual take.
+        use AudioSourceType::{Call, Media};
+        const IDLE: u32 = AUDIO_CATEGORY_IDLE;
+        let decide = |trigger, routing, recovery| {
+            decide_takeover(TakeoverInputs::handoff(trigger, routing, recovery)).action
+        };
+        let skip = TakeoverAction::Skip;
+        let remote_media = || category_routing(IDLE, Some((REMOTE, Media)), &[]);
+        use CaseRecovery::*;
+        use TakeoverTrigger::{Manual, Undo};
+        assert_eq!(
+            decide(Undo, remote_media(), Immediate),
+            TakeoverAction::TakeOver
+        );
+        assert_eq!(
+            decide(Manual, remote_media(), Immediate),
+            skip(TakeoverSkip::AudioNotIdle)
+        );
+        assert_eq!(
+            decide(
+                Undo,
+                category_routing(IDLE, Some((REMOTE, Call)), &[]),
+                Immediate
+            ),
+            skip(TakeoverSkip::AudioNotIdle)
+        );
+        let no_session = RoutingSnapshot {
+            has_session: false,
+            ..remote_media()
+        };
+        assert_eq!(
+            decide(Undo, no_session, Immediate),
+            skip(TakeoverSkip::NoSession)
+        );
+        let no_remote_host = RoutingSnapshot {
+            host_count: 1,
+            remote_host: false,
+            ..remote_media()
+        };
+        assert_eq!(
+            decide(Undo, no_remote_host, Immediate),
+            skip(TakeoverSkip::NoRemoteHost)
+        );
+        assert_eq!(
+            decide(Undo, remote_media(), WaitingForPlayback),
+            skip(TakeoverSkip::AwaitingNewPlayback)
+        );
+        let not_worn = RoutingSnapshot {
+            bud_in_ear: false,
+            ..remote_media()
+        };
+        assert_eq!(
+            decide(Undo, not_worn, Immediate),
             skip(TakeoverSkip::NoBudInEar)
         );
     }

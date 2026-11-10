@@ -143,6 +143,116 @@ async fn a2dp_resume_yield_during_check_after_cycle_stops_chain() {
     yield_during_audio_check("5A:00:00:00:00:CB", 3).await;
 }
 
+/// #17: an Undo click after a playing yield to REMOTE takes back and
+/// relays the reverse request, and its ACK resumes nothing.
+#[tokio::test]
+async fn undo_sends_the_take_then_the_reverse_packet() {
+    let mac = "5A:00:00:00:00:17";
+    let acks = || {
+        traced(mac)
+            .iter()
+            .filter(|l| l.starts_with("ACK owner=linux"))
+            .count()
+    };
+    let (manager, mut rx, _tx) = no_source_session().await;
+    let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+    expect_startup(&h, &mut rx).await;
+    expect_take(&h, &mut rx).await;
+    h.emit(owns(1));
+    wait_until("the take's ACK", || acks() == 1).await;
+    // Reported after that ACK, so only the Undo's ACK could resume.
+    h.a2dp(false).await;
+    // REMOTE's media information names it.
+    let dict = crate::bluetooth::aacp::media_information_body(
+        "com.spotify.client",
+        true,
+        REMOTE,
+        "iPhone",
+        AUDIO_CATEGORY_MEDIA,
+    );
+    let mut relay = crate::bluetooth::aacp::smart_routing_packet(REMOTE, &dict).expect("relay");
+    relay[0] = crate::bluetooth::aacp::opcodes::SMART_ROUTING_RESP;
+    manager
+        .receive_packet(&[[0x04, 0x00, 0x04, 0x00].as_slice(), &relay].concat())
+        .await;
+    h.emit_queued(AACPEvent::AudioSource(AudioSource {
+        mac: REMOTE.to_string(),
+        r#type: AudioSourceType::Media,
+    }))
+    .await;
+    h.emit(owns(0));
+    wait_until("the yield's pause", || h.pauses() == 1).await;
+    // The pause's stop: Linux is idle under REMOTE's media at the click.
+    h.play(false).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    use crate::notifications::Notice::{Connected, MovedTo};
+    let id = match &h.notices.lock().unwrap()[..] {
+        [Connected, MovedTo { id, taker }] if taker.as_deref() == Some("iPhone") => *id,
+        notices => panic!("{notices:?}"),
+    };
+
+    h.undo_tx.send(id).expect("the task takes Undo clicks");
+    assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+    let reversed = reference(|m| async move { m.send_hijack_reversed(REMOTE).await }).await;
+    let encoded = crate::bluetooth::aacp::encode_hijack_reversed(REMOTE).expect("encode");
+    assert!(reversed.ends_with(&encoded), "{reversed:02x?}");
+    assert_eq!(next_packet(&mut rx).await, reversed);
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+    h.emit(owns(1));
+    wait_until("the Undo's ACK", || acks() == 2).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    assert_eq!(
+        *h.records.resume_spawns.lock().unwrap(),
+        Vec::<usize>::new()
+    );
+    assert_eq!(h.pauses(), 1);
+    let notices = h.notices.lock().unwrap();
+    assert_eq!(notices.len(), 3, "{notices:?}");
+    assert_eq!(notices[2], Connected);
+    drop(notices);
+
+    stop_handoff_task(mac);
+}
+
+/// #17: the shell's `notifications` setting reaches the post: off, a
+/// take's ACK posts nothing; on, it posts "Connected".
+#[tokio::test]
+async fn notifications_setting_off_posts_nothing() {
+    use crate::notifications::Notice;
+    for enabled in [false, true] {
+        let (manager, _rx, _tx) = ready_session().await;
+        let mut shell = bare_shell("5A:00:00:00:01:17", manager, mpsc::unbounded_channel().1);
+        let posted = Arc::new(StdMutex::new(Vec::new()));
+        let record = posted.clone();
+        shell.notifier = Arc::new(move |notice: Notice| record.lock().unwrap().push(notice));
+        shell.notifications = enabled;
+        let mut core =
+            Handoff::new(LOCAL.to_string(), Instant::now(), false, true).with_notifications(true);
+        for input in [
+            Input::ConnectedDevices {
+                old: Vec::new(),
+                new: vec![host(LOCAL), host(REMOTE)],
+            },
+            Input::EarState(vec![EarDetectionStatus::InEar; 2]),
+            Input::AudioSource(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            }),
+            Input::Take,
+            Input::Ownership(vec![1]),
+        ] {
+            assert!(!step(&mut core, &mut shell, input).await);
+        }
+        let expected = if enabled {
+            vec![Notice::Connected]
+        } else {
+            vec![]
+        };
+        assert_eq!(*posted.lock().unwrap(), expected, "{enabled}");
+    }
+}
+
 #[tokio::test]
 async fn handoff_task_ends_on_session_loss_without_reconnect() {
     let mac = "5A:00:00:00:00:03";

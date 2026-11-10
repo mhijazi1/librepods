@@ -86,7 +86,10 @@ impl Handoff {
                 }
                 None => {}
             }
-            self.requested_take = false;
+            // A late acknowledgement behind Undo's take (#17) leaves it.
+            if !self.pending.is_some_and(|p| p.desired) {
+                self.requested_take = false;
+            }
         }
         let Some(pending) = acked else {
             if late_release.is_some() {
@@ -120,6 +123,9 @@ impl Handoff {
         let held = pending.desired && self.live() && self.requested_take && self.pending.is_none();
         if held {
             self.route_held_take(out);
+            if self.notifications {
+                out.push(Command::NotifyConnected);
+            }
         }
     }
 
@@ -142,6 +148,7 @@ impl Handoff {
         }
         self.route_away(out);
         self.hold_for_remote(out);
+        self.notify_moved_to(out);
         self.say(format!(
             "YIELD owner=not-linux; another host has the AirPods; Linux gave up its {}take{}",
             if dropped { "pending " } else { "" },
@@ -151,6 +158,34 @@ impl Handoff {
                 ""
             },
         ));
+    }
+
+    /// A yield while Linux plays posts "moved to" naming the taker, and an
+    /// Undo may answer it; an idle yield posts nothing (#17, spike #259).
+    pub(super) fn notify_moved_to(&mut self, out: &mut Vec<Command>) {
+        if self.notifications && self.category > AUDIO_CATEGORY_IDLE {
+            let taker = self.taker();
+            self.last_yield += 1;
+            let id = self.last_yield;
+            self.undo_taker = Some((id, taker.clone()));
+            out.push(Command::NotifyMovedTo { id, taker });
+        }
+    }
+
+    /// Who took the AirPods (#17, Q10): the remote media or call source,
+    /// else the only remote host listed, else unknown.
+    fn taker(&self) -> Option<String> {
+        use crate::bluetooth::aacp::AudioSourceType::{Call, Media};
+        let source = self
+            .audio
+            .as_ref()
+            .filter(|a| a.mac != self.local && matches!(a.r#type, Media | Call));
+        let mut remotes = self.hosts.iter().filter(|h| h.mac != self.local);
+        match (source, remotes.next(), remotes.next()) {
+            (Some(a), _, _) => Some(a.mac.clone()),
+            (None, Some(h), None) => Some(h.mac.clone()),
+            _ => None,
+        }
     }
 
     /// `RouteAway`, once per take (#40).

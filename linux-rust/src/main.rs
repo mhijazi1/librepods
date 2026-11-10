@@ -8,6 +8,7 @@ mod handoff;
 mod handoff_log;
 mod handoff_probe;
 mod media_controller;
+mod notifications;
 mod pulse;
 mod reconnect;
 mod settings_file;

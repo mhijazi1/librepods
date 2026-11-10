@@ -211,6 +211,12 @@ pub(crate) enum Input {
     /// for automatic takes until the session ends. Its own variant: no other
     /// input carries a per-host fact.
     MediaInformation { host: String, category: u32 },
+    /// The user clicked Undo on the "moved to …" of yield `id` (#17). While
+    /// that yield stands (no newer yield, take, OwnsConnection [1] or
+    /// disconnect since), Linux takes back without resuming and relays the
+    /// reverse request to the host that took, if known. A click during the
+    /// yield's pending release runs once the release settles.
+    Undo(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,6 +262,17 @@ pub(crate) enum Command {
     /// holds no take, so PipeWire can't re-acquire A2DP; false turns it back
     /// to A2DP from `off` (#264). Only when `with_a2dp_hold` enables it.
     HoldA2dp(bool),
+    /// Post "moved to <taker>" with Undo (#17): another host took the
+    /// AirPods while Linux played. `id` names this yield for its Undo;
+    /// `taker` is the taker's address, if known. Only with
+    /// `with_notifications(true)`.
+    NotifyMovedTo { id: u64, taker: Option<String> },
+    /// Post "Connected": a take of Linux's was acknowledged (#17). Only
+    /// with `with_notifications(true)`.
+    NotifyConnected,
+    /// Relay the reverse request (`AACPManager::send_hijack_reversed`) to
+    /// this host after an Undo's take (#17).
+    SendHijackReversed(String),
     /// Stop the probe.
     Exit,
     /// Stop the probe with this error.
@@ -435,6 +452,17 @@ pub(crate) struct Handoff {
     /// The category of a play edge in that wait skipped only for a report
     /// not yet in (#490); read only while the wait is open.
     deferred_play: Option<u32>,
+    /// Emit the notification commands (#17).
+    notifications: bool,
+    /// The id and taker (None: unknown) of the playing yield an Undo would
+    /// answer (#17); None once a take, an OwnsConnection [1] or a disconnect
+    /// made it stale.
+    undo_taker: Option<(u64, Option<String>)>,
+    /// The last playing yield's id.
+    last_yield: u64,
+    /// An Undo clicked while a release was pending: it runs once nothing
+    /// is (#17).
+    undo_waiting: Option<u64>,
     /// Taking the AirPods back after a remote call (#14).
     take_back: take_back::TakeBack,
 }
@@ -499,6 +527,10 @@ impl Handoff {
             ear_resume_confirmed: false,
             connect_until: None,
             deferred_play: None,
+            notifications: false,
+            undo_taker: None,
+            last_yield: 0,
+            undo_waiting: None,
             take_back: take_back::TakeBack::default(),
         }
     }
@@ -507,6 +539,13 @@ impl Handoff {
     /// (#272); off by default.
     pub(crate) fn with_category_relay(mut self, enabled: bool) -> Self {
         self.category_relay = enabled;
+        self
+    }
+
+    /// Emit the "moved to" and "Connected" notification commands (#17);
+    /// off by default.
+    pub(crate) fn with_notifications(mut self, enabled: bool) -> Self {
+        self.notifications = enabled;
         self
     }
 
@@ -632,9 +671,22 @@ impl Handoff {
         let mut out = Vec::new();
         // An [1] in `Auto`'s wait keeps (#452).
         let owns = input == Input::Ownership(vec![1]);
+        let disconnected = input == Input::Disconnected;
         self.apply(now, input, &mut out);
         self.settle_connect(now, owns, &mut out);
         self.take_back(now, owns, &mut out);
+        // Linux has the AirPods again (a take of this step's, the connect
+        // wait's and the take-back's included), or the session is gone: a
+        // later Undo answers nothing (#17).
+        if owns || disconnected || out.contains(&Command::SendOwnership(true)) {
+            self.undo_taker = None;
+        }
+        // A click that waited for a release runs once it settled (#17).
+        if self.pending.is_none()
+            && let Some(id) = self.undo_waiting.take()
+        {
+            self.undo(now, id, &mut out);
+        }
         if !out
             .iter()
             .any(|c| matches!(c, Command::Exit | Command::Fail(_)))
@@ -833,6 +885,7 @@ impl Handoff {
                 self.say("REMOTE requested ownership; yielding");
                 self.request(now, false, Cause::Remote, out);
                 self.hold_for_remote(out);
+                self.notify_moved_to(out);
             }
             Input::SessionLost => {
                 self.ear_resume_until = None;
@@ -938,6 +991,52 @@ impl Handoff {
             Input::MediaInformation { host, category } => {
                 self.take_back.relay(now, &host, category);
                 self.relays.insert(host, category);
+            }
+            Input::Undo(id) => self.undo(now, id, out),
+        }
+    }
+
+    /// Undo of yield `id` (#17): take back without resuming, then relay
+    /// the reverse request to the taker, if known.
+    fn undo(&mut self, now: Instant, id: u64, out: &mut Vec<Command>) {
+        if !self
+            .undo_taker
+            .as_ref()
+            .is_some_and(|(yielded, _)| *yielded == id)
+        {
+            self.say("UNDO ignored: its yield no longer stands");
+            return;
+        }
+        if self.pending.is_some() {
+            // A take now would leave the pending release's [0] acking
+            // nothing, which yields that take: run once it settles.
+            self.undo_waiting = Some(id);
+            self.say("WAIT ownership request pending; Undo runs once it settles");
+            return;
+        }
+        let Some((_, taker)) = self.undo_taker.take() else {
+            return;
+        };
+        if self
+            .decide_take(TakeoverTrigger::Undo, self.category)
+            .action
+            != TakeoverAction::TakeOver
+        {
+            self.say("BLOCKED undo needs a live session, a remote host, an in-ear bud, and no remote call");
+            return;
+        }
+        // A timed-out release (the yield's) may still be acknowledged late:
+        // that [0] is not a loss of this take (#55).
+        let late = self.timed_out_release;
+        self.request(now, true, Cause::User, out);
+        self.timed_out_release = late;
+        // Undo never resumes (spike #259): the ACK skips the resume.
+        self.resume_deferred = true;
+        self.say("REQUEST owner=linux for Undo");
+        match taker {
+            Some(host) => out.push(Command::SendHijackReversed(host)),
+            None => {
+                self.say("UNDO the host that took is unknown; not relaying the reverse request")
             }
         }
     }
