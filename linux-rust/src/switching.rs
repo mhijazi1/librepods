@@ -1073,7 +1073,8 @@ async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
         }
     }
     // The core's own automatic startup: A2DP, "not owning" (or the connect
-    // take from an idle other host, #324), announce.
+    // take from an idle other host, #324), announce. The ownership decision
+    // may wait for the routing reports queued after it (#452).
     if !for_playback && step(&mut core, &mut shell, Input::Auto).await {
         return;
     }
@@ -1752,17 +1753,22 @@ mod tests {
         (manager, rx, tx)
     }
 
-    /// `ready_session` with no audio source reported yet: the startup's
-    /// connect take (#324) needs a confirmed idle source, so the startup
-    /// sends "not owning" and the playback take stays under test.
+    /// `ready_session` whose audio source report is `Unknown` (no usable
+    /// source): the startup's connect take (#324) needs a confirmed idle
+    /// source and the state is complete, so the startup sends "not owning"
+    /// at once (#452) and the playback take stays under test.
     /// `expect_startup` then reports the idle source.
     async fn no_source_session() -> (AACPManager, mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
         let session = ready_session().await;
-        session.0.state.lock().await.audio_source = None;
+        session.0.state.lock().await.audio_source = Some(AudioSource {
+            mac: "00:00:00:00:00:00".to_string(),
+            r#type: AudioSourceType::Unknown,
+        });
         session
     }
 
-    /// The idle audio source report `no_source_session` holds back.
+    /// The idle audio source report that replaces `no_source_session`'s
+    /// `Unknown` one.
     fn idle_source() -> AACPEvent {
         AACPEvent::AudioSource(AudioSource {
             mac: "00:00:00:00:00:00".to_string(),
@@ -2131,7 +2137,7 @@ mod tests {
     /// Startup on a `no_source_session` (or one whose connect mode blocks
     /// the connect take): the core's automatic start, [ConnectA2dp,
     /// SendOwnership(false), Announce], and nothing else; then the idle
-    /// source report `no_source_session` held back.
+    /// source report that replaces `no_source_session`'s `Unknown` one.
     async fn expect_startup(h: &Harness, rx: &mut mpsc::Receiver<Vec<u8>>) {
         assert_eq!(next_packet(rx).await, expected_owns(0).await);
         assert_eq!(next_packet(rx).await, expected_new_device(REMOTE).await);
@@ -2224,6 +2230,47 @@ mod tests {
         .await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         assert_eq!(h.pauses(), 0);
+        stop_handoff_task(mac);
+    }
+
+    /// #452: on hardware the routing reports land after the session start
+    /// (spike #157). The startup sends nothing; the reports then make the
+    /// connect take, its only ownership packet, with no pause.
+    #[tokio::test]
+    async fn startup_connect_take_waits_for_the_routing_reports() {
+        let mac = "5A:00:00:00:04:52";
+        let (manager, mut rx, _tx) = injected_manager().await;
+        let h = Harness::start_connect(ConnectMode::Automatically, mac, &manager).await;
+        wait_until("the startup", || {
+            traced(mac).iter().any(|l| l.starts_with("AUTO enabled"))
+        })
+        .await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        // As the manager does: the state first, then the event.
+        let hosts = vec![host(LOCAL), host(REMOTE)];
+        manager.state.lock().await.connected_devices = hosts.clone();
+        h.emit_queued(AACPEvent::ConnectedDevices(Vec::new(), hosts))
+            .await;
+        h.emit_queued(wear(EarDetectionStatus::InEar)).await;
+        h.emit_queued(idle_source()).await;
+        h.emit_queued(AACPEvent::MediaInformation {
+            host: REMOTE.to_string(),
+            category: AUDIO_CATEGORY_IDLE,
+        })
+        .await;
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(REMOTE).await
+        );
+        assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(h.pauses(), 0);
+        let takes = traced(mac)
+            .iter()
+            .filter(|l| l.starts_with("AUTO connected while the other host is idle"))
+            .count();
+        assert_eq!(takes, 1);
         stop_handoff_task(mac);
     }
 
@@ -2900,7 +2947,10 @@ mod tests {
             traced(mac).iter().any(|l| l.starts_with("AUTO enabled"))
         })
         .await;
-        assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+        // With no routing reports its decision waits (#452): nothing is sent.
+        // Auto's release at the deadline isn't asserted here: the core runs
+        // on std `Instant` and this test on paused tokio time. The core's
+        // `assert_no_connect_take` with `waits` (handoff.rs) covers it.
         h.play(true).await;
         assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
         let trace = traced(mac);
@@ -5090,11 +5140,15 @@ mod tests {
             }
         }
 
-        /// `facts` before the audio source report: no connect take (#324),
-        /// so Linux does not own when the session starts.
+        /// `facts` with an `Unknown` audio source report: no connect take
+        /// (#324) and a complete state (#452), so Linux does not own when
+        /// the session starts.
         fn no_source() -> SessionFacts {
             SessionFacts {
-                audio: None,
+                audio: Some(AudioSource {
+                    mac: "00:00:00:00:00:00".to_string(),
+                    r#type: AudioSourceType::Unknown,
+                }),
                 ..facts()
             }
         }
@@ -6090,14 +6144,15 @@ mod tests {
                 r#type: AudioSourceType::Media,
             };
             p.feed(20, Input::AudioSource(remote));
-            // The relay comes after Auto: an idle iPhone at the session
-            // start would get the connect take (#324).
-            p.feed(30, Input::Auto);
-            let relay = Input::MediaInformation {
+            // Relayed playing at the session start, then idle: an idle
+            // iPhone at the start would get the connect take (#324, #452).
+            let relay = |category| Input::MediaInformation {
                 host: REMOTE.to_string(),
-                category: IDLE,
+                category,
             };
-            p.feed(35, relay);
+            p.feed(25, relay(MEDIA));
+            p.feed(30, Input::Auto);
+            p.feed(35, relay(IDLE));
             p.step(40, true, &[music(1)]);
             p.feed(100, Input::EarState(vec![InEar, OutOfEar]));
             p.step(150, false, &[]);
@@ -6943,7 +6998,9 @@ mod tests {
             records,
             Arc::new(DeviceHandler::default()),
             (mpsc::channel(1).0, poller),
-            ConnectMode::default(),
+            // Blocks the connect take, so the seed's unrelayed media gets
+            // Auto's release at once rather than at the deadline (#452).
+            ConnectMode::WhenLastConnected,
         )
         .await;
         // The startup: "not owning", announce.
