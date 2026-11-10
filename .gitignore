@@ -675,3 +675,5 @@ result-*
 .cargo-target/
 .swarm/project-cache.json
 .swarm/lane-claim
+.swarm/lane.lock
+.swarm/lane-run.pid
