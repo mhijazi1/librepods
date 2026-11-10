@@ -20,7 +20,7 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use libpulse_sys as sys;
 use log::{info, warn};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -165,7 +165,8 @@ impl DefaultSinkRouter {
     }
 }
 
-/// Plan and apply each event in order, counting each in `applied`, after
+/// Plan and apply each event in order (but for an Unpark(Local) behind a
+/// hold release, #473), counting each in `applied` in send order, after
 /// unloading a park sink an earlier run left behind.
 async fn run(
     io: impl DefaultSinkIo,
@@ -178,6 +179,9 @@ async fn run(
     let mut park: Option<Held> = None;
     // The local sink of the park a take with no hold replaced (#488).
     let mut park_local: Option<String> = None;
+    // Events received during a hold release, in send order; true once an
+    // Unpark(Local) ran ahead of the release (#473).
+    let mut backlog: VecDeque<(SinkEvent, bool)> = VecDeque::new();
     loop {
         // Only the park this router holds can end it: an earlier one's
         // watch is dropped.
@@ -189,7 +193,13 @@ async fn run(
         };
         let event = tokio::select! {
             biased;
-            event = events.recv() => event,
+            // The backlog holds earlier events than the channel.
+            event = async {
+                match backlog.pop_front() {
+                    Some(next) => Some(next),
+                    None => events.recv().await.map(|event| (event, false)),
+                }
+            } => event,
             () = watch_ended => {
                 // Not a routed event: `applied` doesn't count it. The first
                 // holder to see it unparks, for every holder.
@@ -204,8 +214,33 @@ async fn run(
                 continue;
             }
         };
-        let Some(event) = event else { break };
-        if matches!(event, SinkEvent::Park | SinkEvent::Unpark(_)) {
+        let Some((event, ran)) = event else { break };
+        if ran {
+            // An Unpark(Local) that ran ahead of a release: counted here,
+            // in send order, so `settled()` keeps its meaning.
+        } else if event == SinkEvent::Hold(false) {
+            // A release can wait `HOLD_RELEASE_WAIT` for the AirPods sink,
+            // past `SHUTDOWN_RELEASE_WAIT`: an Unpark(Local) with only Takes
+            // and Holds ahead of it (a dropped handoff's) runs now, so the
+            // park ends in time; every other event waits in order (#473).
+            let mut release = io.hold_a2dp(false);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut release => break,
+                    Some(next) = events.recv() => {
+                        let ahead = next == SinkEvent::Unpark(UnparkTo::Local)
+                            && backlog
+                                .iter()
+                                .all(|(e, _)| matches!(e, SinkEvent::Take | SinkEvent::Hold(_)));
+                        if ahead {
+                            park = apply_park(&io, &shared, park, next, &mut remembered).await;
+                        }
+                        backlog.push_back((next, ahead));
+                    }
+                }
+            }
+        } else if matches!(event, SinkEvent::Park | SinkEvent::Unpark(_)) {
             park = apply_park(&io, &shared, park, event, &mut remembered).await;
         } else if event == SinkEvent::Take && park.is_some() {
             // A take while parked that replaced the park sink remembers the
@@ -1712,6 +1747,120 @@ pub(crate) mod tests {
         let sinks = FakeSinks::new(false);
         route_all(&sinks, &[]).await;
         assert_eq!(sinks.sets(), Vec::<String>::new());
+    }
+
+    // #473: an Unpark(Local) runs ahead of a waiting hold release. Directly
+    // in `tests` (not a submodule): the criteria name these paths.
+
+    /// A router over `sinks` whose Park settled; each hold release then
+    /// waits for `found` or its full `HOLD_RELEASE_WAIT`.
+    async fn stuck_parked_router(sinks: &FakeSinks) -> DefaultSinkRouter {
+        let router = DefaultSinkRouter::spawn(sinks.clone());
+        router.route(Park);
+        settles(router.settled()).await;
+        sinks.stuck.store(true, Ordering::SeqCst);
+        router
+    }
+
+    fn has_set(sinks: &FakeSinks, call: &str) -> bool {
+        sinks.sets().iter().any(|set| set == call)
+    }
+
+    /// The router queue a handoff task dropped after its ACK step leaves
+    /// (`park_drop_after_the_acks_route_still_unparks`).
+    #[tokio::test(start_paused = true)]
+    async fn park_unpark_local_overtakes_a_waiting_hold_release() {
+        use crate::media_controller::HOLD_RELEASE_WAIT;
+        use crate::switching::SHUTDOWN_RELEASE_WAIT;
+        let sinks = FakeSinks::new(false);
+        let router = stuck_parked_router(&sinks).await;
+        let routed = tokio::time::Instant::now();
+        for event in [Hold(false), Take, Unpark(ToLocal)] {
+            router.route(event);
+        }
+        let unloaded = tokio::time::timeout(SHUTDOWN_RELEASE_WAIT, async {
+            while !has_set(&sinks, "unload 7") {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(unloaded.is_ok(), "no unpark within SHUTDOWN_RELEASE_WAIT");
+        tokio::time::sleep_until(routed + SHUTDOWN_RELEASE_WAIT).await;
+        // The release still waits, and the take behind it.
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+        assert_eq!(
+            sinks.sets(),
+            ["load", PARK_SINK, "Hold(false)", DAC, "unload 7"]
+        );
+        let after = HOLD_RELEASE_WAIT + Duration::from_secs(1);
+        let settled = tokio::time::timeout(after, router.settled()).await;
+        assert!(settled.is_ok(), "the release never ended");
+        assert!(routed.elapsed() >= HOLD_RELEASE_WAIT);
+        assert_eq!(
+            sinks.sets(),
+            ["load", PARK_SINK, "Hold(false)", DAC, "unload 7", AIRPODS]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn park_unpark_waits_behind_a_queued_park_or_airpods_unpark() {
+        use crate::media_controller::HOLD_RELEASE_WAIT;
+        let before_release_ends = HOLD_RELEASE_WAIT - Duration::from_millis(10);
+        // (a) A Park queued ahead: the Unpark(Local) ends it after it loads.
+        let sinks = FakeSinks::new(false);
+        let router = DefaultSinkRouter::spawn(sinks.clone());
+        sinks.stuck.store(true, Ordering::SeqCst);
+        for event in [Hold(false), Park, Unpark(ToLocal)] {
+            router.route(event);
+        }
+        tokio::time::sleep(before_release_ends).await;
+        assert_eq!(sinks.sets(), ["Hold(false)"]);
+        router.settled().await;
+        assert_eq!(
+            sinks.sets(),
+            ["Hold(false)", "load", PARK_SINK, DAC, "unload 7"]
+        );
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+        assert!(sinks.park.try_lock().unwrap().park.is_none());
+        // (b) Unpark(AirPods) never overtakes: it needs the AirPods sink.
+        let sinks = FakeSinks::new(false);
+        let router = stuck_parked_router(&sinks).await;
+        for event in [Hold(false), Take, Unpark(ToAirPods)] {
+            router.route(event);
+        }
+        tokio::time::sleep(before_release_ends).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, "Hold(false)"]);
+        router.settled().await;
+        assert_eq!(
+            sinks.sets(),
+            ["load", PARK_SINK, "Hold(false)", AIRPODS, "unload 7"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_waits_for_a_release_an_unpark_overtook() {
+        use crate::media_controller::HOLD_RELEASE_WAIT;
+        let sinks = FakeSinks::new(false);
+        let router = stuck_parked_router(&sinks).await;
+        let routed = tokio::time::Instant::now();
+        router.route(Hold(false));
+        let s1 = router.settled();
+        router.route(Unpark(ToLocal));
+        let s2 = router.settled();
+        tokio::pin!(s1, s2);
+        eventually("the unpark", || has_set(&sinks, "unload 7")).await;
+        // Let the worker run on; only the release may still be pending.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!((&mut s1).now_or_never(), None, "the release settled");
+        assert_eq!((&mut s2).now_or_never(), None, "the unpark settled");
+        sinks.found.notify_one();
+        settles(&mut s1).await;
+        settles(&mut s2).await;
+        assert!(routed.elapsed() < HOLD_RELEASE_WAIT);
+        assert_eq!(
+            sinks.sets(),
+            ["load", PARK_SINK, "Hold(false)", DAC, "unload 7"]
+        );
     }
 
     // #448: one park shared by every router; the leftover check retries; a
