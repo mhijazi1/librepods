@@ -244,6 +244,7 @@ impl Switching {
                 let (flush_tx, flush_rx) = mpsc::unbounded_channel();
                 // Before the router starts, so no reinsertion's report is lost.
                 let ear_rx = media.ear_resumes();
+                let connect_mode = watch::Sender::new(self.connect_mode);
                 let shell = Shell {
                     mac: self.airpods_mac.clone(),
                     local,
@@ -258,7 +259,8 @@ impl Switching {
                     ear_rx,
                     resume: None,
                     lines: self.lines,
-                    connect_mode: watch::Sender::new(self.connect_mode),
+                    connect_mode_rx: connect_mode.subscribe(),
+                    connect_mode,
                     relay_category: self.relay_category,
                     held: false,
                     parked: false,

@@ -170,6 +170,50 @@ async fn live_connect_mode_without_task_is_ignored() {
     stop_handoff_task(mac);
 }
 
+/// #153: a change saved while a picked input waits for the state lock
+/// (`mark_session_lost`) gates that input's decision: the #452 connect
+/// take the last routing report would make in "Automatically" is skipped.
+#[tokio::test]
+async fn live_connect_mode_applies_before_the_next_step() {
+    let mac = "5A:01:53:00:00:06";
+    let (manager, mut rx, _tx) = injected_manager().await;
+    let h = Harness::start_connect(ConnectMode::Automatically, mac, &manager).await;
+    wait_until("the startup", || {
+        traced(mac).iter().any(|l| l.starts_with("AUTO enabled"))
+    })
+    .await;
+    let hosts = vec![host(LOCAL), host(REMOTE)];
+    manager.state.lock().await.connected_devices = hosts.clone();
+    h.emit_queued(AACPEvent::ConnectedDevices(Vec::new(), hosts))
+        .await;
+    h.emit_queued(wear(EarDetectionStatus::InEar)).await;
+    let state = manager.state.lock().await;
+    // Not `emit_queued`: no await, so no tick is picked ahead of it.
+    h.emit(idle_source());
+    // The task picks the report and waits on the lock.
+    tokio::time::sleep(SETTLE).await;
+    set_connect_mode(mac, ConnectMode::WhenLastConnected);
+    drop(state);
+    // The gated decision: "not owning" after the hosts' announce.
+    assert_eq!(
+        rest(&mut rx).await,
+        [
+            expected_new_device(REMOTE).await,
+            expected_tipi(REMOTE).await,
+            expected_owns(0).await,
+        ]
+    );
+    let lines = traced(mac);
+    assert!(
+        lines.iter().any(|l| l.starts_with("CONNECT MODE "))
+            && !lines
+                .iter()
+                .any(|l| l.starts_with("AUTO connected while the other host is idle")),
+        "{lines:?}"
+    );
+    stop_handoff_task(mac);
+}
+
 /// #153: a change while the task waits for its predecessor's release
 /// (#294) reaches the core it then builds: the startup's connect take
 /// (#324) follows the new mode.

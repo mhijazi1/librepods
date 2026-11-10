@@ -690,6 +690,7 @@ async fn expect_take(h: &Harness, rx: &mut mpsc::Receiver<Vec<u8>>) {
 /// A task's `Shell` on fake media, with no samples.
 fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
     let (_records, (_, media)) = Harness::fake_media(mac);
+    let connect_mode = watch::Sender::new(ConnectMode::default());
     Shell {
         mac: mac.to_string(),
         local: LOCAL.to_string(),
@@ -703,7 +704,8 @@ fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
         ear_rx: mpsc::unbounded_channel().1,
         resume: None,
         lines: None,
-        connect_mode: watch::Sender::new(ConnectMode::default()),
+        connect_mode_rx: connect_mode.subscribe(),
+        connect_mode,
         relay_category: false,
         held: false,
         parked: false,
