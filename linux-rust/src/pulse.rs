@@ -314,33 +314,28 @@ impl RawConnection {
         })
     }
 
-    /// Move sink input `input` to sink `sink`; false on any error or if
-    /// the server refused.
-    pub(crate) fn move_sink_input(&mut self, input: u32, sink: u32) -> bool {
-        let cb = Some(success_cb as extern "C" fn(_, _, _));
-        let moved = self.query("sink input move", |context, list| {
-            // SAFETY: `context` is Ready and `list` is what `success_cb` expects.
-            unsafe { sys::pa_context_move_sink_input_by_index(context, input, sink, cb, list) }
-        });
-        matches!(moved.as_deref(), Ok([true]))
-    }
-
-    /// Move sink input `input` to the default sink, so the server stores
-    /// no target for it (pipewire-pulse writes `target.object` -1, spike
-    /// #314); false on any error or if the server refused.
-    pub(crate) fn move_sink_input_to_default(&mut self, input: u32) -> bool {
+    /// Move sink input `input` to sink `sink`, or with None to the default
+    /// sink, so the server stores no target for it (pipewire-pulse writes
+    /// `target.object` -1, spike #314); false on any error or if the server
+    /// refused.
+    pub(crate) fn move_sink_input(&mut self, input: u32, sink: Option<u32>) -> bool {
         let cb = Some(success_cb as extern "C" fn(_, _, _));
         let moved = self.query("sink input move", |context, list| {
             // SAFETY: `context` is Ready and `list` is what `success_cb`
             // expects; the name is a static C string.
             unsafe {
-                sys::pa_context_move_sink_input_by_name(
-                    context,
-                    input,
-                    c"@DEFAULT_SINK@".as_ptr(),
-                    cb,
-                    list,
-                )
+                match sink {
+                    Some(sink) => {
+                        sys::pa_context_move_sink_input_by_index(context, input, sink, cb, list)
+                    }
+                    None => sys::pa_context_move_sink_input_by_name(
+                        context,
+                        input,
+                        c"@DEFAULT_SINK@".as_ptr(),
+                        cb,
+                        list,
+                    ),
+                }
             }
         });
         matches!(moved.as_deref(), Ok([true]))

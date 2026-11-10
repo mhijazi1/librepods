@@ -2626,8 +2626,11 @@ impl A2dpResumeIo for MediaController {
     }
 }
 
-async fn blocking(f: impl FnOnce() -> bool + Send + 'static) -> bool {
-    tokio::task::spawn_blocking(f).await.unwrap_or(false)
+/// `f` on the blocking pool; the default if it panicked.
+pub(crate) async fn blocking<T: Default + Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    tokio::task::spawn_blocking(f).await.unwrap_or_default()
 }
 
 // --- PulseAudio helpers ---
