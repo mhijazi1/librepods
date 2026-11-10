@@ -362,7 +362,8 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     .with_default_sink_routing(true)
     .with_a2dp_hold(true)
     .with_park_sink(true)
-    .with_category_relay(shell.relay_category);
+    .with_category_relay(shell.relay_category)
+    .with_take_back_after_call(crate::utils::load_take_back_after_call(&shell.mac));
     let start = if let Some((category, requested)) = take_category {
         core = core
             .with_playback_requested()
