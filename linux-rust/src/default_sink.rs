@@ -220,10 +220,13 @@ async fn run(
             };
         } else if event == SinkEvent::Take {
             // A take that replaced another device's park remembers the park,
-            // and its local sink for a yield after the park ended (#488).
+            // and its local sink for a yield after the park ended (#488); a
+            // retake that replaced nothing keeps the first one's.
             let state = shared.lock().await;
+            let replaces = io.current_default().await.as_deref() == Some(PARK_SINK);
             remembered = apply(&io, remembered, event).await;
-            if remembered.as_deref() == Some(PARK_SINK)
+            if replaces
+                && remembered.as_deref() == Some(PARK_SINK)
                 && let Some(parked) = state.park.as_ref()
             {
                 park_local = Some(parked.local.clone());
@@ -1917,8 +1920,10 @@ pub(crate) mod tests {
         a.route(Unpark(ToLocal));
         settles(a.settled()).await;
         // A parks again from HDMI, then another device's Unpark(AirPods)
-        // leaves the park in place.
+        // leaves the park in place. Its watch waits to connect, so it runs.
         *sinks.default.lock().unwrap() = HDMI.to_string();
+        let (_connect, gate) = std::sync::mpsc::channel::<()>();
+        *sinks.connect.lock().unwrap() = Some(gate);
         a.route(Park);
         settles(a.settled()).await;
         *sinks.default.lock().unwrap() = AIRPODS.to_string();
@@ -1926,6 +1931,34 @@ pub(crate) mod tests {
         settles(b.settled()).await;
         assert_eq!(sinks.sets().last().map(String::as_str), Some(PARK_SINK));
         assert_eq!(*sinks.default.lock().unwrap(), PARK_SINK);
+    }
+
+    #[tokio::test]
+    async fn park_shared_unheld_retake_keeps_the_replaced_parks_local() {
+        const HDMI: &str = "alsa_output.hdmi";
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = DefaultSinkRouter::spawn(sinks.clone());
+        b.route(Take);
+        settles(b.settled()).await;
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        // A parks again from HDMI; its watch waits to connect, so it runs.
+        *sinks.default.lock().unwrap() = HDMI.to_string();
+        let (_connect, gate) = std::sync::mpsc::channel::<()>();
+        *sinks.connect.lock().unwrap() = Some(gate);
+        a.route(Park);
+        settles(a.settled()).await;
+        // B's retake, with the AirPods already default, sets nothing.
+        *sinks.default.lock().unwrap() = AIRPODS.to_string();
+        b.route(Take);
+        settles(b.settled()).await;
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        b.route(Yield);
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets().last().map(String::as_str), Some(DAC));
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
     }
 
     #[tokio::test]
