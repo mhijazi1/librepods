@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 use log::{error, info};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// The handoff task's I/O: executes the core's commands.
 pub(super) struct Shell {
@@ -41,8 +41,9 @@ pub(super) struct Shell {
     pub(super) resume: Option<oneshot::Sender<()>>,
     /// Where the core's lines go after they are logged, if anywhere.
     pub(super) lines: Option<LineSink>,
-    /// The device's "Connect to this computer" (#16).
-    pub(super) connect_mode: ConnectMode,
+    /// The device's "Connect to this computer" (#16); the registry keeps a
+    /// clone to change it live (#153).
+    pub(super) connect_mode: watch::Sender<ConnectMode>,
     /// Relay Linux's audio category to the other hosts (#272).
     pub(super) relay_category: bool,
     /// Whether the last `HoldA2dp` held (#264); released on drop (#294).
@@ -335,13 +336,15 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
         }
         (session_facts(&state), backlog)
     };
+    // The latest mode, so a change during the waits above is not lost.
+    let mut connect_mode = shell.connect_mode.subscribe();
     let mut core = Handoff::new(
         shell.local.clone(),
         Instant::now(),
         for_playback,
         !for_playback,
     )
-    .with_connect_mode(shell.connect_mode)
+    .with_connect_mode(*connect_mode.borrow())
     .with_last_owner_linux(last_owner_linux(&shell.mac))
     .with_default_sink_routing(true)
     .with_a2dp_hold(true)
@@ -390,6 +393,13 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     loop {
         let end = tokio::select! {
             biased;
+            // Gates the next automatic take only: no step, nothing sent (#153).
+            Ok(()) = connect_mode.changed() => {
+                let mode = *connect_mode.borrow_and_update();
+                core.set_connect_mode(mode);
+                shell.log(&format!("CONNECT MODE {mode:?} (live)"));
+                false
+            }
             event = shell.events.recv() => match event {
                 // Check the session before stepping the event, but keep the
                 // rest of the queue for the next sync.

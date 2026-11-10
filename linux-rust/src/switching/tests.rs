@@ -703,7 +703,7 @@ fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
         ear_rx: mpsc::unbounded_channel().1,
         resume: None,
         lines: None,
-        connect_mode: ConnectMode::default(),
+        connect_mode: watch::Sender::new(ConnectMode::default()),
         relay_category: false,
         held: false,
         parked: false,

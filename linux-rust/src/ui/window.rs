@@ -940,6 +940,7 @@ impl App {
                 let result = write_settings_file(&path, &format!("{prefs:#}"));
                 match &result {
                     Ok(()) => {
+                        crate::switching::set_connect_mode(&mac, mode);
                         self.connect_modes.insert(mac, mode);
                     }
                     Err(e) => error!("Failed to write {}: {}", path.display(), e),
