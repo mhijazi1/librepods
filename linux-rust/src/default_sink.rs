@@ -16,13 +16,15 @@ use crate::call_detect::{
 };
 use crate::media_controller::{MediaController, blocking};
 use crate::pulse;
-use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use libpulse_sys as sys;
 use log::{info, warn};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -107,11 +109,14 @@ pub(crate) trait DefaultSinkIo: Send + Sync + 'static {
     fn load_park_sink(&self) -> BoxFuture<'static, Option<u32>>;
     /// True when the server unloaded `module`.
     fn unload_module(&self, module: u32) -> BoxFuture<'static, bool>;
-    /// The module of a park sink an earlier run left loaded.
-    fn park_module(&self) -> BoxFuture<'static, Option<u32>>;
+    /// The module of a park sink an earlier run left loaded; None when the
+    /// module listing failed.
+    fn park_module(&self) -> BoxFuture<'static, Option<Option<u32>>>;
     /// Start the park event path, which moves the non-worthy streams on the
     /// park sink to `local` (#311).
     fn watch_park(&self, local: String) -> ParkWatch;
+    /// The one park every router on this server shares.
+    fn shared_park(&self) -> SharedPark;
 }
 
 /// Enqueues route events for one worker task, which ends when this drops.
@@ -167,14 +172,16 @@ async fn run(
     mut events: mpsc::UnboundedReceiver<SinkEvent>,
     applied: watch::Sender<u64>,
 ) {
-    unload_leftover_park(&io).await;
+    let shared = io.shared_park();
+    unload_leftover_park(&io, &shared).await;
     let mut remembered: Option<String> = None;
-    let mut park: Option<Parked> = None;
+    let mut park: Option<Held> = None;
     loop {
-        // Only this park's watch can end it: an earlier one's is dropped.
+        // Only the park this router holds can end it: an earlier one's
+        // watch is dropped.
         let watch_ended = async {
-            match park.as_mut() {
-                Some(parked) => parked.watch.ended().await,
+            match park.as_ref() {
+                Some(held) => drop(held.ended.clone().await),
                 None => std::future::pending().await,
             }
         };
@@ -182,8 +189,13 @@ async fn run(
             biased;
             event = events.recv() => event,
             () = watch_ended => {
-                // Not a routed event: `applied` doesn't count it.
-                if let Some(parked) = park.take() {
+                // Not a routed event: `applied` doesn't count it. The first
+                // holder to see it unparks, for every holder.
+                let mut state = shared.lock().await;
+                if let Some(held) = park.take()
+                    && state.holds(&held)
+                    && let Some(parked) = state.park.take()
+                {
                     warn!("Default sink: the park's event path failed; unparking to the local sink");
                     unpark(&io, parked, UnparkTo::Local).await;
                 }
@@ -192,16 +204,33 @@ async fn run(
         };
         let Some(event) = event else { break };
         if matches!(event, SinkEvent::Park | SinkEvent::Unpark(_)) {
-            park = apply_park(&io, park, event, &mut remembered).await;
-        } else {
-            remembered = match (apply(&io, remembered, event).await, &park) {
-                // A take while parked replaced the park sink: remember the
-                // local sink it replaced in turn.
-                (Some(sink), Some(parked)) if sink == PARK_SINK => Some(parked.local.clone()),
-                (next, _) => next,
+            park = apply_park(&io, &shared, park, event, &mut remembered).await;
+        } else if event == SinkEvent::Take && park.is_some() {
+            // A take while parked that replaced the park sink remembers the
+            // local sink of the park in place (this router's hold may be on
+            // an ended one), which no holder can end while the lock is held.
+            let state = shared.lock().await;
+            remembered = match apply(&io, remembered, event).await {
+                Some(sink) if sink == PARK_SINK => {
+                    state.park.as_ref().map(|parked| parked.local.clone())
+                }
+                next => next,
             };
+        } else {
+            remembered = apply(&io, remembered, event).await;
         }
         applied.send_modify(|n| *n += 1);
+    }
+    // Only this router's hold ends; the last one stops the event path and
+    // leaves the park sink loaded, as before.
+    let mut state = shared.lock().await;
+    if let Some(held) = park
+        && state.holds(&held)
+    {
+        state.holders -= 1;
+        if state.holders == 0 {
+            state.park = None;
+        }
     }
 }
 
@@ -213,15 +242,69 @@ struct Parked {
     watch: ParkWatch,
 }
 
-/// Park or unpark; returns the park in place after `event`.
+/// The process's one park, which every router (one per device) shares.
+pub(crate) type SharedPark = Arc<tokio::sync::Mutex<ParkState>>;
+
+#[derive(Default)]
+pub(crate) struct ParkState {
+    park: Option<Parked>,
+    /// The routers holding `park`.
+    holders: usize,
+    /// Bumped by each new park, so a hold on an ended one shows.
+    generation: u64,
+    /// A module listing has looked for an earlier run's park sink.
+    checked: bool,
+}
+
+/// One router's hold on the shared park.
+struct Held {
+    generation: u64,
+    /// The park's watch's `ended`.
+    ended: Shared<oneshot::Receiver<()>>,
+}
+
+impl ParkState {
+    /// A new hold on the park in place.
+    fn hold(&mut self) -> Option<Held> {
+        let parked = self.park.as_ref()?;
+        self.holders += 1;
+        Some(Held {
+            generation: self.generation,
+            ended: parked.watch.ended.clone(),
+        })
+    }
+
+    /// Whether `held` is on the park in place.
+    fn holds(&self, held: &Held) -> bool {
+        self.park.is_some() && self.generation == held.generation
+    }
+}
+
+/// Park or unpark; returns this router's hold after `event`.
 async fn apply_park(
     io: &impl DefaultSinkIo,
-    park: Option<Parked>,
+    shared: &SharedPark,
+    held: Option<Held>,
     event: SinkEvent,
     remembered: &mut Option<String>,
-) -> Option<Parked> {
-    match (event, park) {
+) -> Option<Held> {
+    let mut state = shared.lock().await;
+    // A hold on a park whose event path failed holds nothing.
+    let held = held.filter(|held| state.holds(held));
+    match (event, held) {
         (SinkEvent::Park, None) => {
+            // Another device's park: share it, and make it the default
+            // again if a take and yield since replaced it.
+            if let Some(held) = state.hold() {
+                if io.current_default().await.as_deref() != Some(PARK_SINK) {
+                    if io.set_default(PARK_SINK.to_string()).await {
+                        info!("Default sink: Park set the shared {PARK_SINK} again");
+                    } else {
+                        warn!("Default sink: Park failed to set the shared {PARK_SINK}");
+                    }
+                }
+                return Some(held);
+            }
             // With no local sink, no event path could move notifications
             // and calls off the park sink.
             let Some(local) = io.current_default().await.filter(|sink| sink != PARK_SINK) else {
@@ -240,21 +323,40 @@ async fn apply_park(
             }
             info!("Default sink: Park set {PARK_SINK}, replacing {local}");
             let watch = io.watch_park(local.clone());
-            Some(Parked {
+            state.generation += 1;
+            state.holders = 0;
+            state.park = Some(Parked {
                 module,
                 local,
                 watch,
-            })
+            });
+            state.hold()
         }
-        (SinkEvent::Unpark(to), Some(parked)) => {
-            if let Some(local) = unpark(io, parked, to).await {
+        (SinkEvent::Unpark(to), Some(_)) => {
+            state.holders -= 1;
+            let local = if state.holders == 0
+                && let Some(parked) = state.park.take()
+            {
+                unpark(io, parked, to).await
+            } else if to == UnparkTo::AirPods
+                && io.current_default().await.as_deref() == Some(PARK_SINK)
+                && let Some(airpods) = io.airpods_sink().await
+                && io.set_default(airpods.clone()).await
+            {
+                // Another device is still parked: the park sink stays.
+                info!("Default sink: Unpark(AirPods) set {airpods}; {PARK_SINK} stays");
+                state.park.as_ref().map(|parked| parked.local.clone())
+            } else {
+                None
+            };
+            if let Some(local) = local {
                 // The take before it failed to set the AirPods, so
                 // remembered nothing; a later Yield restores the local sink.
                 remembered.get_or_insert(local);
             }
             None
         }
-        (_, park) => park,
+        (_, held) => held,
     }
 }
 
@@ -297,9 +399,19 @@ async fn unload_park(io: &impl DefaultSinkIo, module: u32, pin: bool) {
     }
 }
 
-/// An earlier run's park sink (a crash, or an exit before its unpark).
-async fn unload_leftover_park(io: &impl DefaultSinkIo) {
-    if let Some(module) = io.park_module().await {
+/// An earlier run's park sink (a crash, or an exit before its unpark):
+/// looked for until a listing succeeds, and never while this process's
+/// own park is in place.
+async fn unload_leftover_park(io: &impl DefaultSinkIo, shared: &SharedPark) {
+    let mut state = shared.lock().await;
+    if state.checked || state.park.is_some() {
+        return;
+    }
+    let Some(leftover) = io.park_module().await else {
+        return;
+    };
+    state.checked = true;
+    if let Some(module) = leftover {
         let park_default = io.current_default().await.as_deref() == Some(PARK_SINK);
         info!("Default sink: unloading a leftover {PARK_SINK} (module {module})");
         unload_park(io, module, park_default).await;
@@ -307,7 +419,7 @@ async fn unload_leftover_park(io: &impl DefaultSinkIo) {
 }
 
 /// One event; returns the new memory, which is empty unless every action
-/// succeeded, so a failed take or restore remembers nothing.
+/// was applied, so a failed take or restore remembers nothing.
 async fn apply(
     io: &impl DefaultSinkIo,
     remembered: Option<String>,
@@ -329,6 +441,9 @@ async fn apply(
     for SinkAction::SetDefault(name) in actions {
         if io.set_default(name.clone()).await {
             info!("Default sink: {event:?} set {name}");
+        } else if io.current_default().await.as_deref() == Some(name.as_str()) {
+            // The reply was lost, but the server applied it.
+            info!("Default sink: {event:?} set {name} (its reply was lost)");
         } else {
             warn!("Default sink: {event:?} failed to set {name}");
             ok = false;
@@ -380,28 +495,29 @@ impl DefaultSinkIo for MediaController {
         Box::pin(blocking(move || pulse::unload_module("LibrePods", module)))
     }
 
-    fn park_module(&self) -> BoxFuture<'static, Option<u32>> {
-        // Once per process: a later router (another device, a reconnect)
-        // would unload a park still in place.
-        static CHECKED: AtomicBool = AtomicBool::new(false);
-        if CHECKED.swap(true, Ordering::SeqCst) {
-            return Box::pin(async { None });
-        }
+    fn park_module(&self) -> BoxFuture<'static, Option<Option<u32>>> {
         Box::pin(blocking(|| {
             let modules = pulse::modules("LibrePods").map_err(|e| warn!("Default sink: {e}"));
-            modules.ok()?.into_iter().find_map(|m| {
+            let found = modules.ok()?.into_iter().find_map(|m| {
                 let ours = m.name.as_deref() == Some("module-null-sink")
                     && m.argument.as_deref().is_some_and(|a| {
                         a.split_whitespace()
                             .any(|arg| arg == "sink_name=librepods_park")
                     });
                 ours.then_some(m.index)
-            })
+            });
+            Some(found)
         }))
     }
 
     fn watch_park(&self, local: String) -> ParkWatch {
         ParkWatch::spawn(pulse::ParkConnection::connect, local)
+    }
+
+    fn shared_park(&self) -> SharedPark {
+        // One per process: every device's router parks on it.
+        static PARK: LazyLock<SharedPark> = LazyLock::new(SharedPark::default);
+        PARK.clone()
     }
 }
 
@@ -421,7 +537,7 @@ pub(crate) struct ParkWatch {
     /// Dropped to stop the thread.
     _stop: Sender<()>,
     /// Closed once the thread ends: before a stop, only on a failure.
-    ended: oneshot::Receiver<()>,
+    ended: Shared<oneshot::Receiver<()>>,
 }
 
 impl ParkWatch {
@@ -445,13 +561,8 @@ impl ParkWatch {
         if let Err(e) = spawned {
             warn!("Park: no event path thread: {e}");
         }
+        let ended = ended.shared();
         ParkWatch { _stop: stop, ended }
-    }
-
-    /// Resolves once the event path has ended unstopped: it failed. Not
-    /// polled again after that.
-    async fn ended(&mut self) {
-        let _ = (&mut self.ended).await;
     }
 }
 
@@ -764,6 +875,10 @@ pub(crate) mod tests {
         no_airpods: Arc<AtomicBool>,
         /// A park sink module an earlier run left (#311).
         leftover: Option<u32>,
+        /// The module listing that looks for it fails.
+        listing_fails: Arc<AtomicBool>,
+        /// The park every router on this server shares.
+        park: SharedPark,
         /// The park event path's sound server (#311).
         pulse: Arc<Mutex<FakePulse>>,
         /// Once set, a hold release waits its full `HOLD_RELEASE_WAIT` for
@@ -785,6 +900,8 @@ pub(crate) mod tests {
                 gate: None,
                 no_airpods: Arc::default(),
                 leftover: None,
+                listing_fails: Arc::default(),
+                park: Arc::default(),
                 pulse: Arc::default(),
                 stuck: Arc::default(),
                 found: Arc::default(),
@@ -858,13 +975,14 @@ pub(crate) mod tests {
             Box::pin(async { true })
         }
 
-        fn park_module(&self) -> BoxFuture<'static, Option<u32>> {
-            let leftover = self.leftover;
-            Box::pin(async move { leftover })
+        fn park_module(&self) -> BoxFuture<'static, Option<Option<u32>>> {
+            let listed = (!self.listing_fails.load(Ordering::SeqCst)).then_some(self.leftover);
+            Box::pin(async move { listed })
         }
 
         fn watch_park(&self, local: String) -> ParkWatch {
             let pulse = self.pulse.clone();
+            pulse.lock().unwrap().watches += 1;
             let gate = self.connect.lock().unwrap().take();
             ParkWatch::spawn(
                 move || {
@@ -882,6 +1000,10 @@ pub(crate) mod tests {
                 },
                 local,
             )
+        }
+
+        fn shared_park(&self) -> SharedPark {
+            self.park.clone()
         }
     }
 
@@ -903,6 +1025,8 @@ pub(crate) mod tests {
         queue: Vec<pulse::SinkInputEvent>,
         watching: bool,
         calls: Vec<String>,
+        /// Watches started.
+        watches: u32,
         clearers: u32,
         /// When set, the next call named so (`move` or `open`) waits for
         /// the receiver's sender to drop.
@@ -1550,6 +1674,242 @@ pub(crate) mod tests {
         let sinks = FakeSinks::new(false);
         route_all(&sinks, &[]).await;
         assert_eq!(sinks.sets(), Vec::<String>::new());
+    }
+
+    // #448: one park shared by every router; the leftover check retries; a
+    // lost reply keeps the memory.
+
+    #[tokio::test]
+    async fn park_shared_two_routers_unload_after_last() {
+        let gate = Arc::new(Notify::new());
+        let sinks = FakeSinks {
+            gate: Some(gate.clone()),
+            ..FakeSinks::new(false)
+        };
+        let a = DefaultSinkRouter::spawn(sinks.clone());
+        let b = DefaultSinkRouter::spawn(sinks.clone());
+        a.route(Park);
+        eventually("A's set of the park sink", || sinks.sets().len() == 2).await;
+        // B's Park overlaps A's set, held by the gate.
+        b.route(Park);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.notify_one();
+        settles(a.settled()).await;
+        settles(b.settled()).await;
+        eventually("the event path", || sinks.watching()).await;
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK]);
+        b.route(Unpark(ToLocal));
+        eventually("B's set of the local sink", || sinks.sets().len() == 3).await;
+        gate.notify_one();
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, DAC, "unload 7"]);
+        assert_eq!(sinks.pulse.lock().unwrap().watches, 1);
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+    }
+
+    #[tokio::test]
+    async fn park_shared_airpods_unpark_keeps_park_for_other() {
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = parked_router(&sinks).await;
+        a.route(Unpark(ToAirPods));
+        settles(a.settled()).await;
+        assert_eq!(*sinks.default.lock().unwrap(), AIRPODS);
+        assert!(sinks.watching());
+        b.route(Unpark(ToLocal));
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, "unload 7"]);
+        assert_eq!(*sinks.default.lock().unwrap(), AIRPODS);
+    }
+
+    #[tokio::test]
+    async fn park_shared_joined_take_remembers_the_local_sink() {
+        let sinks = FakeSinks::new(false);
+        let _a = parked_router(&sinks).await;
+        let b = parked_router(&sinks).await;
+        for event in [Take, Unpark(ToAirPods), Yield] {
+            b.route(event);
+        }
+        settles(b.settled()).await;
+        // No PARK_SINK set follows the take, and the yield restores the DAC.
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, DAC]);
+    }
+
+    #[tokio::test]
+    async fn park_shared_event_path_failure_ends_it_for_all() {
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = parked_router(&sinks).await;
+        sinks.pulse.lock().unwrap().fail = Some("next");
+        let unloaded = || sinks.sets().contains(&"unload 7".to_string());
+        eventually("the park's own unpark", unloaded).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ended = ["load", PARK_SINK, DAC, "unload 7"];
+        assert_eq!(sinks.sets(), ended);
+        for router in [&a, &b] {
+            router.route(Unpark(ToLocal));
+            settles(router.settled()).await;
+        }
+        assert_eq!(sinks.sets(), ended);
+    }
+
+    #[tokio::test]
+    async fn park_shared_router_dropped_keeps_park_for_other() {
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = parked_router(&sinks).await;
+        drop(a);
+        let one_hold = || sinks.park.try_lock().is_ok_and(|park| park.holders == 1);
+        eventually("A's hold to end", one_hold).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK]);
+        assert!(sinks.watching());
+        b.route(Unpark(ToLocal));
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, DAC, "unload 7"]);
+    }
+
+    #[tokio::test]
+    async fn park_shared_rejoin_after_yield_sets_the_park() {
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let _b = parked_router(&sinks).await;
+        // A takes and yields while B stays parked, then parks again.
+        for event in [Take, Unpark(ToAirPods), Yield, Park] {
+            a.route(event);
+        }
+        settles(a.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, DAC, PARK_SINK]);
+        assert_eq!(sinks.pulse.lock().unwrap().watches, 1);
+        assert_eq!(*sinks.default.lock().unwrap(), PARK_SINK);
+    }
+
+    #[tokio::test]
+    async fn park_shared_stale_hold_take_remembers_the_live_parks_local() {
+        const HDMI: &str = "alsa_output.hdmi";
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = parked_router(&sinks).await;
+        // B's events wait behind a hold release that waits for `found`.
+        sinks.stuck.store(true, Ordering::SeqCst);
+        for event in [Hold(false), Take, Unpark(ToAirPods), Yield] {
+            b.route(event);
+        }
+        let held = || sinks.sets().contains(&"Hold(false)".to_string());
+        eventually("B's hold release", held).await;
+        // The event path fails; A unparks to the DAC.
+        sinks.pulse.lock().unwrap().fail = Some("next");
+        let unloaded = || sinks.sets().contains(&"unload 7".to_string());
+        eventually("the park's own unpark", unloaded).await;
+        // A parks again from HDMI; its watch waits to connect, so it runs.
+        *sinks.default.lock().unwrap() = HDMI.to_string();
+        let (_connect, gate) = std::sync::mpsc::channel::<()>();
+        *sinks.connect.lock().unwrap() = Some(gate);
+        a.route(Park);
+        settles(a.settled()).await;
+        sinks.found.notify_one();
+        settles(b.settled()).await;
+        let sets = sinks.sets();
+        assert_eq!(
+            sets,
+            [
+                "load",
+                PARK_SINK,
+                "Hold(false)",
+                DAC,
+                "unload 7",
+                "load",
+                PARK_SINK,
+                AIRPODS,
+                HDMI
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn park_shared_take_reply_pending_keeps_the_parks_local() {
+        let sinks = FakeSinks::new(false);
+        let _a = parked_router(&sinks).await;
+        // Only B's sets wait on the gate; its join sets nothing.
+        let gate = Arc::new(Notify::new());
+        let gated = FakeSinks {
+            gate: Some(gate.clone()),
+            ..sinks.clone()
+        };
+        let b = parked_router(&gated).await;
+        b.route(Take);
+        eventually("B's take to apply", || sinks.sets().len() == 3).await;
+        // The event path fails while the take's reply is pending.
+        sinks.pulse.lock().unwrap().fail = Some("next");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        gate.notify_one();
+        settles(b.settled()).await;
+        let unloaded = || sinks.sets().contains(&"unload 7".to_string());
+        eventually("the park's own unpark", unloaded).await;
+        b.route(Unpark(ToAirPods));
+        b.route(Yield);
+        // A permit for the yield's set.
+        gate.notify_one();
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, "unload 7", DAC]);
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+    }
+
+    #[tokio::test]
+    async fn park_leftover_check_retries_after_failed_listing() {
+        let sinks = FakeSinks {
+            leftover: Some(3),
+            ..FakeSinks::new(false)
+        };
+        sinks.listing_fails.store(true, Ordering::SeqCst);
+        route_all(&sinks, &[]).await;
+        assert_eq!(sinks.sets(), Vec::<String>::new());
+        sinks.listing_fails.store(false, Ordering::SeqCst);
+        route_all(&sinks, &[]).await;
+        assert_eq!(sinks.sets(), ["unload 3"]);
+        // Done once a listing succeeded.
+        route_all(&sinks, &[]).await;
+        assert_eq!(sinks.sets(), ["unload 3"]);
+    }
+
+    #[tokio::test]
+    async fn park_leftover_check_spares_the_shared_park() {
+        let sinks = FakeSinks::new(false);
+        sinks.listing_fails.store(true, Ordering::SeqCst);
+        let a = parked_router(&sinks).await;
+        sinks.listing_fails.store(false, Ordering::SeqCst);
+        // The listing would show the park itself.
+        let listed = FakeSinks {
+            leftover: Some(PARK_MODULE),
+            ..sinks.clone()
+        };
+        route_all(&listed, &[]).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK]);
+        assert!(sinks.watching());
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, DAC, "unload 7"]);
+    }
+
+    #[tokio::test]
+    async fn take_with_lost_reply_still_restores_on_yield() {
+        let sinks = FakeSinks::new(false);
+        sinks.lost_reply.store(true, Ordering::SeqCst);
+        route_all(&sinks, &[Take, Yield]).await;
+        assert_eq!(sinks.sets(), [AIRPODS, DAC]);
+    }
+
+    #[tokio::test]
+    async fn park_take_with_lost_reply_then_unpark_remembers_the_local_sink() {
+        let sinks = FakeSinks::new(false);
+        let router = parked_router(&sinks).await;
+        sinks.lost_reply.store(true, Ordering::SeqCst);
+        for event in [Take, Unpark(ToAirPods), Yield] {
+            router.route(event);
+        }
+        settles(router.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, "unload 7", DAC]);
     }
 
     #[test]
