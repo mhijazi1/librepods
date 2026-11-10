@@ -1593,7 +1593,8 @@ impl MediaController {
     /// The activation after the MAC check, every step bounded by `deadline`:
     /// `lookup` is the initial full card lookup, `connect` asks BlueZ for the
     /// A2DP profile and finds the card again when the lookup found none,
-    /// `snapshot` reads the streams and cards (None when that failed),
+    /// `snapshot` reads the streams and cards (None when that failed), before
+    /// `recover` and again right before `set`,
     /// `recover` makes sure A2DP is offered, `choose` picks the profile and
     /// `set` switches to it. State is written only after a step returns, so a
     /// step cut off writes nothing.
@@ -1602,7 +1603,7 @@ impl MediaController {
         deadline: Instant,
         lookup: L,
         connect: K,
-        snapshot: S,
+        mut snapshot: S,
         recover: V,
         choose: C,
         set: P,
@@ -1612,7 +1613,7 @@ impl MediaController {
         LFut: Future<Output = Option<u32>>,
         K: FnOnce() -> KFut,
         KFut: Future<Output = Option<u32>>,
-        S: FnOnce() -> SFut,
+        S: FnMut() -> SFut,
         SFut: Future<Output = Option<AudioSnapshot>>,
         V: FnOnce() -> VFut,
         VFut: Future<Output = bool>,
@@ -1644,10 +1645,10 @@ impl MediaController {
         // WirePlumber put the card on head-unit for a recording and switches
         // back after it: neither restart it nor write a profile now (#12).
         let mac = self.state.lock().await.connected_device_mac.clone();
-        if before_deadline(deadline, snapshot)
-            .await?
-            .is_some_and(|s| holds_head_unit(&s.streams, airpods_card_profile(&s.cards, &mac)))
-        {
+        let records_on_head_unit = |s: Option<AudioSnapshot>| {
+            s.is_some_and(|s| holds_head_unit(&s.streams, airpods_card_profile(&s.cards, &mac)))
+        };
+        if records_on_head_unit(before_deadline(deadline, &mut snapshot).await?) {
             debug!("AirPods on a head-unit profile while something records, leaving it");
             return Ok(());
         }
@@ -1690,6 +1691,16 @@ impl MediaController {
         // A hold that started during the activation wins (#264); the lock
         // keeps the hold's card read behind this write.
         let _write = before_deadline(deadline, || self.profile_write.lock()).await?;
+        if self.a2dp_hold_skips() {
+            return Ok(());
+        }
+        // A recording that started during `recover` or `choose` (#519).
+        if records_on_head_unit(before_deadline(deadline, &mut snapshot).await?) {
+            debug!("AirPods moved to a head-unit profile for a recording, leaving it");
+            return Ok(());
+        }
+        // `hold_a2dp` sets the flag without `profile_write`: a hold may have
+        // arrived during the read.
         if self.a2dp_hold_skips() {
             return Ok(());
         }
@@ -4703,15 +4714,42 @@ mod tests {
     async fn activate_with_snapshot(
         snapshot: Option<AudioSnapshot>,
     ) -> (Steps, Option<(u32, String)>) {
+        let reads = vec![
+            (Duration::ZERO, snapshot.clone()),
+            (Duration::ZERO, snapshot),
+        ];
+        let (outcome, steps, set_to, _) = activate_with_reads(reads).await;
+        assert_eq!(outcome, Ok(()));
+        (steps, set_to)
+    }
+
+    /// Run an activation of card 3 whose snapshot reads take and return
+    /// `reads` in turn; returns the outcome, the steps (reads as "snapshot"),
+    /// what `set` was called with, and whether `profile_write` was held at
+    /// each read.
+    async fn activate_with_reads(
+        reads: Vec<(Duration, Option<AudioSnapshot>)>,
+    ) -> (
+        Result<(), DeadlineExceeded>,
+        Steps,
+        Option<(u32, String)>,
+        Vec<bool>,
+    ) {
         let controller = MediaController::new(RECORDING_MAC.to_string(), String::new());
         let steps = Steps::default();
         let set_to = std::cell::RefCell::new(None);
+        let mut reads = reads.into_iter();
+        let mut locked = Vec::new();
         let outcome = controller
             .activate_a2dp_profile_with(
                 Instant::now() + A2DP_ACTIVATION_DEADLINE,
                 || steps.step("lookup", Duration::ZERO, Some(3)),
                 || steps.step("connect", Duration::ZERO, None),
-                || std::future::ready(snapshot),
+                || {
+                    locked.push(controller.profile_write.try_lock().is_err());
+                    let (took, snapshot) = reads.next().expect("one snapshot read too many");
+                    steps.step("snapshot", took, snapshot)
+                },
                 || steps.step("recover", Duration::ZERO, true),
                 |_| {
                     let choice = ProfileChoice::Activate("a2dp-sink-sbc".to_string());
@@ -4723,10 +4761,9 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(outcome, Ok(()));
         // The lookup's index is stored either way.
         assert_eq!(controller.state.try_lock().unwrap().device_index, Some(3));
-        (steps, set_to.into_inner())
+        (outcome, steps, set_to.into_inner(), locked)
     }
 
     #[tokio::test(start_paused = true)]
@@ -4752,6 +4789,121 @@ mod tests {
         let (steps, set_to) = activate_with_snapshot(None).await;
         assert_eq!(steps.started("recover"), 1);
         assert_eq!(set_to, Some((3, "a2dp-sink-sbc".to_string())));
+    }
+
+    // #519: the guard is read again under `profile_write`, right before `set`.
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_rechecks_recording_before_write() {
+        let (outcome, steps, set_to, _) = activate_with_reads(vec![
+            (
+                Duration::ZERO,
+                recording_snapshot("headset-head-unit", false),
+            ),
+            (
+                Duration::ZERO,
+                recording_snapshot("headset-head-unit", true),
+            ),
+        ])
+        .await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!((steps.started("recover"), steps.started("choose")), (1, 1));
+        assert_eq!(steps.started("set"), 0);
+        assert_eq!(set_to, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_second_snapshot_runs_under_profile_write() {
+        let quiet = recording_snapshot("a2dp-sink", false);
+        let (outcome, steps, set_to, locked) = activate_with_reads(vec![
+            (Duration::ZERO, quiet.clone()),
+            (Duration::ZERO, quiet),
+        ])
+        .await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(steps.started("snapshot"), 2);
+        assert_eq!(locked, [false, true]);
+        assert_eq!(steps.started("set"), 1);
+        assert_eq!(set_to, Some((3, "a2dp-sink-sbc".to_string())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_writes_when_second_snapshot_fails() {
+        let (outcome, steps, set_to, _) = activate_with_reads(vec![
+            (
+                Duration::ZERO,
+                recording_snapshot("headset-head-unit", false),
+            ),
+            (Duration::ZERO, None),
+        ])
+        .await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(steps.started("set"), 1);
+        assert_eq!(set_to, Some((3, "a2dp-sink-sbc".to_string())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_second_snapshot_past_deadline_skips_write() {
+        let quiet = recording_snapshot("a2dp-sink", false);
+        let (outcome, steps, set_to, _) = activate_with_reads(vec![
+            (Duration::ZERO, quiet.clone()),
+            (A2DP_ACTIVATION_DEADLINE, quiet),
+        ])
+        .await;
+        assert_eq!(outcome, Err(DeadlineExceeded));
+        assert_eq!(steps.started("snapshot"), 2);
+        assert_eq!(steps.started("set"), 0);
+        assert_eq!(set_to, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_hold_set_during_second_snapshot_skips_write() {
+        for second in [recording_snapshot("a2dp-sink", false), None] {
+            let controller = MediaController::new(RECORDING_MAC.to_string(), String::new());
+            let steps = Steps::default();
+            let mut reads = 0;
+            let outcome = controller
+                .activate_a2dp_profile_with(
+                    Instant::now() + A2DP_ACTIVATION_DEADLINE,
+                    || steps.step("lookup", Duration::ZERO, Some(3)),
+                    || steps.step("connect", Duration::ZERO, None),
+                    || {
+                        reads += 1;
+                        if reads == 2 {
+                            controller.set_a2dp_held(true);
+                            return steps.step("snapshot", Duration::ZERO, second.clone());
+                        }
+                        let quiet = recording_snapshot("a2dp-sink", false);
+                        steps.step("snapshot", Duration::ZERO, quiet)
+                    },
+                    || steps.step("recover", Duration::ZERO, true),
+                    |_| {
+                        let choice = ProfileChoice::Activate("a2dp-sink-sbc".to_string());
+                        steps.step("choose", Duration::ZERO, choice)
+                    },
+                    |_, _| steps.step("set", Duration::ZERO, true),
+                )
+                .await;
+            assert_eq!(outcome, Ok(()));
+            assert_eq!(steps.started("snapshot"), 2);
+            assert_eq!(steps.started("set"), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_recording_at_first_check_reads_snapshot_once() {
+        let (outcome, steps, set_to, _) = activate_with_reads(vec![(
+            Duration::ZERO,
+            recording_snapshot("headset-head-unit", true),
+        )])
+        .await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(steps.started("snapshot"), 1);
+        assert_eq!(
+            steps.started("recover") + steps.started("choose") + steps.started("set"),
+            0
+        );
+        assert_eq!(set_to, None);
     }
 
     /// Deactivate cached card 7 with `snapshot`; whether `set_off` ran.
