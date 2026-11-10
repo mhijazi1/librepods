@@ -23,6 +23,7 @@ mod ownership;
 mod park;
 mod playback;
 mod session;
+mod take_back;
 mod timers;
 
 /// How long an ownership request may wait for its acknowledgement.
@@ -425,6 +426,8 @@ pub(crate) struct Handoff {
     /// The category of a play edge in that wait skipped only for a report
     /// not yet in (#490); read only while the wait is open.
     deferred_play: Option<u32>,
+    /// Taking the AirPods back after a remote call (#14).
+    take_back: take_back::TakeBack,
 }
 
 impl Handoff {
@@ -486,6 +489,7 @@ impl Handoff {
             ear_resume_confirmed: false,
             connect_until: None,
             deferred_play: None,
+            take_back: take_back::TakeBack::default(),
         }
     }
 
@@ -620,6 +624,7 @@ impl Handoff {
         let owns = input == Input::Ownership(vec![1]);
         self.apply(now, input, &mut out);
         self.settle_connect(now, owns, &mut out);
+        self.take_back(now, owns, &mut out);
         if !out
             .iter()
             .any(|c| matches!(c, Command::Exit | Command::Fail(_)))
@@ -812,6 +817,9 @@ impl Handoff {
                     self.hold_for_remote(out);
                     return;
                 }
+                if self.requested_take || self.owner.as_deref() == Some(&[1]) {
+                    self.take_back.yielded(now);
+                }
                 self.say("REMOTE requested ownership; yielding");
                 self.request(now, false, Cause::Remote, out);
                 self.hold_for_remote(out);
@@ -823,7 +831,10 @@ impl Handoff {
                     self.say("SESSION lost; finishing its queued events before disconnecting");
                 }
             }
-            Input::Disconnected => self.disconnected(now, out),
+            Input::Disconnected => {
+                self.take_back.clear();
+                self.disconnected(now, out);
+            }
             Input::Reconnected(facts) => self.reconnected(now, facts, out),
             Input::ReconnectFailed(error) => {
                 self.reconnecting = false;
@@ -914,6 +925,7 @@ impl Handoff {
             Input::Tick => self.tick(now, out),
             Input::A2dpTransport { active } => self.a2dp_active = Some(active),
             Input::MediaInformation { host, category } => {
+                self.take_back.relay(now, &host, category);
                 self.relays.insert(host, category);
             }
         }
