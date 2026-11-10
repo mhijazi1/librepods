@@ -1,5 +1,6 @@
 mod a2dp_resume;
 mod activity;
+mod activity_wayland;
 mod battery_provider;
 mod bluetooth;
 mod call_detect;
@@ -131,6 +132,7 @@ fn main() -> iced::Result {
         };
     }
     env_logger::init();
+    activity::set_session_source(activity_wayland::start());
 
     let (ui_tx, ui_rx) = unbounded_channel::<BluetoothUIMessage>();
 

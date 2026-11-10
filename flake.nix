@@ -84,6 +84,8 @@
               # Default files from crane (Rust and cargo files)
               (craneLib.fileset.commonCargoSources unfilteredRoot)
               (lib.fileset.maybeMissing ./linux-rust/assets/font)
+              # Wayland protocol XMLs the binary generates bindings from
+              ./linux-rust/protocols
             ];
           };
 

@@ -7,7 +7,7 @@
 use crate::bluetooth::aacp::TipiFields;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Input at most this long ago is Max.
@@ -127,6 +127,22 @@ pub(crate) fn logind_inputs(locked: bool, idle: bool) -> ActivityInputs {
         idle,
         since_input: None,
     }
+}
+
+/// The process's activity source, chosen once at startup (#511).
+static SESSION_SOURCE: OnceLock<Arc<dyn ActivitySource>> = OnceLock::new();
+
+/// Sets the session source; only the first call counts.
+pub(crate) fn set_session_source(source: Arc<dyn ActivitySource>) {
+    let _ = SESSION_SOURCE.set(source);
+}
+
+/// The source `main` set, or logind when none was set.
+pub(crate) fn session_source() -> Arc<dyn ActivitySource> {
+    SESSION_SOURCE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(LogindActivity))
 }
 
 #[cfg(test)]
