@@ -2468,6 +2468,37 @@ mod tests {
         assert_eq!(acted, [(AT_ROUTE + 250, Play(P.into()))]);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn watch_ends_once_nothing_is_left_to_replay() {
+        // The take read is back: once P's Play empties the list, the next
+        // read due ends the watch instead of skipping to the guard's end.
+        let io = SampledIo {
+            read: &[],
+            read_at: 0,
+            paused: &[P],
+            start: tokio::time::Instant::now(),
+            acted: Arc::default(),
+        };
+        let routed_at = clock();
+        let replayable = Mutex::new(players(&[P]));
+        let (_cancel, cancelled) = oneshot::channel::<()>();
+        let until = routed_at + A2DP_RESUME_WINDOW;
+        let pauses = pause_counts(&io);
+        let reading = AtomicBool::new(false);
+        replay_self_pauses(
+            &io,
+            &replayable,
+            &reading,
+            routed_at,
+            until,
+            pauses,
+            cancelled.shared(),
+        )
+        .await;
+        assert_eq!(*io.acted.lock().unwrap(), [(0, Play(P.into()))]);
+        assert!(clock() <= routed_at + SELF_PAUSE_READ);
+    }
+
     #[test]
     fn read_transport_once_empty_mac_is_unknown() {
         assert_eq!(read_transport_once(""), None);
