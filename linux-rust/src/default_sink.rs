@@ -205,8 +205,12 @@ async fn run(
         } else {
             remembered = match (apply(&io, remembered, event).await, &park) {
                 // A take while parked replaced the park sink: remember the
-                // local sink it replaced in turn.
-                (Some(sink), Some(held)) if sink == PARK_SINK => Some(held.local.clone()),
+                // local sink it replaced in turn. The park in place's, as
+                // this router's hold may be on a park that has since ended.
+                (Some(sink), Some(_)) if sink == PARK_SINK => {
+                    let state = shared.lock().await;
+                    state.park.as_ref().map(|parked| parked.local.clone())
+                }
                 (next, _) => next,
             };
         }
@@ -287,8 +291,16 @@ async fn apply_park(
     let held = held.filter(|held| state.holds(held));
     match (event, held) {
         (SinkEvent::Park, None) => {
-            // Another device's park: share it.
+            // Another device's park: share it, and make it the default
+            // again if a take and yield since replaced it.
             if let Some(held) = state.hold() {
+                if io.current_default().await.as_deref() != Some(PARK_SINK) {
+                    if io.set_default(PARK_SINK.to_string()).await {
+                        info!("Default sink: Park set the shared {PARK_SINK} again");
+                    } else {
+                        warn!("Default sink: Park failed to set the shared {PARK_SINK}");
+                    }
+                }
                 return Some(held);
             }
             // With no local sink, no event path could move notifications
@@ -1782,6 +1794,63 @@ pub(crate) mod tests {
         b.route(Unpark(ToLocal));
         settles(b.settled()).await;
         assert_eq!(sinks.sets(), ["load", PARK_SINK, DAC, "unload 7"]);
+    }
+
+    #[tokio::test]
+    async fn park_shared_rejoin_after_yield_sets_the_park() {
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let _b = parked_router(&sinks).await;
+        // A takes and yields while B stays parked, then parks again.
+        for event in [Take, Unpark(ToAirPods), Yield, Park] {
+            a.route(event);
+        }
+        settles(a.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, DAC, PARK_SINK]);
+        assert_eq!(sinks.pulse.lock().unwrap().watches, 1);
+        assert_eq!(*sinks.default.lock().unwrap(), PARK_SINK);
+    }
+
+    #[tokio::test]
+    async fn park_shared_stale_hold_take_remembers_the_live_parks_local() {
+        const HDMI: &str = "alsa_output.hdmi";
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = parked_router(&sinks).await;
+        // B's events wait behind a hold release that waits for `found`.
+        sinks.stuck.store(true, Ordering::SeqCst);
+        for event in [Hold(false), Take, Unpark(ToAirPods), Yield] {
+            b.route(event);
+        }
+        let held = || sinks.sets().contains(&"Hold(false)".to_string());
+        eventually("B's hold release", held).await;
+        // The event path fails; A unparks to the DAC.
+        sinks.pulse.lock().unwrap().fail = Some("next");
+        let unloaded = || sinks.sets().contains(&"unload 7".to_string());
+        eventually("the park's own unpark", unloaded).await;
+        // A parks again from HDMI; its watch waits to connect, so it runs.
+        *sinks.default.lock().unwrap() = HDMI.to_string();
+        let (_connect, gate) = std::sync::mpsc::channel::<()>();
+        *sinks.connect.lock().unwrap() = Some(gate);
+        a.route(Park);
+        settles(a.settled()).await;
+        sinks.found.notify_one();
+        settles(b.settled()).await;
+        let sets = sinks.sets();
+        assert_eq!(
+            sets,
+            [
+                "load",
+                PARK_SINK,
+                "Hold(false)",
+                DAC,
+                "unload 7",
+                "load",
+                PARK_SINK,
+                AIRPODS,
+                HDMI
+            ]
+        );
     }
 
     #[tokio::test]
