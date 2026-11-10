@@ -5,7 +5,7 @@
 
 use dbus::Message;
 use dbus::arg::PropMap;
-use dbus::blocking::{BlockingSender, Connection};
+use dbus::blocking::Connection;
 use dbus::message::MatchRule;
 use log::warn;
 use std::sync::Arc;
@@ -163,11 +163,13 @@ fn show(
         dbus.method_call("org.freedesktop.DBus", "StartServiceByName", (IFACE, 0u32));
     let (server,): (String,) =
         dbus.method_call("org.freedesktop.DBus", "GetNameOwner", (IFACE,))?;
+    // Every call goes to that unique name, so the server asked for its
+    // capabilities is the one that shows the body, even if the name
+    // changes hands.
+    let notifier = bus.with_proxy(server.as_str(), PATH, CALL_TIMEOUT);
     // Escaped unless the server says it shows no markup: the name is the
     // peer's, so a failed answer must not let it through as markup.
-    let caps: Result<(Vec<String>,), _> = bus
-        .with_proxy(server.as_str(), PATH, CALL_TIMEOUT)
-        .method_call(IFACE, "GetCapabilities", ());
+    let caps: Result<(Vec<String>,), _> = notifier.method_call(IFACE, "GetCapabilities", ());
     let markup = caps.map_or(true, |(caps,)| caps.iter().any(|c| c == "body-markup"));
     let content = content(notice, airpods, markup);
     // Matched before Notify, so a click that beats its reply is queued; the
@@ -204,23 +206,21 @@ fn show(
         .iter()
         .flat_map(|label| [UNDO_KEY, *label])
         .collect();
-    let mut notify = Message::new_method_call(IFACE, PATH, IFACE, "Notify")
-        .map_err(|e| dbus::Error::new_failed(&e))?;
-    notify.append_all((
-        "LibrePods",
-        0u32,
-        "",
-        content.title.as_str(),
-        content.body.as_str(),
-        actions,
-        PropMap::new(),
-        content.expire_ms,
-    ));
-    let reply = bus.send_with_reply_and_block(notify, CALL_TIMEOUT)?;
-    let posted: u32 = reply.read1()?;
-    // Another server answered (the name changed hands): its signals are
-    // not matched, so there is nothing to wait for.
-    if content.action.is_none() || reply.sender().as_deref() != Some(server.as_str()) {
+    let (posted,): (u32,) = notifier.method_call(
+        IFACE,
+        "Notify",
+        (
+            "LibrePods",
+            0u32,
+            "",
+            content.title.as_str(),
+            content.body.as_str(),
+            actions,
+            PropMap::new(),
+            content.expire_ms,
+        ),
+    )?;
+    if content.action.is_none() {
         return Ok(());
     }
     id.store(posted, Ordering::SeqCst);
@@ -228,8 +228,7 @@ fn show(
     while !done.load(Ordering::SeqCst) {
         let left = expiry.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            let server = bus.with_proxy(server.as_str(), PATH, CALL_TIMEOUT);
-            return server.method_call(IFACE, "CloseNotification", (posted,));
+            return notifier.method_call(IFACE, "CloseNotification", (posted,));
         }
         bus.process(left)?;
     }
@@ -423,9 +422,14 @@ mod tests {
     }
 
     /// Serves one post as `server`, the owner of the notification name:
-    /// answers GetCapabilities with `caps` (an error if `None`), then
-    /// Notify, closes the notice, and returns Notify's body.
-    fn serve_one(server: &Connection, caps: Option<&[&str]>) -> String {
+    /// answers GetCapabilities with `caps` (an error if `None`) after
+    /// calling `before_caps_reply`, then Notify, closes the notice, and
+    /// returns Notify's body.
+    fn serve_one(
+        server: &Connection,
+        caps: Option<&[&str]>,
+        before_caps_reply: fn(&Connection),
+    ) -> String {
         let me = server.unique_name().to_string();
         let mut asked = 0;
         loop {
@@ -438,6 +442,7 @@ mod tests {
                 Some("GetCapabilities") => {
                     assert_eq!(call.destination().as_deref(), Some(me.as_str()));
                     asked += 1;
+                    before_caps_reply(server);
                     match caps {
                         Some(caps) => call.method_return().append1(caps.to_vec()),
                         None => call.error(&"org.freedesktop.DBus.Error.Failed".into(), c"no"),
@@ -474,7 +479,7 @@ mod tests {
             .expect("the server name");
         let fake = std::thread::spawn(move || {
             caps.iter()
-                .map(|caps| serve_one(&server, *caps))
+                .map(|caps| serve_one(&server, *caps, |_| {}))
                 .collect::<Vec<_>>()
         });
         for _ in caps {
@@ -500,6 +505,30 @@ mod tests {
         assert_eq!(
             post_moved_to_markup(&[None]),
             ["moved to name with &amp; &lt; &gt;"]
+        );
+    }
+
+    #[test]
+    fn notify_goes_to_the_server_asked_for_capabilities() {
+        let bus = PrivateBus::start();
+        let (asked, next) = (bus.connect(), bus.connect());
+        asked
+            .request_name(IFACE, false, true, true)
+            .expect("the server name");
+        // Queued: owns the name once `asked` lets it go.
+        next.request_name(IFACE, false, false, false)
+            .expect("queued for the name");
+        // Hands the name over before saying it shows no markup.
+        let fake = std::thread::spawn(move || {
+            serve_one(&asked, Some(&[]), |server| {
+                server.release_name(IFACE).expect("release");
+            })
+        });
+        let notice = moved_to(Some("name with & < >"));
+        show(&bus.connect(), &notice, "AirPods", || {}).expect("shown");
+        assert_eq!(
+            fake.join().expect("the fake server"),
+            "moved to name with & < >"
         );
     }
 
