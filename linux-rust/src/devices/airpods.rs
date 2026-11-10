@@ -2,6 +2,7 @@ use crate::battery_provider::{BatteryExporter, BluezBatteryProvider, export_batt
 use crate::bluetooth::aacp::BatteryInfo;
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
+use crate::bluetooth::managers::DeviceManagers;
 use crate::media_controller::MediaController;
 use crate::switching::{Switching, SwitchingSetup, device_media, spawn_playback_poller};
 use crate::ui::messages::BluetoothUIMessage;
@@ -28,8 +29,55 @@ pub fn bump_connection_generation(mac: &str) {
 
 /// `mac`'s current connection generation, for `AirPodsDevice::new`.
 pub fn connection_generation(mac: &str) -> u64 {
-    let g = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
-    g.get(&mac.to_ascii_uppercase()).copied().unwrap_or(0)
+    generation_in(&GENERATIONS.lock().unwrap_or_else(|e| e.into_inner()), mac)
+}
+
+/// `mac`'s generation in a locked `GENERATIONS` map.
+fn generation_in(generations: &HashMap<String, u64>, mac: &str) -> u64 {
+    generations
+        .get(&mac.to_ascii_uppercase())
+        .copied()
+        .unwrap_or(0)
+}
+
+/// A setup gate: whether a Connected edge since `generation` made `mac`'s
+/// setup stale. A stale setup closes its AACP connection and stops (#475).
+async fn setup_is_stale(aacp_manager: &AACPManager, mac: &str, generation: u64) -> bool {
+    if connection_generation(mac) == generation {
+        return false;
+    }
+    info!("AirPods {mac} disconnected during setup; stopping the setup");
+    aacp_manager.disconnect().await;
+    true
+}
+
+/// Publishes a finished AirPods setup: its AACP manager in `managers` and
+/// `DeviceConnected` to the window, unless a Connected edge since
+/// `generation` made it stale. Compares, inserts and sends under one
+/// `GENERATIONS` lock, so the disconnect's bump (and its later
+/// `DeviceDisconnected`) comes either before (skip) or after all of it.
+/// Returns whether it published.
+pub async fn finish_airpods_setup(
+    managers: &tokio::sync::RwLock<HashMap<String, DeviceManagers>>,
+    ui_tx: &tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
+    mac: &str,
+    generation: u64,
+    aacp: AACPManager,
+) -> bool {
+    let mut managers = managers.write().await;
+    let generations = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if generation_in(&generations, mac) != generation {
+        info!("AirPods {mac} disconnected during setup; not adding it to the window");
+        return false;
+    }
+    managers
+        .entry(mac.to_string())
+        .or_insert_with(|| DeviceManagers::with_aacp(aacp.clone()))
+        .set_aacp(aacp);
+    if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceConnected(mac.to_string())) {
+        warn!("Failed to send DeviceConnected UI message: {:?}", e);
+    }
+    true
 }
 
 /// Registers the AirPods `mac`'s setup with the tray, unless a Connected edge
@@ -60,12 +108,13 @@ pub struct AirPodsDevice {
 }
 
 impl AirPodsDevice {
+    /// Ok(None): a disconnect since `generation` made the setup stale (#475).
     pub async fn new(
         mac_address: Address,
         generation: u64,
         tray_handle: Option<Handle<MyTray>>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
-    ) -> Result<Self, bluer::Error> {
+    ) -> Result<Option<Self>, bluer::Error> {
         info!("Creating new AirPodsDevice for {}", mac_address);
 
         // Resolve the local adapter before any side effect (AACP connect, tray
@@ -96,6 +145,10 @@ impl AirPodsDevice {
 
         let mut aacp_manager = AACPManager::new();
         aacp_manager.connect(mac_address).await;
+        let mac = mac_address.to_string();
+        if setup_is_stale(&aacp_manager, &mac, generation).await {
+            return Ok(None);
+        }
 
         // let mut att_manager = ATTManager::new();
         // att_manager.connect(mac_address).await.expect("Failed to connect ATT");
@@ -160,6 +213,9 @@ impl AirPodsDevice {
             {
                 error!("Failed to enable stem press detection: {}", e);
             }
+        }
+        if setup_is_stale(&aacp_manager, &mac, generation).await {
+            return Ok(None);
         }
 
         // Desktop battery (BlueZ BatteryProvider1, battery_provider.rs). The
@@ -237,6 +293,9 @@ impl AirPodsDevice {
             mc.activate_a2dp_profile().await;
         });
 
+        if setup_is_stale(&aacp_manager, &mac, generation).await {
+            return Ok(None);
+        }
         // Who answers AirPods ownership: the handoff core (default), the
         // legacy eager takeover, or nobody (switching.rs).
         let switching = Switching::start(
@@ -419,13 +478,13 @@ impl AirPodsDevice {
             }
         });
 
-        Ok(AirPodsDevice {
+        Ok(Some(AirPodsDevice {
             mac_address,
             aacp_manager,
             // att_manager,
             media_controller,
             // command_tx: Some(command_tx.clone()),
-        })
+        }))
     }
 }
 
@@ -732,5 +791,102 @@ mod tests {
         assert_ne!(connection_generation(upper), generation);
         assert!(!register(&mut tray, upper, generation).0);
         assert!(tray.devices.is_empty());
+    }
+
+    /// An AACP manager that looks connected: its state holds a sender.
+    async fn connected_manager() -> AACPManager {
+        let manager = AACPManager::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        manager.state.lock().await.sender = Some(tx);
+        manager
+    }
+
+    #[tokio::test]
+    async fn setup_gate_stale_after_bump() {
+        let mac = "BB:00:00:00:04:75";
+        let manager = connected_manager().await;
+        let generation = connection_generation(mac);
+
+        bump_connection_generation(mac);
+
+        assert!(setup_is_stale(&manager, mac, generation).await);
+        assert!(manager.state.lock().await.sender.is_none());
+    }
+
+    #[tokio::test]
+    async fn setup_gate_current_without_bump() {
+        let mac = "BB:00:00:00:04:76";
+        let manager = connected_manager().await;
+
+        assert!(!setup_is_stale(&manager, mac, connection_generation(mac)).await);
+        assert!(manager.state.lock().await.sender.is_some());
+    }
+
+    type Managers = tokio::sync::RwLock<HashMap<String, DeviceManagers>>;
+    type UiRx = tokio::sync::mpsc::UnboundedReceiver<BluetoothUIMessage>;
+
+    fn drain(rx: &mut UiRx) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|m| format!("{m:?}"))
+            .collect()
+    }
+
+    async fn entry_is(managers: &Managers, mac: &str, manager: &AACPManager) -> bool {
+        let aacp = managers.read().await[mac].get_aacp().unwrap();
+        Arc::ptr_eq(&aacp.state, &manager.state)
+    }
+
+    #[tokio::test]
+    async fn finish_setup_stale_keeps_live_entry() {
+        let b = address("BB:00:00:00:04:77");
+        let (live, stale) = (AACPManager::new(), AACPManager::new());
+        let managers = Managers::default();
+        managers
+            .write()
+            .await
+            .insert(b.clone(), DeviceManagers::with_aacp(live.clone()));
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let generation = connection_generation(&b);
+
+        bump_connection_generation(&b);
+
+        assert!(!finish_airpods_setup(&managers, &ui_tx, &b, generation, stale.clone()).await);
+        assert!(entry_is(&managers, &b, &live).await);
+        assert!(!entry_is(&managers, &b, &stale).await);
+        assert!(drain(&mut ui_rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn finish_setup_after_disconnect_sends_nothing() {
+        let b = address("BB:00:00:00:04:78");
+        let managers = Managers::default();
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let generation = connection_generation(&b);
+
+        // The callback's Connected=false: bump, then DeviceDisconnected.
+        bump_connection_generation(&b);
+        ui_tx
+            .send(BluetoothUIMessage::DeviceDisconnected(b.clone()))
+            .unwrap();
+        let finished =
+            finish_airpods_setup(&managers, &ui_tx, &b, generation, AACPManager::new()).await;
+
+        assert!(!finished);
+        assert_eq!(drain(&mut ui_rx), [format!("DeviceDisconnected({b:?})")]);
+        assert!(!managers.read().await.contains_key(&b));
+    }
+
+    #[tokio::test]
+    async fn finish_setup_current_inserts_and_sends() {
+        let b = address("BB:00:00:00:04:79");
+        let setup = AACPManager::new();
+        let managers = Managers::default();
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let generation = connection_generation(&b);
+        assert!(finish_airpods_setup(&managers, &ui_tx, &b, generation, setup.clone()).await);
+
+        assert!(entry_is(&managers, &b, &setup).await);
+        assert_eq!(drain(&mut ui_rx), [format!("DeviceConnected({b:?})")]);
     }
 }

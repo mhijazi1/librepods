@@ -29,7 +29,9 @@ use dbus::arg::{RefArg, Variant};
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use dbus::message::MatchRule;
-use devices::airpods::{AirPodsDevice, bump_connection_generation, connection_generation};
+use devices::airpods::{
+    AirPodsDevice, bump_connection_generation, connection_generation, finish_airpods_setup,
+};
 use ksni::TrayMethods;
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -267,30 +269,28 @@ async fn async_main(
                 .await?
                 .unwrap_or_else(|| "Unknown".to_string());
             info!("Found connected AirPods: {}, initializing.", name);
+            let mac = device.address().to_string();
+            let generation = connection_generation(&mac);
             match AirPodsDevice::new(
                 device.address(),
-                connection_generation(&device.address().to_string()),
+                generation,
                 tray_handle.clone(),
                 ui_tx.clone(),
             )
             .await
             {
-                Ok(airpods_device) => {
-                    let mut managers = device_managers.write().await;
-                    // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
-                    let dev_managers =
-                        DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
-                    managers
-                        .entry(device.address().to_string())
-                        .or_insert(dev_managers)
-                        .set_aacp(airpods_device.aacp_manager);
-                    drop(managers);
-                    if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceConnected(
-                        device.address().to_string(),
-                    )) {
-                        warn!("Failed to send DeviceConnected UI message: {:?}", e);
-                    }
+                Ok(Some(airpods_device)) => {
+                    finish_airpods_setup(
+                        &device_managers,
+                        &ui_tx,
+                        &mac,
+                        generation,
+                        airpods_device.aacp_manager,
+                    )
+                    .await;
                 }
+                // A disconnect made the setup stale; new() logged it.
+                Ok(None) => {}
                 Err(e) => {
                     // new() already logged the cause; keep the app running.
                     warn!(
@@ -460,25 +460,23 @@ async fn async_main(
             let airpods_device =
                 match AirPodsDevice::new(addr, generation, handle_clone, ui_tx_clone.clone()).await
                 {
-                    Ok(device) => device,
+                    Ok(Some(device)) => device,
+                    // A disconnect made the setup stale; new() logged it.
+                    Ok(None) => return,
                     Err(e) => {
                         // new() already logged the cause.
                         warn!("Skipping AirPods {}: setup failed: {}", addr_str, e);
                         return;
                     }
                 };
-            let mut managers = device_managers.write().await;
-            // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
-            let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
-            managers
-                .entry(addr_str.clone())
-                .or_insert(dev_managers)
-                .set_aacp(airpods_device.aacp_manager);
-            drop(managers);
-            if let Err(e) = ui_tx_clone.send(BluetoothUIMessage::DeviceConnected(addr_str.clone()))
-            {
-                warn!("Failed to send DeviceConnected UI message: {:?}", e);
-            }
+            finish_airpods_setup(
+                &device_managers,
+                &ui_tx_clone,
+                &addr_str,
+                generation,
+                airpods_device.aacp_manager,
+            )
+            .await;
         });
         true
     })?;
