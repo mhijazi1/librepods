@@ -11,8 +11,45 @@ use bluer::Address;
 use ksni::Handle;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
+
+/// Per-MAC connection generation, bumped on every Device1 Connected edge, so
+/// a setup can tell that a disconnect made it stale (#474).
+static GENERATIONS: LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    LazyLock::new(Default::default);
+
+/// A Connected edge (true or false) for `mac`: setups started before it are stale.
+pub fn bump_connection_generation(mac: &str) {
+    let mut g = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    *g.entry(mac.to_ascii_uppercase()).or_default() += 1;
+}
+
+/// `mac`'s current connection generation, for `AirPodsDevice::new`.
+pub fn connection_generation(mac: &str) -> u64 {
+    let g = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get(&mac.to_ascii_uppercase()).copied().unwrap_or(0)
+}
+
+/// Registers the AirPods `mac`'s setup with the tray, unless a Connected edge
+/// since `generation` made it stale. Run inside `Handle::update`: the
+/// disconnect bumps before it queues its `device_disconnected` update, so
+/// either this skips or that update removes the device. Returns whether it
+/// registered.
+fn register_tray_device(
+    tray: &mut MyTray,
+    mac: &str,
+    generation: u64,
+    command_tx: tokio::sync::mpsc::UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>,
+) -> bool {
+    if connection_generation(mac) != generation {
+        info!("AirPods {mac} disconnected during setup; not adding it to the tray");
+        return false;
+    }
+    tray.connect_device(mac, command_tx);
+    true
+}
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
@@ -25,6 +62,7 @@ pub struct AirPodsDevice {
 impl AirPodsDevice {
     pub async fn new(
         mac_address: Address,
+        generation: u64,
         tray_handle: Option<Handle<MyTray>>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
     ) -> Result<Self, bluer::Error> {
@@ -66,7 +104,12 @@ impl AirPodsDevice {
         if let Some(handle) = &tray_handle {
             handle
                 .update(|tray: &mut MyTray| {
-                    tray.connect_device(&mac_address.to_string(), command_tx.clone())
+                    register_tray_device(
+                        tray,
+                        &mac_address.to_string(),
+                        generation,
+                        command_tx.clone(),
+                    )
                 })
                 .await;
         }
@@ -566,5 +609,128 @@ mod tests {
             assert_eq!(drained, (k + 1..=N).collect::<Vec<u8>>(), "seed level {k}");
             assert_eq!(tray.battery_l, Some(N));
         }
+    }
+
+    // The generation registry is global: each test uses its own MACs.
+    type CommandRx = tokio::sync::mpsc::UnboundedReceiver<(ControlCommandIdentifiers, Vec<u8>)>;
+
+    /// A setup's tray registration, through the production function.
+    fn register(tray: &mut MyTray, mac: &str, generation: u64) -> (bool, CommandRx) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (register_tray_device(tray, mac, generation, tx), rx)
+    }
+
+    /// A Connected=false as main.rs delivers it: the bump from the object
+    /// path's MAC, then the tray update for the Address property.
+    fn disconnect(tray: &mut MyTray, path: &str, mac: &str) {
+        bump_connection_generation(&crate::reconnect::mac_from_path(path).unwrap());
+        tray.device_disconnected(mac);
+    }
+
+    fn menu_send(tray: &MyTray) {
+        let tx = tray.command_tx.as_ref().expect("menu target");
+        tx.send((ControlCommandIdentifiers::ListeningMode, vec![0x02]))
+            .unwrap();
+    }
+
+    /// A tray showing `a`, registered with its current generation.
+    fn tray_showing(a: &str) -> (MyTray, CommandRx) {
+        let mut tray = MyTray::default();
+        let (registered, rx) = register(&mut tray, a, connection_generation(a));
+        assert!(registered);
+        (tray, rx)
+    }
+
+    fn address(mac: &str) -> String {
+        mac.parse::<Address>().unwrap().to_string()
+    }
+
+    #[test]
+    fn tray_registration_skips_setup_after_disconnect() {
+        let a = "AA:00:00:00:04:01";
+        let b = address("BB:00:00:00:04:01");
+        let (mut tray, mut rx_a) = tray_showing(a);
+        let generation = connection_generation(&b);
+
+        disconnect(&mut tray, "/org/bluez/hci0/dev_BB_00_00_00_04_01", &b);
+        let (registered, mut rx_b) = register(&mut tray, &b, generation);
+
+        assert!(!registered);
+        assert_eq!(tray.device.as_deref(), Some(a));
+        assert!(tray.connected);
+        menu_send(&tray);
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_err());
+        assert_eq!(tray.devices.len(), 1);
+        assert!(!format!("{:?}", tray.devices).contains(&b));
+    }
+
+    #[test]
+    fn tray_registration_without_disconnect_registers() {
+        let a = "AA:00:00:00:04:02";
+        let b = address("BB:00:00:00:04:02");
+        let (mut tray, mut rx_a) = tray_showing(a);
+
+        let (registered, mut rx_b) = register(&mut tray, &b, connection_generation(&b));
+
+        assert!(registered);
+        assert_eq!(tray.device.as_deref(), Some(b.as_str()));
+        menu_send(&tray);
+        assert!(rx_b.try_recv().is_ok());
+        assert!(rx_a.try_recv().is_err());
+    }
+
+    #[test]
+    fn tray_registration_before_disconnect_is_removed() {
+        let a = "AA:00:00:00:04:03";
+        let b = address("BB:00:00:00:04:03");
+        let (mut tray, mut rx_a) = tray_showing(a);
+
+        let (registered, mut rx_b) = register(&mut tray, &b, connection_generation(&b));
+        disconnect(&mut tray, "/org/bluez/hci0/dev_BB_00_00_00_04_03", &b);
+
+        assert!(registered);
+        assert_eq!(tray.device.as_deref(), Some(a));
+        assert!(tray.connected);
+        assert!(!format!("{:?}", tray.devices).contains(&b));
+        menu_send(&tray);
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_err());
+    }
+
+    #[test]
+    fn tray_registration_after_reconnect_registers() {
+        let a = "AA:00:00:00:04:04";
+        let b = address("BB:00:00:00:04:04");
+        let path = "/org/bluez/hci0/dev_BB_00_00_00_04_04";
+        let (mut tray, _rx_a) = tray_showing(a);
+        let stale = connection_generation(&b);
+
+        disconnect(&mut tray, path, &b);
+        // The reconnect's Connected=true edge, then its setup's generation.
+        bump_connection_generation(&crate::reconnect::mac_from_path(path).unwrap());
+        let generation = connection_generation(&b);
+
+        assert!(!register(&mut tray, &b, stale).0);
+        let (registered, mut rx_b) = register(&mut tray, &b, generation);
+        assert!(registered);
+        assert_eq!(tray.device.as_deref(), Some(b.as_str()));
+        menu_send(&tray);
+        assert!(rx_b.try_recv().is_ok());
+    }
+
+    #[test]
+    fn tray_registration_mac_case_insensitive() {
+        let upper = "BB:00:00:00:04:0A";
+        let lower = "bb:00:00:00:04:0a";
+        let mut tray = MyTray::default();
+        let generation = connection_generation(upper);
+
+        bump_connection_generation(lower);
+
+        assert_eq!(connection_generation(lower), connection_generation(upper));
+        assert_ne!(connection_generation(upper), generation);
+        assert!(!register(&mut tray, upper, generation).0);
+        assert!(tray.devices.is_empty());
     }
 }
