@@ -420,6 +420,8 @@ fn mic_use_refuses_remote_request() {
         ),
         []
     );
+    // The remote source isn't counted as taken: Linux stays the last owner.
+    assert!(p.core.last_owner_linux());
     assert_eq!(p.feed(1200, Input::RemoteOwnershipRequest), []);
     assert_eq!(
         p.core.take_lines(),
