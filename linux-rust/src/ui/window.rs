@@ -181,6 +181,18 @@ fn with_take_back_after_call(
     with_device_key(prefs, mac, "takeBackAfterCall", serde_json::json!(on))
 }
 
+/// `with_connect_mode` for the top-level `switchingNotifications` (#514),
+/// which applies to every device: only the root must be an object.
+fn with_switching_notifications(prefs: Option<&str>, on: bool) -> Option<serde_json::Value> {
+    let mut root = match prefs {
+        Some(content) => serde_json::from_str(content).ok()?,
+        None => serde_json::json!({}),
+    };
+    root.as_object_mut()?
+        .insert("switchingNotifications".to_string(), serde_json::json!(on));
+    Some(root)
+}
+
 fn with_device_key(
     prefs: Option<&str>,
     mac: &str,
@@ -324,6 +336,8 @@ pub struct App {
     connect_modes: HashMap<String, ConnectMode>,
     /// Each AirPods' `takeBackAfterCall` (#14), read with `connect_modes`.
     take_back_after_call: HashMap<String, bool>,
+    /// The global `switchingNotifications` (#514), read with `connect_modes`.
+    switching_notifications: bool,
     /// Switching mode as of the last AirPods connection, for the picker's hint.
     switching_mode: crate::utils::SwitchingMode,
     /// "Couldn't save" status per tab (Settings, or Device(mac) for per-device preferences),
@@ -364,6 +378,7 @@ pub enum Message {
     PreferredCodecChanged(PreferredCodec),
     ConnectModeChanged(String, ConnectMode), // AirPods MAC
     TakeBackAfterCallChanged(String, bool),  // AirPods MAC
+    SwitchingNotificationsChanged(String, bool), // AirPods MAC, for the save status
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -477,6 +492,7 @@ impl App {
                 preferred_codec,
                 connect_modes: HashMap::new(),
                 take_back_after_call: HashMap::new(),
+                switching_notifications: true,
                 switching_mode: crate::utils::SwitchingMode::default(),
                 save_statuses: HashMap::new(),
             },
@@ -686,6 +702,8 @@ impl App {
                                     crate::utils::load_take_back_after_call(&mac),
                                 );
                                 self.switching_mode = crate::utils::load_switching_mode();
+                                self.switching_notifications =
+                                    crate::utils::load_switching_notifications();
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
                                     battery: connect_seed(self.last_case.get(&mac), &state.battery_info),
@@ -997,6 +1015,15 @@ impl App {
                 }
                 Task::none()
             }
+            Message::SwitchingNotificationsChanged(mac, on) => {
+                if self.save_device_pref(&mac, "switchingNotifications", |p| {
+                    with_switching_notifications(p, on)
+                }) {
+                    crate::switching::set_switching_notifications(on);
+                    self.switching_notifications = on;
+                }
+                Task::none()
+            }
             Message::StemControlChanged(is_enabled) => {
                 self.stem_control = is_enabled;
                 self.save_app_settings();
@@ -1211,6 +1238,15 @@ impl App {
                                                                     text("Take back after a call on another device").size(16).width(Length::Fill),
                                                                     toggler(self.take_back_after_call.get(id).copied().unwrap_or(false))
                                                                         .on_toggle(move |on| Message::TakeBackAfterCallChanged(id.clone(), on))
+                                                                        .spacing(0)
+                                                                        .size(20)
+                                                                ]
+                                                                    .align_y(Center)
+                                                                    .spacing(12),
+                                                                row![
+                                                                    text("Switching notifications").size(16).width(Length::Fill),
+                                                                    toggler(self.switching_notifications)
+                                                                        .on_toggle(move |on| Message::SwitchingNotificationsChanged(id.clone(), on))
                                                                         .spacing(0)
                                                                         .size(20)
                                                                 ]
@@ -2386,6 +2422,58 @@ mod tests {
                 let text = serde_json::from_str(&format!("{written:#}")).ok();
                 assert_eq!(
                     crate::utils::take_back_after_call_from_value(text.as_ref(), MAC),
+                    on
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn switching_notifications_write_preserves_other_keys() {
+        let prefs = r#"{"switching":"handoff","switchingNotifications":true,
+            "AA:BB:CC:DD:EE:FF":{"connectMode":"when_last_connected"},"11:22:33:44:55:66":3}"#;
+        assert_eq!(
+            with_switching_notifications(Some(prefs), false),
+            Some(serde_json::json!({
+                "switching": "handoff",
+                "switchingNotifications": false,
+                MAC: {"connectMode": "when_last_connected"},
+                "11:22:33:44:55:66": 3,
+            }))
+        );
+    }
+
+    #[test]
+    fn switching_notifications_write_creates_missing_file() {
+        assert_eq!(
+            with_switching_notifications(None, false),
+            Some(serde_json::json!({"switchingNotifications": false}))
+        );
+    }
+
+    #[test]
+    fn switching_notifications_write_refuses_invalid_file() {
+        for prefs in ["", "not json", "[]", "3", "null", r#""on""#] {
+            assert_eq!(
+                with_switching_notifications(Some(prefs), true),
+                None,
+                "{prefs}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_notifications_round_trips() {
+        for on in [true, false] {
+            for prefs in [
+                None,
+                Some(r#"{"switchingNotifications":true,"switching":"off"}"#),
+                Some(r#"{"switchingNotifications":false}"#),
+            ] {
+                let written = with_switching_notifications(prefs, on).unwrap();
+                // Through the text the arm writes.
+                assert_eq!(
+                    crate::utils::parse_switching_notifications(&format!("{written:#}")),
                     on
                 );
             }

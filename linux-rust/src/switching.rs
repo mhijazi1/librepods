@@ -47,7 +47,9 @@ pub(crate) use poller::{
     NOT_PAUSING, PlaybackSamples, device_media, pause_own_players, spawn_playback_poller,
 };
 use registry::{HANDOFF_TASKS, spawn_handoff_task, stop_handoff_task};
-pub(crate) use registry::{last_owner_linux, set_connect_mode, stop_all_handoff_tasks};
+pub(crate) use registry::{
+    last_owner_linux, set_connect_mode, set_switching_notifications, stop_all_handoff_tasks,
+};
 pub(crate) use shell::LineSink;
 use shell::Shell;
 
@@ -281,7 +283,7 @@ impl Switching {
                     parked: false,
                     released: None,
                     notifier: self.notifier,
-                    notifications: self.notifications,
+                    notifications: Arc::new(self.notifications.into()),
                     // No notifier clicks: a closed channel.
                     undo_rx: self.undo.unwrap_or_else(|| mpsc::unbounded_channel().1),
                 };

@@ -732,7 +732,7 @@ fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
         parked: false,
         released: None,
         notifier: Arc::new(|_: crate::notifications::Notice| {}),
-        notifications: true,
+        notifications: Arc::new(true.into()),
         undo_rx: mpsc::unbounded_channel().1,
     }
 }

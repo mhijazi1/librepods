@@ -18,6 +18,7 @@ use crate::utils::ConnectMode;
 use futures::future::BoxFuture;
 use log::{error, info};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -57,8 +58,9 @@ pub(super) struct Shell {
     pub(super) released: Option<oneshot::Sender<BoxFuture<'static, ()>>>,
     /// Posts the "moved to" and "Connected" notices (#17).
     pub(super) notifier: Arc<dyn Notifier>,
-    /// The `switchingNotifications` preference.
-    pub(super) notifications: bool,
+    /// The `switchingNotifications` preference; the registry keeps a clone
+    /// to change it live (#514).
+    pub(super) notifications: Arc<AtomicBool>,
     /// Undo clicks on "moved to", by yield id.
     pub(super) undo_rx: mpsc::UnboundedReceiver<u64>,
 }
@@ -179,11 +181,14 @@ impl Shell {
                         None => None,
                     };
                     let notice = Notice::MovedTo { id, taker };
-                    notifications::post(&*self.notifier, self.notifications, notice);
+                    let on = self.notifications.load(Ordering::Relaxed);
+                    notifications::post(&*self.notifier, on, notice);
                 }
-                Command::NotifyConnected => {
-                    notifications::post(&*self.notifier, self.notifications, Notice::Connected)
-                }
+                Command::NotifyConnected => notifications::post(
+                    &*self.notifier,
+                    self.notifications.load(Ordering::Relaxed),
+                    Notice::Connected,
+                ),
                 Command::SendHijackReversed(host) => {
                     if let Err(e) = self.manager.send_hijack_reversed(&host).await {
                         error!("Handoff: failed to send the reverse request to {host}: {e}");
