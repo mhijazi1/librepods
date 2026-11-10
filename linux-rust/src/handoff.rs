@@ -413,6 +413,9 @@ pub(crate) struct Handoff {
     /// `Auto`'s ownership decision waits for the routing reports until
     /// then (#452); None once decided or ended.
     connect_until: Option<Instant>,
+    /// The category of a play edge in that wait skipped only for a report
+    /// not yet in (#490); read only while the wait is open.
+    deferred_play: Option<u32>,
 }
 
 impl Handoff {
@@ -473,6 +476,7 @@ impl Handoff {
             ear_reports_due: 0,
             ear_resume_confirmed: false,
             connect_until: None,
+            deferred_play: None,
         }
     }
 
@@ -835,6 +839,7 @@ impl Handoff {
                 // A take Linux holds stays held: Linux is the idle owner (#262).
                 self.reset_baseline(now);
                 self.connect_until = Some(now + CONNECT_TAKE_WINDOW);
+                self.deferred_play = None;
                 let decision = self.connect_decision(now, false);
                 // An idle other host (#324): Linux takes, so hold nothing.
                 if decision == Some(true) {
@@ -956,10 +961,11 @@ impl Handoff {
         if self.quitting || self.session_lost {
             return;
         }
-        // A play edge, taken or skipped, ends `Auto`'s wait (#452).
-        if fresh_play {
-            self.connect_until = self.connect_until.map(|_| now);
+        // Linux stopped: the deferred edge is gone (#490).
+        if stopped {
+            self.deferred_play = None;
         }
+        let mut deferred = false;
         // A local call's 501 wins; its end relays the category (#272).
         if self.category_relay && category != last_category && !self.local_call {
             out.push(Command::RelayCategory(category));
@@ -1004,6 +1010,21 @@ impl Handoff {
                     .say(format!(
                         "AUTO takeover skipped: the audio source's category {remote} is above Linux's {local}"
                     )),
+                // In `Auto`'s wait, a skip only for a report not yet in
+                // waits for it (#490), as a Mac never decides without it.
+                TakeoverAction::Skip(skip)
+                    if self.connect_until.is_some()
+                        && match skip {
+                            TakeoverSkip::NoRemoteHost => self.hosts.is_empty(),
+                            TakeoverSkip::NoBudInEar => self.ears.is_empty(),
+                            TakeoverSkip::AudioNotIdle => self.audio.is_none(),
+                            _ => false,
+                        } =>
+                {
+                    deferred = true;
+                    self.deferred_play = self.deferred_play.max(Some(behind.unwrap_or(category)));
+                    self.say("AUTO playback started; deciding once the routing reports are in");
+                }
                 TakeoverAction::Skip(_) => self
                     .say("AUTO takeover blocked by remote activity, wear, or missing host state"),
             },
@@ -1029,6 +1050,10 @@ impl Handoff {
                 }
             }
             Some(_) => {}
+        }
+        // Any other play edge, taken or skipped, ends `Auto`'s wait (#452).
+        if fresh_play && !deferred {
+            self.connect_until = self.connect_until.map(|_| now);
         }
     }
 
@@ -1595,10 +1620,11 @@ impl Handoff {
         self.say(CONNECT_TAKE);
     }
 
-    /// `Auto`'s one ownership decision (#324, #452): Some(true) takes, or
-    /// keeps an owner [1]; Some(false) releases; None waits for the routing
-    /// reports. An [1] reported in the wait (`owns`) keeps; past the
-    /// deadline, or when no report can allow the take, it releases.
+    /// `Auto`'s one ownership decision (#324, #452): Some(true) takes (for
+    /// playback if a play edge was deferred, #490), or keeps an owner [1];
+    /// Some(false) releases; None waits for the routing reports. An [1]
+    /// reported in the wait (`owns`) keeps; past the deadline, or when no
+    /// report can allow the take, it releases.
     fn connect_decision(&self, now: Instant, owns: bool) -> Option<bool> {
         use crate::bluetooth::aacp::AudioSourceType::Media;
         let expired = now >= self.connect_until?;
@@ -1612,7 +1638,18 @@ impl Handoff {
             && self.audio.as_ref().is_some_and(|a| {
                 a.mac == self.local || a.r#type != Media || self.relays.contains_key(&a.mac)
             });
-        if !expired && !gated && self.connect_take_allowed() {
+        if !expired
+            && !gated
+            && complete
+            && let Some(category) = self.deferred_play
+        {
+            // A play edge deferred for these reports (#490): a playback take
+            // at its own category, if the policy allows it now.
+            Some(
+                self.decide_poll(Some(false), true, category).action == TakeoverAction::TakeOver
+                    && !self.ear_resumed(now),
+            )
+        } else if !expired && !gated && self.connect_take_allowed() {
             Some(true)
         } else if expired || gated || complete {
             Some(false)
@@ -1636,6 +1673,7 @@ impl Handoff {
 
     fn decide_connect(&mut self, now: Instant, take: bool, out: &mut Vec<Command>) {
         self.connect_until = None;
+        let deferred = self.deferred_play.take().is_some();
         // Linux played in the wait (#452): no later first sample resumes.
         let played = self.was_playing == Some(true);
         if take && self.owner.as_deref() == Some(&[1]) {
@@ -1660,6 +1698,9 @@ impl Handoff {
                 self.resume_if_idle(out);
             }
             self.say("AUTO connected; Linux already owns the AirPods, keeping them");
+        } else if take && deferred {
+            self.request(now, true, Cause::Playback, out);
+            self.say("AUTO playback started; requested Linux ownership");
         } else if take {
             self.connect_take(now, out);
             // Its ACK resumes.
@@ -6889,6 +6930,130 @@ mod tests {
             p.feed(50, Input::Ownership(vec![1])),
             [RouteToAirPods, ResumeA2dp]
         );
+    }
+
+    // #490: a play edge skipped only for a report not yet in waits for it.
+
+    const PLAYBACK_TAKE: &str = "AUTO playback started; requested Linux ownership";
+
+    /// `waiting_start` with an idle first sample at 30 ms and a play edge
+    /// at `category` at 60 ms, before any report: nothing is sent and the
+    /// wait stays open.
+    fn deferred_edge(category: u32) -> Probe {
+        let mut p = waiting_start(false);
+        assert_eq!(p.play(30, false), []);
+        assert_eq!(p.play_category(60, category), []);
+        assert!(p.core.connect_until.is_some());
+        p
+    }
+
+    #[test]
+    fn connect_window_edge_before_the_reports_takes_once_they_land() {
+        let mut p = deferred_edge(STREAM);
+        hosts_and_ears(&mut p);
+        assert_eq!(
+            p.feed(120, Input::AudioSource(idle())),
+            [SendOwnership(true)]
+        );
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, CONNECT_TAKE), 0);
+        assert_eq!(count_lines(&lines, PLAYBACK_TAKE), 1);
+        // A playback take: its ACK routes and resumes.
+        assert_eq!(
+            p.feed(200, Input::Ownership(vec![1])),
+            [RouteToAirPods, ResumeA2dp]
+        );
+        assert_eq!(p.feed(10 + WINDOW_MS, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), PLAYBACK_TAKE), 0);
+    }
+
+    #[test]
+    fn connect_window_deferred_edge_skips_a_higher_remote_relay() {
+        let mut p = deferred_edge(STREAM);
+        hosts_and_ears(&mut p);
+        assert_eq!(p.feed(120, remote_source(AudioSourceType::Media)), []);
+        // Auto's release, untracked with the owner unknown (#289).
+        assert_eq!(p.feed(130, relay(REMOTE, MEDIA)), [SendOwnership(false)]);
+        assert!(p.core.pending.is_none());
+        assert_eq!(p.feed(10 + WINDOW_MS, Input::Tick), []);
+        assert_eq!(count_lines(&p.core.take_lines(), PLAYBACK_TAKE), 0);
+        // A cached [1]: the release is tracked.
+        let mut p = Probe::new(false, true);
+        assert_eq!(p.feed(0, Input::Ownership(vec![1])), []);
+        p.feed(10, Input::Auto);
+        assert_eq!(p.play(30, false), []);
+        assert_eq!(p.play(60, true), []);
+        hosts_and_ears(&mut p);
+        assert_eq!(p.feed(120, remote_source(AudioSourceType::Media)), []);
+        assert_eq!(p.feed(130, relay(REMOTE, MEDIA)), [SendOwnership(false)]);
+        assert!(p.core.pending.is_some());
+    }
+
+    #[test]
+    fn connect_window_deferred_edge_decides_at_its_own_category() {
+        // Deferred for the hosts; a connect take at 100 would skip the
+        // relayed 201.
+        let mut p = deferred_edge(MEDIA);
+        assert_eq!(p.feed(100, Input::EarState(vec![InEar, InEar])), []);
+        assert_eq!(p.feed(110, remote_source(AudioSourceType::Media)), []);
+        assert_eq!(p.feed(120, relay(REMOTE, STREAM)), []);
+        let hosts = Input::ConnectedDevices {
+            old: Vec::new(),
+            new: two_hosts(),
+        };
+        assert_eq!(p.feed(130, hosts), [Announce, SendOwnership(true)]);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, CONNECT_TAKE), 0);
+        assert_eq!(count_lines(&lines, PLAYBACK_TAKE), 1);
+    }
+
+    #[test]
+    fn connect_window_deferred_edge_releases_at_the_deadline() {
+        let mut p = deferred_edge(STREAM);
+        hosts_and_ears(&mut p);
+        assert_eq!(p.feed(10 + WINDOW_MS - 1, Input::Tick), []);
+        assert_eq!(p.feed(10 + WINDOW_MS, Input::Tick), [SendOwnership(false)]);
+        assert_eq!(p.feed(10 + WINDOW_MS + 1, Input::AudioSource(idle())), []);
+        assert_eq!(count_lines(&p.core.take_lines(), PLAYBACK_TAKE), 0);
+    }
+
+    #[test]
+    fn connect_window_deferred_edge_dropped_when_linux_stops() {
+        // As with no edge: the idle connect take, its resume deferred.
+        let mut p = deferred_edge(STREAM);
+        assert_eq!(p.play(90, false), []);
+        hosts_and_ears(&mut p);
+        assert_eq!(
+            p.feed(120, Input::AudioSource(idle())),
+            [SendOwnership(true)]
+        );
+        assert!(p.core.resume_deferred);
+        let lines = p.core.take_lines();
+        assert_eq!(count_lines(&lines, CONNECT_TAKE), 1);
+        assert_eq!(count_lines(&lines, PLAYBACK_TAKE), 0);
+    }
+
+    #[test]
+    fn connect_window_edge_skipped_on_reported_state_ends_the_wait() {
+        // Both buds reported out.
+        let mut p = waiting_start(false);
+        unworn_remote_media(&mut p);
+        assert_eq!(p.play_category(150, MEDIA), [SendOwnership(false)]);
+        // Only Linux listed.
+        let mut p = waiting_start(false);
+        let local = Input::ConnectedDevices {
+            old: Vec::new(),
+            new: vec![host(LOCAL)],
+        };
+        assert_eq!(p.feed(100, local), []);
+        assert_eq!(p.play(130, false), []);
+        assert_eq!(p.play(150, true), [SendOwnership(false)]);
+        // A remote Media source with no relay, its derived 301 above 201.
+        let mut p = waiting_start(false);
+        hosts_and_ears(&mut p);
+        assert_eq!(p.feed(120, remote_source(AudioSourceType::Media)), []);
+        assert_eq!(p.play(130, false), []);
+        assert_eq!(p.play(150, true), [SendOwnership(false)]);
     }
 
     /// A #307 reconnect at the aggregate 301 for a play that asked at
