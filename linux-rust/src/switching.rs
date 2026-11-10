@@ -77,6 +77,9 @@ pub(crate) struct PlaybackSamples {
     /// The stream monitor's state, read at `Command::PauseMedia` (#302) and
     /// `Command::ResumeA2dp` (#330), with its counting streams' starts (#96).
     streams: watch::Receiver<(PlaybackState, Starts)>,
+    /// The latest completed MPRIS sample's Playing players with their
+    /// resolved owners, read at `Command::ResumeA2dp` (#351).
+    players: Arc<StdMutex<Vec<(String, Option<u32>)>>>,
 }
 
 impl PlaybackSamples {
@@ -130,6 +133,14 @@ impl PlaybackSamples {
     pub(crate) fn streams(&self) -> PlaybackState {
         self.streams.borrow().0.clone()
     }
+
+    /// The poller's latest MPRIS sample, for `Command::ResumeA2dp` (#351).
+    fn players(&self) -> Vec<(String, Option<u32>)> {
+        self.players
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// The media side effects the handoff core can ask for, injected so tests
@@ -146,11 +157,13 @@ pub(crate) trait MediaActions: Send + Sync {
     /// kick or profile cycle whose Play can't be due before `until`. It
     /// first waits for the default sink routes enqueued before it; a cancel
     /// or `until` during that wait ends it with no action. Its players are
-    /// those Playing at the take that `streams`, the stream monitor's state
+    /// those Playing at the take, read then or in `players` (the poller's
+    /// latest MPRIS sample, #351), that `streams`, the stream monitor's state
     /// then, says play locally (#361).
     fn resume_a2dp(
         &self,
         streams: PlaybackState,
+        players: Vec<(String, Option<u32>)>,
         until: Instant,
         cancel: oneshot::Receiver<()>,
     ) -> BoxFuture<'static, ()>;
@@ -232,6 +245,7 @@ impl MediaActions for ControllerMedia {
     fn resume_a2dp(
         &self,
         streams: PlaybackState,
+        players: Vec<(String, Option<u32>)>,
         until: Instant,
         cancel: oneshot::Receiver<()>,
     ) -> BoxFuture<'static, ()> {
@@ -240,6 +254,7 @@ impl MediaActions for ControllerMedia {
         Box::pin(a2dp_resume::run(
             self.controller.clone(),
             streams,
+            players,
             until,
             cancel,
             routed,
@@ -315,9 +330,10 @@ pub(crate) fn spawn_playback_poller() -> PlaybackSamples {
 /// never holds up the MPRIS samples. Only edges reach the handoff core
 /// (`Input::Playback`), which keeps every takeover decision;
 /// `PlaybackSamples::handle` re-baselines the stream monitor when the core
-/// resets its baseline (#90). `mpris` gives the Playing players' resolved
-/// owners (`media_controller::player_owner`), and `live` is whether one of
-/// them owns a live stream (#329).
+/// resets its baseline (#90). `mpris` gives the Playing players with their
+/// resolved owners (`media_controller::player_owner`), kept as the latest
+/// sample for `PlaybackSamples::players` (#351), and `live` is whether one
+/// of them owns a live stream (#329).
 fn spawn_playback_poller_with<M, S, P>(
     mpris: M,
     streams: S,
@@ -327,7 +343,7 @@ fn spawn_playback_poller_with<M, S, P>(
     observed: impl Fn(Instant) + Send + Sync + 'static,
 ) -> PlaybackSamples
 where
-    M: Fn() -> Vec<Option<u32>> + Send + Sync + 'static,
+    M: Fn() -> Vec<(String, Option<u32>)> + Send + Sync + 'static,
     S: PlaybackSource + 'static,
     P: PeakSource + 'static,
 {
@@ -343,6 +359,8 @@ where
     );
     let mpris = Arc::new(mpris);
     let samples = streams.clone();
+    let players = Arc::new(StdMutex::new(Vec::new()));
+    let latest = players.clone();
     tokio::spawn(async move {
         let mut last = None;
         loop {
@@ -351,7 +369,9 @@ where
             // stream monitor published before that reset.
             let sampled_at = Instant::now();
             let mpris = mpris.clone();
-            let owners = blocking(move || mpris()).await;
+            let playing = blocking(move || mpris()).await;
+            let owners: Vec<_> = playing.iter().map(|&(_, owner)| owner).collect();
+            *latest.lock().unwrap_or_else(|e| e.into_inner()) = playing;
             let (category, new_source) = sample_sources(&owners, &samples.borrow(), &mut last);
             if play_tx
                 .send((sampled_at, category, new_source))
@@ -367,6 +387,7 @@ where
         rx,
         rebaseline,
         streams,
+        players,
     }
 }
 
@@ -848,9 +869,11 @@ impl Shell {
                     self.resume = Some(cancel);
                     // The core opened its hold window at `now`.
                     let until = now + a2dp_resume::A2DP_RESUME_WINDOW;
-                    // Now: a player's stream may cork at the route (#330).
+                    // Now: a player's stream may cork at the route (#330),
+                    // and a player may pause itself after it (#351).
                     let streams = self.play_rx.streams();
-                    tokio::spawn(self.media.resume_a2dp(streams, until, cancelled));
+                    let players = self.play_rx.players();
+                    tokio::spawn(self.media.resume_a2dp(streams, players, until, cancelled));
                 }
                 Command::RouteToAirPods => self.media.route_default_sink(SinkEvent::Take),
                 Command::RouteAway => self.media.route_default_sink(SinkEvent::Yield),
@@ -1542,6 +1565,8 @@ mod tests {
         routes: StdMutex<Vec<SinkEvent>>,
         /// `routes.len()` at each resume chain spawn (#264).
         resume_spawns: StdMutex<Vec<usize>>,
+        /// The players given to each resume chain spawn (#351).
+        resume_players: StdMutex<Vec<Vec<(String, Option<u32>)>>>,
         /// While set, `hold_settled` waits for one `gate` permit (#294).
         gated: AtomicBool,
         gate: Notify,
@@ -1573,17 +1598,24 @@ mod tests {
         fn resume_a2dp(
             &self,
             streams: PlaybackState,
+            players: Vec<(String, Option<u32>)>,
             until: Instant,
             cancel: oneshot::Receiver<()>,
         ) -> BoxFuture<'static, ()> {
             let routed = self.records.routes.lock().unwrap().len();
             self.records.resume_spawns.lock().unwrap().push(routed);
+            self.records
+                .resume_players
+                .lock()
+                .unwrap()
+                .push(players.clone());
             let io = FakeResume {
                 mac: self.mac.clone(),
             };
             Box::pin(a2dp_resume::run(
                 io,
                 streams,
+                players,
                 until,
                 cancel,
                 std::future::ready(()),
@@ -1892,6 +1924,7 @@ mod tests {
             (play_tx, move || PlaybackSamples {
                 rx: play_rx,
                 rebaseline: Default::default(),
+                players: Default::default(),
                 streams: watch::channel(Default::default()).1,
             })
         }
@@ -1968,7 +2001,7 @@ mod tests {
             min_stream: Duration,
         ) -> Self
         where
-            M: Fn() -> Vec<Option<u32>> + Send + Sync + 'static,
+            M: Fn() -> Vec<(String, Option<u32>)> + Send + Sync + 'static,
             S: PlaybackSource + 'static,
         {
             let (records, media) = Self::fake_media(mac);
@@ -2571,6 +2604,7 @@ mod tests {
             move || PlaybackSamples {
                 rx: play_rx,
                 rebaseline: Default::default(),
+                players: Default::default(),
                 streams: watch::channel(Default::default()).1,
             },
             move |_: &str| call_rx,
@@ -3570,6 +3604,7 @@ mod tests {
             (play_tx, move || PlaybackSamples {
                 rx: play_rx,
                 rebaseline: Default::default(),
+                players: Default::default(),
                 streams,
             }),
             ConnectMode::default(),
@@ -4124,6 +4159,12 @@ mod tests {
         playing.then_some(Some(PLAYER_PID)).into_iter().collect()
     }
 
+    /// `player` with the player's name, as the poller's MPRIS source gives it.
+    fn named_player(playing: bool) -> Vec<(String, Option<u32>)> {
+        let owners = player(playing).into_iter();
+        owners.map(|owner| (PLAYER.to_string(), owner)).collect()
+    }
+
     fn sink_input(index: u32, role: &str) -> StreamProps {
         StreamProps {
             direction: StreamDirection::Playback,
@@ -4180,7 +4221,7 @@ mod tests {
         let streams = LiveStreams::default();
         streams.set(vec![music(1)]);
         let mut rx = spawn_playback_poller_with(
-            move || player(reads.load(Ordering::SeqCst)),
+            move || named_player(reads.load(Ordering::SeqCst)),
             streams,
             AllAudible,
             STREAM_TEST_MIN,
@@ -4232,7 +4273,7 @@ mod tests {
         let mpris = Arc::new(AtomicBool::new(false));
         let reads = mpris.clone();
         let mut rx = spawn_playback_poller_with(
-            move || player(reads.load(Ordering::SeqCst)),
+            move || named_player(reads.load(Ordering::SeqCst)),
             StalledStreams(stalled),
             AllAudible,
             STREAM_TEST_MIN,
@@ -4486,6 +4527,7 @@ mod tests {
         let samples = PlaybackSamples {
             rx: mpsc::channel(1).1,
             rebaseline: rx.rebaseline.clone(),
+            players: Default::default(),
             streams: rx.streams.clone(),
         };
         let (reset_tx, reset) = oneshot::channel();
@@ -4765,6 +4807,54 @@ mod tests {
         stop_handoff_task(mac);
     }
 
+    /// #351: the take's resume chain gets the players of the poller's MPRIS
+    /// sample before the take, without waiting for the read still running
+    /// at the ACK: every read from the take on takes 5 s.
+    #[tokio::test]
+    async fn take_resume_gets_the_sampled_players_during_a_slow_mpris_read() {
+        let mac = "5A:00:00:00:03:51";
+        let (manager, mut rx, _tx) = no_source_session().await;
+        let (slow, running) = (Arc::new(AtomicBool::new(false)), Arc::default());
+        // Dropped at the test's end, which ends a slow read at once.
+        let (_release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = StdMutex::new(gate);
+        let mpris = {
+            let (slow, running): (_, Arc<AtomicBool>) = (slow.clone(), Arc::clone(&running));
+            move || {
+                if slow.load(Ordering::SeqCst) {
+                    running.store(true, Ordering::SeqCst);
+                    let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                    running.store(false, Ordering::SeqCst);
+                }
+                named_player(true)
+            }
+        };
+        let streams = LiveStreams::default();
+        let h =
+            Harness::start_streams(mac, &manager, mpris, streams.clone(), STREAM_TEST_MIN).await;
+        expect_startup(&h, &mut rx).await;
+        h.emit_queued(owns(0)).await;
+        h.a2dp(false).await;
+        streams.settle().await;
+        // The player's own stream goes live: a take.
+        streams.set(vec![music(51)]);
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        slow.store(true, Ordering::SeqCst);
+        wait_until("a slow MPRIS read", || running.load(Ordering::SeqCst)).await;
+
+        h.emit(owns(1));
+        let spawns = || h.records.resume_spawns.lock().unwrap().clone();
+        wait_until("the resume chain's spawn", || !spawns().is_empty()).await;
+        assert!(running.load(Ordering::SeqCst), "the slow read ended first");
+        let resumed = h.records.resume_players.lock().unwrap().clone();
+        assert_eq!(resumed, [named_player(true)]);
+        // The take's route was enqueued before the spawn.
+        let routes = h.sink_events();
+        assert_eq!(routes.last(), Some(&SinkEvent::Take));
+        assert_eq!(spawns(), [routes.len()]);
+        stop_handoff_task(mac);
+    }
+
     #[tokio::test]
     async fn handoff_event_sound_stream_never_takes() {
         let mac = "5A:00:00:00:00:0E";
@@ -4889,7 +4979,7 @@ mod tests {
         let reads = mpris.clone();
         let streams = LiveStreams::default();
         let mut rx = spawn_playback_poller_with(
-            move || player(reads.load(Ordering::SeqCst)),
+            move || named_player(reads.load(Ordering::SeqCst)),
             streams.clone(),
             AllAudible,
             STREAM_TEST_MIN,
@@ -4919,7 +5009,7 @@ mod tests {
     async fn playback_poller_mpris_without_live_stream_is_idle() {
         let streams = LiveStreams::default();
         let mut rx = spawn_playback_poller_with(
-            || player(true),
+            || named_player(true),
             streams.clone(),
             AllAudible,
             STREAM_TEST_MIN,
@@ -4940,7 +5030,7 @@ mod tests {
     async fn playback_poller_mpris_with_other_process_stream_is_not_media() {
         let streams = LiveStreams::default();
         let mut rx = spawn_playback_poller_with(
-            || player(true),
+            || named_player(true),
             streams.clone(),
             AllAudible,
             STREAM_TEST_MIN,
@@ -5021,7 +5111,7 @@ mod tests {
         let h = Harness::start_streams(
             mac,
             &manager,
-            move || player(reads.load(Ordering::SeqCst)),
+            move || named_player(reads.load(Ordering::SeqCst)),
             streams.clone(),
             STREAM_TEST_MIN,
         )
@@ -5960,7 +6050,7 @@ mod tests {
                 let reads = mpris.clone();
                 let streams = LiveStreams::default();
                 let mut rx = spawn_playback_poller_with(
-                    move || player(reads.load(Ordering::SeqCst)),
+                    move || named_player(reads.load(Ordering::SeqCst)),
                     streams.clone(),
                     AllAudible,
                     STREAM_TEST_MIN,
@@ -6594,6 +6684,7 @@ mod tests {
         (play_tx, move || PlaybackSamples {
             rx: play_rx,
             rebaseline: Default::default(),
+            players: Default::default(),
             streams,
         })
     }
@@ -6779,10 +6870,11 @@ mod tests {
         fn resume_a2dp(
             &self,
             streams: PlaybackState,
+            players: Vec<(String, Option<u32>)>,
             until: Instant,
             cancel: oneshot::Receiver<()>,
         ) -> BoxFuture<'static, ()> {
-            self.fake.resume_a2dp(streams, until, cancel)
+            self.fake.resume_a2dp(streams, players, until, cancel)
         }
 
         fn route_default_sink(&self, event: SinkEvent) {
