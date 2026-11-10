@@ -169,6 +169,24 @@ fn with_connect_mode(
     mac: &str,
     mode: ConnectMode,
 ) -> Option<serde_json::Value> {
+    with_device_key(prefs, mac, "connectMode", serde_json::json!(mode))
+}
+
+/// `with_connect_mode` for `[mac].takeBackAfterCall` (#14).
+fn with_take_back_after_call(
+    prefs: Option<&str>,
+    mac: &str,
+    on: bool,
+) -> Option<serde_json::Value> {
+    with_device_key(prefs, mac, "takeBackAfterCall", serde_json::json!(on))
+}
+
+fn with_device_key(
+    prefs: Option<&str>,
+    mac: &str,
+    key: &str,
+    value: serde_json::Value,
+) -> Option<serde_json::Value> {
     let mut root = match prefs {
         Some(content) => serde_json::from_str(content).ok()?,
         None => serde_json::json!({}),
@@ -177,7 +195,7 @@ fn with_connect_mode(
         .entry(mac)
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()?
-        .insert("connectMode".to_string(), serde_json::json!(mode));
+        .insert(key.to_string(), value);
     Some(root)
 }
 
@@ -185,7 +203,7 @@ fn with_connect_mode(
 enum SaveError {
     /// Reading preferences.json or `write_settings_file` failed.
     Io(std::io::Error),
-    /// `with_connect_mode` refused: preferences.json isn't a JSON object with an object per device.
+    /// A preferences writer (`with_connect_mode`, `with_take_back_after_call`) refused: preferences.json isn't a JSON object with an object per device.
     NotSettingsJson,
 }
 
@@ -304,9 +322,11 @@ pub struct App {
     /// Each AirPods' "Connect to this computer" (#16), read from
     /// preferences.json when the device connects.
     connect_modes: HashMap<String, ConnectMode>,
+    /// Each AirPods' `takeBackAfterCall` (#14), read with `connect_modes`.
+    take_back_after_call: HashMap<String, bool>,
     /// Switching mode as of the last AirPods connection, for the picker's hint.
     switching_mode: crate::utils::SwitchingMode,
-    /// "Couldn't save" status per tab (Settings, or Device(mac) for connectMode),
+    /// "Couldn't save" status per tab (Settings, or Device(mac) for per-device preferences),
     /// set and cleared only through `apply_save_result`.
     save_statuses: HashMap<Tab, String>,
 }
@@ -343,6 +363,7 @@ pub enum Message {
     StemControlChanged(bool),
     PreferredCodecChanged(PreferredCodec),
     ConnectModeChanged(String, ConnectMode), // AirPods MAC
+    TakeBackAfterCallChanged(String, bool),  // AirPods MAC
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -455,6 +476,7 @@ impl App {
                 stem_control,
                 preferred_codec,
                 connect_modes: HashMap::new(),
+                take_back_after_call: HashMap::new(),
                 switching_mode: crate::utils::SwitchingMode::default(),
                 save_statuses: HashMap::new(),
             },
@@ -489,6 +511,53 @@ impl App {
             Tab::Settings,
             result.map_err(SaveError::Io),
         );
+    }
+
+    /// Writes preferences.json as `write` makes it from the current file (None:
+    /// none yet), logging `key`, and records the outcome on the device's tab.
+    /// True when written.
+    fn save_device_pref(
+        &mut self,
+        mac: &str,
+        key: &str,
+        write: impl FnOnce(Option<&str>) -> Option<serde_json::Value>,
+    ) -> bool {
+        let path = get_preferences_path();
+        let scope = Tab::Device(mac.to_string());
+        // Only a missing file counts as empty: any other read error
+        // must not replace the user's preferences.
+        let current = match std::fs::read_to_string(&path) {
+            Ok(content) => Some(content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                error!("Not saving {key}: failed to read {}: {}", path.display(), e);
+                apply_save_result(&mut self.save_statuses, scope, Err(SaveError::Io(e)));
+                return false;
+            }
+        };
+        let Some(prefs) = write(current.as_deref()) else {
+            error!(
+                "Not saving {key}: {} is not a JSON object with an object per device",
+                path.display()
+            );
+            apply_save_result(
+                &mut self.save_statuses,
+                scope,
+                Err(SaveError::NotSettingsJson),
+            );
+            return false;
+        };
+        let result = write_settings_file(&path, &format!("{prefs:#}"));
+        if let Err(e) = &result {
+            error!("Failed to write {}: {}", path.display(), e);
+        }
+        let written = result.is_ok();
+        apply_save_result(
+            &mut self.save_statuses,
+            scope,
+            result.map_err(SaveError::Io),
+        );
+        written
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -612,6 +681,10 @@ impl App {
                                 };
                                 self.connect_modes
                                     .insert(mac.clone(), crate::utils::load_connect_mode(&mac));
+                                self.take_back_after_call.insert(
+                                    mac.clone(),
+                                    crate::utils::load_take_back_after_call(&mac),
+                                );
                                 self.switching_mode = crate::utils::load_switching_mode();
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
@@ -908,48 +981,20 @@ impl App {
                 Task::none()
             }
             Message::ConnectModeChanged(mac, mode) => {
-                let path = get_preferences_path();
-                let scope = Tab::Device(mac.clone());
-                // Only a missing file counts as empty: any other read error
-                // must not replace the user's preferences.
-                let current = match std::fs::read_to_string(&path) {
-                    Ok(content) => Some(content),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => {
-                        error!(
-                            "Not saving connectMode: failed to read {}: {}",
-                            path.display(),
-                            e
-                        );
-                        apply_save_result(&mut self.save_statuses, scope, Err(SaveError::Io(e)));
-                        return Task::none();
-                    }
-                };
-                let Some(prefs) = with_connect_mode(current.as_deref(), &mac, mode) else {
-                    error!(
-                        "Not saving connectMode: {} is not a JSON object with an object per device",
-                        path.display()
-                    );
-                    apply_save_result(
-                        &mut self.save_statuses,
-                        scope,
-                        Err(SaveError::NotSettingsJson),
-                    );
-                    return Task::none();
-                };
-                let result = write_settings_file(&path, &format!("{prefs:#}"));
-                match &result {
-                    Ok(()) => {
-                        crate::switching::set_connect_mode(&mac, mode);
-                        self.connect_modes.insert(mac, mode);
-                    }
-                    Err(e) => error!("Failed to write {}: {}", path.display(), e),
+                if self.save_device_pref(&mac, "connectMode", |p| with_connect_mode(p, &mac, mode))
+                {
+                    crate::switching::set_connect_mode(&mac, mode);
+                    self.connect_modes.insert(mac, mode);
                 }
-                apply_save_result(
-                    &mut self.save_statuses,
-                    scope,
-                    result.map_err(SaveError::Io),
-                );
+                Task::none()
+            }
+            Message::TakeBackAfterCallChanged(mac, on) => {
+                // The handoff core reads it at its next session (#14).
+                if self.save_device_pref(&mac, "takeBackAfterCall", |p| {
+                    with_take_back_after_call(p, &mac, on)
+                }) {
+                    self.take_back_after_call.insert(mac, on);
+                }
                 Task::none()
             }
             Message::StemControlChanged(is_enabled) => {
@@ -1159,6 +1204,15 @@ impl App {
                                                                         Some(self.connect_modes.get(id).copied().unwrap_or_default()),
                                                                         move |mode| Message::ConnectModeChanged(id.clone(), mode),
                                                                     )
+                                                                ]
+                                                                    .align_y(Center)
+                                                                    .spacing(12),
+                                                                row![
+                                                                    text("Take back after a call on another device").size(16).width(Length::Fill),
+                                                                    toggler(self.take_back_after_call.get(id).copied().unwrap_or(false))
+                                                                        .on_toggle(move |on| Message::TakeBackAfterCallChanged(id.clone(), on))
+                                                                        .spacing(0)
+                                                                        .size(20)
                                                                 ]
                                                                     .align_y(Center)
                                                                     .spacing(12),
@@ -2261,6 +2315,78 @@ mod tests {
                 assert_eq!(
                     crate::utils::parse_connect_mode(&format!("{written:#}"), MAC),
                     mode
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn take_back_after_call_write_preserves_other_keys() {
+        let prefs = r#"{"switching":"legacy","exportBattery":false,
+            "AA:BB:CC:DD:EE:FF":{"autoConnect":false,"connectMode":"when_last_connected"},
+            "11:22:33:44:55:66":{"takeBackAfterCall":true}}"#;
+        assert_eq!(
+            with_take_back_after_call(Some(prefs), MAC, true),
+            Some(serde_json::json!({
+                "switching": "legacy",
+                "exportBattery": false,
+                MAC: {"autoConnect": false, "connectMode": "when_last_connected", "takeBackAfterCall": true},
+                "11:22:33:44:55:66": {"takeBackAfterCall": true},
+            }))
+        );
+        // A device without an entry gets one; an existing value is replaced.
+        assert_eq!(
+            with_take_back_after_call(Some(r#"{"switching":"off"}"#), MAC, true),
+            Some(serde_json::json!({"switching": "off", MAC: {"takeBackAfterCall": true}}))
+        );
+        assert_eq!(
+            with_take_back_after_call(
+                Some(r#"{"AA:BB:CC:DD:EE:FF":{"takeBackAfterCall":true}}"#),
+                MAC,
+                false
+            ),
+            Some(serde_json::json!({MAC: {"takeBackAfterCall": false}}))
+        );
+        assert_eq!(
+            with_take_back_after_call(None, MAC, true),
+            Some(serde_json::json!({MAC: {"takeBackAfterCall": true}}))
+        );
+    }
+
+    #[test]
+    fn take_back_after_call_write_refuses_invalid_file() {
+        for prefs in [
+            "",
+            "not json",
+            "[]",
+            "3",
+            "null",
+            r#"{"AA:BB:CC:DD:EE:FF":3}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":null}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":"off"}"#,
+        ] {
+            assert_eq!(
+                with_take_back_after_call(Some(prefs), MAC, true),
+                None,
+                "{prefs}"
+            );
+        }
+    }
+
+    #[test]
+    fn take_back_after_call_round_trips() {
+        for on in [true, false] {
+            for prefs in [None, Some(r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":true}}"#)] {
+                let written = with_take_back_after_call(prefs, MAC, on).unwrap();
+                assert_eq!(
+                    crate::utils::take_back_after_call_from_value(Some(&written), MAC),
+                    on
+                );
+                // Through the text the arm writes, too.
+                let text = serde_json::from_str(&format!("{written:#}")).ok();
+                assert_eq!(
+                    crate::utils::take_back_after_call_from_value(text.as_ref(), MAC),
+                    on
                 );
             }
         }

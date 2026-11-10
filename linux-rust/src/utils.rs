@@ -251,6 +251,23 @@ pub fn load_connect_mode(mac: &str) -> ConnectMode {
         .unwrap_or_default()
 }
 
+/// Reads a device's `takeBackAfterCall` (#14) from already-parsed
+/// preferences: only a bool counts, anything else gives the default (off).
+pub fn take_back_after_call_from_value(preferences: Option<&serde_json::Value>, mac: &str) -> bool {
+    preferences
+        .and_then(|p| p.get(mac))
+        .and_then(|device| device.get("takeBackAfterCall"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Reads a device's `takeBackAfterCall` from preferences.json, defaulting to
+/// off.
+pub fn load_take_back_after_call(mac: &str) -> bool {
+    let prefs = std::fs::read_to_string(get_preferences_path()).unwrap_or_default();
+    take_back_after_call_from_value(serde_json::from_str(&prefs).ok().as_ref(), mac)
+}
+
 /// Reads the top-level `exportBattery` (export the AirPods battery to BlueZ,
 /// see battery_provider.rs) from already-parsed preferences. Missing
 /// preferences, a missing key or null give the default (true); a bool is used
@@ -542,6 +559,50 @@ mod tests {
         let prefs = r#"{"AA:BB:CC:DD:EE:FF":{"autoConnect":false},"11:22:33:44:55:66":{"autoConnect":true}}"#;
         assert!(!parse_auto_connect(prefs, "AA:BB:CC:DD:EE:FF"));
         assert!(parse_auto_connect(prefs, "11:22:33:44:55:66"));
+    }
+
+    #[test]
+    fn take_back_after_call_defaults_off() {
+        let mac = "AA:BB:CC:DD:EE:FF";
+        assert!(!take_back_after_call_from_value(None, mac));
+        for prefs in [
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!("garbage"),
+            serde_json::json!({mac: "on"}),
+            serde_json::json!({mac: {}}),
+            serde_json::json!({mac: {"takeBackAfterCall": null}}),
+            serde_json::json!({mac: {"takeBackAfterCall": "true"}}),
+            serde_json::json!({mac: {"takeBackAfterCall": 1}}),
+            serde_json::json!({mac: {"takeBackAfterCall": [true]}}),
+            serde_json::json!({"takeBackAfterCall": true}),
+        ] {
+            assert!(
+                !take_back_after_call_from_value(Some(&prefs), mac),
+                "{prefs}"
+            );
+        }
+    }
+
+    #[test]
+    fn take_back_after_call_reads_each_device() {
+        let prefs = serde_json::json!({
+            "switching": "handoff",
+            "AA:BB:CC:DD:EE:FF": {"takeBackAfterCall": true, "connectMode": "when_last_connected"},
+            "11:22:33:44:55:66": {"takeBackAfterCall": false},
+        });
+        assert!(take_back_after_call_from_value(
+            Some(&prefs),
+            "AA:BB:CC:DD:EE:FF"
+        ));
+        assert!(!take_back_after_call_from_value(
+            Some(&prefs),
+            "11:22:33:44:55:66"
+        ));
+        assert!(!take_back_after_call_from_value(
+            Some(&prefs),
+            "77:88:99:AA:BB:CC"
+        ));
     }
 
     #[test]

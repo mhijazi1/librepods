@@ -75,6 +75,7 @@ impl Handoff {
                 // Another host took the AirPods from a take Linux made or
                 // was making: yield once and forget the take.
                 None if self.requested_take => {
+                    self.take_back.yielded(now);
                     self.yield_take(out);
                     return;
                 }
