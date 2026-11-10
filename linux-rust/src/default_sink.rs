@@ -405,7 +405,7 @@ async fn unload_leftover_park(io: &impl DefaultSinkIo, shared: &SharedPark) {
 }
 
 /// One event; returns the new memory, which is empty unless every action
-/// succeeded, so a failed take or restore remembers nothing.
+/// was applied, so a failed take or restore remembers nothing.
 async fn apply(
     io: &impl DefaultSinkIo,
     remembered: Option<String>,
