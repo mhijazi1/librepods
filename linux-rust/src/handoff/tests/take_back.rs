@@ -15,13 +15,24 @@ fn window() -> u64 {
 /// doesn't matter.
 const END: u64 = 30_000;
 
-/// `acked_auto_take` (Linux owns, playing at 1000 ms) with the setting
-/// `on`; then #179: REMOTE asks at 1100 and Linux yields, the release's ACK
-/// [0] at 1200, the pause's stop sample at 1300, and REMOTE relays the call
-/// (501) at 2100.
+/// Turn the setting on through the builder `run_handoff` uses.
+fn enable(p: &mut Probe) {
+    let core = std::mem::replace(
+        &mut p.core,
+        Handoff::new(LOCAL.to_string(), p.t0, false, false),
+    );
+    p.core = core.with_take_back_after_call(true);
+}
+
+/// `acked_auto_take` (Linux owns, playing at 1000 ms), with the setting on
+/// if `on` (else left at its default); then #179: REMOTE asks at 1100 and
+/// Linux yields, the release's ACK [0] at 1200, the pause's stop sample at
+/// 1300, and REMOTE relays the call (501) at 2100.
 fn remote_call(on: bool) -> Probe {
     let mut p = acked_auto_take();
-    p.core.take_back.enabled = on;
+    if on {
+        enable(&mut p);
+    }
     assert_eq!(
         p.feed(1100, Input::RemoteOwnershipRequest),
         [PauseMedia, SendOwnership(false)]
@@ -73,7 +84,7 @@ fn takes_back_once_when_the_call_ends() {
 #[test]
 fn takes_back_after_a_lost_take() {
     let mut p = acked_auto_take();
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     // The call takes the AirPods without asking: `yield_take`.
     assert_eq!(p.feed(1100, Input::Ownership(vec![0])), [PauseMedia]);
     assert_eq!(p.play(1300, false), []);
@@ -84,9 +95,24 @@ fn takes_back_after_a_lost_take() {
 }
 
 #[test]
+fn takes_back_after_yielding_a_pending_take() {
+    // Owner [0]: only the pending take makes the yield Linux's.
+    let mut p = Probe::ready();
+    enable(&mut p);
+    assert_eq!(p.play(500, true), [SendOwnership(true)]);
+    assert_eq!(
+        p.feed(600, Input::RemoteOwnershipRequest),
+        [PauseMedia, SendOwnership(false)]
+    );
+    assert_eq!(p.feed(700, Input::Ownership(vec![0])), []);
+    assert_eq!(p.feed(1500, relay(REMOTE, CALL)), []);
+    assert_eq!(p.feed(END, relay(REMOTE, IDLE)), [SendOwnership(true)]);
+}
+
+#[test]
 fn takes_back_when_the_call_relay_precedes_the_yield() {
     let mut p = acked_auto_take();
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     assert_eq!(p.feed(1100, relay(REMOTE, CALL)), []);
     // The window is inclusive.
     let ask = 1100 + window();
@@ -102,7 +128,7 @@ fn takes_back_when_the_call_relay_precedes_the_yield() {
 fn no_take_back_for_a_call_after_the_window() {
     // A call relayed just after the window, in either order.
     let mut p = acked_auto_take();
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     assert_eq!(
         p.feed(1100, Input::RemoteOwnershipRequest),
         [PauseMedia, SendOwnership(false)]
@@ -113,7 +139,7 @@ fn no_take_back_for_a_call_after_the_window() {
     no_take_until(&mut p, END, END + 2 * window());
 
     let mut p = acked_auto_take();
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     assert_eq!(p.feed(1100, relay(REMOTE, CALL)), []);
     let ask = 1100 + window() + 1;
     assert_eq!(
@@ -126,7 +152,7 @@ fn no_take_back_for_a_call_after_the_window() {
 
     // A call that ended before the yield took nothing from it.
     let mut p = acked_auto_take();
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     assert_eq!(p.feed(1100, relay(REMOTE, CALL)), []);
     assert_eq!(p.feed(1500, relay(REMOTE, IDLE)), []);
     assert_eq!(
@@ -142,14 +168,14 @@ fn no_take_back_for_a_call_after_the_window() {
 fn no_take_back_when_linux_did_not_own() {
     // Linux idle, REMOTE already owns ([0]), no take: nothing to yield.
     let mut p = Probe::ready();
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     assert_eq!(p.feed(100, relay(REMOTE, CALL)), []);
     assert_eq!(p.feed(END, relay(REMOTE, IDLE)), []);
     no_take_until(&mut p, END, END + 2 * window());
 
     // REMOTE asks anyway: "Linux already yielded" records nothing.
     let mut p = Probe::ready();
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     assert_eq!(p.feed(100, Input::RemoteOwnershipRequest), []);
     assert_eq!(
         p.core.take_lines(),
@@ -209,7 +235,7 @@ fn no_take_back_in_manual_mode_or_with_a_request_pending() {
 
     // The yield's release is still pending when the call ends.
     let mut p = acked_auto_take();
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     assert_eq!(
         p.feed(1100, Input::RemoteOwnershipRequest),
         [PauseMedia, SendOwnership(false)]
@@ -228,7 +254,7 @@ fn no_take_back_in_manual_mode_or_with_a_request_pending() {
 fn takes_back_in_when_last_connected_mode() {
     let mut p = acked_auto_take();
     p.core.connect_mode = WhenLastConnected;
-    p.core.take_back.enabled = true;
+    enable(&mut p);
     assert_eq!(
         p.feed(1100, Input::RemoteOwnershipRequest),
         [PauseMedia, SendOwnership(false)]

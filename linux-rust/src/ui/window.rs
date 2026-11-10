@@ -326,7 +326,7 @@ pub struct App {
     take_back_after_call: HashMap<String, bool>,
     /// Switching mode as of the last AirPods connection, for the picker's hint.
     switching_mode: crate::utils::SwitchingMode,
-    /// "Couldn't save" status per tab (Settings, or Device(mac) for connectMode),
+    /// "Couldn't save" status per tab (Settings, or Device(mac) for per-device preferences),
     /// set and cleared only through `apply_save_result`.
     save_statuses: HashMap<Tab, String>,
 }
