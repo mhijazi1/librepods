@@ -169,6 +169,8 @@ async fn undo_sends_the_take_then_the_reverse_packet() {
     .await;
     h.emit(owns(0));
     wait_until("the yield's pause", || h.pauses() == 1).await;
+    // The pause's stop: Linux is idle under REMOTE's media at the click.
+    h.play(false).await;
     assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
 
     h.undo_tx.send(()).expect("the task takes Undo clicks");

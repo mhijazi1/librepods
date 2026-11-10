@@ -641,6 +641,9 @@ fn yield_taker_unknown_with_two_remote_hosts() {
 #[test]
 fn undo_takes_back_and_relays_without_resume() {
     let mut p = yielded_to_remote();
+    // The yield's pause stops Linux: the remote media is above it, so only
+    // Undo's own guard lets this take through.
+    assert_eq!(p.play(850, false), []);
     p.core.take_lines();
     assert_eq!(
         p.feed(900, Input::Undo),
