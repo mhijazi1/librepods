@@ -10,11 +10,6 @@
     "max": 8,
     "dir": "../librepods-lanes",
     "cpus": "1-7,9-15",
-    "frozen": "paused by mo 2026-11-10",
-    "allow": [
-      351,
-      490
-    ],
     "cargo_target": true
   }
 }
