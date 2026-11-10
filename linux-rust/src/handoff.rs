@@ -49,6 +49,8 @@ const CONNECT_MODE_SKIP: &str =
     "AUTO takeover skipped: connect mode is when-last-connected and Linux was not the last owner";
 /// The connect take (#324).
 const CONNECT_TAKE: &str = "AUTO connected while the other host is idle; requested Linux ownership";
+/// A take for a Linux play edge.
+const PLAYBACK_TAKE: &str = "AUTO playback started; requested Linux ownership";
 /// How long after `Auto` its ownership decision waits for the routing
 /// reports the connect take needs, which land just after it on hardware
 /// (#452, spike #157).
@@ -997,7 +999,7 @@ impl Handoff {
                 TakeoverAction::TakeOver if self.ear_resumed(sampled_at) => self.say(EAR_RESUMED),
                 TakeoverAction::TakeOver => {
                     self.request(now, true, Cause::Playback, out);
-                    self.say("AUTO playback started; requested Linux ownership");
+                    self.say(PLAYBACK_TAKE);
                 }
                 TakeoverAction::Skip(TakeoverSkip::InitialState | TakeoverSkip::NoTransition) => {
                     // Linux keeps the AirPods idle, relaying 100 like the
@@ -1700,7 +1702,7 @@ impl Handoff {
             self.say("AUTO connected; Linux already owns the AirPods, keeping them");
         } else if take && deferred {
             self.request(now, true, Cause::Playback, out);
-            self.say("AUTO playback started; requested Linux ownership");
+            self.say(PLAYBACK_TAKE);
         } else if take {
             self.connect_take(now, out);
             // Its ACK resumes.
@@ -6934,8 +6936,6 @@ mod tests {
 
     // #490: a play edge skipped only for a report not yet in waits for it.
 
-    const PLAYBACK_TAKE: &str = "AUTO playback started; requested Linux ownership";
-
     /// `waiting_start` with an idle first sample at 30 ms and a play edge
     /// at `category` at 60 ms, before any report: nothing is sent and the
     /// wait stays open.
@@ -7089,6 +7089,17 @@ mod tests {
         let mut p = waiting_start(false);
         hosts_and_ears(&mut p);
         assert_eq!(p.feed(120, remote_source(AudioSourceType::Media)), []);
+        assert_eq!(p.play(130, false), []);
+        assert_eq!(p.play(150, true), [SendOwnership(false)]);
+        // A remote call reported, the ears not yet: AudioNotIdle on a
+        // reported source.
+        let mut p = waiting_start(false);
+        let hosts = Input::ConnectedDevices {
+            old: Vec::new(),
+            new: two_hosts(),
+        };
+        assert_eq!(p.feed(100, hosts), [Announce]);
+        assert_eq!(p.feed(120, remote_source(AudioSourceType::Call)), []);
         assert_eq!(p.play(130, false), []);
         assert_eq!(p.play(150, true), [SendOwnership(false)]);
     }
