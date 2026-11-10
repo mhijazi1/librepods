@@ -33,6 +33,7 @@ use crate::handoff::{Command, Handoff, Input, Park, SessionFacts};
 use crate::handoff_log;
 use crate::media_controller::{
     self, AUDIO_CATEGORY_IDLE, AUDIO_CATEGORY_MEDIA, AUDIO_CATEGORY_STREAM, MediaController,
+    blocking,
 };
 use crate::reconnect;
 use crate::stream_monitor::{
@@ -350,9 +351,7 @@ where
             // stream monitor published before that reset.
             let sampled_at = Instant::now();
             let mpris = mpris.clone();
-            let owners = tokio::task::spawn_blocking(move || mpris())
-                .await
-                .unwrap_or_default();
+            let owners = blocking(move || mpris()).await;
             let (category, new_source) = sample_sources(&owners, &samples.borrow(), &mut last);
             if play_tx
                 .send((sampled_at, category, new_source))

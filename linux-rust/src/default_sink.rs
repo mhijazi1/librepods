@@ -360,11 +360,7 @@ impl DefaultSinkIo for MediaController {
     }
 
     fn set_default(&self, name: String) -> BoxFuture<'static, bool> {
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || set_default_sink_sync(&name))
-                .await
-                .unwrap_or(false)
-        })
+        Box::pin(async move { blocking(move || set_default_sink_sync(&name)).await })
     }
 
     fn hold_a2dp(&self, hold: bool) -> BoxFuture<'static, ()> {

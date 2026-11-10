@@ -686,7 +686,7 @@ async fn connect_a2dp_profile(mac: String) -> Result<(), String> {
 
 /// One read of the AirPods card of `mac`, whole.
 async fn read_card(mac: String) -> Option<pulse::Card> {
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         get_card_info_list_sync().into_iter().find(|card| {
             card.device_string
                 .as_deref()
@@ -694,8 +694,6 @@ async fn read_card(mac: String) -> Option<pulse::Card> {
         })
     })
     .await
-    .ok()
-    .flatten()
 }
 
 /// A connect already under way (`InProgress`) or done (`AlreadyConnected`)
@@ -1033,9 +1031,7 @@ impl MediaController {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            let is_playing = tokio::task::spawn_blocking(|| Self::check_if_playing())
-                .await
-                .unwrap_or(false);
+            let is_playing = blocking(|| Self::check_if_playing()).await;
 
             // Snapshot the AACP state and release the guard straight away: the
             // takeover below awaits profile activation and packet sends, and
@@ -1423,7 +1419,7 @@ impl MediaController {
     /// Profiles the card offers and its active profile, from one snapshot.
     /// The active profile is used to avoid pointless switches.
     async fn get_card_profiles(&self, card_index: u32) -> (Vec<String>, Option<String>) {
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             get_card_info_list_sync()
                 .into_iter()
                 .find(|c| c.index == card_index)
@@ -1431,7 +1427,6 @@ impl MediaController {
                 .unwrap_or_default()
         })
         .await
-        .unwrap_or_default()
     }
 
     /// One availability check inside the A2DP enumeration waits. The first
@@ -1524,9 +1519,7 @@ impl MediaController {
                 },
                 |idx| self.get_preferred_a2dp_profile(idx),
                 |idx, profile| async move {
-                    tokio::task::spawn_blocking(move || set_card_profile_sync(idx, &profile))
-                        .await
-                        .unwrap_or(false)
+                    blocking(move || set_card_profile_sync(idx, &profile)).await
                 },
             )
             .await;
@@ -1862,7 +1855,7 @@ impl MediaController {
             }
         };
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             let available = get_card_info_list_sync()
                 .iter()
                 .find(|c| c.index == index)
@@ -1872,7 +1865,6 @@ impl MediaController {
             available
         })
         .await
-        .unwrap_or(false)
     }
 
     /// Gathers the inputs of `select_a2dp_profile` (one card snapshot, the
@@ -1973,15 +1965,14 @@ impl MediaController {
 
         info!("Deactivating A2DP profile for AirPods by setting to off");
 
-        let success = tokio::task::spawn_blocking(move || {
+        let success = blocking(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| set_off(device_index)))
                 .unwrap_or_else(|e| {
                     warn!("Panic in set_card_profile_sync: {:?}", e);
                     false
                 })
         })
-        .await
-        .unwrap_or(false);
+        .await;
 
         if success {
             info!("Successfully deactivated A2DP profile");
@@ -2248,12 +2239,11 @@ impl MediaController {
             }
         };
 
-        let current_volume_opt = tokio::task::spawn_blocking({
+        let current_volume_opt = blocking({
             let sink = sink.clone();
             move || get_sink_volume_percent_by_name_sync(&sink)
         })
-        .await
-        .unwrap_or(None);
+        .await;
 
         match status {
             1 => {
@@ -2272,9 +2262,7 @@ impl MediaController {
                 }
                 if original > 25 {
                     let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, 25))
-                        .await
-                        .unwrap_or(false);
+                    blocking(move || transition_sink_volume(&sink_clone, 25)).await;
                     info!(
                         "Conversation start: lowered volume to 25% (original {})",
                         original
@@ -2289,11 +2277,7 @@ impl MediaController {
                     debug!("Conversation reduce (2). Original: {}", orig);
                     if orig > 15 {
                         let sink_clone = sink.clone();
-                        tokio::task::spawn_blocking(move || {
-                            transition_sink_volume(&sink_clone, 15)
-                        })
-                        .await
-                        .unwrap_or(false);
+                        blocking(move || transition_sink_volume(&sink_clone, 15)).await;
                         info!(
                             "Conversation reduce: lowered volume to 15% (original {})",
                             orig
@@ -2317,11 +2301,7 @@ impl MediaController {
                 if let Some(orig) = conv_original {
                     let target = orig.min(25);
                     let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || {
-                        transition_sink_volume(&sink_clone, target)
-                    })
-                    .await
-                    .unwrap_or(false);
+                    blocking(move || transition_sink_volume(&sink_clone, target)).await;
                     info!(
                         "Conversation partial increase (3): set volume to {} (original {})",
                         target, orig
@@ -2329,11 +2309,7 @@ impl MediaController {
                 } else if let Some(orig_from_current) = current_volume_opt {
                     let target = orig_from_current.min(25);
                     let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || {
-                        transition_sink_volume(&sink_clone, target)
-                    })
-                    .await
-                    .unwrap_or(false);
+                    blocking(move || transition_sink_volume(&sink_clone, target)).await;
                     info!(
                         "Conversation partial increase (3) with fallback current: set volume to {} (measured {})",
                         target, orig_from_current
@@ -2410,9 +2386,7 @@ impl MediaController {
 
         if let Some(orig) = maybe_original {
             let sink = sink.to_string();
-            tokio::task::spawn_blocking(move || transition_sink_volume(&sink, orig))
-                .await
-                .unwrap_or(false);
+            blocking(move || transition_sink_volume(&sink, orig)).await;
         }
     }
 
@@ -2563,9 +2537,7 @@ impl A2dpResumeIo for MediaController {
         let state = self.state.clone();
         Box::pin(async move {
             let mac = state.lock().await.connected_device_mac.clone();
-            let inputs = tokio::task::spawn_blocking(move || uncorked_inputs_on_sink_of(&mac))
-                .await
-                .unwrap_or_default();
+            let inputs = blocking(move || uncorked_inputs_on_sink_of(&mac)).await;
             if inputs.is_empty() {
                 return false;
             }
@@ -2580,30 +2552,18 @@ impl A2dpResumeIo for MediaController {
     }
 
     fn playing(&self) -> BoxFuture<'static, Vec<String>> {
-        Box::pin(async {
-            tokio::task::spawn_blocking(Self::playing_mpris_players)
-                .await
-                .unwrap_or_default()
-        })
+        Box::pin(async { blocking(Self::playing_mpris_players).await })
     }
 
     fn playing_owned(
         &self,
         own: Box<dyn Fn(Option<u32>) -> bool + Send>,
     ) -> BoxFuture<'static, Vec<String>> {
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || Self::playing_mpris_players_owned(&*own))
-                .await
-                .unwrap_or_default()
-        })
+        Box::pin(async move { blocking(move || Self::playing_mpris_players_owned(&*own)).await })
     }
 
     fn paused(&self) -> BoxFuture<'static, Vec<String>> {
-        Box::pin(async {
-            tokio::task::spawn_blocking(Self::paused_mpris_players)
-                .await
-                .unwrap_or_default()
-        })
+        Box::pin(async { blocking(Self::paused_mpris_players).await })
     }
 
     fn self_pauses(&self) -> usize {
@@ -2618,10 +2578,7 @@ impl A2dpResumeIo for MediaController {
         let state = self.state.clone();
         Box::pin(async move {
             let mac = state.lock().await.connected_device_mac.clone();
-            tokio::task::spawn_blocking(move || crate::a2dp_resume::read_transport_once(&mac))
-                .await
-                .ok()
-                .flatten()
+            blocking(move || crate::a2dp_resume::read_transport_once(&mac)).await
         })
     }
 }
@@ -2640,14 +2597,13 @@ pub(crate) async fn blocking<T: Default + Send + 'static>(
 /// One scan of the card list for the card whose `device.string` contains
 /// `mac`. Never retries; callers pick the retry budget.
 async fn find_card_index(mac: String) -> Option<u32> {
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         get_card_info_list_sync().into_iter().find_map(|card| {
             let device_string = card.device_string?;
             device_string.contains(&mac).then_some(card.index)
         })
     })
     .await
-    .unwrap_or(None)
 }
 
 fn get_card_info_list_sync() -> Vec<pulse::Card> {
@@ -2737,7 +2693,7 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
     }
     let mac_clone = mac.to_string();
 
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         let sink_list = pulse::sinks("LibrePods", pulse::Sinks::All).ok()?;
         let name = sink_list
             .into_iter()
@@ -2749,7 +2705,6 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
         name
     })
     .await
-    .unwrap_or(None)
 }
 
 /// Whether `sink` belongs to the Bluetooth device `mac`.
