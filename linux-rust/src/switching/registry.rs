@@ -7,8 +7,8 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use log::info;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::sync::{oneshot, watch};
 use tokio::task::AbortHandle;
 
@@ -18,6 +18,8 @@ pub(super) struct HandoffTask {
     released: Released,
     /// The task's "Connect to this computer" (#153).
     connect_mode: watch::Sender<ConnectMode>,
+    /// The task's `switchingNotifications` (#514).
+    notifications: Arc<AtomicBool>,
 }
 
 /// A stopped task's queued sink work (#294, #311): its settle, sent by the
@@ -117,6 +119,20 @@ pub(crate) fn set_connect_mode(mac: &str, mode: ConnectMode) {
     }
 }
 
+/// Hand a `switchingNotifications` change to every running handoff task
+/// (#514); the key is global. Without one it does nothing: the next task
+/// reads preferences.json.
+pub(crate) fn set_switching_notifications(on: bool) {
+    set_notifications(&HANDOFF_TASKS, on);
+}
+
+pub(super) fn set_notifications(registry: &StdMutex<Registry>, on: bool) {
+    let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+    for task in registry.tasks.values() {
+        task.notifications.store(on, Ordering::Relaxed);
+    }
+}
+
 /// At exit: stop every handoff task, then wait, at most
 /// `SHUTDOWN_RELEASE_WAIT`, for the held ones' releases to settle (#294).
 /// Every call waits for the same shutdown.
@@ -186,6 +202,7 @@ pub(super) fn spawn_handoff_task(
     let (release_tx, released) = oneshot::channel();
     shell.released = Some(release_tx);
     let connect_mode = shell.connect_mode.clone();
+    let notifications = shell.notifications.clone();
     let unregister = Unregister {
         registry,
         mac: mac.clone(),
@@ -202,6 +219,7 @@ pub(super) fn spawn_handoff_task(
             handle: task.abort_handle(),
             released,
             connect_mode,
+            notifications,
         },
     );
 }

@@ -226,7 +226,7 @@ async fn notifications_setting_off_posts_nothing() {
         let posted = Arc::new(StdMutex::new(Vec::new()));
         let record = posted.clone();
         shell.notifier = Arc::new(move |notice: Notice| record.lock().unwrap().push(notice));
-        shell.notifications = enabled;
+        shell.notifications = Arc::new(enabled.into());
         let mut core =
             Handoff::new(LOCAL.to_string(), Instant::now(), false, true).with_notifications(true);
         for input in [
@@ -251,6 +251,38 @@ async fn notifications_setting_off_posts_nothing() {
         };
         assert_eq!(*posted.lock().unwrap(), expected, "{enabled}");
     }
+}
+
+/// #514: a `switchingNotifications` change reaches a running task: off,
+/// a take's ACK posts nothing; back on, the next yield posts "moved to".
+#[tokio::test]
+async fn live_switching_notifications_off_then_on() {
+    use crate::notifications::Notice::MovedTo;
+    let mac = "5A:00:00:00:05:14";
+    let (manager, mut rx, _tx) = no_source_session().await;
+    let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+    let registry = private_registry(&[mac]);
+    set_notifications(registry, false);
+    expect_startup(&h, &mut rx).await;
+    expect_take(&h, &mut rx).await;
+    h.emit(owns(1));
+    wait_until("the take's ACK", || {
+        traced(mac).iter().any(|l| l.starts_with("ACK owner=linux"))
+    })
+    .await;
+    // Settled: the ACK step's commands have run.
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+    set_notifications(registry, true);
+    h.emit(owns(0));
+    wait_until("the yield's notice", || {
+        !h.notices.lock().unwrap().is_empty()
+    })
+    .await;
+    let notices = h.notices.lock().unwrap();
+    assert!(matches!(&notices[..], [MovedTo { .. }]), "{notices:?}");
+    drop(notices);
+    shutdown(registry).await;
 }
 
 #[tokio::test]
