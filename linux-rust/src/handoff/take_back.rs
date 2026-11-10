@@ -16,7 +16,7 @@ const TAKE_BACK: &str =
 pub(super) struct TakeBack {
     pub(super) enabled: bool,
     /// Linux's last yield.
-    yielded: Option<Instant>,
+    yielded_at: Option<Instant>,
     /// The last host to relay a call it hasn't ended yet, and when.
     call: Option<(String, Instant)>,
     /// The host whose call took the AirPods from Linux.
@@ -39,7 +39,7 @@ impl TakeBack {
         if !self.enabled {
             return;
         }
-        self.yielded = Some(now);
+        self.yielded_at = Some(now);
         if let Some((host, at)) = &self.call
             && within(*at, now)
         {
@@ -55,7 +55,7 @@ impl TakeBack {
         }
         if category == AUDIO_CATEGORY_CALL {
             self.call = Some((host.to_string(), now));
-            if self.yielded.is_some_and(|at| within(at, now)) {
+            if self.yielded_at.is_some_and(|at| within(at, now)) {
                 self.host = Some(host.to_string());
                 self.ended = None;
             }
