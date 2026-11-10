@@ -1,7 +1,7 @@
 //! The core's inputs from an AACP session, and the packets announcing Linux to the other hosts.
 
 use crate::bluetooth::aacp::{
-    AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control,
+    AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control, TipiFields,
 };
 use crate::handoff::{Input, SessionFacts};
 
@@ -57,17 +57,21 @@ pub(crate) fn event_input(event: AACPEvent) -> Option<Input> {
     }
 }
 
-/// Announce Linux to every connected remote host (the core's `Announce`).
+/// Announce Linux to every connected remote host (the core's `Announce`),
+/// with the tipi values `fields`.
 pub(crate) async fn announce(
     manager: &AACPManager,
     local: &str,
+    fields: TipiFields,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let peers = manager.state.lock().await.connected_devices.clone();
     for peer in peers.iter().filter(|d| d.mac != local) {
         manager
             .send_media_information_new_device(local, &peer.mac)
             .await?;
-        manager.send_add_tipi_device(local, &peer.mac).await?;
+        manager
+            .send_add_tipi_device(local, &peer.mac, fields)
+            .await?;
     }
     Ok(())
 }
