@@ -18,6 +18,7 @@ use dbus::blocking::stdintf::org_freedesktop_dbus::{ObjectManager, Properties};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use log::{debug, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -330,8 +331,10 @@ fn pause_counts(io: &impl A2dpResumeIo) -> (usize, usize) {
 /// or `until` ends the run with no action. The take's players
 /// (`take_candidates` of `streams`, the stream monitor's state at the take,
 /// and of `sampled`, the poller's MPRIS sample before it, #351) are read
-/// before the route; beside the chain, `replay_self_pauses` plays those that
-/// pause themselves after it once (#327).
+/// from before the route; beside the chain, `replay_self_pauses` plays those
+/// that pause themselves after it once (#327). The watch starts at the route
+/// with the sample's players and gets the fresh read's others once it is
+/// back; the chain starts once it is back.
 pub(crate) async fn run(
     io: impl A2dpResumeIo,
     streams: PlaybackState,
@@ -342,18 +345,25 @@ pub(crate) async fn run(
 ) {
     let mut cancel = cancel.shared();
     let pauses = pause_counts(&io);
+    let (sampled, mut read) = take_candidates(&io, streams, sampled);
+    let mut fresh = None;
     let routed = async {
         routed.await;
         clock()
     };
-    let (start, routed_at) = tokio::select! {
-        biased;
-        _ = &mut cancel => {
-            info!("A2DP resume: cancelled before the default sink route ended");
-            return;
+    let mut routed = std::pin::pin!(routed);
+    // The fresh read is polled during the route too, so it starts at once.
+    let routed_at = loop {
+        tokio::select! {
+            biased;
+            _ = &mut cancel => {
+                info!("A2DP resume: cancelled before the default sink route ended");
+                return;
+            }
+            at = &mut routed => break at,
+            players = &mut read, if fresh.is_none() => fresh = Some(players),
+            _ = tokio::time::sleep_until(until.into()) => break until,
         }
-        read = futures::future::join(take_candidates(&io, streams, sampled), routed) => read,
-        _ = tokio::time::sleep_until(until.into()) => (Vec::new(), until),
     };
     // The route and the deadline can both be ready at one poll.
     if clock() >= until {
@@ -367,11 +377,39 @@ pub(crate) async fn run(
         "A2DP resume: chain start {} ms after the ACK",
         after_ack.as_millis()
     );
-    let replayable = Mutex::new(start.clone());
-    let watch = replay_self_pauses(&io, &replayable, routed_at, until, pauses, cancel.clone());
-    let mut chain = Chain::new(routed_at, until, start);
-    let mut reads = 0;
+    let replayable = Mutex::new(sampled.clone());
+    let reading = AtomicBool::new(true);
+    let watch = replay_self_pauses(
+        &io,
+        &replayable,
+        &reading,
+        routed_at,
+        until,
+        pauses,
+        cancel.clone(),
+    );
     let chained = async {
+        let fresh = match fresh {
+            Some(fresh) => fresh,
+            None => tokio::select! {
+                biased;
+                _ = &mut cancel => {
+                    info!("A2DP resume: cancelled");
+                    return;
+                }
+                fresh = read => fresh,
+                _ = tokio::time::sleep_until(until.into()) => {
+                    info!("A2DP resume: the take's player read outlasted the window");
+                    return;
+                }
+            },
+        };
+        // Only the sample's players may have been played already.
+        let others: Vec<String> = fresh.into_iter().filter(|p| !sampled.contains(p)).collect();
+        replayable.lock().unwrap().extend(others.iter().cloned());
+        reading.store(false, Ordering::SeqCst);
+        let mut chain = Chain::new(routed_at, until, [sampled, others].concat());
+        let mut reads = 0;
         loop {
             let (due, senses, reads_players) = (chain.due(), chain.senses(), chain.reads_players());
             let (reads_transport, read_end) = (chain.reads_transport(), chain.read_end);
@@ -437,17 +475,17 @@ pub(crate) async fn run(
 /// The take's players (#361): the Playing ones whose bus owner PID owns a
 /// live stream in `streams` (`PlaybackState::live_or_unknown`), so a remote
 /// such as Spotify Connect is never paused or played; every Playing one,
-/// with no owner lookup, while live presence is unknown. Those of `sampled`
-/// (the poller's earlier sample, #351) come first, then the fresh read's
-/// others, so a player that pauses itself before that read ends is kept.
+/// with no owner lookup, while live presence is unknown. Returns the
+/// accepted players of `sampled` (the poller's earlier sample, #351) at
+/// once, and the fresh read.
 fn take_candidates(
     io: &impl A2dpResumeIo,
     streams: PlaybackState,
     sampled: Vec<(String, Option<u32>)>,
-) -> BoxFuture<'static, Vec<String>> {
+) -> (Vec<String>, BoxFuture<'static, Vec<String>>) {
     let unknown = streams.live.is_none();
     let own = move |owner| streams.live_or_unknown(owner);
-    let mut candidates: Vec<String> = sampled
+    let sampled = sampled
         .into_iter()
         .filter(|&(_, owner)| own(owner))
         .map(|(player, _)| player)
@@ -457,14 +495,7 @@ fn take_candidates(
     } else {
         io.playing_owned(Box::new(own))
     };
-    Box::pin(async move {
-        for player in read.await {
-            if !candidates.contains(&player) {
-                candidates.push(player);
-            }
-        }
-        candidates
-    })
+    (sampled, read)
 }
 
 /// Tokio's clock, so tests can pause it; the same as std's otherwise.
@@ -482,10 +513,12 @@ fn clock() -> Instant {
 /// `pauses` (its (started, finished) counts at the take), or reaching the
 /// `PLAY_EDGE_MARGIN` ends it with no further Play or read; all are checked
 /// before each Play, and all but `cancel` (which ends a read at once) before
-/// each read.
+/// each read. While `reading` (the take's fresh read may still add players,
+/// #351), an empty `replayable` skips the read instead of ending it.
 async fn replay_self_pauses(
     io: &impl A2dpResumeIo,
     replayable: &Mutex<Vec<String>>,
+    reading: &AtomicBool,
     routed_at: Instant,
     until: Instant,
     pauses: (usize, usize),
@@ -513,7 +546,13 @@ async fn replay_self_pauses(
                 _ = &mut read_cancel => return,
                 read_at = due.tick() => read_at.into_std(),
             };
-            if read_at > guard_end || replayable.lock().unwrap().is_empty() || cannot_play() {
+            if read_at > guard_end || cannot_play() {
+                return;
+            }
+            if replayable.lock().unwrap().is_empty() {
+                if reading.load(Ordering::SeqCst) {
+                    continue;
+                }
                 return;
             }
             let paused = tokio::select! {
@@ -2223,7 +2262,9 @@ mod tests {
     }
 
     async fn take_candidates_of(pids: Option<&[u32]>) -> Vec<String> {
-        take_candidates(&OwnIo::new(&OWNERS), live(pids), Vec::new()).await
+        take_candidates(&OwnIo::new(&OWNERS), live(pids), Vec::new())
+            .1
+            .await
     }
 
     #[tokio::test(start_paused = true)]
@@ -2297,18 +2338,19 @@ mod tests {
         );
     }
 
-    /// The route ends `SAMPLED_ROUTE` after the take; the take's fresh read
-    /// is back `SAMPLED_READ` after it.
+    /// The route ends `SAMPLED_ROUTE` ms after the take; the take's fresh
+    /// read is back `SAMPLED_READ` ms after it unless a test says otherwise.
     const SAMPLED_ROUTE: u64 = 100;
     const SAMPLED_READ: u64 = 200;
 
-    /// A take whose fresh read, back only after the route, finds `read`
-    /// Playing (the others paused themselves at the route), while every
-    /// Paused read finds `paused`. The transport reads active, so the chain
-    /// ends at its first step and only the self-pause watch acts.
+    /// A take whose fresh read, back `read_at` ms after the take, finds
+    /// `read` Playing (the others paused themselves at the route), while
+    /// every Paused read finds `paused`. The transport reads active, so the
+    /// chain ends at its first step and only the self-pause watch acts.
     #[derive(Clone)]
     struct SampledIo {
         read: &'static [&'static str],
+        read_at: u64,
         paused: &'static [&'static str],
         start: tokio::time::Instant,
         acted: Arc<StdMutex<Vec<(u128, Action)>>>,
@@ -2326,9 +2368,9 @@ mod tests {
         }
 
         fn playing(&self) -> BoxFuture<'static, Vec<String>> {
-            let read = players(self.read);
+            let (read, at) = (players(self.read), self.start + ms(self.read_at));
             Box::pin(async move {
-                tokio::time::sleep(ms(SAMPLED_READ)).await;
+                tokio::time::sleep_until(at).await;
                 read
             })
         }
@@ -2348,11 +2390,12 @@ mod tests {
     async fn sampled_take(
         streams: PlaybackState,
         sampled: &[(&str, Option<u32>)],
-        read: &'static [&'static str],
+        (read, read_at): (&'static [&'static str], u64),
         paused: &'static [&'static str],
     ) -> Vec<(u128, Action)> {
         let io = SampledIo {
             read,
+            read_at,
             paused,
             start: tokio::time::Instant::now(),
             acted: Arc::default(),
@@ -2365,33 +2408,64 @@ mod tests {
         io.acted.lock().unwrap().clone()
     }
 
+    /// The sample's player gets its Play at the route's first Paused read.
+    const AT_ROUTE: u128 = SAMPLED_ROUTE as u128;
+
     #[tokio::test(start_paused = true)]
     async fn self_pause_before_a_late_take_read_is_played_from_the_sample() {
         // P paused itself at the route, before the take's read was back.
-        let acted = sampled_take(live(Some(&[1])), &[(P, Some(1))], &[], &[P]).await;
-        assert_eq!(acted, [(SAMPLED_READ as u128, Play(P.into()))]);
-        let after_route = ms(SAMPLED_READ - SAMPLED_ROUTE);
-        assert!(after_route < SELF_PAUSE_GUARD);
+        let read = (&[] as &[&str], SAMPLED_READ);
+        let acted = sampled_take(live(Some(&[1])), &[(P, Some(1))], read, &[P]).await;
+        assert_eq!(acted, [(AT_ROUTE, Play(P.into()))]);
         // With only the racing read (#343), P is no candidate.
-        let acted = sampled_take(live(Some(&[1])), &[], &[], &[P]).await;
+        let acted = sampled_take(live(Some(&[1])), &[], read, &[P]).await;
         assert_eq!(acted, []);
     }
 
     #[tokio::test(start_paused = true)]
     async fn player_in_the_sample_and_the_take_read_gets_one_play() {
-        let acted = sampled_take(live(Some(&[1])), &[(P, Some(1))], &[P], &[P]).await;
-        assert_eq!(acted, [(SAMPLED_READ as u128, Play(P.into()))]);
+        let read = (&[P] as &[&str], SAMPLED_READ);
+        let acted = sampled_take(live(Some(&[1])), &[(P, Some(1))], read, &[P]).await;
+        assert_eq!(acted, [(AT_ROUTE, Play(P.into()))]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn sampled_player_without_a_live_stream_gets_no_play() {
         // Q, a remote (Spotify Connect, #361), owns no live stream.
-        let sampled = [(Q, Some(2))];
-        let acted = sampled_take(live(Some(&[1])), &sampled, &[], &[Q]).await;
+        let (sampled, read) = ([(Q, Some(2))], (&[] as &[&str], SAMPLED_READ));
+        let acted = sampled_take(live(Some(&[1])), &sampled, read, &[Q]).await;
         assert_eq!(acted, []);
         // While live presence is unknown, it is kept.
-        let acted = sampled_take(live(None), &sampled, &[], &[Q]).await;
-        assert_eq!(acted, [(SAMPLED_READ as u128, Play(Q.into()))]);
+        let acted = sampled_take(live(None), &sampled, read, &[Q]).await;
+        assert_eq!(acted, [(AT_ROUTE, Play(Q.into()))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sampled_self_pause_is_played_while_a_slow_take_read_runs() {
+        // The fresh read is back after 5 s, past the guard's end.
+        let read_at = 5000;
+        assert!(ms(read_at - SAMPLED_ROUTE) > SELF_PAUSE_GUARD + SELF_PAUSE_READ);
+        let read = (&[] as &[&str], read_at);
+        let acted = sampled_take(live(Some(&[1])), &[(P, Some(1))], read, &[P]).await;
+        // At the route: within the guard, while the read is pending.
+        assert_eq!(acted, [(AT_ROUTE, Play(P.into()))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sampled_self_pause_is_played_when_the_take_read_outlasts_the_window() {
+        let read_at = (A2DP_RESUME_WINDOW + Duration::from_secs(1)).as_millis() as u64;
+        let read = (&[] as &[&str], read_at);
+        let acted = sampled_take(live(Some(&[1])), &[(P, Some(1))], read, &[P]).await;
+        assert_eq!(acted, [(AT_ROUTE, Play(P.into()))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn take_read_player_reaches_the_watch_after_the_route() {
+        // No sample; the fresh read is back 200 ms after the route, so the
+        // Paused read due then (route + 250 ms) is the first to run.
+        let read = (&[P] as &[&str], SAMPLED_ROUTE + 200);
+        let acted = sampled_take(live(Some(&[1])), &[], read, &[P]).await;
+        assert_eq!(acted, [(AT_ROUTE + 250, Play(P.into()))]);
     }
 
     #[test]
