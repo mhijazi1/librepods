@@ -29,7 +29,7 @@ use dbus::arg::{RefArg, Variant};
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use dbus::message::MatchRule;
-use devices::airpods::AirPodsDevice;
+use devices::airpods::{AirPodsDevice, bump_connection_generation, connection_generation};
 use ksni::TrayMethods;
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -267,7 +267,14 @@ async fn async_main(
                 .await?
                 .unwrap_or_else(|| "Unknown".to_string());
             info!("Found connected AirPods: {}, initializing.", name);
-            match AirPodsDevice::new(device.address(), tray_handle.clone(), ui_tx.clone()).await {
+            match AirPodsDevice::new(
+                device.address(),
+                connection_generation(&device.address().to_string()),
+                tray_handle.clone(),
+                ui_tx.clone(),
+            )
+            .await
+            {
                 Ok(airpods_device) => {
                     let mut managers = device_managers.write().await;
                     // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
@@ -369,6 +376,10 @@ async fn async_main(
         let Some(is_connected) = connected_var.0.as_ref().as_u64() else {
             return true;
         };
+        // Before any fallible read, so a setup this edge makes stale always sees it (#474).
+        if let Some(mac) = reconnect::mac_from_path(&path) {
+            bump_connection_generation(&mac);
+        }
         let proxy = conn.with_proxy("org.bluez", &path, std::time::Duration::from_millis(5000));
         // Without the reset, a dropped AirPods' next drop goes unrecorded.
         let read_failed = || {
@@ -441,12 +452,14 @@ async fn async_main(
             .get::<String>("org.bluez.Device1", "Name")
             .unwrap_or_else(|_| "Unknown".to_string());
         info!("AirPods connected: {}, initializing", name);
+        let generation = connection_generation(&addr_str);
         let handle_clone = tray_handle.clone();
         let ui_tx_clone = ui_tx.clone();
         let device_managers = device_managers.clone();
         tokio::spawn(async move {
             let airpods_device =
-                match AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await {
+                match AirPodsDevice::new(addr, generation, handle_clone, ui_tx_clone.clone()).await
+                {
                     Ok(device) => device,
                     Err(e) => {
                         // new() already logged the cause.
