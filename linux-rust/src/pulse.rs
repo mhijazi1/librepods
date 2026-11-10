@@ -86,6 +86,7 @@ pub(crate) fn wait<F: ?Sized>(
 
 /// What LibrePods reads of a sink.
 pub(crate) struct Sink {
+    pub(crate) index: u32,
     pub(crate) name: Option<String>,
     pub(crate) device_string: Option<String>,
     pub(crate) bluez_path: Option<String>,
@@ -171,6 +172,54 @@ pub(crate) fn set_default_sink(name: &str, sink: &str) -> bool {
     matches!(accepted.as_deref(), Ok([true]))
 }
 
+/// What LibrePods reads of a module.
+pub(crate) struct Module {
+    pub(crate) index: u32,
+    pub(crate) name: Option<String>,
+    pub(crate) argument: Option<String>,
+}
+
+/// Load `module` with `argument`, on a new connection named `name`; its
+/// index.
+pub(crate) fn load_module(name: &str, module: &str, argument: &str) -> io::Result<u32> {
+    let c_string = |s| CString::new(s).map_err(|_| pulse_error("module load"));
+    let (module, argument) = (c_string(module)?, c_string(argument)?);
+    let cb = Some(index_cb as extern "C" fn(_, _, _));
+    let index = RawConnection::connect(name)?.query("module load", |context, list| {
+        // SAFETY: `context` is Ready, `list` is what `index_cb` expects, and
+        // libpulse copies both strings before this returns.
+        unsafe {
+            sys::pa_context_load_module(context, module.as_ptr(), argument.as_ptr(), cb, list)
+        }
+    })?;
+    match index.as_slice() {
+        [index] if *index != sys::PA_INVALID_INDEX => Ok(*index),
+        _ => Err(pulse_error("module load")),
+    }
+}
+
+/// Unload module `index`, on a new connection named `name`. False on any
+/// error or if the server refused.
+pub(crate) fn unload_module(name: &str, index: u32) -> bool {
+    let cb = Some(success_cb as extern "C" fn(_, _, _));
+    let unloaded = RawConnection::connect(name).and_then(|mut connection| {
+        connection.query("module unload", |context, list| {
+            // SAFETY: `context` is Ready and `list` is what `success_cb` expects.
+            unsafe { sys::pa_context_unload_module(context, index, cb, list) }
+        })
+    });
+    matches!(unloaded.as_deref(), Ok([true]))
+}
+
+/// Every module, on a new connection named `name`.
+pub(crate) fn modules(name: &str) -> io::Result<Vec<Module>> {
+    let cb = Some(module_cb as extern "C" fn(_, _, _, _));
+    RawConnection::connect(name)?.query("module list", |context, list| {
+        // SAFETY: `context` is Ready and `list` is what `module_cb` expects.
+        unsafe { sys::pa_context_get_module_info_list(context, cb, list) }
+    })
+}
+
 /// A raw libpulse-sys connection on its own binding `Mainloop`. `context`
 /// is declared first, so it is dropped before its mainloop.
 pub(crate) struct RawConnection {
@@ -182,7 +231,7 @@ impl RawConnection {
     /// Connect as `name` on a new mainloop, within `CONNECT_TIMEOUT`.
     pub(crate) fn connect(name: &str) -> io::Result<Self> {
         let mut mainloop = Mainloop::new().ok_or_else(|| pulse_error("mainloop"))?;
-        let context = RawContext::connect(&mut mainloop, name)?;
+        let context = RawContext::connect(&mut mainloop, name, &[])?;
         Ok(RawConnection { context, mainloop })
     }
 
@@ -265,6 +314,38 @@ impl RawConnection {
         })
     }
 
+    /// Move sink input `input` to sink `sink`; false on any error or if
+    /// the server refused.
+    pub(crate) fn move_sink_input(&mut self, input: u32, sink: u32) -> bool {
+        let cb = Some(success_cb as extern "C" fn(_, _, _));
+        let moved = self.query("sink input move", |context, list| {
+            // SAFETY: `context` is Ready and `list` is what `success_cb` expects.
+            unsafe { sys::pa_context_move_sink_input_by_index(context, input, sink, cb, list) }
+        });
+        matches!(moved.as_deref(), Ok([true]))
+    }
+
+    /// Move sink input `input` to the default sink, so the server stores
+    /// no target for it (pipewire-pulse writes `target.object` -1, spike
+    /// #314); false on any error or if the server refused.
+    pub(crate) fn move_sink_input_to_default(&mut self, input: u32) -> bool {
+        let cb = Some(success_cb as extern "C" fn(_, _, _));
+        let moved = self.query("sink input move", |context, list| {
+            // SAFETY: `context` is Ready and `list` is what `success_cb`
+            // expects; the name is a static C string.
+            unsafe {
+                sys::pa_context_move_sink_input_by_name(
+                    context,
+                    input,
+                    c"@DEFAULT_SINK@".as_ptr(),
+                    cb,
+                    list,
+                )
+            }
+        });
+        matches!(moved.as_deref(), Ok([true]))
+    }
+
     /// Run the query `start` begins and return its entries. `start` gets
     /// the context and the callback's userdata. The wait is bounded like
     /// `wait`; a query still running when it gives up is cancelled before
@@ -315,14 +396,16 @@ impl RawConnection {
 struct RawContext(*mut sys::pa_context);
 
 impl RawContext {
-    /// Connect as `name` on `mainloop`, within `CONNECT_TIMEOUT`. The
-    /// context must be dropped before `mainloop`.
-    fn connect(mainloop: &mut Mainloop, name: &str) -> io::Result<Self> {
+    /// Connect as `name`, with the client properties `props`, on
+    /// `mainloop`, within `CONNECT_TIMEOUT`. The context must be dropped
+    /// before `mainloop`.
+    fn connect(mainloop: &mut Mainloop, name: &str, props: &[(&str, &str)]) -> io::Result<Self> {
         let name = CString::new(name).map_err(|_| pulse_error("context"))?;
+        let props = RawProplist::new(props)?;
         let api: &sys::pa_mainloop_api = mainloop.get_api().as_ref();
         // SAFETY: `api` is `mainloop`'s own vtable (same libpulse-sys), live
-        // while the mainloop is; libpulse copies `name`.
-        let context = unsafe { sys::pa_context_new(api, name.as_ptr()) };
+        // while the mainloop is; libpulse copies `name` and `props`.
+        let context = unsafe { sys::pa_context_new_with_proplist(api, name.as_ptr(), props.0) };
         if context.is_null() {
             return Err(pulse_error("context"));
         }
@@ -360,6 +443,283 @@ impl Drop for RawContext {
             sys::pa_context_disconnect(self.0);
             sys::pa_context_unref(self.0);
         }
+    }
+}
+
+/// A raw proplist, freed on drop.
+struct RawProplist(*mut sys::pa_proplist);
+
+impl RawProplist {
+    fn new(props: &[(&str, &str)]) -> io::Result<Self> {
+        // SAFETY: a new proplist, owned by the guard from here.
+        let list = RawProplist(unsafe { sys::pa_proplist_new() });
+        for &(key, value) in props {
+            let c_string = |s| CString::new(s).map_err(|_| pulse_error("proplist"));
+            let (key, value) = (c_string(key)?, c_string(value)?);
+            // SAFETY: `list.0` is live; libpulse copies both strings.
+            if unsafe { sys::pa_proplist_sets(list.0, key.as_ptr(), value.as_ptr()) } < 0 {
+                return Err(pulse_error("proplist"));
+            }
+        }
+        Ok(list)
+    }
+}
+
+impl Drop for RawProplist {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from `pa_proplist_new` and this is its only
+        // owner.
+        unsafe { sys::pa_proplist_free(self.0) }
+    }
+}
+
+/// How long a target reset's corked stream stays connected after its move:
+/// WirePlumber's store hook returns early once the node is gone (spike
+/// #314, state-stream.lua#L218-223; probe.c kept it 300-1500 ms).
+const CLEARER_LINGER: Duration = Duration::from_millis(500);
+
+/// A sink input event, kept as libpulse gives it: its type and index.
+pub(crate) type SinkInputEvent = (sys::pa_subscription_event_type_t, u32);
+
+/// The park event path's connection (#311): sink input events from a raw
+/// subscription, and the corked streams that reset a moved stream's stored
+/// target. Fields drop in order: the clearers before the connection's
+/// mainloop.
+pub(crate) struct ParkConnection {
+    clearers: Vec<Clearer>,
+    connection: RawConnection,
+    /// What `subscribe_cb` collects; freed in `drop`.
+    events: *mut Vec<SinkInputEvent>,
+}
+
+/// A corked playback stream on its own connection, whose
+/// `application.name` can then be the moved stream's.
+struct Clearer {
+    stream: *mut sys::pa_stream,
+    index: u32,
+    /// None until `close` lets it go `CLEARER_LINGER` later.
+    close_at: Option<Instant>,
+    /// Held for `stream`, which drops first.
+    _context: RawContext,
+}
+
+impl Drop for Clearer {
+    fn drop(&mut self) {
+        // SAFETY: `stream` is the live stream `open_corked` made on
+        // `context`, which drops after this.
+        unsafe {
+            sys::pa_stream_disconnect(self.stream);
+            sys::pa_stream_unref(self.stream);
+        }
+    }
+}
+
+impl ParkConnection {
+    /// Connect and subscribe to sink input events, each within its bound.
+    pub(crate) fn connect() -> io::Result<Self> {
+        let connection = RawConnection::connect("LibrePods park")?;
+        let events = Box::into_raw(Box::<Vec<SinkInputEvent>>::default());
+        // SAFETY: `events` lives until `drop` unsets the callback.
+        unsafe {
+            sys::pa_context_set_subscribe_callback(
+                connection.context.0,
+                Some(subscribe_cb),
+                events.cast(),
+            )
+        };
+        let mut park = ParkConnection {
+            clearers: Vec::new(),
+            connection,
+            events,
+        };
+        let cb = Some(success_cb as extern "C" fn(_, _, _));
+        let subscribed = park.connection.query("subscription", |context, list| {
+            // SAFETY: `context` is Ready and `list` is what `success_cb` expects.
+            unsafe {
+                sys::pa_context_subscribe(context, sys::PA_SUBSCRIPTION_MASK_SINK_INPUT, cb, list)
+            }
+        })?;
+        match subscribed.as_slice() {
+            [true] => Ok(park),
+            _ => Err(pulse_error("subscription")),
+        }
+    }
+
+    /// The sink inputs events since the last call, after waiting at most
+    /// `wait` for one; closes the clearers whose linger is over. An error
+    /// once the connection is gone.
+    pub(crate) fn next(&mut self, wait: Duration) -> io::Result<Vec<SinkInputEvent>> {
+        if !self.connection.ready() {
+            return Err(pulse_error("park connection"));
+        }
+        let now = Instant::now();
+        let wait = self
+            .clearers
+            .iter()
+            .filter_map(|c| c.close_at)
+            .map(|at| at.saturating_duration_since(now))
+            .fold(wait, Duration::min);
+        iterate(&mut self.connection.mainloop, wait)?;
+        let now = Instant::now();
+        self.clearers
+            .retain(|c| c.close_at.is_none_or(|at| at > now));
+        // SAFETY: `events` is live, and the callback runs only inside
+        // `iterate` on this thread.
+        Ok(std::mem::take(unsafe { &mut *self.events }))
+    }
+
+    pub(crate) fn connection(&mut self) -> &mut RawConnection {
+        &mut self.connection
+    }
+
+    /// Open a corked playback stream whose client and stream carry `key`
+    /// = `value`; its sink input index. It stays open until `close`.
+    pub(crate) fn open_corked(&mut self, key: &str, value: &str) -> io::Result<u32> {
+        // The client name is its `application.name`.
+        let name = if key == "application.name" {
+            value
+        } else {
+            "LibrePods"
+        };
+        let props = [(key, value)];
+        let context = RawContext::connect(&mut self.connection.mainloop, name, &props)?;
+        let list = RawProplist::new(&props)?;
+        let spec = sys::pa_sample_spec {
+            format: sys::PA_SAMPLE_FLOAT32LE,
+            rate: 48_000,
+            channels: 2,
+        };
+        // SAFETY: `context` is Ready; libpulse copies the name, `spec` and
+        // `list`.
+        let stream = unsafe {
+            sys::pa_stream_new_with_proplist(
+                context.0,
+                c"LibrePods reset".as_ptr(),
+                &spec,
+                ptr::null(),
+                list.0,
+            )
+        };
+        if stream.is_null() {
+            return Err(pulse_error("reset stream"));
+        }
+        let mut clearer = Clearer {
+            stream,
+            index: sys::PA_INVALID_INDEX,
+            close_at: None,
+            _context: context,
+        };
+        // SAFETY: a new stream; null device, attributes, volume and sync
+        // stream mean the defaults.
+        let connected = unsafe {
+            sys::pa_stream_connect_playback(
+                stream,
+                ptr::null(),
+                ptr::null(),
+                sys::PA_STREAM_START_CORKED,
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        };
+        if connected < 0 {
+            return Err(pulse_error("reset stream"));
+        }
+        run_until(
+            OPERATION_TIMEOUT,
+            "reset stream",
+            Instant::now,
+            // SAFETY: `stream` is live until `clearer` drops.
+            || stream_ready(unsafe { sys::pa_stream_get_state(stream) }),
+            |left| iterate(&mut self.connection.mainloop, left),
+        )?;
+        // SAFETY: as above.
+        clearer.index = unsafe { sys::pa_stream_get_index(stream) };
+        let index = clearer.index;
+        self.clearers.push(clearer);
+        Ok(index)
+    }
+
+    /// Disconnect the corked stream `index` `CLEARER_LINGER` from now,
+    /// without waiting for it.
+    pub(crate) fn close(&mut self, index: u32) {
+        let at = Instant::now() + CLEARER_LINGER;
+        for clearer in self.clearers.iter_mut().filter(|c| c.index == index) {
+            clearer.close_at = Some(at);
+        }
+    }
+}
+
+impl Drop for ParkConnection {
+    /// Lets each clearer finish its linger first.
+    fn drop(&mut self) {
+        while let Some(last) = self.clearers.iter().filter_map(|c| c.close_at).max() {
+            let left = last.saturating_duration_since(Instant::now());
+            if left.is_zero() || iterate(&mut self.connection.mainloop, left).is_err() {
+                break;
+            }
+        }
+        self.clearers.clear();
+        // SAFETY: with the callback unset, nothing reaches `events` again.
+        unsafe {
+            sys::pa_context_set_subscribe_callback(
+                self.connection.context.0,
+                None,
+                ptr::null_mut(),
+            );
+            drop(Box::from_raw(self.events));
+        }
+    }
+}
+
+fn stream_ready(state: sys::pa_stream_state_t) -> io::Result<bool> {
+    match state {
+        sys::pa_stream_state_t::Ready => Ok(true),
+        sys::pa_stream_state_t::Failed | sys::pa_stream_state_t::Terminated => {
+            Err(pulse_error("reset stream"))
+        }
+        _ => Ok(false),
+    }
+}
+
+extern "C" fn subscribe_cb(
+    _: *mut sys::pa_context,
+    event: sys::pa_subscription_event_type_t,
+    index: u32,
+    events: *mut c_void,
+) {
+    // SAFETY: `ParkConnection::connect` passes its event queue, which only
+    // this thread touches.
+    unsafe { (*events.cast::<Vec<SinkInputEvent>>()).push((event, index)) }
+}
+
+/// An index callback is called once: `index` is the answer and ends the
+/// list.
+extern "C" fn index_cb(_: *mut sys::pa_context, index: u32, list: *mut c_void) {
+    // SAFETY: `load_module` passes a `List<u32>`.
+    unsafe {
+        collect(list, 0, Some(index));
+        collect::<u32>(list, 1, None);
+    }
+}
+
+extern "C" fn module_cb(
+    _: *mut sys::pa_context,
+    info: *const sys::pa_module_info,
+    eol: i32,
+    list: *mut c_void,
+) {
+    // SAFETY: `modules` passes a `List<Module>`; a non-null `info` is a
+    // filled-in entry whose strings live for this call.
+    unsafe {
+        collect(
+            list,
+            eol,
+            (!info.is_null()).then(|| Module {
+                index: (*info).index,
+                name: string((*info).name),
+                argument: string((*info).argument),
+            }),
+        )
     }
 }
 
@@ -615,6 +975,7 @@ unsafe fn sink_fields(info: *const sys::pa_sink_info) -> Sink {
     unsafe {
         let props = (*info).proplist;
         Sink {
+            index: (*info).index,
             name: string((*info).name),
             device_string: prop(props, c"device.string"),
             bluez_path: prop(props, c"bluez.path"),
@@ -1147,6 +1508,7 @@ mod tests {
                 (*p).proplist = props;
                 (*p).volume = *volume.as_ref();
                 (*p).monitor_source = 7;
+                (*p).index = 3;
                 (empty, sink_fields(p))
             };
             let none = (None, None, None);
@@ -1156,6 +1518,7 @@ mod tests {
             assert_eq!(sink.bluez_path.as_deref(), Some("/dev_AA"));
             assert_eq!(sink.volume, volume);
             assert_eq!(sink.monitor_source, 7);
+            assert_eq!(sink.index, 3);
         }
         // SAFETY: `props` is no longer used.
         unsafe { sys::pa_proplist_free(props) };
