@@ -4,6 +4,7 @@ use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control, TipiFields,
 };
 use crate::handoff::{Input, SessionFacts};
+use log::error;
 
 /// Copy a session's routing, wear and ownership state for the core. The
 /// caller holds the guard only for the copy.
@@ -74,6 +75,20 @@ pub(crate) async fn announce(
             .await?;
     }
     Ok(())
+}
+
+/// Re-send Linux's tipi, without newTipi, to every connected remote host
+/// (#509). A failed send is logged and the next host still gets its update.
+pub(super) async fn send_tipi_updates(manager: &AACPManager, local: &str, fields: TipiFields) {
+    let peers = manager.state.lock().await.connected_devices.clone();
+    for peer in peers.iter().filter(|d| d.mac != local) {
+        if let Err(e) = manager.send_tipi_update(local, &peer.mac, fields).await {
+            error!(
+                "Handoff: failed to send the tipi update to {}: {e}",
+                peer.mac
+            );
+        }
+    }
 }
 
 /// Tell every connected remote host whether Linux is in a call (the core's

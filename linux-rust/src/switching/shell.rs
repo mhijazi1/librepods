@@ -1,14 +1,14 @@
 //! The handoff task: feeds the core and executes its commands.
 
 use super::inputs::{
-    advertise_call, announce, event_input, relay_category, seed_inputs, session_alive,
-    session_facts,
+    advertise_call, announce, event_input, relay_category, seed_inputs, send_tipi_updates,
+    session_alive, session_facts,
 };
 use super::poller::{MediaActions, NOT_PAUSING, PlaybackSamples};
 use super::registry::{Pending, last_owner_linux, remember_last_owner_linux};
 use super::{Events, FlushRequest, TICK};
 use crate::a2dp_resume;
-use crate::activity::{self, ActivitySource};
+use crate::activity::{self, ActivityLevel, ActivitySource};
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers as Control};
 use crate::default_sink::{SinkEvent, UnparkTo};
 use crate::handoff::{Command, Handoff, Input, Park, local_inputs};
@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use log::{error, info};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// The handoff task's I/O: executes the core's commands.
@@ -86,6 +86,20 @@ impl Drop for Shell {
         if let Some(released) = self.released.take() {
             let _ = released.send(self.media.hold_settled());
         }
+    }
+}
+
+/// How often the handoff task samples Linux's activity level (#509).
+pub(super) const ACTIVITY_POLL: Duration = Duration::from_secs(1);
+
+/// Sample `source` every `ACTIVITY_POLL`, one snapshot at a time however
+/// long it blocks, and forward each level until the task's receiver is gone.
+async fn poll_activity(source: Arc<dyn ActivitySource>, levels: mpsc::Sender<ActivityLevel>) {
+    while !levels.is_closed() {
+        if let Some(level) = activity::current_level(&source).await {
+            let _ = levels.send(level).await;
+        }
+        tokio::time::sleep(ACTIVITY_POLL).await;
     }
 }
 
@@ -438,6 +452,11 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
         return;
     }
     let mut tick = tokio::time::interval(TICK);
+    // The Mac re-sends its tipi on each Activity State change (#509). The
+    // first level is the baseline; a failed snapshot keeps the last one.
+    let (level_tx, mut levels) = mpsc::channel(1);
+    tokio::spawn(poll_activity(shell.activity.clone(), level_tx));
+    let mut prev = None;
     loop {
         let end = tokio::select! {
             biased;
@@ -482,6 +501,15 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
             Some(id) = shell.undo_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::Undo(id)).await
+            }
+            Some(next) = levels.recv() => {
+                if prev.is_some_and(|prev| activity::resend_tipi(prev, next)) && core.live() {
+                    let fields = activity::tipi_fields(next);
+                    info!("Handoff: activity now {next:?}; re-sending the tipi with {fields:?}");
+                    send_tipi_updates(&shell.manager, &shell.local, fields).await;
+                }
+                prev = Some(next);
+                false
             }
             _ = tick.tick() => {
                 sync_session(&mut core, &mut shell).await

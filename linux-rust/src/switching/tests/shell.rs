@@ -727,3 +727,204 @@ async fn park_shutdown_unparks_before_a_slow_watch_stops() {
     assert_eq!(default_sink(&sinks), DAC);
     drop(connected);
 }
+
+// #509: the tipi re-sent on each Activity State change.
+
+/// An activity source the test switches, counting its snapshots.
+struct SwitchedActivity {
+    inputs: StdMutex<Option<ActivityInputs>>,
+    calls: AtomicUsize,
+}
+
+impl ActivitySource for SwitchedActivity {
+    fn snapshot(&self) -> Option<ActivityInputs> {
+        // Counted before the read: a call counted after a switch reads it.
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.inputs.lock().unwrap()
+    }
+}
+
+impl SwitchedActivity {
+    fn new(inputs: Option<ActivityInputs>) -> Arc<Self> {
+        Arc::new(Self {
+            inputs: StdMutex::new(inputs),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Wait for `n` more snapshots.
+    async fn polls(&self, n: usize) {
+        let until = self.calls() + n;
+        tokio::time::timeout(5 * n as u32 * ACTIVITY_POLL, async {
+            while self.calls() < until {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the activity poll");
+    }
+
+    /// Switch to `inputs`, then wait until the poll has read them twice.
+    async fn switch(&self, inputs: Option<ActivityInputs>) {
+        *self.inputs.lock().unwrap() = inputs;
+        self.polls(2).await;
+    }
+}
+
+const HIGH: Option<ActivityInputs> = Some(ActivityInputs {
+    locked: false,
+    idle: false,
+    since_input: Some(Duration::from_secs(10)),
+});
+const IDLE: Option<ActivityInputs> = Some(ActivityInputs {
+    locked: true,
+    idle: false,
+    since_input: None,
+});
+
+/// A handoff task for `mac` on a `no_source_session` with `hosts`,
+/// announcing with `source`'s level.
+async fn tipi_task(
+    mac: &str,
+    hosts: &[&str],
+    source: Arc<dyn ActivitySource>,
+) -> (Harness, mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
+    let (manager, rx, tx) = no_source_session().await;
+    manager.state.lock().await.connected_devices = hosts.iter().map(|mac| host(mac)).collect();
+    let (records, media) = Harness::fake_media(mac);
+    let handler = DeviceHandler {
+        activity: Some(source),
+        ..Default::default()
+    };
+    let h = Harness::start_wired(
+        SwitchingMode::Handoff,
+        mac,
+        &manager,
+        media,
+        records,
+        Arc::new(handler),
+    )
+    .await;
+    (h, rx, tx)
+}
+
+async fn expected_update(remote: &'static str, level: crate::activity::ActivityLevel) -> Vec<u8> {
+    let fields = crate::activity::tipi_fields(level);
+    reference(|m| async move { m.send_tipi_update(LOCAL, remote, fields).await }).await
+}
+
+#[tokio::test]
+async fn tipi_update_on_activity_state_change() {
+    use crate::activity::ActivityLevel::{Idle, Low};
+    let mac = "5A:00:00:05:09:01";
+    let source = SwitchedActivity::new(HIGH);
+    let hosts = [LOCAL, REMOTE, SECOND_REMOTE];
+    let (_h, mut rx, _tx) = tipi_task(mac, &hosts, source.clone()).await;
+    assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+    for remote in [REMOTE, SECOND_REMOTE] {
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(remote).await
+        );
+        assert_eq!(next_packet(&mut rx).await, expected_tipi(remote).await);
+    }
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    // High -> Max stays in its group: two more poll periods, nothing sent.
+    source.switch(unlocked_since(1)).await;
+    source.polls(1).await;
+    assert!(rx.try_recv().is_err());
+    for (inputs, level) in [(unlocked_since(40), Low), (IDLE, Idle)] {
+        source.switch(inputs).await;
+        for remote in [REMOTE, SECOND_REMOTE] {
+            assert_eq!(
+                next_packet(&mut rx).await,
+                expected_update(remote, level).await
+            );
+        }
+    }
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    stop_handoff_task(mac);
+}
+
+#[tokio::test]
+async fn tipi_update_none_snapshot_sends_nothing() {
+    let mac = "5A:00:00:05:09:02";
+    let source = SwitchedActivity::new(HIGH);
+    let (_h, mut rx, _tx) = tipi_task(mac, &[LOCAL, REMOTE], source.clone()).await;
+    assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+    assert_eq!(
+        next_packet(&mut rx).await,
+        expected_new_device(REMOTE).await
+    );
+    assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    source.switch(None).await;
+    source.switch(HIGH).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    stop_handoff_task(mac);
+}
+
+#[tokio::test]
+async fn tipi_update_skips_failed_host() {
+    let mac = "5A:00:00:05:09:03";
+    let source = SwitchedActivity::new(HIGH);
+    let hosts = [LOCAL, "not a MAC", REMOTE];
+    let (_h, mut rx, _tx) = tipi_task(mac, &hosts, source.clone()).await;
+    // The startup's announcement stops at the invalid host.
+    assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    source.switch(unlocked_since(40)).await;
+    let low = expected_update(REMOTE, crate::activity::ActivityLevel::Low).await;
+    assert_eq!(next_packet(&mut rx).await, low);
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    stop_handoff_task(mac);
+}
+
+/// Every snapshot blocks 3 s; counts the calls and those in flight.
+#[derive(Default)]
+struct StuckActivity {
+    calls: AtomicUsize,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl ActivitySource for StuckActivity {
+    fn snapshot(&self) -> Option<ActivityInputs> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(3));
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        HIGH
+    }
+}
+
+#[tokio::test]
+async fn tipi_poll_stuck_source_no_overlap() {
+    let mac = "5A:00:00:05:09:04";
+    let source = Arc::new(StuckActivity::default());
+    let (_h, _rx, _tx) = tipi_task(mac, &[LOCAL, REMOTE], source.clone()).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // The startup announcement's timed-out call plus one poll.
+    assert!(source.max_in_flight.load(Ordering::SeqCst) <= 2);
+    assert!(source.calls.load(Ordering::SeqCst) >= 2);
+    stop_handoff_task(mac);
+}
+
+#[tokio::test]
+async fn tipi_poll_ends_with_task() {
+    let mac = "5A:00:00:05:09:05";
+    let source = SwitchedActivity::new(HIGH);
+    let (_h, _rx, _tx) = tipi_task(mac, &[LOCAL, REMOTE], source.clone()).await;
+    source.polls(3).await;
+    stop_handoff_task(mac);
+    // The abort lands.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let calls = source.calls();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(source.calls(), calls);
+}

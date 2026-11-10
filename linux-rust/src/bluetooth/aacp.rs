@@ -1157,6 +1157,20 @@ impl AACPManager {
         .await
     }
 
+    pub async fn send_tipi_update(
+        &self,
+        self_mac_address: &str,
+        target_mac_address: &str,
+        fields: TipiFields,
+    ) -> Result<()> {
+        self.send_data_packet(&encode_tipi_update(
+            self_mac_address,
+            target_mac_address,
+            fields,
+        )?)
+        .await
+    }
+
     pub async fn send_some_packet(&self) -> Result<()> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
@@ -1487,6 +1501,23 @@ pub(crate) fn encode_add_tipi_device(
         nearby_audio_score,
     } = fields;
     let dict = tipi_body(idle_time, true, self_mac_address, "Mac", nearby_audio_score);
+    smart_routing_packet(target_mac_address, &dict)
+}
+
+/// The tipi re-sent on an activity change (#509): the Mac's shape without
+/// newTipi.
+pub(crate) fn encode_tipi_update(
+    self_mac_address: &str,
+    target_mac_address: &str,
+    fields: TipiFields,
+) -> std::io::Result<Vec<u8>> {
+    let dict = tipi_body(
+        fields.idle_time,
+        false,
+        self_mac_address,
+        "Mac",
+        fields.nearby_audio_score,
+    );
     smart_routing_packet(target_mac_address, &dict)
 }
 
@@ -2218,6 +2249,38 @@ mod tests {
         assert_eq!(sent_packet(&mut rx), GOLDEN_ADD_TIPI_DEVICE);
     }
 
+    // #509: Apple's no-newTipi shape (golden_apple_tipi_idle0_score2).
+    const TIPI_UPDATE_LOW: TipiFields = TipiFields {
+        idle_time: 0,
+        nearby_audio_score: 2,
+    };
+
+    fn apple_tipi_update_low() -> Vec<u8> {
+        let dict = tipi_body(0, false, GOLDEN_SELF_MAC, "Mac", 2);
+        smart_routing_packet(GOLDEN_TARGET_MAC, &dict).expect("smart_routing_packet")
+    }
+
+    #[test]
+    fn encode_tipi_update_matches_apple_shape() {
+        let packet = encode_tipi_update(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, TIPI_UPDATE_LOW)
+            .expect("encode_tipi_update");
+        assert_eq!(packet, apple_tipi_update_low());
+        let add = encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, TIPI_UPDATE_LOW)
+            .expect("encode_add_tipi_device");
+        assert_ne!(packet, add);
+    }
+
+    #[tokio::test]
+    async fn golden_send_tipi_update() {
+        let (manager, mut rx) = manager_with_send_channel().await;
+        manager
+            .send_tipi_update(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, TIPI_UPDATE_LOW)
+            .await
+            .expect("send_tipi_update");
+        let expected = [HEADER_BYTES.as_slice(), &apple_tipi_update_low()].concat();
+        assert_eq!(sent_packet(&mut rx), expected);
+    }
+
     #[tokio::test]
     async fn golden_send_hijack_reversed() {
         let (manager, mut rx) = manager_with_send_channel().await;
@@ -2930,6 +2993,11 @@ mod tests {
                 "add_tipi_device",
                 encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, TipiFields::LEGACY)
                     .expect("add_tipi_device"),
+            ),
+            (
+                "tipi_update",
+                encode_tipi_update(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, TipiFields::LEGACY)
+                    .expect("tipi_update"),
             ),
             (
                 "hijack_reversed",
