@@ -85,7 +85,10 @@ impl Handoff {
                 }
                 None => {}
             }
-            self.requested_take = false;
+            // A late acknowledgement behind Undo's take (#17) leaves it.
+            if !self.pending.is_some_and(|p| p.desired) {
+                self.requested_take = false;
+            }
         }
         let Some(pending) = acked else {
             if late_release.is_some() {

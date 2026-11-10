@@ -215,6 +215,44 @@ async fn undo_sends_the_take_then_the_reverse_packet() {
     stop_handoff_task(mac);
 }
 
+/// #17: the shell's `notifications` setting reaches the post: off, a
+/// take's ACK posts nothing; on, it posts "Connected".
+#[tokio::test]
+async fn notifications_setting_off_posts_nothing() {
+    use crate::notifications::Notice;
+    for enabled in [false, true] {
+        let (manager, _rx, _tx) = ready_session().await;
+        let mut shell = bare_shell("5A:00:00:00:01:17", manager, mpsc::unbounded_channel().1);
+        let posted = Arc::new(StdMutex::new(Vec::new()));
+        let record = posted.clone();
+        shell.notifier = Arc::new(move |notice: Notice| record.lock().unwrap().push(notice));
+        shell.notifications = enabled;
+        let mut core =
+            Handoff::new(LOCAL.to_string(), Instant::now(), false, true).with_notifications(true);
+        for input in [
+            Input::ConnectedDevices {
+                old: Vec::new(),
+                new: vec![host(LOCAL), host(REMOTE)],
+            },
+            Input::EarState(vec![EarDetectionStatus::InEar; 2]),
+            Input::AudioSource(AudioSource {
+                mac: "00:00:00:00:00:00".to_string(),
+                r#type: AudioSourceType::None,
+            }),
+            Input::Take,
+            Input::Ownership(vec![1]),
+        ] {
+            assert!(!step(&mut core, &mut shell, input).await);
+        }
+        let expected = if enabled {
+            vec![Notice::Connected]
+        } else {
+            vec![]
+        };
+        assert_eq!(*posted.lock().unwrap(), expected, "{enabled}");
+    }
+}
+
 #[tokio::test]
 async fn handoff_task_ends_on_session_loss_without_reconnect() {
     let mac = "5A:00:00:00:00:03";

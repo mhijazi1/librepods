@@ -737,6 +737,13 @@ fn undo_during_the_release_runs_once_it_settles() {
         p.feed(6000, Input::Tick),
         [SendOwnership(true), SendHijackReversed(REMOTE.to_string())]
     );
+    // The release's late [0] (#55) is not a loss of Undo's take, whose
+    // [1] then routes without a pause or a resume.
+    assert_eq!(p.feed(6100, Input::Ownership(vec![0])), []);
+    assert_eq!(
+        p.feed(6200, Input::Ownership(vec![1])),
+        [RouteToAirPods, NotifyConnected]
+    );
 }
 
 #[test]

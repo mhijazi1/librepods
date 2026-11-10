@@ -1002,7 +1002,11 @@ impl Handoff {
             self.say("BLOCKED undo needs a live session, a remote host, an in-ear bud, and no remote call");
             return;
         }
+        // A timed-out release (the yield's) may still be acknowledged late:
+        // that [0] is not a loss of this take (#55).
+        let late = self.timed_out_release;
         self.request(now, true, Cause::User, out);
+        self.timed_out_release = late;
         // Undo never resumes (spike #259): the ACK skips the resume.
         self.resume_deferred = true;
         self.say("REQUEST owner=linux for Undo");

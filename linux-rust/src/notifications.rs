@@ -9,7 +9,7 @@ use dbus::blocking::{BlockingSender, Connection};
 use dbus::message::MatchRule;
 use log::warn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -121,7 +121,10 @@ impl Notifier for Desktop {
         tokio::spawn(async move {
             let airpods = alias(&mac).await.unwrap_or_default();
             let content = content(&notice, &airpods);
-            match tokio::task::spawn_blocking(move || show(&content, on_undo)).await {
+            let shown = tokio::task::spawn_blocking(move || {
+                Connection::new_session().and_then(|bus| show(&bus, &content, on_undo))
+            });
+            match shown.await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!("Notification not shown: {e}"),
                 Err(e) => warn!("Notification task failed: {e}"),
@@ -136,11 +139,54 @@ async fn alias(mac: &str) -> Option<String> {
     adapter.device(mac.parse().ok()?).ok()?.alias().await.ok()
 }
 
-/// Show `content`; with an action, wait until it is clicked (calling
-/// `on_undo`), closed or expired, and close it on expiry so no dead button
-/// stays.
-fn show(content: &Content, on_undo: impl Fn() + Send + 'static) -> Result<(), dbus::Error> {
-    let bus = Connection::new_session()?;
+/// Show `content` on `bus`; with an action, wait until it is clicked
+/// (calling `on_undo`), closed or expired, and close it on expiry so no
+/// dead button stays.
+fn show(
+    bus: &Connection,
+    content: &Content,
+    on_undo: impl Fn() + Send + 'static,
+) -> Result<(), dbus::Error> {
+    // The server's unique name: only its signals count, so another client
+    // can't fake a click. Started first if the bus activates it.
+    let dbus = bus.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        CALL_TIMEOUT,
+    );
+    let _: Result<(u32,), _> =
+        dbus.method_call("org.freedesktop.DBus", "StartServiceByName", (IFACE, 0u32));
+    let (server,): (String,) =
+        dbus.method_call("org.freedesktop.DBus", "GetNameOwner", (IFACE,))?;
+    // Matched before Notify, so a click that beats its reply is queued; the
+    // callbacks run in `process`, once the id is set.
+    let id = Arc::new(AtomicU32::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    if content.action.is_some() {
+        let rule = |member: &'static str| {
+            MatchRule::new_signal(IFACE, member)
+                .with_sender(server.clone())
+                .with_path(PATH)
+        };
+        let (owner, clicked, finished) = (server.clone(), id.clone(), done.clone());
+        bus.add_match(rule("ActionInvoked"), move |_: (), _, msg: &Message| {
+            if clicked_undo(msg, &owner, clicked.load(Ordering::SeqCst)) {
+                on_undo();
+                finished.store(true, Ordering::SeqCst);
+            }
+            true
+        })?;
+        let (owner, closed, finished) = (server.clone(), id.clone(), done.clone());
+        bus.add_match(
+            rule("NotificationClosed"),
+            move |_: (), _, msg: &Message| {
+                if from_server(msg, &owner, closed.load(Ordering::SeqCst)) {
+                    finished.store(true, Ordering::SeqCst);
+                }
+                true
+            },
+        )?;
+    }
     let actions: Vec<&str> = content
         .action
         .iter()
@@ -159,46 +205,19 @@ fn show(content: &Content, on_undo: impl Fn() + Send + 'static) -> Result<(), db
         content.expire_ms,
     ));
     let reply = bus.send_with_reply_and_block(notify, CALL_TIMEOUT)?;
-    let id: u32 = reply.read1()?;
-    // The unique name that posted it: only its signals count, so another
-    // client can't fake a click. Matched after the reply, before the
-    // banner can have been clicked.
-    let Some(server) = reply.sender().map(|s| s.to_string()) else {
-        return Ok(());
-    };
-    if content.action.is_none() {
+    let posted: u32 = reply.read1()?;
+    // Another server answered (the name changed hands): its signals are
+    // not matched, so there is nothing to wait for.
+    if content.action.is_none() || reply.sender().as_deref() != Some(server.as_str()) {
         return Ok(());
     }
-    let done = Arc::new(AtomicBool::new(false));
-    let rule = |member: &'static str| {
-        MatchRule::new_signal(IFACE, member)
-            .with_sender(server.clone())
-            .with_path(PATH)
-    };
-    let (owner, finished) = (server.clone(), done.clone());
-    bus.add_match(rule("ActionInvoked"), move |_: (), _, msg: &Message| {
-        if clicked_undo(msg, &owner, id) {
-            on_undo();
-            finished.store(true, Ordering::SeqCst);
-        }
-        true
-    })?;
-    let (owner, finished) = (server.clone(), done.clone());
-    bus.add_match(
-        rule("NotificationClosed"),
-        move |_: (), _, msg: &Message| {
-            if from_server(msg, &owner, id) {
-                finished.store(true, Ordering::SeqCst);
-            }
-            true
-        },
-    )?;
+    id.store(posted, Ordering::SeqCst);
     let expiry = Instant::now() + Duration::from_millis(content.expire_ms as u64);
     while !done.load(Ordering::SeqCst) {
         let left = expiry.saturating_duration_since(Instant::now());
         if left.is_zero() {
             let server = bus.with_proxy(server.as_str(), PATH, CALL_TIMEOUT);
-            return server.method_call(IFACE, "CloseNotification", (id,));
+            return server.method_call(IFACE, "CloseNotification", (posted,));
         }
         bus.process(left)?;
     }
@@ -324,5 +343,83 @@ mod tests {
             |sender| from_server(&signal(sender, PATH, "NotificationClosed", None), SERVER, 7);
         assert!(closed(SERVER));
         assert!(!closed(":1.99"));
+    }
+
+    /// A private bus from the dev shell's `dbus-daemon`, killed on drop.
+    struct PrivateBus(std::process::Child, String);
+
+    impl PrivateBus {
+        fn start() -> Self {
+            use std::io::BufRead;
+            let tmpdir = format!("--address=unix:tmpdir={}", std::env::temp_dir().display());
+            let mut daemon = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1", &tmpdir])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("dbus-daemon (in the dev shell)");
+            let mut address = String::new();
+            std::io::BufReader::new(daemon.stdout.take().expect("stdout"))
+                .read_line(&mut address)
+                .expect("the bus address");
+            PrivateBus(daemon, address.trim().to_string())
+        }
+
+        fn connect(&self) -> Connection {
+            let mut channel = dbus::channel::Channel::open_private(&self.1).expect("open");
+            channel.register().expect("register");
+            Connection::from(channel)
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn a_click_before_the_notify_reply_still_undoes() {
+        let bus = PrivateBus::start();
+        let server = bus.connect();
+        server
+            .request_name(IFACE, false, true, true)
+            .expect("the server name");
+        // A server that sends the click before it answers Notify.
+        let fake = std::thread::spawn(move || {
+            loop {
+                let call = server
+                    .channel()
+                    .blocking_pop_message(Duration::from_secs(5))
+                    .expect("receive")
+                    .expect("a Notify call");
+                if call.member().as_deref() != Some("Notify") {
+                    continue;
+                }
+                let click = Message::new_signal(PATH, IFACE, "ActionInvoked")
+                    .expect("signal")
+                    .append2(7u32, UNDO_KEY);
+                server.channel().send(click).expect("send the click");
+                server
+                    .channel()
+                    .send(call.method_return().append1(7u32))
+                    .expect("reply");
+                server.channel().flush();
+                return;
+            }
+        });
+        let clicked = Arc::new(AtomicBool::new(false));
+        let undo = clicked.clone();
+        let started = Instant::now();
+        show(
+            &bus.connect(),
+            &content(&moved_to(Some("iPhone")), "AirPods"),
+            move || undo.store(true, Ordering::SeqCst),
+        )
+        .expect("shown");
+        fake.join().expect("the fake server");
+        assert!(clicked.load(Ordering::SeqCst));
+        // Ended by the click, not the 20 s expiry.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }
