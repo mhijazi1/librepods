@@ -539,6 +539,11 @@ impl Handoff {
         self
     }
 
+    /// Change the connect mode of a running core (#153): no command.
+    pub(crate) fn set_connect_mode(&mut self, mode: ConnectMode) {
+        self.connect_mode = mode;
+    }
+
     /// Start with Linux as the last owner or not: the shell keeps the value
     /// across a session's handoff tasks (#16).
     pub(crate) fn with_last_owner_linux(mut self, last_owner_linux: bool) -> Self {

@@ -33,7 +33,7 @@ use log::{error, info};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 mod inputs;
 mod poller;
@@ -46,7 +46,7 @@ pub(crate) use poller::{
     NOT_PAUSING, PlaybackSamples, device_media, pause_own_players, spawn_playback_poller,
 };
 use registry::{HANDOFF_TASKS, spawn_handoff_task, stop_handoff_task};
-pub(crate) use registry::{last_owner_linux, stop_all_handoff_tasks};
+pub(crate) use registry::{last_owner_linux, set_connect_mode, stop_all_handoff_tasks};
 pub(crate) use shell::LineSink;
 use shell::Shell;
 
@@ -131,7 +131,6 @@ impl Switching {
         let handoff = setup.mode == SwitchingMode::Handoff;
         let log = handoff.then(handoff_log::app_log).flatten();
         let mac = setup.airpods_mac.clone();
-        // shortcut: connect mode is read once at start; a live update is tracked in (#153)
         let mut switching =
             Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller)
                 .await
@@ -245,6 +244,7 @@ impl Switching {
                 let (flush_tx, flush_rx) = mpsc::unbounded_channel();
                 // Before the router starts, so no reinsertion's report is lost.
                 let ear_rx = media.ear_resumes();
+                let connect_mode = watch::Sender::new(self.connect_mode);
                 let shell = Shell {
                     mac: self.airpods_mac.clone(),
                     local,
@@ -259,7 +259,8 @@ impl Switching {
                     ear_rx,
                     resume: None,
                     lines: self.lines,
-                    connect_mode: self.connect_mode,
+                    connect_mode_rx: connect_mode.subscribe(),
+                    connect_mode,
                     relay_category: self.relay_category,
                     held: false,
                     parked: false,

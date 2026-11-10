@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 use log::{error, info};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// The handoff task's I/O: executes the core's commands.
 pub(super) struct Shell {
@@ -41,8 +41,11 @@ pub(super) struct Shell {
     pub(super) resume: Option<oneshot::Sender<()>>,
     /// Where the core's lines go after they are logged, if anywhere.
     pub(super) lines: Option<LineSink>,
-    /// The device's "Connect to this computer" (#16).
-    pub(super) connect_mode: ConnectMode,
+    /// The device's "Connect to this computer" (#16); the registry keeps a
+    /// clone to change it live (#153).
+    pub(super) connect_mode: watch::Sender<ConnectMode>,
+    /// `connect_mode`'s changes not yet applied to the core.
+    pub(super) connect_mode_rx: watch::Receiver<ConnectMode>,
     /// Relay Linux's audio category to the other hosts (#272).
     pub(super) relay_category: bool,
     /// Whether the last `HoldA2dp` held (#264); released on drop (#294).
@@ -191,6 +194,14 @@ impl Shell {
     }
 }
 
+/// Hand the latest "Connect to this computer" to the core (#153). It gates
+/// the next automatic take only: no step, nothing sent.
+fn apply_connect_mode(core: &mut Handoff, shell: &mut Shell) {
+    let mode = *shell.connect_mode_rx.borrow_and_update();
+    core.set_connect_mode(mode);
+    shell.log(&format!("CONNECT MODE {mode:?} (live)"));
+}
+
 /// Feed one input to the core, log its lines and execute its commands. True
 /// when the task should end.
 pub(super) async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) -> bool {
@@ -198,6 +209,10 @@ pub(super) async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) ->
     {
         let streams = &shell.play_rx.streams.borrow().0;
         core.set_streams(streams.live.is_some(), streams.baseline);
+    }
+    // A change saved while this input waited still gates its decision.
+    if shell.connect_mode_rx.has_changed().unwrap_or(false) {
+        apply_connect_mode(core, shell);
     }
     let (now, commands) = shell.play_rx.handle(|now| core.handle(now, input));
     if commands.contains(&Command::DropSession) {
@@ -335,13 +350,14 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
         }
         (session_facts(&state), backlog)
     };
+    // The latest mode, so a change during the waits above is not lost.
     let mut core = Handoff::new(
         shell.local.clone(),
         Instant::now(),
         for_playback,
         !for_playback,
     )
-    .with_connect_mode(shell.connect_mode)
+    .with_connect_mode(*shell.connect_mode_rx.borrow_and_update())
     .with_last_owner_linux(last_owner_linux(&shell.mac))
     .with_default_sink_routing(true)
     .with_a2dp_hold(true)
@@ -390,6 +406,11 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     loop {
         let end = tokio::select! {
             biased;
+            // An idle change logs at once; `step` applies one it beats.
+            Ok(()) = shell.connect_mode_rx.changed() => {
+                apply_connect_mode(&mut core, &mut shell);
+                false
+            }
             event = shell.events.recv() => match event {
                 // Check the session before stepping the event, but keep the
                 // rest of the queue for the next sync.

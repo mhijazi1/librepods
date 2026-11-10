@@ -67,6 +67,174 @@ async fn handoff_automatically_takes_new_playback() {
     stop_handoff_task(mac);
 }
 
+/// The running task's `CONNECT MODE ` lines (#153).
+fn connect_mode_changes(mac: &str) -> usize {
+    traced(mac)
+        .iter()
+        .filter(|line| line.starts_with("CONNECT MODE "))
+        .count()
+}
+
+/// #153: switching to "Automatically" while the task runs, as the window
+/// does, sends nothing by itself; the next new playback takes.
+#[tokio::test]
+async fn live_connect_mode_automatically_ungates_new_playback() {
+    let mac = "5A:01:53:00:00:01";
+    let (manager, mut rx, _tx) = ready_session().await;
+    let h = Harness::start_connect(ConnectMode::WhenLastConnected, mac, &manager).await;
+    expect_startup(&h, &mut rx).await;
+
+    set_connect_mode(mac, ConnectMode::Automatically);
+    wait_until("the live connect mode", || connect_mode_changes(mac) == 1).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    expect_take(&h, &mut rx).await;
+    assert_eq!(connect_mode_skips(mac), 0);
+    stop_handoff_task(mac);
+}
+
+/// #153: switching to "When last connected" while the task runs gates the
+/// next new playback, and sends nothing.
+#[tokio::test]
+async fn live_connect_mode_when_last_connected_gates_new_playback() {
+    let mac = "5A:01:53:00:00:02";
+    let (manager, mut rx, _tx) = no_source_session().await;
+    let h = Harness::start_connect(ConnectMode::Automatically, mac, &manager).await;
+    expect_startup(&h, &mut rx).await;
+
+    set_connect_mode(mac, ConnectMode::WhenLastConnected);
+    wait_until("the live connect mode", || connect_mode_changes(mac) == 1).await;
+    h.emit(owns(0));
+    h.play(false).await;
+    h.play(true).await;
+    wait_until("the connect-mode skip", || connect_mode_skips(mac) > 0).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    assert_eq!(connect_mode_skips(mac), 1);
+    stop_handoff_task(mac);
+}
+
+/// #153: with Linux owning, switching to "When last connected" releases
+/// nothing (spike #255) and keeps Linux the last owner.
+#[tokio::test]
+async fn live_connect_mode_change_keeps_linux_ownership() {
+    let mac = "5A:01:53:00:00:03";
+    let (manager, mut rx, _tx) = no_source_session().await;
+    let h = Harness::start_connect(ConnectMode::Automatically, mac, &manager).await;
+    expect_startup(&h, &mut rx).await;
+    expect_take(&h, &mut rx).await;
+    h.emit_queued(owns(1)).await;
+    wait_until("the take's ACK", || {
+        traced(mac).iter().any(|l| l.starts_with("ACK owner=linux"))
+    })
+    .await;
+
+    set_connect_mode(mac, ConnectMode::WhenLastConnected);
+    wait_until("the live connect mode", || connect_mode_changes(mac) == 1).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    h.play(false).await;
+    h.play(true).await;
+    wait_until("the new play edge", || {
+        traced(mac)
+            .iter()
+            .any(|l| l == "AUTO playback started; Linux already owns")
+    })
+    .await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    assert_eq!(connect_mode_skips(mac), 0);
+    assert!(last_owner_linux(mac));
+    stop_handoff_task(mac);
+}
+
+/// #153: a change with no running task, before one starts or after it
+/// stopped, reaches nothing and leaves nothing for the next task.
+#[tokio::test]
+async fn live_connect_mode_without_task_is_ignored() {
+    let mac = "5A:01:53:00:00:04";
+    set_connect_mode(mac, ConnectMode::Automatically);
+    let (manager, mut rx, _tx) = ready_session().await;
+    let h = Harness::start_connect(ConnectMode::WhenLastConnected, mac, &manager).await;
+    expect_startup(&h, &mut rx).await;
+    stop_handoff_task(mac);
+    set_connect_mode(mac, ConnectMode::Automatically);
+    assert_eq!(connect_mode_changes(mac), 0);
+
+    let (manager, mut rx, _tx) = ready_session().await;
+    let h = Harness::start_connect(ConnectMode::WhenLastConnected, mac, &manager).await;
+    expect_startup(&h, &mut rx).await;
+    h.emit(owns(0));
+    h.play(false).await;
+    h.play(true).await;
+    wait_until("the connect-mode skip", || connect_mode_skips(mac) > 0).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    assert_eq!(connect_mode_skips(mac), 1);
+    assert_eq!(connect_mode_changes(mac), 0);
+    stop_handoff_task(mac);
+}
+
+/// #153: a change saved while a picked input waits for the state lock
+/// (`mark_session_lost`) gates that input's decision: the #452 connect
+/// take the last routing report would make in "Automatically" is skipped.
+#[tokio::test]
+async fn live_connect_mode_applies_before_the_next_step() {
+    let mac = "5A:01:53:00:00:06";
+    let (manager, mut rx, _tx) = injected_manager().await;
+    let h = Harness::start_connect(ConnectMode::Automatically, mac, &manager).await;
+    wait_until("the startup", || {
+        traced(mac).iter().any(|l| l.starts_with("AUTO enabled"))
+    })
+    .await;
+    let hosts = vec![host(LOCAL), host(REMOTE)];
+    manager.state.lock().await.connected_devices = hosts.clone();
+    h.emit_queued(AACPEvent::ConnectedDevices(Vec::new(), hosts))
+        .await;
+    h.emit_queued(wear(EarDetectionStatus::InEar)).await;
+    let state = manager.state.lock().await;
+    // Not `emit_queued`: no await, so no tick is picked ahead of it.
+    h.emit(idle_source());
+    // The task picks the report and waits on the lock.
+    tokio::time::sleep(SETTLE).await;
+    set_connect_mode(mac, ConnectMode::WhenLastConnected);
+    drop(state);
+    // The gated decision: "not owning" after the hosts' announce.
+    assert_eq!(
+        rest(&mut rx).await,
+        [
+            expected_new_device(REMOTE).await,
+            expected_tipi(REMOTE).await,
+            expected_owns(0).await,
+        ]
+    );
+    let lines = traced(mac);
+    assert!(
+        lines.iter().any(|l| l.starts_with("CONNECT MODE "))
+            && !lines
+                .iter()
+                .any(|l| l.starts_with("AUTO connected while the other host is idle")),
+        "{lines:?}"
+    );
+    stop_handoff_task(mac);
+}
+
+/// #153: a change while the task waits for its predecessor's release
+/// (#294) reaches the core it then builds: the startup's connect take
+/// (#324) follows the new mode.
+#[tokio::test]
+async fn live_connect_mode_during_the_start_wait_is_applied() {
+    let mac = "5A:01:53:00:00:05";
+    let (first_manager, mut first_rx, _first_tx) = no_source_session().await;
+    let first = Harness::start_connect(ConnectMode::Automatically, mac, &first_manager).await;
+    expect_startup(&first, &mut first_rx).await;
+    first.records.gated.store(true, Ordering::SeqCst);
+
+    let (manager, mut rx, _tx) = ready_session().await;
+    let h = Harness::start_connect(ConnectMode::WhenLastConnected, mac, &manager).await;
+    tokio::time::sleep(SETTLE).await;
+    assert!(rx.try_recv().is_err());
+    set_connect_mode(mac, ConnectMode::Automatically);
+    first.records.gate.notify_one();
+    expect_connect_take(&h, &mut rx).await;
+    stop_handoff_task(mac);
+}
+
 /// #324: the daemon's session start finds the other host idle, so its
 /// first ownership packet is OwnsConnection [1], as the Mac takes when it
 /// connects (spike #325), with no pause; the acknowledged idle take

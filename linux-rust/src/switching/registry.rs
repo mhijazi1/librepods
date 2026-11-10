@@ -2,19 +2,22 @@
 
 use super::SHUTDOWN_RELEASE_WAIT;
 use super::shell::{Shell, run_handoff};
+use crate::utils::ConnectMode;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use log::info;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex as StdMutex};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::AbortHandle;
 
 pub(super) struct HandoffTask {
     id: u64,
     handle: AbortHandle,
     released: Released,
+    /// The task's "Connect to this computer" (#153).
+    connect_mode: watch::Sender<ConnectMode>,
 }
 
 /// A stopped task's queued sink work (#294, #311): its settle, sent by the
@@ -103,6 +106,17 @@ pub(crate) fn stop_handoff_task(mac: &str) {
     HANDOFF_TASKS.lock().unwrap().stop(mac);
 }
 
+/// Hand a "Connect to this computer" change to this AirPods MAC's running
+/// handoff task (#153). Without one it does nothing: the next task reads
+/// preferences.json.
+pub(crate) fn set_connect_mode(mac: &str, mode: ConnectMode) {
+    let registry = HANDOFF_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(task) = registry.tasks.get(mac) {
+        task.connect_mode
+            .send_if_modified(|current| std::mem::replace(current, mode) != mode);
+    }
+}
+
 /// At exit: stop every handoff task, then wait, at most
 /// `SHUTDOWN_RELEASE_WAIT`, for the held ones' releases to settle (#294).
 /// Every call waits for the same shutdown.
@@ -171,6 +185,7 @@ pub(super) fn spawn_handoff_task(
     let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
     let (release_tx, released) = oneshot::channel();
     shell.released = Some(release_tx);
+    let connect_mode = shell.connect_mode.clone();
     let unregister = Unregister {
         registry,
         mac: mac.clone(),
@@ -186,6 +201,7 @@ pub(super) fn spawn_handoff_task(
             id,
             handle: task.abort_handle(),
             released,
+            connect_mode,
         },
     );
 }
