@@ -499,9 +499,17 @@ fn notifying_take(hosts: &[&str], category: u32) -> Probe {
 
 fn moved_to(out: &[Command]) -> Vec<Command> {
     out.iter()
-        .filter(|c| matches!(c, NotifyMovedTo(_)))
+        .filter(|c| matches!(c, NotifyMovedTo { .. }))
         .cloned()
         .collect()
+}
+
+/// The "moved to" of yield `id`, naming `taker`.
+fn moved(id: u64, taker: Option<&str>) -> Command {
+    NotifyMovedTo {
+        id,
+        taker: taker.map(str::to_string),
+    }
 }
 
 /// `notifying_take` on [L, R] while Linux plays 301, REMOTE's media
@@ -511,11 +519,7 @@ fn yielded_to_remote() -> Probe {
     assert_eq!(p.feed(700, remote_media()), []);
     assert_eq!(
         p.feed(800, Input::Ownership(vec![0])),
-        [
-            PauseMedia,
-            RouteAway,
-            NotifyMovedTo(Some(REMOTE.to_string()))
-        ]
+        [PauseMedia, RouteAway, moved(1, Some(REMOTE))]
     );
     p
 }
@@ -529,7 +533,7 @@ fn lost_take_while_playing_notifies_moved_to() {
     assert_eq!(p.play_category(500, MEDIA), [SendOwnership(true)]);
     assert_eq!(
         p.feed(600, Input::Ownership(vec![0])),
-        [PauseMedia, NotifyMovedTo(Some(REMOTE.to_string()))]
+        [PauseMedia, moved(1, Some(REMOTE))]
     );
 }
 
@@ -555,7 +559,7 @@ fn remote_request_while_playing_notifies_moved_to() {
             PauseMedia,
             RouteAway,
             SendOwnership(false),
-            NotifyMovedTo(Some(REMOTE.to_string()))
+            moved(1, Some(REMOTE))
         ]
     );
     // Its ACK yields nothing more.
@@ -595,13 +599,13 @@ fn yield_taker_is_the_remote_source() {
     for r#type in [AudioSourceType::Media, AudioSourceType::Call] {
         assert_eq!(
             taker_with(&[L, R, R2], Some(source(R2, r#type))),
-            [NotifyMovedTo(Some(R2.to_string()))],
+            [moved(1, Some(R2))],
             "{type:?}"
         );
         // The source beats the only remote host.
         assert_eq!(
             taker_with(&[L, R], Some(source(R2, r#type))),
-            [NotifyMovedTo(Some(R2.to_string()))],
+            [moved(1, Some(R2))],
             "{type:?}"
         );
     }
@@ -617,7 +621,7 @@ fn yield_taker_is_the_sole_remote_host() {
     ] {
         assert_eq!(
             taker_with(&[L, R], audio.clone()),
-            [NotifyMovedTo(Some(R.to_string()))],
+            [moved(1, Some(R))],
             "{audio:?}"
         );
     }
@@ -632,7 +636,7 @@ fn yield_taker_unknown_with_two_remote_hosts() {
     ] {
         assert_eq!(
             taker_with(&[L, R, R2], audio.clone()),
-            [NotifyMovedTo(None)],
+            [moved(1, None)],
             "{audio:?}"
         );
     }
@@ -646,7 +650,7 @@ fn undo_takes_back_and_relays_without_resume() {
     assert_eq!(p.play(850, false), []);
     p.core.take_lines();
     assert_eq!(
-        p.feed(900, Input::Undo),
+        p.feed(900, Input::Undo(1)),
         [SendOwnership(true), SendHijackReversed(REMOTE.to_string())]
     );
     assert_eq!(count_lines(&p.core.take_lines(), "REQUEST owner=linux"), 1);
@@ -656,7 +660,7 @@ fn undo_takes_back_and_relays_without_resume() {
         [RouteToAirPods, NotifyConnected]
     );
     // One Undo per yield.
-    assert_eq!(p.feed(1100, Input::Undo), []);
+    assert_eq!(p.feed(1100, Input::Undo(1)), []);
 }
 
 #[test]
@@ -664,10 +668,10 @@ fn undo_without_a_taker_takes_without_relay() {
     let mut p = notifying_take(&[L, R, R2], MEDIA);
     assert_eq!(
         moved_to(&p.feed(700, Input::Ownership(vec![0]))),
-        [NotifyMovedTo(None)]
+        [moved(1, None)]
     );
     p.core.take_lines();
-    assert_eq!(p.feed(800, Input::Undo), [SendOwnership(true)]);
+    assert_eq!(p.feed(800, Input::Undo(1)), [SendOwnership(true)]);
     assert_eq!(
         count_lines(&p.core.take_lines(), "UNDO the host that took is unknown"),
         1
@@ -680,22 +684,76 @@ fn undo_after_a_later_take_or_disconnect_does_nothing() {
     let mut p = yielded_to_remote();
     assert_eq!(p.play(900, false), []);
     assert_eq!(p.play_category(1000, MEDIA), [SendOwnership(true)]);
-    assert_eq!(p.feed(1100, Input::Undo), []);
+    assert_eq!(p.feed(1100, Input::Undo(1)), []);
     // An OwnsConnection [1].
     let mut p = yielded_to_remote();
     assert_eq!(p.feed(900, Input::Ownership(vec![1])), []);
-    assert_eq!(p.feed(1000, Input::Undo), []);
-    // A disconnect.
+    assert_eq!(p.feed(1000, Input::Undo(1)), []);
+    // A disconnect: a reconnect with REMOTE's media, which Undo could take
+    // from, doesn't revive it.
     let mut p = yielded_to_remote();
     assert_eq!(p.feed(900, Input::Disconnected), [DropSession]);
-    assert_eq!(p.feed(1000, Input::Undo), []);
-    // A release still pending waits; the Undo stays for after its ACK.
+    p.feed(2000, Input::Tick);
+    p.feed(
+        2100,
+        Input::Reconnected(SessionFacts {
+            audio: Some(source(REMOTE, AudioSourceType::Media)),
+            ..ready_facts()
+        }),
+    );
+    assert_eq!(p.feed(2200, Input::Undo(1)), []);
+    // A take from `Auto`'s wait, decided at the relay it waited for
+    // (#452), then lost while Linux is idle: no newer "moved to".
+    let mut p = yielded_to_remote();
+    assert_eq!(p.play(850, false), []);
+    assert_eq!(
+        p.feed(900, Input::Auto),
+        [ConnectA2dp, Announce, DrainPlayback]
+    );
+    assert_eq!(p.feed(1000, relay(REMOTE, IDLE)), [SendOwnership(true)]);
+    assert_eq!(moved_to(&p.feed(1100, Input::Ownership(vec![0]))), []);
+    assert_eq!(p.feed(1200, Input::Undo(1)), []);
+}
+
+#[test]
+fn undo_during_the_release_runs_once_it_settles() {
+    // One click before the remote release's ACK, none after.
+    let mut p = notifying_take(&[L, R], MEDIA);
+    assert_eq!(
+        moved_to(&p.feed(700, Input::RemoteOwnershipRequest)),
+        [moved(1, Some(REMOTE))]
+    );
+    assert_eq!(p.feed(800, Input::Undo(1)), []);
+    assert_eq!(
+        p.feed(900, Input::Ownership(vec![0])),
+        [SendOwnership(true), SendHijackReversed(REMOTE.to_string())]
+    );
+    assert_eq!(p.feed(1000, Input::Tick), []);
+    // Or once its ACK times out.
     let mut p = notifying_take(&[L, R], MEDIA);
     p.feed(700, Input::RemoteOwnershipRequest);
-    assert_eq!(p.feed(800, Input::Undo), []);
-    assert_eq!(p.feed(900, Input::Ownership(vec![0])), []);
+    assert_eq!(p.feed(800, Input::Undo(1)), []);
     assert_eq!(
-        p.feed(1000, Input::Undo),
+        p.feed(6000, Input::Tick),
+        [SendOwnership(true), SendHijackReversed(REMOTE.to_string())]
+    );
+}
+
+#[test]
+fn undo_of_an_older_yield_does_nothing() {
+    let mut p = yielded_to_remote();
+    assert_eq!(p.play(850, false), []);
+    // Linux takes back and loses it again: yield 2.
+    assert_eq!(p.play_category(900, MEDIA), [SendOwnership(true)]);
+    p.feed(1000, Input::Ownership(vec![1]));
+    assert_eq!(
+        moved_to(&p.feed(1100, Input::Ownership(vec![0]))),
+        [moved(2, Some(REMOTE))]
+    );
+    // A click on yield 1's banner, queued until now.
+    assert_eq!(p.feed(1200, Input::Undo(1)), []);
+    assert_eq!(
+        p.feed(1300, Input::Undo(2)),
         [SendOwnership(true), SendHijackReversed(REMOTE.to_string())]
     );
 }
@@ -713,11 +771,7 @@ fn take_ack_notifies_connected() {
     assert_eq!(p.play_category(1100, MEDIA), [SendOwnership(true)]);
     assert_eq!(
         p.feed(1200, Input::Ownership(vec![0])),
-        [
-            PauseMedia,
-            RouteAway,
-            NotifyMovedTo(Some(REMOTE.to_string()))
-        ]
+        [PauseMedia, RouteAway, moved(1, Some(REMOTE))]
     );
     // Not on #324's keep, which takes nothing.
     let mut p = Probe::new(false, true);

@@ -99,7 +99,7 @@ pub(crate) struct Switching {
     /// The `switchingNotifications` preference; `start` reads it.
     notifications: bool,
     /// The notifier's Undo clicks; `start_with_calls` sets none.
-    undo: Option<mpsc::UnboundedReceiver<()>>,
+    undo: Option<mpsc::UnboundedReceiver<u64>>,
 }
 
 enum Policy {

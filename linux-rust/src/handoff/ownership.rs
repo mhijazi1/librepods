@@ -161,8 +161,10 @@ impl Handoff {
     pub(super) fn notify_moved_to(&mut self, out: &mut Vec<Command>) {
         if self.notifications && self.category > AUDIO_CATEGORY_IDLE {
             let taker = self.taker();
-            self.undo_taker = Some(taker.clone());
-            out.push(Command::NotifyMovedTo(taker));
+            self.last_yield += 1;
+            let id = self.last_yield;
+            self.undo_taker = Some((id, taker.clone()));
+            out.push(Command::NotifyMovedTo { id, taker });
         }
     }
 

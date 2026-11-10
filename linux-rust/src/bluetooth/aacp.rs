@@ -1322,7 +1322,10 @@ pub(crate) fn tipi_body(
 // Smart-routing data packet: opcode, reversed target MAC, u16 LE length of
 // what follows (the 0x01 byte plus the dict), 0x01, then the dict with no
 // padding. A dict too long for the u16 length field is an InvalidInput error.
-fn smart_routing_packet(target_mac_address: &str, dict: &[u8]) -> std::io::Result<Vec<u8>> {
+pub(crate) fn smart_routing_packet(
+    target_mac_address: &str,
+    dict: &[u8],
+) -> std::io::Result<Vec<u8>> {
     let mac = reversed_mac_bytes(target_mac_address)?;
     let length = u16::try_from(1 + dict.len()).map_err(|_| {
         std::io::Error::new(

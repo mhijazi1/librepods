@@ -59,8 +59,8 @@ pub(super) struct Shell {
     pub(super) notifier: Arc<dyn Notifier>,
     /// The `switchingNotifications` preference.
     pub(super) notifications: bool,
-    /// Undo clicks on "moved to".
-    pub(super) undo_rx: mpsc::UnboundedReceiver<()>,
+    /// Undo clicks on "moved to", by yield id.
+    pub(super) undo_rx: mpsc::UnboundedReceiver<u64>,
 }
 
 /// The task's future drops its `Shell` on return, abort and panic alike,
@@ -173,12 +173,12 @@ impl Shell {
                     self.held = hold;
                     self.media.hold_a2dp(hold);
                 }
-                Command::NotifyMovedTo(taker) => {
-                    let name = match taker {
+                Command::NotifyMovedTo { id, taker } => {
+                    let taker = match taker {
                         Some(host) => self.manager.host_name(&host).await,
                         None => None,
                     };
-                    let notice = Notice::MovedTo(name);
+                    let notice = Notice::MovedTo { id, taker };
                     notifications::post(&*self.notifier, self.notifications, notice);
                 }
                 Command::NotifyConnected => {
@@ -465,9 +465,9 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
                 sync_session(&mut core, &mut shell).await
                     || step(&mut core, &mut shell, Input::A2dpTransport { active }).await
             }
-            Some(()) = shell.undo_rx.recv() => {
+            Some(id) = shell.undo_rx.recv() => {
                 sync_session(&mut core, &mut shell).await
-                    || step(&mut core, &mut shell, Input::Undo).await
+                    || step(&mut core, &mut shell, Input::Undo(id)).await
             }
             _ = tick.tick() => {
                 sync_session(&mut core, &mut shell).await

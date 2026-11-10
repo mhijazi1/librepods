@@ -162,6 +162,19 @@ async fn undo_sends_the_take_then_the_reverse_packet() {
     wait_until("the take's ACK", || acks() == 1).await;
     // Reported after that ACK, so only the Undo's ACK could resume.
     h.a2dp(false).await;
+    // REMOTE's media information names it.
+    let dict = crate::bluetooth::aacp::media_information_body(
+        "com.spotify.client",
+        true,
+        REMOTE,
+        "iPhone",
+        AUDIO_CATEGORY_MEDIA,
+    );
+    let mut relay = crate::bluetooth::aacp::smart_routing_packet(REMOTE, &dict).expect("relay");
+    relay[0] = crate::bluetooth::aacp::opcodes::SMART_ROUTING_RESP;
+    manager
+        .receive_packet(&[[0x04, 0x00, 0x04, 0x00].as_slice(), &relay].concat())
+        .await;
     h.emit_queued(AACPEvent::AudioSource(AudioSource {
         mac: REMOTE.to_string(),
         r#type: AudioSourceType::Media,
@@ -172,8 +185,13 @@ async fn undo_sends_the_take_then_the_reverse_packet() {
     // The pause's stop: Linux is idle under REMOTE's media at the click.
     h.play(false).await;
     assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    use crate::notifications::Notice::{Connected, MovedTo};
+    let id = match &h.notices.lock().unwrap()[..] {
+        [Connected, MovedTo { id, taker }] if taker.as_deref() == Some("iPhone") => *id,
+        notices => panic!("{notices:?}"),
+    };
 
-    h.undo_tx.send(()).expect("the task takes Undo clicks");
+    h.undo_tx.send(id).expect("the task takes Undo clicks");
     assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
     let reversed = reference(|m| async move { m.send_hijack_reversed(REMOTE).await }).await;
     let encoded = crate::bluetooth::aacp::encode_hijack_reversed(REMOTE).expect("encode");
@@ -189,6 +207,10 @@ async fn undo_sends_the_take_then_the_reverse_packet() {
         Vec::<usize>::new()
     );
     assert_eq!(h.pauses(), 1);
+    let notices = h.notices.lock().unwrap();
+    assert_eq!(notices.len(), 3, "{notices:?}");
+    assert_eq!(notices[2], Connected);
+    drop(notices);
 
     stop_handoff_task(mac);
 }
