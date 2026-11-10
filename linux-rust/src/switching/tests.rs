@@ -5,10 +5,11 @@ use super::poller::*;
 use super::registry::*;
 use super::shell::*;
 use super::*;
+use crate::activity::{ActivityInputs, ActivitySource};
 use crate::bluetooth::aacp::ControlCommandIdentifiers as Control;
 use crate::bluetooth::aacp::{
     AudioSource, AudioSourceType, ConnectedDevice, ControlCommandStatus, EarDetectionStatus,
-    encode_media_information_call,
+    TipiFields, encode_media_information_call,
 };
 use crate::call_detect::{StreamDirection, StreamProps};
 use crate::default_sink::PARK_SINK;
@@ -221,6 +222,8 @@ struct DeviceHandler {
     hold: Option<Arc<Mutex<MediaController>>>,
     /// Harness setup, not handler behavior: the core relays categories (#505).
     relay_category: bool,
+    /// Harness setup: the announced tipi's activity source (#13).
+    activity: Option<Arc<dyn ActivitySource>>,
 }
 
 impl DeviceHandler {
@@ -351,7 +354,11 @@ async fn expected_new_device(remote: &'static str) -> Vec<u8> {
 }
 
 async fn expected_tipi(remote: &'static str) -> Vec<u8> {
-    reference(|m| async move { m.send_add_tipi_device(LOCAL, remote).await }).await
+    reference(|m| async move {
+        m.send_add_tipi_device(LOCAL, remote, TipiFields::LEGACY)
+            .await
+    })
+    .await
 }
 
 async fn next_packet(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
@@ -594,6 +601,9 @@ impl Harness {
             posted.lock().unwrap().push(notice)
         });
         switching.relay_category = handler.relay_category;
+        if let Some(source) = handler.activity.clone() {
+            switching = switching.with_activity(source);
+        }
         switching.dispatch_events(events_rx, handler.clone().handle());
         Harness {
             records,
@@ -734,6 +744,7 @@ fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
         notifier: Arc::new(|_: crate::notifications::Notice| {}),
         notifications: true,
         undo_rx: mpsc::unbounded_channel().1,
+        activity: Arc::new(|| None),
     }
 }
 
@@ -1013,4 +1024,81 @@ mod t505 {
 
         stop_handoff_task(mac);
     }
+}
+
+// #13: the startup's announcement carries the activity source's level.
+
+/// The tipi `mac`'s handoff startup announces to REMOTE when `source`
+/// gives `snapshot`.
+async fn announced_tipi(mac: &str, snapshot: Option<ActivityInputs>) -> Vec<u8> {
+    let (manager, mut rx, _tx) = no_source_session().await;
+    let (records, media) = Harness::fake_media(mac);
+    let handler = DeviceHandler {
+        activity: Some(Arc::new(move || snapshot)),
+        ..Default::default()
+    };
+    let _h = Harness::start_wired(
+        SwitchingMode::Handoff,
+        mac,
+        &manager,
+        media,
+        records,
+        Arc::new(handler),
+    )
+    .await;
+    assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+    assert_eq!(
+        next_packet(&mut rx).await,
+        expected_new_device(REMOTE).await
+    );
+    let tipi = next_packet(&mut rx).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    stop_handoff_task(mac);
+    tipi
+}
+
+async fn expected_tipi_fields(idle_time: u32, nearby_audio_score: u32) -> Vec<u8> {
+    let fields = TipiFields {
+        idle_time,
+        nearby_audio_score,
+    };
+    reference(|m| async move { m.send_add_tipi_device(LOCAL, REMOTE, fields).await }).await
+}
+
+fn unlocked_since(secs: u64) -> Option<ActivityInputs> {
+    Some(ActivityInputs {
+        locked: false,
+        idle: false,
+        since_input: Some(Duration::from_secs(secs)),
+    })
+}
+
+#[tokio::test]
+async fn announce_tipi_locked_sends_idle_score() {
+    let locked = Some(ActivityInputs {
+        locked: true,
+        idle: false,
+        since_input: Some(Duration::from_secs(46)),
+    });
+    let tipi = announced_tipi("5A:00:00:00:13:01", locked).await;
+    assert_eq!(tipi, expected_tipi_fields(0, 1).await);
+    assert_ne!(tipi, expected_tipi(REMOTE).await);
+}
+
+#[tokio::test]
+async fn announce_tipi_recent_input_sends_max() {
+    let tipi = announced_tipi("5A:00:00:00:13:02", unlocked_since(2)).await;
+    assert_eq!(tipi, expected_tipi_fields(0, 7).await);
+}
+
+#[tokio::test]
+async fn announce_tipi_long_idle_sends_low() {
+    let tipi = announced_tipi("5A:00:00:00:13:03", unlocked_since(40)).await;
+    assert_eq!(tipi, expected_tipi_fields(0, 2).await);
+}
+
+#[tokio::test]
+async fn announce_tipi_failed_snapshot_sends_legacy() {
+    let tipi = announced_tipi("5A:00:00:00:13:04", None).await;
+    assert_eq!(tipi, expected_tipi(REMOTE).await);
 }

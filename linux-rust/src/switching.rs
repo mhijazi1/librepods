@@ -24,7 +24,8 @@
 //! the handoff task can still drain every event the manager emitted.
 
 use crate::a2dp_resume;
-use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers};
+use crate::activity::{ActivitySource, LogindActivity};
+use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers, TipiFields};
 use crate::handoff_log;
 use crate::media_controller::{self, MediaController};
 use crate::notifications::{self, Notice, Notifier};
@@ -100,6 +101,9 @@ pub(crate) struct Switching {
     notifications: bool,
     /// The notifier's Undo clicks; `start_with_calls` sets none.
     undo: Option<mpsc::UnboundedReceiver<u64>>,
+    /// The announced tipi's activity level (#13); `start` reads logind,
+    /// `start_with_calls` sends LEGACY.
+    activity: Arc<dyn ActivitySource>,
 }
 
 enum Policy {
@@ -142,7 +146,8 @@ impl Switching {
         let mut switching =
             Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller)
                 .await
-                .with_connect_mode(utils::load_connect_mode(&mac));
+                .with_connect_mode(utils::load_connect_mode(&mac))
+                .with_activity(Arc::new(LogindActivity));
         switching.a2dp = handoff.then(|| a2dp_resume::spawn_transport_poller(&mac));
         switching.relay_category = true;
         let (undo, undo_rx) = mpsc::unbounded_channel();
@@ -209,7 +214,15 @@ impl Switching {
             notifier: Arc::new(|_: Notice| {}),
             notifications: true,
             undo: None,
+            // No snapshot: LEGACY.
+            activity: Arc::new(|| None),
         }
+    }
+
+    /// Announce with the activity level `source` reads (#13).
+    pub(crate) fn with_activity(mut self, source: Arc<dyn ActivitySource>) -> Self {
+        self.activity = source;
+        self
     }
 
     /// Run the handoff core in `mode` ("Connect to this computer", #16).
@@ -284,6 +297,7 @@ impl Switching {
                     notifications: self.notifications,
                     // No notifier clicks: a closed channel.
                     undo_rx: self.undo.unwrap_or_else(|| mpsc::unbounded_channel().1),
+                    activity: self.activity,
                 };
                 spawn_handoff_task(&HANDOFF_TASKS, self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
@@ -424,7 +438,11 @@ impl Legacy {
                             error!("Failed to send media info new device: {}", e);
                         }
                         if let Err(e) = aacp_manager_clone
-                            .send_add_tipi_device(&local_mac_clone, &device_mac_clone)
+                            .send_add_tipi_device(
+                                &local_mac_clone,
+                                &device_mac_clone,
+                                TipiFields::LEGACY,
+                            )
                             .await
                         {
                             error!("Failed to send add tipi device: {}", e);

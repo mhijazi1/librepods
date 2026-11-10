@@ -1,5 +1,5 @@
 use crate::bluetooth::aacp::{
-    AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control,
+    AACPEvent, AACPManager, AACPManagerState, ControlCommandIdentifiers as Control, TipiFields,
 };
 use crate::handoff::{Command, Handoff, Input, SessionFacts};
 use crate::handoff_log;
@@ -269,7 +269,7 @@ impl Io {
                     self.tolerate_lost_session(sent).await?
                 }
                 Command::Announce => {
-                    let sent = announce(&self.manager, &self.local).await;
+                    let sent = announce(&self.manager, &self.local, TipiFields::LEGACY).await;
                     self.tolerate_lost_session(sent).await?
                 }
                 // The probe feeds no LocalCall, so the core never asks.
@@ -472,7 +472,7 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
             manager
                 .send_control_command(Control::OwnsConnection, &[0])
                 .await?;
-            announce(&manager, &local).await?;
+            announce(&manager, &local, TipiFields::LEGACY).await?;
         }
         println!("AUTO service enabled; waiting for a new playback start");
     } else {
@@ -578,7 +578,7 @@ pub async fn run(address: Address, daemon: bool) -> Result<()> {
                         continue;
                     }
                     "announce" => {
-                        announce(&io.manager, &io.local).await?;
+                        announce(&io.manager, &io.local, TipiFields::LEGACY).await?;
                         println!("Announced Linux to connected remote hosts");
                         continue;
                     }

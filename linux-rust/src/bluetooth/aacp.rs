@@ -1147,10 +1147,12 @@ impl AACPManager {
         &self,
         self_mac_address: &str,
         target_mac_address: &str,
+        fields: TipiFields,
     ) -> Result<()> {
         self.send_data_packet(&encode_add_tipi_device(
             self_mac_address,
             target_mac_address,
+            fields,
         )?)
         .await
     }
@@ -1460,11 +1462,31 @@ pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> std::io::Resul
     smart_routing_packet(target_mac_address, &dict)
 }
 
+/// The tipi values Linux announces itself with (#13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TipiFields {
+    pub(crate) idle_time: u32,
+    pub(crate) nearby_audio_score: u32,
+}
+
+impl TipiFields {
+    /// The values Linux sent before #13: idleTime 0, nearbyAudioScore 6.
+    pub(crate) const LEGACY: Self = Self {
+        idle_time: 0,
+        nearby_audio_score: 6,
+    };
+}
+
 pub(crate) fn encode_add_tipi_device(
     self_mac_address: &str,
     target_mac_address: &str,
+    fields: TipiFields,
 ) -> std::io::Result<Vec<u8>> {
-    let dict = tipi_body(0, true, self_mac_address, "Mac", 6);
+    let TipiFields {
+        idle_time,
+        nearby_audio_score,
+    } = fields;
+    let dict = tipi_body(idle_time, true, self_mac_address, "Mac", nearby_audio_score);
     smart_routing_packet(target_mac_address, &dict)
 }
 
@@ -2190,7 +2212,7 @@ mod tests {
     async fn golden_send_add_tipi_device() {
         let (manager, mut rx) = manager_with_send_channel().await;
         manager
-            .send_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+            .send_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, TipiFields::LEGACY)
             .await
             .expect("send_add_tipi_device");
         assert_eq!(sent_packet(&mut rx), GOLDEN_ADD_TIPI_DEVICE);
@@ -2301,10 +2323,29 @@ mod tests {
     #[test]
     fn golden_encode_add_tipi_device() {
         assert_eq!(
-            encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+            encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, TipiFields::LEGACY)
                 .expect("encode_add_tipi_device"),
             without_header(GOLDEN_ADD_TIPI_DEVICE)
         );
+    }
+
+    // #13: only idleTime's value (OPACK 0x08 + n) and the score's change.
+    #[test]
+    fn golden_encode_add_tipi_device_idle13_score1() {
+        let fields = TipiFields {
+            idle_time: 13,
+            nearby_audio_score: 1,
+        };
+        let packet = encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, fields)
+            .expect("encode_add_tipi_device");
+        let legacy = without_header(GOLDEN_ADD_TIPI_DEVICE);
+        assert_eq!(packet.len(), legacy.len());
+        let diff: Vec<_> = (0..packet.len())
+            .filter(|&i| packet[i] != legacy[i])
+            .map(|i| (i, legacy[i], packet[i]))
+            .collect();
+        let score = legacy.len() - 1;
+        assert_eq!(diff, [(21, 0x08, 0x15), (score, 0x0E, 0x09)]);
     }
 
     #[test]
@@ -2369,7 +2410,10 @@ mod tests {
                 bad,
             );
             assert_invalid_mac_error(encode_media_information_call(GOLDEN_SELF_MAC, bad), bad);
-            assert_invalid_mac_error(encode_add_tipi_device(GOLDEN_SELF_MAC, bad), bad);
+            assert_invalid_mac_error(
+                encode_add_tipi_device(GOLDEN_SELF_MAC, bad, TipiFields::LEGACY),
+                bad,
+            );
         }
     }
 
@@ -2392,7 +2436,9 @@ mod tests {
             manager
                 .send_media_information_call(GOLDEN_SELF_MAC, bad)
                 .await,
-            manager.send_add_tipi_device(GOLDEN_SELF_MAC, bad).await,
+            manager
+                .send_add_tipi_device(GOLDEN_SELF_MAC, bad, TipiFields::LEGACY)
+                .await,
         ];
         for result in errors {
             let err = result.expect_err("an invalid target MAC must be an error");
@@ -2882,7 +2928,7 @@ mod tests {
             ),
             (
                 "add_tipi_device",
-                encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC)
+                encode_add_tipi_device(GOLDEN_SELF_MAC, GOLDEN_TARGET_MAC, TipiFields::LEGACY)
                     .expect("add_tipi_device"),
             ),
             (
