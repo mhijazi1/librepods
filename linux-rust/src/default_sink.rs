@@ -223,13 +223,10 @@ async fn run(
             // and its local sink for a yield after the park ended (#488); a
             // retake that replaced nothing keeps the first one's.
             let state = shared.lock().await;
-            let replaces = io.current_default().await.as_deref() == Some(PARK_SINK);
-            remembered = apply(&io, remembered, event).await;
-            if replaces
-                && remembered.as_deref() == Some(PARK_SINK)
-                && let Some(parked) = state.park.as_ref()
-            {
-                park_local = Some(parked.local.clone());
+            let (next, replaced) = apply_replacing(&io, remembered, event).await;
+            remembered = next;
+            if replaced.as_deref() == Some(PARK_SINK) {
+                park_local = state.park.as_ref().map(|parked| parked.local.clone());
             }
         } else if event == SinkEvent::Yield && remembered.as_deref() == Some(PARK_SINK) {
             // The park only while one is in place, else that local sink; no
@@ -449,9 +446,19 @@ async fn apply(
     remembered: Option<String>,
     event: SinkEvent,
 ) -> Option<String> {
+    apply_replacing(io, remembered, event).await.0
+}
+
+/// `apply`, and the default read that planned its sets once they all
+/// applied (#488).
+async fn apply_replacing(
+    io: &impl DefaultSinkIo,
+    remembered: Option<String>,
+    event: SinkEvent,
+) -> (Option<String>, Option<String>) {
     if let SinkEvent::Hold(hold) = event {
         io.hold_a2dp(hold).await;
-        return remembered;
+        return (remembered, None);
     }
     let airpods = io.airpods_sink().await;
     let current = io.current_default().await;
@@ -461,6 +468,7 @@ async fn apply(
         current.as_deref(),
         event,
     );
+    let replaced = current.filter(|_| !actions.is_empty());
     let mut ok = true;
     for SinkAction::SetDefault(name) in actions {
         if io.set_default(name.clone()).await {
@@ -473,7 +481,7 @@ async fn apply(
             ok = false;
         }
     }
-    if ok { next } else { None }
+    if ok { (next, replaced) } else { (None, None) }
 }
 
 /// Production I/O on the controller clone `ControllerMedia` holds; it never
@@ -897,6 +905,9 @@ pub(crate) mod tests {
         gate: Option<Arc<Notify>>,
         /// The AirPods sink is gone (#311).
         no_airpods: Arc<AtomicBool>,
+        /// `current_default` reads none, as on a query error, until the
+        /// next `airpods_sink` (#488).
+        read_fails: Arc<AtomicBool>,
         /// A park sink module an earlier run left (#311).
         leftover: Option<u32>,
         /// The module listing that looks for it fails.
@@ -923,6 +934,7 @@ pub(crate) mod tests {
                 lost_reply: Arc::default(),
                 gate: None,
                 no_airpods: Arc::default(),
+                read_fails: Arc::default(),
                 leftover: None,
                 listing_fails: Arc::default(),
                 park: Arc::default(),
@@ -941,11 +953,13 @@ pub(crate) mod tests {
     impl DefaultSinkIo for FakeSinks {
         fn current_default(&self) -> BoxFuture<'static, Option<String>> {
             // An empty default reads as none.
-            let default = Some(self.default.lock().unwrap().clone()).filter(|d| !d.is_empty());
+            let default = Some(self.default.lock().unwrap().clone())
+                .filter(|d| !d.is_empty() && !self.read_fails.load(Ordering::SeqCst));
             Box::pin(async move { default })
         }
 
         fn airpods_sink(&self) -> BoxFuture<'static, Option<String>> {
+            self.read_fails.store(false, Ordering::SeqCst);
             let gone = self.no_airpods.load(Ordering::SeqCst);
             Box::pin(async move { (!gone).then(|| AIRPODS.to_string()) })
         }
@@ -1953,6 +1967,53 @@ pub(crate) mod tests {
         *sinks.default.lock().unwrap() = AIRPODS.to_string();
         b.route(Take);
         settles(b.settled()).await;
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        b.route(Yield);
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets().last().map(String::as_str), Some(DAC));
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+    }
+
+    #[tokio::test]
+    async fn park_shared_unheld_take_records_from_the_read_that_planned_it() {
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = DefaultSinkRouter::spawn(sinks.clone());
+        // A query error that clears before the take lists the AirPods sink.
+        sinks.read_fails.store(true, Ordering::SeqCst);
+        b.route(Take);
+        settles(b.settled()).await;
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        b.route(Yield);
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, "unload 7", DAC]);
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+    }
+
+    #[tokio::test]
+    async fn park_shared_unheld_retake_without_airpods_keeps_the_replaced_parks_local() {
+        const HDMI: &str = "alsa_output.hdmi";
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = DefaultSinkRouter::spawn(sinks.clone());
+        b.route(Take);
+        settles(b.settled()).await;
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        // A parks again from HDMI; its watch waits to connect, so it runs.
+        *sinks.default.lock().unwrap() = HDMI.to_string();
+        let (_connect, gate) = std::sync::mpsc::channel::<()>();
+        *sinks.connect.lock().unwrap() = Some(gate);
+        a.route(Park);
+        settles(a.settled()).await;
+        // B's retake finds no AirPods sink, so sets nothing.
+        sinks.no_airpods.store(true, Ordering::SeqCst);
+        b.route(Take);
+        settles(b.settled()).await;
+        sinks.no_airpods.store(false, Ordering::SeqCst);
+        *sinks.default.lock().unwrap() = AIRPODS.to_string();
         a.route(Unpark(ToLocal));
         settles(a.settled()).await;
         b.route(Yield);
