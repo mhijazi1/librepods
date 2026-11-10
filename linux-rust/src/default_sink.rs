@@ -176,6 +176,8 @@ async fn run(
     unload_leftover_park(&io, &shared).await;
     let mut remembered: Option<String> = None;
     let mut park: Option<Held> = None;
+    // The local sink of the park a take with no hold replaced (#488).
+    let mut park_local: Option<String> = None;
     loop {
         // Only the park this router holds can end it: an earlier one's
         // watch is dropped.
@@ -216,6 +218,25 @@ async fn run(
                 }
                 next => next,
             };
+        } else if event == SinkEvent::Take {
+            // A take that replaced another device's park remembers the park,
+            // and its local sink for a yield after the park ended (#488).
+            let state = shared.lock().await;
+            remembered = apply(&io, remembered, event).await;
+            if remembered.as_deref() == Some(PARK_SINK)
+                && let Some(parked) = state.park.as_ref()
+            {
+                park_local = Some(parked.local.clone());
+            }
+        } else if event == SinkEvent::Yield && remembered.as_deref() == Some(PARK_SINK) {
+            // The park only while one is in place, else that local sink; no
+            // unpark can end the park between this check and the set.
+            let state = shared.lock().await;
+            let local = park_local.take();
+            if state.park.is_none() {
+                remembered = local;
+            }
+            remembered = apply(&io, remembered, event).await;
         } else {
             remembered = apply(&io, remembered, event).await;
         }
@@ -1854,6 +1875,57 @@ pub(crate) mod tests {
         settles(b.settled()).await;
         assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, "unload 7", DAC]);
         assert_eq!(*sinks.default.lock().unwrap(), DAC);
+    }
+
+    // #488: a take on a router that holds no park replaced another device's.
+
+    #[tokio::test]
+    async fn park_shared_unheld_take_yield_restores_the_park_while_parked() {
+        let sinks = FakeSinks::new(false);
+        let _a = parked_router(&sinks).await;
+        let b = DefaultSinkRouter::spawn(sinks.clone());
+        b.route(Take);
+        b.route(Yield);
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, PARK_SINK]);
+        assert_eq!(*sinks.default.lock().unwrap(), PARK_SINK);
+    }
+
+    #[tokio::test]
+    async fn park_shared_unheld_take_yield_after_unpark_restores_the_parks_local() {
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = DefaultSinkRouter::spawn(sinks.clone());
+        b.route(Take);
+        settles(b.settled()).await;
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        b.route(Yield);
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK, AIRPODS, "unload 7", DAC]);
+        assert_eq!(*sinks.default.lock().unwrap(), DAC);
+    }
+
+    #[tokio::test]
+    async fn park_shared_unheld_take_yield_restores_a_new_park() {
+        const HDMI: &str = "alsa_output.hdmi";
+        let sinks = FakeSinks::new(false);
+        let a = parked_router(&sinks).await;
+        let b = DefaultSinkRouter::spawn(sinks.clone());
+        b.route(Take);
+        settles(b.settled()).await;
+        a.route(Unpark(ToLocal));
+        settles(a.settled()).await;
+        // A parks again from HDMI, then another device's Unpark(AirPods)
+        // leaves the park in place.
+        *sinks.default.lock().unwrap() = HDMI.to_string();
+        a.route(Park);
+        settles(a.settled()).await;
+        *sinks.default.lock().unwrap() = AIRPODS.to_string();
+        b.route(Yield);
+        settles(b.settled()).await;
+        assert_eq!(sinks.sets().last().map(String::as_str), Some(PARK_SINK));
+        assert_eq!(*sinks.default.lock().unwrap(), PARK_SINK);
     }
 
     #[tokio::test]
