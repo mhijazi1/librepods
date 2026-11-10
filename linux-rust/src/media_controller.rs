@@ -1699,6 +1699,11 @@ impl MediaController {
             debug!("AirPods moved to a head-unit profile for a recording, leaving it");
             return Ok(());
         }
+        // `hold_a2dp` sets the flag without `profile_write`: a hold may have
+        // arrived during the read.
+        if self.a2dp_hold_skips() {
+            return Ok(());
+        }
         info!("Activating A2DP profile for AirPods: {}", preferred_profile);
         // Awaited to its end, past the deadline too: a dropped wait would let
         // the blocking write land after the lock is gone, under a hold (#264).
@@ -4849,6 +4854,40 @@ mod tests {
         assert_eq!(steps.started("snapshot"), 2);
         assert_eq!(steps.started("set"), 0);
         assert_eq!(set_to, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_hold_set_during_second_snapshot_skips_write() {
+        for second in [recording_snapshot("a2dp-sink", false), None] {
+            let controller = MediaController::new(RECORDING_MAC.to_string(), String::new());
+            let steps = Steps::default();
+            let mut reads = 0;
+            let outcome = controller
+                .activate_a2dp_profile_with(
+                    Instant::now() + A2DP_ACTIVATION_DEADLINE,
+                    || steps.step("lookup", Duration::ZERO, Some(3)),
+                    || steps.step("connect", Duration::ZERO, None),
+                    || {
+                        reads += 1;
+                        if reads == 2 {
+                            controller.set_a2dp_held(true);
+                            return steps.step("snapshot", Duration::ZERO, second.clone());
+                        }
+                        let quiet = recording_snapshot("a2dp-sink", false);
+                        steps.step("snapshot", Duration::ZERO, quiet)
+                    },
+                    || steps.step("recover", Duration::ZERO, true),
+                    |_| {
+                        let choice = ProfileChoice::Activate("a2dp-sink-sbc".to_string());
+                        steps.step("choose", Duration::ZERO, choice)
+                    },
+                    |_, _| steps.step("set", Duration::ZERO, true),
+                )
+                .await;
+            assert_eq!(outcome, Ok(()));
+            assert_eq!(steps.started("snapshot"), 2);
+            assert_eq!(steps.started("set"), 0);
+        }
     }
 
     #[tokio::test(start_paused = true)]
