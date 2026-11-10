@@ -479,6 +479,261 @@ fn no_double_yield_loss_then_remote() {
     );
 }
 
+// #17: "moved to" with Undo, and "Connected" on Linux's take.
+
+/// `routed` with notifications on and `hosts` listed, the transport
+/// reported idle, and Linux's playback take at `category` acknowledged:
+/// one "Connected".
+fn notifying_take(hosts: &[&str], category: u32) -> Probe {
+    let mut p = Probe::ready_with_hosts(hosts.iter().map(|m| host(m)).collect());
+    p.core.default_sink_routing = true;
+    p.core.notifications = true;
+    assert_eq!(p.feed(20, idle_transport()), []);
+    assert_eq!(p.play_category(500, category), [SendOwnership(true)]);
+    assert_eq!(
+        p.feed(600, Input::Ownership(vec![1])),
+        [RouteToAirPods, ResumeA2dp, NotifyConnected]
+    );
+    p
+}
+
+fn moved_to(out: &[Command]) -> Vec<Command> {
+    out.iter()
+        .filter(|c| matches!(c, NotifyMovedTo(_)))
+        .cloned()
+        .collect()
+}
+
+/// `notifying_take` on [L, R] while Linux plays 301, REMOTE's media
+/// takes and the AirPods report the loss: one "moved to REMOTE".
+fn yielded_to_remote() -> Probe {
+    let mut p = notifying_take(&[L, R], MEDIA);
+    assert_eq!(p.feed(700, remote_media()), []);
+    assert_eq!(
+        p.feed(800, Input::Ownership(vec![0])),
+        [
+            PauseMedia,
+            RouteAway,
+            NotifyMovedTo(Some(REMOTE.to_string()))
+        ]
+    );
+    p
+}
+
+#[test]
+fn lost_take_while_playing_notifies_moved_to() {
+    yielded_to_remote();
+    // A pending take lost before its ACK is a yield too.
+    let mut p = Probe::ready();
+    p.core.notifications = true;
+    assert_eq!(p.play_category(500, MEDIA), [SendOwnership(true)]);
+    assert_eq!(
+        p.feed(600, Input::Ownership(vec![0])),
+        [PauseMedia, NotifyMovedTo(Some(REMOTE.to_string()))]
+    );
+}
+
+#[test]
+fn lost_take_while_idle_notifies_nothing() {
+    let mut p = notifying_take(&[L, R], MEDIA);
+    // Linux keeps the take idle (#262), then loses it.
+    assert_eq!(p.play(700, false), []);
+    assert_eq!(p.feed(800, remote_media()), []);
+    assert_eq!(
+        p.feed(900, Input::Ownership(vec![0])),
+        [PauseMedia, RouteAway]
+    );
+    assert_eq!(count_lines(&p.core.take_lines(), "YIELD"), 1);
+}
+
+#[test]
+fn remote_request_while_playing_notifies_moved_to() {
+    let mut p = notifying_take(&[L, R], MEDIA);
+    assert_eq!(
+        p.feed(700, Input::RemoteOwnershipRequest),
+        [
+            PauseMedia,
+            RouteAway,
+            SendOwnership(false),
+            NotifyMovedTo(Some(REMOTE.to_string()))
+        ]
+    );
+    // Its ACK yields nothing more.
+    assert_eq!(p.feed(800, Input::Ownership(vec![0])), []);
+}
+
+#[test]
+fn remote_request_while_idle_notifies_nothing() {
+    let mut p = notifying_take(&[L, R], MEDIA);
+    assert_eq!(p.play(700, false), []);
+    assert_eq!(
+        p.feed(800, Input::RemoteOwnershipRequest),
+        [PauseMedia, RouteAway, SendOwnership(false)]
+    );
+    // Linux owning without a take of its own, idle: the same.
+    let mut p = Probe::ready();
+    p.core.notifications = true;
+    assert_eq!(p.feed(20, Input::Ownership(vec![1])), []);
+    assert_eq!(
+        p.feed(100, Input::RemoteOwnershipRequest),
+        [SendOwnership(false)]
+    );
+}
+
+/// The taker `notifying_take(hosts, STREAM)` names when `audio` is
+/// reported and the AirPods report the loss.
+fn taker_with(hosts: &[&str], audio: Option<AudioSource>) -> Vec<Command> {
+    let mut p = notifying_take(hosts, STREAM);
+    if let Some(audio) = audio {
+        p.feed(700, Input::AudioSource(audio));
+    }
+    moved_to(&p.feed(800, Input::Ownership(vec![0])))
+}
+
+#[test]
+fn yield_taker_is_the_remote_source() {
+    for r#type in [AudioSourceType::Media, AudioSourceType::Call] {
+        assert_eq!(
+            taker_with(&[L, R, R2], Some(source(R2, r#type))),
+            [NotifyMovedTo(Some(R2.to_string()))],
+            "{type:?}"
+        );
+        // The source beats the only remote host.
+        assert_eq!(
+            taker_with(&[L, R], Some(source(R2, r#type))),
+            [NotifyMovedTo(Some(R2.to_string()))],
+            "{type:?}"
+        );
+    }
+}
+
+#[test]
+fn yield_taker_is_the_sole_remote_host() {
+    for audio in [
+        None,
+        Some(idle()),
+        Some(source(LOCAL, AudioSourceType::Media)),
+        Some(source(R2, AudioSourceType::None)),
+    ] {
+        assert_eq!(
+            taker_with(&[L, R], audio.clone()),
+            [NotifyMovedTo(Some(R.to_string()))],
+            "{audio:?}"
+        );
+    }
+}
+
+#[test]
+fn yield_taker_unknown_with_two_remote_hosts() {
+    for audio in [
+        None,
+        Some(idle()),
+        Some(source(LOCAL, AudioSourceType::Media)),
+    ] {
+        assert_eq!(
+            taker_with(&[L, R, R2], audio.clone()),
+            [NotifyMovedTo(None)],
+            "{audio:?}"
+        );
+    }
+}
+
+#[test]
+fn undo_takes_back_and_relays_without_resume() {
+    let mut p = yielded_to_remote();
+    p.core.take_lines();
+    assert_eq!(
+        p.feed(900, Input::Undo),
+        [SendOwnership(true), SendHijackReversed(REMOTE.to_string())]
+    );
+    assert_eq!(count_lines(&p.core.take_lines(), "REQUEST owner=linux"), 1);
+    // Q12: the transport is still idle, but Undo never resumes or pauses.
+    assert_eq!(
+        p.feed(1000, Input::Ownership(vec![1])),
+        [RouteToAirPods, NotifyConnected]
+    );
+    // One Undo per yield.
+    assert_eq!(p.feed(1100, Input::Undo), []);
+}
+
+#[test]
+fn undo_without_a_taker_takes_without_relay() {
+    let mut p = notifying_take(&[L, R, R2], MEDIA);
+    assert_eq!(
+        moved_to(&p.feed(700, Input::Ownership(vec![0]))),
+        [NotifyMovedTo(None)]
+    );
+    p.core.take_lines();
+    assert_eq!(p.feed(800, Input::Undo), [SendOwnership(true)]);
+    assert_eq!(
+        count_lines(&p.core.take_lines(), "UNDO the host that took is unknown"),
+        1
+    );
+}
+
+#[test]
+fn undo_after_a_later_take_or_disconnect_does_nothing() {
+    // A later take.
+    let mut p = yielded_to_remote();
+    assert_eq!(p.play(900, false), []);
+    assert_eq!(p.play_category(1000, MEDIA), [SendOwnership(true)]);
+    assert_eq!(p.feed(1100, Input::Undo), []);
+    // An OwnsConnection [1].
+    let mut p = yielded_to_remote();
+    assert_eq!(p.feed(900, Input::Ownership(vec![1])), []);
+    assert_eq!(p.feed(1000, Input::Undo), []);
+    // A disconnect.
+    let mut p = yielded_to_remote();
+    assert_eq!(p.feed(900, Input::Disconnected), [DropSession]);
+    assert_eq!(p.feed(1000, Input::Undo), []);
+    // A release still pending waits; the Undo stays for after its ACK.
+    let mut p = notifying_take(&[L, R], MEDIA);
+    p.feed(700, Input::RemoteOwnershipRequest);
+    assert_eq!(p.feed(800, Input::Undo), []);
+    assert_eq!(p.feed(900, Input::Ownership(vec![0])), []);
+    assert_eq!(
+        p.feed(1000, Input::Undo),
+        [SendOwnership(true), SendHijackReversed(REMOTE.to_string())]
+    );
+}
+
+#[test]
+fn take_ack_notifies_connected() {
+    // Once per held take's ACK (in `notifying_take`), not for a repeat.
+    let mut p = notifying_take(&[L, R], MEDIA);
+    assert_eq!(p.feed(700, Input::Ownership(vec![1])), []);
+    // Not on a release's ACK.
+    assert_eq!(p.feed(800, Input::Release), [SendOwnership(false)]);
+    assert_eq!(p.feed(900, Input::Ownership(vec![0])), [PauseMedia]);
+    // Not on a lost take.
+    assert_eq!(p.play(1000, false), []);
+    assert_eq!(p.play_category(1100, MEDIA), [SendOwnership(true)]);
+    assert_eq!(
+        p.feed(1200, Input::Ownership(vec![0])),
+        [
+            PauseMedia,
+            RouteAway,
+            NotifyMovedTo(Some(REMOTE.to_string()))
+        ]
+    );
+    // Not on #324's keep, which takes nothing.
+    let mut p = Probe::new(false, true);
+    p.core.notifications = true;
+    p.routing(SessionFacts {
+        owner: Some(vec![1]),
+        ..ready_facts()
+    });
+    p.core.take_lines();
+    assert_eq!(
+        p.feed(100, Input::Auto),
+        [ConnectA2dp, Announce, DrainPlayback]
+    );
+    assert_eq!(
+        count_lines(&p.core.take_lines(), "AUTO connected; Linux already owns"),
+        1
+    );
+}
+
 #[test]
 fn owns_connection_zero_after_own_release_is_noop() {
     // (a) The ACK of Auto's release.

@@ -389,6 +389,8 @@ struct Harness {
     call_tx: mpsc::Sender<(Instant, bool)>,
     /// The injected A2DP transport poller's sender (no BlueZ in tests).
     a2dp_tx: mpsc::Sender<bool>,
+    /// Undo clicks, as the desktop notifier sends them (#17).
+    undo_tx: mpsc::UnboundedSender<()>,
     /// The sender given to `set_event_channel`.
     events: EventTx,
     handler: Arc<DeviceHandler>,
@@ -580,6 +582,8 @@ impl Harness {
         .with_line_sink(sink)
         .with_connect_mode(connect_mode);
         switching.a2dp = Some(a2dp_rx);
+        let (undo_tx, undo_rx) = mpsc::unbounded_channel();
+        switching.undo = Some(undo_rx);
         switching.dispatch_events(events_rx, handler.clone().handle());
         Harness {
             records,
@@ -587,6 +591,7 @@ impl Harness {
             playback_started,
             call_tx,
             a2dp_tx,
+            undo_tx,
             events,
             handler,
         }
@@ -710,6 +715,9 @@ fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
         held: false,
         parked: false,
         released: None,
+        notifier: Arc::new(|_: crate::notifications::Notice| {}),
+        notifications: true,
+        undo_rx: mpsc::unbounded_channel().1,
     }
 }
 

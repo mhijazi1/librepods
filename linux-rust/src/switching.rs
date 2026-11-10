@@ -27,6 +27,7 @@ use crate::a2dp_resume;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers};
 use crate::handoff_log;
 use crate::media_controller::{self, MediaController};
+use crate::notifications::{self, Notice, Notifier};
 use crate::stream_monitor::{self, CallSamples};
 use crate::utils::{self, ConnectMode, SwitchingMode};
 use log::{error, info};
@@ -92,6 +93,13 @@ pub(crate) struct Switching {
     /// Relay Linux's audio category (#272); `start` sets it,
     /// `start_with_calls` leaves it off.
     relay_category: bool,
+    /// Posts the switching notices (#17); `start` sets the desktop's,
+    /// `start_with_calls` one that posts nothing.
+    notifier: Arc<dyn Notifier>,
+    /// The `switchingNotifications` preference; `start` reads it.
+    notifications: bool,
+    /// The notifier's Undo clicks; `start_with_calls` sets none.
+    undo: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 enum Policy {
@@ -137,6 +145,13 @@ impl Switching {
                 .with_connect_mode(utils::load_connect_mode(&mac));
         switching.a2dp = handoff.then(|| a2dp_resume::spawn_transport_poller(&mac));
         switching.relay_category = true;
+        let (undo, undo_rx) = mpsc::unbounded_channel();
+        switching.notifier = Arc::new(notifications::Desktop {
+            airpods_mac: mac.clone(),
+            undo,
+        });
+        switching.notifications = utils::load_switching_notifications();
+        switching.undo = Some(undo_rx);
         match log {
             Some(log) => switching.with_line_sink(log.sink(mac)),
             None => switching,
@@ -194,6 +209,9 @@ impl Switching {
             connect_mode: ConnectMode::default(),
             a2dp: None,
             relay_category: false,
+            notifier: Arc::new(|_: Notice| {}),
+            notifications: true,
+            undo: None,
         }
     }
 
@@ -265,6 +283,10 @@ impl Switching {
                     held: false,
                     parked: false,
                     released: None,
+                    notifier: self.notifier,
+                    notifications: self.notifications,
+                    // No notifier clicks: a closed channel.
+                    undo_rx: self.undo.unwrap_or_else(|| mpsc::unbounded_channel().1),
                 };
                 spawn_handoff_task(&HANDOFF_TASKS, self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))

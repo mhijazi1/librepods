@@ -282,6 +282,23 @@ pub fn load_export_battery() -> bool {
         .unwrap_or(true)
 }
 
+/// Extracts the top-level `switchingNotifications` (post "moved to" and
+/// "Connected", #17) from the preferences JSON; only a bool false turns
+/// them off.
+pub fn parse_switching_notifications(preferences: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(preferences)
+        .ok()
+        .and_then(|p| p.get("switchingNotifications")?.as_bool())
+        .unwrap_or(true)
+}
+
+/// Reads `switchingNotifications` from preferences.json, defaulting to true.
+pub fn load_switching_notifications() -> bool {
+    std::fs::read_to_string(get_preferences_path())
+        .map(|s| parse_switching_notifications(&s))
+        .unwrap_or(true)
+}
+
 fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let mut swapped_key = *key;
     swapped_key.reverse();
@@ -598,6 +615,25 @@ mod tests {
         assert!(parse_export_battery(prefs));
         assert_eq!(parse_switching_mode(prefs), SwitchingMode::Legacy);
         assert!(parse_auto_connect(prefs, "AA:BB:CC:DD:EE:FF"));
+    }
+
+    #[test]
+    fn switching_notifications_preference_defaults_on() {
+        for prefs in [
+            "{}",
+            "",
+            "not json",
+            r#"{"switchingNotifications":null}"#,
+            r#"{"switchingNotifications":"false"}"#,
+            r#"{"switchingNotifications":0}"#,
+            r#"{"switchingNotifications":true}"#,
+            r#"{"AA:BB:CC:DD:EE:FF":{"switchingNotifications":false}}"#,
+        ] {
+            assert!(parse_switching_notifications(prefs), "{prefs}");
+        }
+        assert!(!parse_switching_notifications(
+            r#"{"switching":"handoff","switchingNotifications":false}"#
+        ));
     }
 
     #[test]

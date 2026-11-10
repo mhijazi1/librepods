@@ -361,6 +361,9 @@ pub struct AACPManagerState {
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub airpods_mac: Option<Address>,
     handshake_replied: bool,
+    /// The last `btName` each host relayed in its media information, by
+    /// `MediaInformation::host()` (#17).
+    host_names: HashMap<String, String>,
 }
 
 impl AACPManagerState {
@@ -392,6 +395,7 @@ impl AACPManagerState {
             event_tx: None,
             airpods_mac: None,
             handshake_replied: false,
+            host_names: HashMap::new(),
         }
     }
 }
@@ -923,13 +927,17 @@ impl AACPManager {
                         let _ = tx.send(AACPEvent::OwnershipToFalseRequest);
                     }
                 }
-                if let Some(info) = parse_media_information(payload)
-                    && let Some(category) = info.category
-                {
+                if let Some(info) = parse_media_information(payload) {
                     let host = info.host().to_string();
-                    info!("Received media information: {host} audio category {category}");
-                    if let Some(ref tx) = self.state.lock().await.event_tx {
-                        let _ = tx.send(AACPEvent::MediaInformation { host, category });
+                    let mut state = self.state.lock().await;
+                    if let Some(name) = info.bt_name {
+                        state.host_names.insert(host.clone(), name);
+                    }
+                    if let Some(category) = info.category {
+                        info!("Received media information: {host} audio category {category}");
+                        if let Some(ref tx) = state.event_tx {
+                            let _ = tx.send(AACPEvent::MediaInformation { host, category });
+                        }
                     }
                 }
             }
@@ -1125,10 +1133,14 @@ impl AACPManager {
             .await
     }
 
-    // Caller arrives with #17 (Undo notification).
     pub async fn send_hijack_reversed(&self, target_mac_address: &str) -> Result<()> {
         self.send_data_packet(&encode_hijack_reversed(target_mac_address)?)
             .await
+    }
+
+    /// The `btName` `host` last relayed in its media information (#17).
+    pub async fn host_name(&self, host: &str) -> Option<String> {
+        self.state.lock().await.host_names.get(host).cloned()
     }
 
     pub async fn send_add_tipi_device(
@@ -1433,7 +1445,6 @@ pub(crate) fn encode_smart_routing_show_ui(target_mac_address: &str) -> std::io:
     smart_routing_packet(target_mac_address, &dict)
 }
 
-// Caller arrives with #17 (Undo notification).
 pub(crate) fn encode_hijack_reversed(target_mac_address: &str) -> std::io::Result<Vec<u8>> {
     let mut dict = Vec::with_capacity(88);
     opack_write_dict_header(&mut dict, 3);
@@ -1697,6 +1708,8 @@ pub(crate) struct MediaInformation {
     pub bt_address: Option<String>,
     /// The dict's `otherDeviceAudioCategory`.
     pub category: Option<u32>,
+    /// The dict's `btName`: the relaying host's display name (#17).
+    pub bt_name: Option<String>,
 }
 
 impl MediaInformation {
@@ -1728,6 +1741,7 @@ pub(crate) fn parse_media_information(payload: &[u8]) -> Option<MediaInformation
         ),
         bt_address: None,
         category: None,
+        bt_name: None,
     };
     // 0xEF (until 0x03) stops at the terminator, which reads as no value.
     let count = if tag == 0xEF {
@@ -1749,6 +1763,7 @@ pub(crate) fn parse_media_information(payload: &[u8]) -> Option<MediaInformation
                 info.bt_address = parse_mac(address).map(|_| address.to_ascii_uppercase())
             }
             ("otherDeviceAudioCategory", Opack::Uint(n)) => info.category = Some(n),
+            ("btName", Opack::Str(name)) => info.bt_name = Some(name.to_string()),
             _ => {}
         }
     }
@@ -3266,12 +3281,46 @@ mod tests {
                     sender: RELAY_SENDER.to_string(),
                     bt_address: Some(APPLE_BT_ADDRESS.to_string()),
                     category: Some(category),
+                    bt_name: Some(APPLE_BT_NAME.to_string()),
                 },
                 "{capture}"
             );
             // The captures' btAddress is all-zero: the host is the sender.
             assert_eq!(info.host(), RELAY_SENDER);
         }
+    }
+
+    #[test]
+    fn parse_media_information_reads_bt_name() {
+        let payload =
+            media_information_payload(&capture_bytes(APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301));
+        let info = parse_media_information(&payload).expect("a dict");
+        assert_eq!(info.bt_name.as_deref(), Some("iPhone"));
+        // Linux's own relay names its host too.
+        let dict = media_information_body("Unknown", false, "aa:bb:cc:dd:ee:ff", "Mac", 201);
+        let info = parse_media_information(&media_information_payload(&dict)).expect("a dict");
+        assert_eq!(info.bt_name.as_deref(), Some("Mac"));
+        // No btName key: none.
+        let mut dict = vec![0xE1];
+        opack_write_str(&mut dict, "otherDeviceAudioCategory");
+        opack_write_uint(&mut dict, 301);
+        let info = parse_media_information(&media_information_payload(&dict)).expect("a dict");
+        assert_eq!(info.bt_name, None);
+    }
+
+    #[tokio::test]
+    async fn media_information_caches_the_hosts_bt_name() {
+        let manager = AACPManager::new();
+        assert_eq!(manager.host_name(RELAY_SENDER).await, None);
+        let payload =
+            media_information_payload(&capture_bytes(APPLE_MEDIA_INFORMATION_SPOTIFY_YES_301));
+        let host = parse_media_information(&payload)
+            .expect("a dict")
+            .host()
+            .to_string();
+        manager.receive_packet(&with_header(&payload)).await;
+        assert_eq!(manager.host_name(&host).await.as_deref(), Some("iPhone"));
+        assert_eq!(manager.host_name("0D:0E:0F:10:11:12").await, None);
     }
 
     #[test]

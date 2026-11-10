@@ -143,6 +143,54 @@ async fn a2dp_resume_yield_during_check_after_cycle_stops_chain() {
     yield_during_audio_check("5A:00:00:00:00:CB", 3).await;
 }
 
+/// #17: an Undo click after a playing yield to REMOTE takes back and
+/// relays the reverse request, and its ACK resumes nothing.
+#[tokio::test]
+async fn undo_sends_the_take_then_the_reverse_packet() {
+    let mac = "5A:00:00:00:00:17";
+    let acks = || {
+        traced(mac)
+            .iter()
+            .filter(|l| l.starts_with("ACK owner=linux"))
+            .count()
+    };
+    let (manager, mut rx, _tx) = no_source_session().await;
+    let h = Harness::start(SwitchingMode::Handoff, mac, &manager).await;
+    expect_startup(&h, &mut rx).await;
+    expect_take(&h, &mut rx).await;
+    h.emit(owns(1));
+    wait_until("the take's ACK", || acks() == 1).await;
+    // Reported after that ACK, so only the Undo's ACK could resume.
+    h.a2dp(false).await;
+    h.emit_queued(AACPEvent::AudioSource(AudioSource {
+        mac: REMOTE.to_string(),
+        r#type: AudioSourceType::Media,
+    }))
+    .await;
+    h.emit(owns(0));
+    wait_until("the yield's pause", || h.pauses() == 1).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+    h.undo_tx.send(()).expect("the task takes Undo clicks");
+    assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+    let reversed = reference(|m| async move { m.send_hijack_reversed(REMOTE).await }).await;
+    let encoded = crate::bluetooth::aacp::encode_hijack_reversed(REMOTE).expect("encode");
+    assert!(reversed.ends_with(&encoded), "{reversed:02x?}");
+    assert_eq!(next_packet(&mut rx).await, reversed);
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+
+    h.emit(owns(1));
+    wait_until("the Undo's ACK", || acks() == 2).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    assert_eq!(
+        *h.records.resume_spawns.lock().unwrap(),
+        Vec::<usize>::new()
+    );
+    assert_eq!(h.pauses(), 1);
+
+    stop_handoff_task(mac);
+}
+
 #[tokio::test]
 async fn handoff_task_ends_on_session_loss_without_reconnect() {
     let mac = "5A:00:00:00:00:03";
