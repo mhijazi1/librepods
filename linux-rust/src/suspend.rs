@@ -1285,6 +1285,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn wake_park_rechecks_a_play_ready_with_the_bluez_read() {
+        // A play and the read's result ready in the same poll: `biased;`
+        // takes the play, so the wait restarts. Unbiased, each MAC would
+        // route Park about half the time.
+        for i in 1..=20 {
+            let mac = &format!("05:46:00:00:00:{i:02X}");
+            let (gate, gated) = oneshot::channel();
+            let link = FakeLink {
+                connected_gate: Mutex::new(Some(gated)),
+                ..FakeLink::default()
+            };
+            let (audio, samples, sinks) = fake_audio();
+            let _prepare = wake(mac, link, audio).await;
+            samples.send(IDLE).unwrap();
+            settle().await;
+            assert!(sinks.sets().is_empty(), "{mac}");
+            samples.send(PLAY).unwrap();
+            drop(gate);
+            settle().await;
+            assert!(sinks.sets().is_empty(), "{mac}");
+            samples.send(IDLE).unwrap();
+            settle().await;
+            assert_eq!(sinks.sets(), ["load", PARK_SINK], "{mac}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn wake_park_falls_back_to_local_at_the_timeout() {
         assert_eq!(WAKE_PARK_TIMEOUT, crate::handoff::PARK_TIMEOUT);
         assert_eq!(WAKE_PARK_TIMEOUT, Duration::from_secs(2));
