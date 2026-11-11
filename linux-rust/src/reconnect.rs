@@ -498,22 +498,23 @@ pub(crate) trait Connector: Send + Sync + 'static {
 /// BlueZ and bluetoothctl; also suspend.rs's `BluezLink`.
 pub(crate) struct Bluez;
 
+/// The default adapter's device at `address`, for `Bluez`.
+pub(crate) async fn bluez_device(address: bluer::Address) -> bluer::Result<bluer::Device> {
+    bluer::Session::new()
+        .await?
+        .default_adapter()
+        .await?
+        .device(address)
+}
+
 impl Connector for Bluez {
     async fn connected(&self, mac: &str) -> bool {
         let Ok(address) = mac.parse::<bluer::Address>() else {
             return false;
         };
-        async {
-            let session = bluer::Session::new().await?;
-            session
-                .default_adapter()
-                .await?
-                .device(address)?
-                .is_connected()
-                .await
-        }
-        .await
-        .unwrap_or(false)
+        async { bluez_device(address).await?.is_connected().await }
+            .await
+            .unwrap_or(false)
     }
 
     async fn connect(&self, mac: &str) -> Result<(), String> {
@@ -669,6 +670,12 @@ mod tests {
     use tokio::sync::mpsc;
 
     const REMOTE: &str = "org.bluez.Reason.Remote";
+
+    // Fails the MAC parse before any D-Bus call.
+    #[tokio::test]
+    async fn bluez_connected_false_on_bad_mac() {
+        assert!(!Connector::connected(&Bluez, "not-a-mac").await);
+    }
 
     fn settings() -> Settings {
         Settings {

@@ -8,7 +8,7 @@
 //! connect take, which resumes nothing. Linux dropped the link itself, so
 //! #308's rule against timer reconnects doesn't apply.
 
-use crate::reconnect::{Bluez, ConnectGuard, Connector};
+use crate::reconnect::{Bluez, ConnectGuard, Connector, bluez_device};
 use crate::utils;
 use dbus::Message;
 use dbus::arg::OwnedFd;
@@ -115,17 +115,9 @@ impl BluezLink for Bluez {
 
     async fn disconnect(&self, mac: &str) -> Result<(), String> {
         let address = mac.parse::<bluer::Address>().map_err(|e| e.to_string())?;
-        async {
-            let session = bluer::Session::new().await?;
-            session
-                .default_adapter()
-                .await?
-                .device(address)?
-                .disconnect()
-                .await
-        }
-        .await
-        .map_err(|e| e.to_string())
+        async { bluez_device(address).await?.disconnect().await }
+            .await
+            .map_err(|e| e.to_string())
     }
 
     fn auto_connect(&self, mac: &str) -> bool {
@@ -405,6 +397,15 @@ mod tests {
     const J: &str = "15:00:00:00:00:13";
     const K: &str = "15:00:00:00:00:14";
     const M: &str = "15:00:00:00:00:15";
+
+    // Fails the MAC parse before any D-Bus call.
+    #[tokio::test]
+    async fn bluez_disconnect_err_on_bad_mac() {
+        assert_eq!(
+            BluezLink::disconnect(&Bluez, "not-a-mac").await,
+            Err("invalid Bluetooth address: not-a-mac".to_string())
+        );
+    }
 
     /// Counts inhibitors taken and still held.
     #[derive(Clone, Default)]
