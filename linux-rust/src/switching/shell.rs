@@ -15,7 +15,7 @@ use crate::handoff::{Command, Handoff, Input, Park, local_inputs};
 use crate::notifications::{self, Notice, Notifier};
 use crate::reconnect;
 use crate::stream_monitor::CallSamples;
-use crate::suspend::{self, SleepNotice};
+use crate::suspend::{SleepNotice, Sleepers};
 use crate::utils::ConnectMode;
 use futures::future::BoxFuture;
 use log::{error, info};
@@ -69,6 +69,11 @@ pub(super) struct Shell {
     pub(super) activity: Arc<dyn ActivitySource>,
     /// Whether the last `Command::Disconnect` disconnected; `on_sleep` takes it.
     pub(super) sleep_disconnected: Option<bool>,
+    /// The sleep's disconnect of a MAC: true only if it disconnected.
+    pub(super) sleep_disconnect: Arc<dyn Fn(String) -> BoxFuture<'static, bool> + Send + Sync>,
+    /// The sleep subscriptions; the pending sleep's deadline bounds the
+    /// pause and relay before its disconnect.
+    pub(super) sleepers: &'static Sleepers,
 }
 
 /// The task's future drops its `Shell` on return, abort and panic alike,
@@ -162,12 +167,10 @@ impl Shell {
                     }
                 }
                 Command::RelayCategory(category) => {
-                    let relayed = suspend::sleep_bounded(relay_category(
-                        &self.manager,
-                        &self.local,
-                        category,
-                    ))
-                    .await;
+                    let relayed = self
+                        .sleepers
+                        .bounded(relay_category(&self.manager, &self.local, category))
+                        .await;
                     if let Some(Err(e)) = relayed {
                         error!("Handoff: failed to relay audio category {category}: {e}");
                     }
@@ -175,8 +178,8 @@ impl Shell {
                 Command::PauseMedia => {
                     // Before the pause, so the chain plays nothing after it.
                     self.resume = None;
-                    let paused =
-                        suspend::sleep_bounded(self.media.pause(self.play_rx.streams())).await;
+                    let pause = self.media.pause(self.play_rx.streams());
+                    let paused = self.sleepers.bounded(pause).await;
                     if paused == Some(false) {
                         // Remote controls only, if anything (#302, #329).
                         self.log(NOT_PAUSING);
@@ -234,7 +237,7 @@ impl Shell {
                 }
                 // Bounded by the sleep's deadline; nothing once it is released.
                 Command::Disconnect => {
-                    self.sleep_disconnected = Some(suspend::disconnect(&self.mac).await)
+                    self.sleep_disconnected = Some((self.sleep_disconnect)(self.mac.clone()).await)
                 }
                 // Reconnection belongs to the app lifecycle (main.rs, BlueZ,
                 // le.rs auto-connect), which starts a new device and task.
@@ -380,7 +383,7 @@ async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
 /// `SleepDisconnectFailed` before the ack: the session is live again. A
 /// notice the sleep no longer waits for is dropped: stepped after the wake,
 /// it would disconnect the AirPods again.
-async fn on_sleep(core: &mut Handoff, shell: &mut Shell, notice: SleepNotice) -> bool {
+pub(super) async fn on_sleep(core: &mut Handoff, shell: &mut Shell, notice: SleepNotice) -> bool {
     if notice.stale() {
         return false;
     }
@@ -410,13 +413,13 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     let marked = reconnect::claim_marker(&shell.mac);
     // A wake park (#529) stays the default: this task's router joins it
     // before suspend.rs drops its hold, and the core starts parked.
-    let wake_park = suspend::claim_wake_park(&shell.mac).map(|claim| {
+    let wake_park = crate::suspend::claim_wake_park(&shell.mac).map(|claim| {
         shell.media.route_default_sink(SinkEvent::Park);
         shell.parked = true;
         claim.hand_over(shell.media.hold_settled())
     });
     // Before the waits below, so a sleep during them waits for this task.
-    let mut sleep_rx = suspend::SLEEPERS.subscribe();
+    let mut sleep_rx = shell.sleepers.subscribe();
     // The stopped tasks' card writes must not land after this session's
     // first hold (#294).
     if let Some(previous) = previous {
