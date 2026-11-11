@@ -602,13 +602,15 @@ mod tests {
 
     #[test]
     fn logind_lock_failed_read_is_unlocked() {
-        let slot = Mutex::new(None::<u32>);
-        assert_eq!(read_lock_hint(&slot, || None, |_| Some(true)), Some(None));
-        assert_eq!(read_lock_hint(&slot, || Some(1), |_| None), Some(None));
-        assert_eq!(
-            read_lock_hint(&slot, || Some(1), |_| Some(true)),
-            Some(Some(true))
-        );
+        let empty = Mutex::new(None::<u32>);
+        let failed_open = read_lock_hint(&empty, || None, |_| panic!("read"));
+        assert_eq!(failed_open, Some(None));
+        // A bus already open: only `read` runs.
+        let open = Mutex::new(Some(1u32));
+        let hint = read_lock_hint(&open, || panic!("opened"), |_| Some(true));
+        assert_eq!(hint, Some(Some(true)));
+        let failed_read = read_lock_hint(&open, || panic!("opened"), |_| None);
+        assert_eq!(failed_read, Some(None));
         let state = idled_3s_ago();
         let (_, reader) = counting_reader(Some(None));
         let source = wayland_source(state.clone(), false, reader);
