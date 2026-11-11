@@ -22,6 +22,17 @@ impl Handoff {
         self.say("SLEEP paused, relayed idle and disconnecting; ownership kept");
     }
 
+    /// `sleep`'s disconnect didn't happen: the session is live again. What
+    /// `sleep` paused stays paused; the next sample change relays.
+    pub(super) fn sleep_disconnect_failed(&mut self) {
+        if !(self.sleeping && self.connected) {
+            return;
+        }
+        self.sleeping = false;
+        self.session_lost = false;
+        self.say("SLEEP disconnect didn't happen; session live again, ownership kept");
+    }
+
     pub(super) fn disconnected(&mut self, now: Instant, out: &mut Vec<Command>) {
         if !self.connected {
             return;

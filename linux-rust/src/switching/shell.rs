@@ -67,6 +67,8 @@ pub(super) struct Shell {
     pub(super) undo_rx: mpsc::UnboundedReceiver<u64>,
     /// Linux's activity level for the announced tipi (#13).
     pub(super) activity: Arc<dyn ActivitySource>,
+    /// Whether the last `Command::Disconnect` disconnected; `on_sleep` takes it.
+    pub(super) sleep_disconnected: Option<bool>,
 }
 
 /// The task's future drops its `Shell` on return, abort and panic alike,
@@ -231,7 +233,9 @@ impl Shell {
                     end = true;
                 }
                 // Bounded by the sleep's deadline; nothing once it is released.
-                Command::Disconnect => suspend::disconnect(&self.mac).await,
+                Command::Disconnect => {
+                    self.sleep_disconnected = Some(suspend::disconnect(&self.mac).await)
+                }
                 // Reconnection belongs to the app lifecycle (main.rs, BlueZ,
                 // le.rs auto-connect), which starts a new device and task.
                 Command::Reconnect { audio } => {
@@ -371,9 +375,11 @@ async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
 }
 
 /// The system is about to sleep (#15): step `Sleep`, then ack. A live
-/// session's MAC is reconnected on wake. A notice the sleep no longer waits
-/// for is dropped: stepped after the wake, it would disconnect the AirPods
-/// again.
+/// session's MAC is reconnected on wake. If its disconnect didn't happen
+/// (refused, timed out, or the sleep no longer waited), step
+/// `SleepDisconnectFailed` before the ack: the session is live again. A
+/// notice the sleep no longer waits for is dropped: stepped after the wake,
+/// it would disconnect the AirPods again.
 async fn on_sleep(core: &mut Handoff, shell: &mut Shell, notice: SleepNotice) -> bool {
     if notice.stale() {
         return false;
@@ -390,6 +396,8 @@ async fn on_sleep(core: &mut Handoff, shell: &mut Shell, notice: SleepNotice) ->
         notice.slept(&shell.mac);
     }
     let end = step(core, shell, Input::Sleep).await;
+    let failed = shell.sleep_disconnected.take() == Some(false);
+    let end = end || (failed && step(core, shell, Input::SleepDisconnectFailed).await);
     notice.ack();
     end
 }
