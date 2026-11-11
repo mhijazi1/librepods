@@ -434,6 +434,13 @@ pub(crate) struct Handoff {
     park: Park,
     /// While parked: `PARK_TIMEOUT` after the last play edge.
     park_until: Option<Instant>,
+    /// Parked on a wake park this task claimed (#529): until the take's
+    /// ACK, `wake_until`, or a connect decision that neither takes nor
+    /// holds.
+    wake_park: bool,
+    /// The wake park's deadline: the first play edge's, which later ones
+    /// don't push out.
+    wake_until: Option<Instant>,
     /// A worthy stream of the stream monitor's baseline is live (#311):
     /// playing for the park, never for a take.
     baseline_playing: bool,
@@ -530,6 +537,8 @@ impl Handoff {
             park_sink: false,
             park: Park::Local,
             park_until: None,
+            wake_park: false,
+            wake_until: None,
             baseline_playing: false,
             streams_known: false,
             sampled_known: false,
@@ -581,6 +590,16 @@ impl Handoff {
     /// `with_park_sink`.
     pub(crate) fn park(&self) -> Park {
         self.park
+    }
+
+    /// Start parked on the wake park this task claimed (#529), with the
+    /// deadline its first play edge started, if any.
+    pub(crate) fn with_wake_park(mut self, until: Option<Instant>) -> Self {
+        self.park = Park::Parked;
+        self.wake_park = true;
+        self.wake_until = until;
+        self.park_until = until;
+        self
     }
 
     /// The stream monitor's state, which the shell sets before each step
@@ -686,6 +705,9 @@ impl Handoff {
         // An [1] in `Auto`'s wait keeps (#452).
         let owns = input == Input::Ownership(vec![1]);
         let disconnected = input == Input::Disconnected;
+        // `Auto`'s or `Reconnected`'s ownership decision (#529).
+        let deciding =
+            self.connect_until.is_some() || matches!(input, Input::Auto | Input::Reconnected(_));
         self.apply(now, input, &mut out);
         self.settle_connect(now, owns, &mut out);
         self.take_back(now, owns, &mut out);
@@ -707,7 +729,7 @@ impl Handoff {
         {
             self.finish_quit(now, &mut out);
         }
-        self.update_park();
+        self.update_park(now, deciding && self.connect_until.is_none());
         out
     }
 
@@ -716,11 +738,18 @@ impl Handoff {
     /// the hold ends (#311). A take's ACK has already unparked to the
     /// AirPods. A baseline stream, which can't take, or a dead stream
     /// monitor, which can't see one, falls a park back to the local output.
-    fn update_park(&mut self) {
+    /// A claimed wake park (#529) is exempt until `decided` makes no take
+    /// and no hold.
+    fn update_park(&mut self, now: Instant, decided: bool) {
         let held = self.held == Some(true);
         let known = self.streams_known && self.sampled_known;
         let idle = known && self.category <= AUDIO_CATEGORY_IDLE && !self.call_or_mic();
         self.park = match self.park {
+            Park::Parked if self.wake_park && decided && !self.requested_take && !held => {
+                self.say("PARK no take and no hold after the wake; new playback goes to the local output");
+                Park::Local
+            }
+            Park::Parked if self.wake_park => Park::Parked,
             Park::Parked | Park::FallenBack if !held => Park::Local,
             Park::Parked if self.baseline_playing || !known => {
                 self.say("PARK a stream playing since the baseline, or no stream monitor; new playback goes to the local output");
@@ -736,6 +765,15 @@ impl Handoff {
         };
         if self.park != Park::Parked {
             self.park_until = None;
+            self.wake_park = false;
+        } else if self.wake_park {
+            // A baseline stream, which this task's poller never counts, is
+            // the parked play: its deadline runs from now.
+            if self.baseline_playing && self.park_until.is_none() {
+                self.park_until = Some(now + PARK_TIMEOUT);
+            }
+            self.wake_until = self.wake_until.or(self.park_until);
+            self.park_until = self.wake_until;
         }
     }
 

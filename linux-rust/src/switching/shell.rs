@@ -408,6 +408,13 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     // first, so the watcher still clears it on a stop during the wait; its
     // age is judged there only, so the wait can't expire it.
     let marked = reconnect::claim_marker(&shell.mac);
+    // A wake park (#529) stays the default: this task's router joins it
+    // before suspend.rs drops its hold, and the core starts parked.
+    let wake_park = suspend::claim_wake_park(&shell.mac).map(|claim| {
+        shell.media.route_default_sink(SinkEvent::Park);
+        shell.parked = true;
+        claim.hand_over(shell.media.hold_settled())
+    });
     // Before the waits below, so a sleep during them waits for this task.
     let mut sleep_rx = suspend::SLEEPERS.subscribe();
     // The stopped tasks' card writes must not land after this session's
@@ -457,6 +464,9 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     .with_category_relay(shell.relay_category)
     .with_notifications(true)
     .with_take_back_after_call(crate::utils::load_take_back_after_call(&shell.mac));
+    if let Some(until) = wake_park {
+        core = core.with_wake_park(until);
+    }
     let start = if let Some((category, requested)) = take_category {
         core = core
             .with_playback_requested()
