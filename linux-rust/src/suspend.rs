@@ -473,14 +473,17 @@ async fn run<L: Logind, B: BluezLink, A: WakeAudio>(
                 let park = wake_park(&mac, &*audio, &*bluez);
                 tokio::pin!(reconnect, park);
                 // A reconnect that gave up ends the park; one that connected
-                // leaves it to the handoff task's claim or its timeout.
+                // leaves a park in place to the handoff task's claim or its
+                // timeout, and drops one not made yet.
                 tokio::select! {
                     () = &mut park => {
                         reconnect.await;
                     }
-                    connected = &mut reconnect => if connected {
-                        park.await;
-                    },
+                    connected = &mut reconnect => {
+                        if connected && on_wake_park(&mac, |p| p.router.is_some()) == Some(true) {
+                            park.await;
+                        }
+                    }
                 }
             });
         }
@@ -549,13 +552,32 @@ async fn park_until_timeout(
         samples.next().await
     };
     // A baseline stream (even a silent one, until SILENCE_HOLD) or a play
-    // only delays the park, to the first known idle sample.
-    while !matches!(next().await?, (category, true, false) if category <= AUDIO_CATEGORY_IDLE) {}
-    // Back already, or never gone (a failed sleep disconnect, #535): its
-    // handoff task routes, and one already running claims nothing.
-    if bluez.connected(mac).await {
-        info!("Wake: {mac} is connected; not parking new playback");
-        return None;
+    // only delays the park, to the first known idle sample. A busy sample
+    // during the BlueZ read starts the wait again, so no play is queued
+    // behind the Park; an idle one lets the read go on.
+    let idle = |s: (u32, bool, bool)| matches!(s, (c, true, false) if c <= AUDIO_CATEGORY_IDLE);
+    'wait: loop {
+        while !idle(next().await?) {}
+        let read = bluez.connected(mac);
+        tokio::pin!(read);
+        loop {
+            tokio::select! {
+                biased;
+                later = next() => if !idle(later?) {
+                    continue 'wait;
+                },
+                // Back already, or never gone (a failed sleep disconnect,
+                // #535): its handoff task routes, and one already running
+                // claims nothing.
+                connected = &mut read => {
+                    if connected {
+                        info!("Wake: {mac} is connected; not parking new playback");
+                        return None;
+                    }
+                    break 'wait;
+                }
+            }
+        }
     }
     on_wake_park(mac, |park| {
         let router = audio.router();
@@ -694,10 +716,21 @@ mod tests {
         hung_disconnect: bool,
         /// `disconnect` returns Err.
         refuse_disconnect: bool,
+        /// The next `connected` waits until this gate's sender drops.
+        connected_gate: Mutex<Option<oneshot::Receiver<()>>>,
+        /// Each `connected` takes this long.
+        connected_delay: Option<Duration>,
     }
 
     impl BluezLink for FakeLink {
         async fn connected(&self, _: &str) -> bool {
+            let gate = self.connected_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            if let Some(delay) = self.connected_delay {
+                tokio::time::sleep(delay).await;
+            }
             let call = self.connected_calls.fetch_add(1, Ordering::SeqCst);
             self.connected_from.is_some_and(|from| call >= from)
         }
@@ -1046,6 +1079,9 @@ mod tests {
     const P9: &str = "05:29:00:00:00:0B";
     const P10: &str = "05:29:00:00:00:0C";
     const P11: &str = "05:29:00:00:00:0D";
+    const P12: &str = "05:29:00:00:00:0E";
+    const P13: &str = "05:29:00:00:00:0F";
+    const P14: &str = "05:29:00:00:00:10";
 
     /// Linux's category, the streams known, a baseline stream live.
     type Sample = (u32, bool, bool);
@@ -1185,6 +1221,67 @@ mod tests {
             assert_eq!(sinks.sets(), ["load", PARK_SINK], "{mac}");
             assert_eq!(default(&sinks), PARK_SINK);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_park_ends_unparked_once_reconnected() {
+        let link = FakeLink {
+            results: Mutex::new([Ok(())].into()),
+            ..FakeLink::default()
+        };
+        let (audio, samples, sinks) = fake_audio();
+        let _prepare = wake(P12, link, audio).await;
+        samples.send(PLAY).unwrap();
+        settle().await;
+        // The reconnect connects at its first attempt; nothing claims.
+        tokio::time::sleep(WAKE_RECONNECT_FIRST).await;
+        settle().await;
+        assert!(claim_wake_park(P12).is_none());
+        // A later idle sample, BlueZ reporting the AirPods gone again.
+        let _ = samples.send(IDLE);
+        settle().await;
+        assert!(sinks.sets().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_park_rechecks_a_sample_during_the_bluez_read() {
+        let (gate, gated) = oneshot::channel();
+        let link = FakeLink {
+            connected_gate: Mutex::new(Some(gated)),
+            ..FakeLink::default()
+        };
+        let (audio, samples, sinks) = fake_audio();
+        let _prepare = wake(P13, link, audio).await;
+        // The idle sample starts the BlueZ read, which waits on the gate.
+        samples.send(IDLE).unwrap();
+        settle().await;
+        assert!(sinks.sets().is_empty());
+        // A play comes during the read, which then finds it disconnected.
+        samples.send(PLAY).unwrap();
+        settle().await;
+        drop(gate);
+        settle().await;
+        assert!(sinks.sets().is_empty());
+        // The next known idle sample parks.
+        samples.send(IDLE).unwrap();
+        settle().await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK]);
+
+        // An idle sample during a slow read lets it go on: polled every
+        // 500 ms, a 1 s read still ends in a park.
+        let link = FakeLink {
+            connected_delay: Some(Duration::from_secs(1)),
+            ..FakeLink::default()
+        };
+        let (audio, samples, sinks) = fake_audio();
+        let _prepare = wake(P14, link, audio).await;
+        for _ in 0..2 {
+            samples.send(IDLE).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let _ = samples.send(IDLE);
+        settle().await;
+        assert_eq!(sinks.sets(), ["load", PARK_SINK]);
     }
 
     #[tokio::test(start_paused = true)]
