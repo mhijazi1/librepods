@@ -3759,6 +3759,53 @@ mod tests {
         assert_eq!(counts(), (4, 4));
     }
 
+    /// A pause whose future is dropped mid-scan (a sleep cut, #537) sends
+    /// no Pause after the cut, and its worker still counts as finished only
+    /// when it returns (#356).
+    #[tokio::test]
+    async fn cut_own_pause_sends_no_late_pause() {
+        let controller = MediaController::new(String::new(), String::new());
+        let (pauses, done) = (
+            controller.self_pauses.clone(),
+            controller.self_pauses_done.clone(),
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = StdMutex::new(release_rx);
+        let accepted = Arc::new(StdMutex::new(Vec::new()));
+        let seen = accepted.clone();
+        let mut pause = Box::pin(crate::switching::pause_own_players(
+            &controller,
+            Arc::new(move |own: &dyn Fn(Option<u32>) -> bool| {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                let owners = [Some(1), Some(2)].into_iter().filter(|&owner| own(owner));
+                seen.lock().unwrap().extend(owners);
+                PauseOutcome::default()
+            }),
+            // live None: every owner plays locally.
+            crate::stream_monitor::PlaybackState::default(),
+        ));
+        let started = tokio::task::spawn_blocking(move || started_rx.recv());
+        tokio::select! {
+            _ = &mut pause => panic!("the pause returned before its scan started"),
+            started = started => started.unwrap().unwrap(),
+        }
+        drop(pause);
+        assert_eq!(pauses.load(Ordering::SeqCst), 1);
+        assert_eq!(done.load(Ordering::SeqCst), 0);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while done.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the released worker returns");
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+        assert_eq!(*accepted.lock().unwrap(), []);
+    }
+
     #[tokio::test]
     async fn ear_removal_both_buds_idle_leaves_self_pause_unset() {
         use EarDetectionStatus::*;
