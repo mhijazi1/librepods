@@ -145,6 +145,9 @@ pub(crate) enum Input {
     /// disconnect without releasing. Until the drop the session is lost,
     /// and the drop pauses nothing more.
     Sleep,
+    /// `Sleep`'s disconnect didn't happen (refused, timed out, or the sleep
+    /// no longer waited): the session is live again, ownership kept.
+    SleepDisconnectFailed,
     /// The control session dropped.
     Disconnected,
     /// A reconnect attempt made a new control session (not yet adopted).
@@ -241,7 +244,8 @@ pub(crate) enum Command {
     ConnectA2dp,
     /// Tear down the dead control session and drop its queued events.
     DropSession,
-    /// Disconnect the AirPods through BlueZ (`Input::Sleep`).
+    /// Disconnect the AirPods through BlueZ (`Input::Sleep`). If it doesn't
+    /// happen, the shell feeds `Input::SleepDisconnectFailed`.
     Disconnect,
     /// Start a reconnect attempt; `audio` also connects A2DP and reports
     /// Linux as not owning.
@@ -905,6 +909,7 @@ impl Handoff {
                 }
             }
             Input::Sleep => self.sleep(out),
+            Input::SleepDisconnectFailed => self.sleep_disconnect_failed(),
             Input::Disconnected => {
                 self.take_back.clear();
                 self.disconnected(now, out);

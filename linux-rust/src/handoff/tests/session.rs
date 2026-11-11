@@ -1420,3 +1420,63 @@ fn reconnect_after_a_loss_pause_takes_without_resume() {
     // The idle take's ACK resumes nothing.
     assert_eq!(p.feed(2400, Input::Ownership(vec![1])), []);
 }
+
+// #535: the sleep disconnect didn't happen.
+
+const SLEEP_FAILED: &str = "SLEEP disconnect didn't happen";
+
+#[test]
+fn sleep_disconnect_failed_takes_again() {
+    let mut p = relaying();
+    assert_eq!(p.feed(400, Input::Sleep), [Disconnect]);
+    assert_eq!(p.feed(450, Input::SleepDisconnectFailed), []);
+    let mut twin = relaying();
+    let take = twin.play(500, true);
+    assert_eq!(take, [RelayCategory(STREAM), SendOwnership(true)]);
+    assert_eq!(p.play(500, true), take);
+
+    // A later drop of an automatic playing owner is an ordinary one.
+    let mut p = relaying_owner();
+    assert_eq!(
+        p.feed(1000, Input::Sleep),
+        [PauseMedia, RelayCategory(IDLE), Disconnect]
+    );
+    assert_eq!(p.feed(1050, Input::SleepDisconnectFailed), []);
+    assert_eq!(p.feed(1300, Input::Disconnected), [PauseMedia, DropSession]);
+}
+
+#[test]
+fn sleep_disconnect_failed_is_a_no_op_otherwise() {
+    // No prior sleep: the core is as if it got nothing.
+    let mut p = relaying();
+    let mut twin = relaying();
+    assert_eq!(p.feed(400, Input::SleepDisconnectFailed), []);
+    assert_eq!(p.play(500, true), twin.play(500, true));
+    assert_eq!(p.core.take_lines(), twin.core.take_lines());
+
+    // A session lost without a sleep stays lost: no take.
+    let mut p = relaying();
+    assert_eq!(p.feed(400, Input::SessionLost), []);
+    assert_eq!(p.feed(450, Input::SleepDisconnectFailed), []);
+    assert_eq!(takes(&p.play(500, true)), 0);
+
+    // After the sleep's drop.
+    let mut p = relaying_owner();
+    p.feed(1000, Input::Sleep);
+    assert_eq!(p.feed(1100, Input::Disconnected), [DropSession]);
+    p.core.take_lines();
+    assert_eq!(p.feed(1200, Input::SleepDisconnectFailed), []);
+    assert_eq!(p.core.take_lines(), Vec::<String>::new());
+    assert!(!p.core.connected());
+
+    // Twice: the second does nothing.
+    let mut p = relaying();
+    assert_eq!(p.feed(400, Input::Sleep), [Disconnect]);
+    assert_eq!(p.feed(450, Input::SleepDisconnectFailed), []);
+    assert_eq!(p.feed(460, Input::SleepDisconnectFailed), []);
+    assert_eq!(count_lines(&p.core.take_lines(), SLEEP_FAILED), 1);
+
+    // A drop after the reset: one DropSession, nothing relayed or
+    // disconnected.
+    assert_eq!(p.feed(500, Input::Disconnected), [DropSession]);
+}

@@ -134,8 +134,8 @@ impl BluezLink for Bluez {
 }
 
 /// The handoff task's `Command::Disconnect`, bounded by the pending
-/// sleep's deadline.
-pub(crate) async fn disconnect(mac: &str) {
+/// sleep's deadline. True only if BlueZ disconnected in time.
+pub(crate) async fn disconnect(mac: &str) -> bool {
     SLEEPERS.disconnect(&Bluez, mac).await
 }
 
@@ -258,19 +258,22 @@ impl Sleepers {
     }
 
     /// The sleep disconnect, bounded by the pending sleep's deadline; with
-    /// none pending (released, or woken) BlueZ isn't called.
-    async fn disconnect(&self, link: &impl BluezLink, mac: &str) {
+    /// none pending (released, or woken) BlueZ isn't called. True only if
+    /// BlueZ disconnected before the deadline.
+    async fn disconnect(&self, link: &impl BluezLink, mac: &str) -> bool {
         let Some(deadline) = self.deadline() else {
-            // shortcut: a task that steps Sleep after the release leaves the core lost without a disconnect (#535)
             warn!("Sleep: not disconnecting {mac}: the sleep no longer waits");
-            return;
+            return false;
         };
         match tokio::time::timeout_at(deadline, link.disconnect(mac)).await {
-            Ok(Ok(())) => info!("Sleep: disconnected {mac}"),
-            // shortcut: on a failed or timed-out disconnect the core stays lost (no take) until the session drops (#535)
+            Ok(Ok(())) => {
+                info!("Sleep: disconnected {mac}");
+                return true;
+            }
             Ok(Err(e)) => warn!("Sleep: failed to disconnect {mac}: {e}"),
             Err(_) => warn!("Sleep: disconnecting {mac} timed out"),
         }
+        false
     }
 }
 
@@ -453,6 +456,8 @@ mod tests {
         disconnects: AtomicUsize,
         /// `disconnect` never returns.
         hung_disconnect: bool,
+        /// `disconnect` returns Err.
+        refuse_disconnect: bool,
     }
 
     impl BluezLink for FakeLink {
@@ -479,6 +484,9 @@ mod tests {
             self.disconnects.fetch_add(1, Ordering::SeqCst);
             if self.hung_disconnect {
                 std::future::pending::<()>().await;
+            }
+            if self.refuse_disconnect {
+                return Err("refused".into());
             }
             Ok(())
         }
@@ -792,6 +800,32 @@ mod tests {
         assert!(sleep.await.unwrap_err().is_cancelled());
         sleepers.disconnect(&link, M).await;
         assert_eq!(disconnects(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleep_disconnect_reports_whether_it_disconnected() {
+        // No sleep pending: false, and BlueZ isn't called.
+        let link = FakeLink::default();
+        assert!(!sleepers().disconnect(&link, M).await);
+        assert_eq!(link.disconnects.load(Ordering::SeqCst), 0);
+        let (sleepers, _notice, _sleep) = pending_sleep().await;
+        assert!(sleepers.disconnect(&link, M).await);
+        let refused = FakeLink {
+            refuse_disconnect: true,
+            ..FakeLink::default()
+        };
+        assert!(!sleepers.disconnect(&refused, M).await);
+        assert_eq!(refused.disconnects.load(Ordering::SeqCst), 1);
+
+        // A hung disconnect: false at the deadline.
+        let hung = FakeLink {
+            hung_disconnect: true,
+            ..FakeLink::default()
+        };
+        let start = Instant::now();
+        let (sleepers, _notice, _sleep) = pending_sleep().await;
+        assert!(!sleepers.disconnect(&hung, M).await);
+        assert_eq!(Instant::now(), start + SLEEP_PREPARE_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]

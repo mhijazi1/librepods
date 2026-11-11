@@ -300,6 +300,7 @@ impl Switching {
                     // No notifier clicks: a closed channel.
                     undo_rx: self.undo.unwrap_or_else(|| mpsc::unbounded_channel().1),
                     activity: self.activity,
+                    sleep_disconnected: None,
                 };
                 spawn_handoff_task(&HANDOFF_TASKS, self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
