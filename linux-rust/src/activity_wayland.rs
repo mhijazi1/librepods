@@ -94,12 +94,13 @@ impl ActivitySource for WaylandActivity {
 }
 
 /// `state`'s source. Without hyprland-lock-notify-v1, `locked` comes from
-/// `logind_locked` (false when it fails), read after the state mutex is
-/// released so a slow bus never stalls the Wayland thread (#526).
+/// `logind_locked` (`read_lock_hint`'s result: busy is no snapshot, a failed
+/// read is unlocked), read after the state mutex is released so a slow bus
+/// never stalls the Wayland thread (#526).
 fn wayland_source(
     state: Arc<Mutex<WaylandState>>,
     lock_notify: bool,
-    logind_locked: impl Fn() -> Option<bool> + Send + Sync + 'static,
+    logind_locked: impl Fn() -> Option<Option<bool>> + Send + Sync + 'static,
 ) -> Arc<dyn ActivitySource> {
     let wayland = WaylandActivity(state);
     if lock_notify {
@@ -108,7 +109,7 @@ fn wayland_source(
     Arc::new(move || {
         let inputs = wayland.snapshot()?;
         Some(ActivityInputs {
-            locked: logind_locked().unwrap_or(false),
+            locked: logind_locked()?.unwrap_or(false),
             ..inputs
         })
     })
@@ -471,14 +472,15 @@ mod tests {
         );
     }
 
+    use crate::activity::read_lock_hint;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     /// A logind lock reader giving `locked` that counts its calls.
     fn counting_reader(
-        locked: Option<bool>,
+        locked: Option<Option<bool>>,
     ) -> (
         Arc<AtomicUsize>,
-        impl Fn() -> Option<bool> + Send + Sync + 'static,
+        impl Fn() -> Option<Option<bool>> + Send + Sync + 'static,
     ) {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
@@ -515,7 +517,7 @@ mod tests {
     #[test]
     fn logind_lock_locked_is_idle() {
         let state = idled_3s_ago();
-        let (calls_made, reader) = counting_reader(Some(true));
+        let (calls_made, reader) = counting_reader(Some(Some(true)));
         let source = wayland_source(state.clone(), false, reader);
         let inputs = mixed_snapshot(&state, &source);
         assert!(inputs.locked);
@@ -527,7 +529,7 @@ mod tests {
     #[test]
     fn logind_lock_unlocked_keeps_input_level() {
         let state = idled_3s_ago();
-        let (_, reader) = counting_reader(Some(false));
+        let (_, reader) = counting_reader(Some(Some(false)));
         let source = wayland_source(state.clone(), false, reader);
         let inputs = mixed_snapshot(&state, &source);
         assert!(!inputs.locked);
@@ -537,7 +539,7 @@ mod tests {
     #[test]
     fn lock_notify_never_reads_logind() {
         let state = idled_3s_ago();
-        let (calls_made, reader) = counting_reader(Some(true));
+        let (calls_made, reader) = counting_reader(Some(Some(true)));
         let source = wayland_source(state.clone(), true, reader);
         for locked in [false, true, false, true] {
             state.lock().unwrap().locked = locked;
@@ -550,7 +552,7 @@ mod tests {
     async fn logind_lock_failed_read_keeps_input() {
         // No events yet is Max (7), so a LEGACY (6) tipi would show.
         let state = Arc::new(Mutex::new(WaylandState::default()));
-        let (calls_made, reader) = counting_reader(None);
+        let (calls_made, reader) = counting_reader(Some(None));
         let source = wayland_source(state.clone(), false, reader);
         let inputs = mixed_snapshot(&state, &source);
         assert!(!inputs.locked);
@@ -569,7 +571,7 @@ mod tests {
                 shared.try_lock().is_ok(),
                 "logind read under the state lock"
             );
-            Some(true)
+            Some(Some(true))
         });
         assert!(source.snapshot().unwrap().locked);
     }
@@ -577,10 +579,41 @@ mod tests {
     #[test]
     fn logind_lock_lost_connection_is_none() {
         let state = idled_3s_ago();
-        let (calls_made, reader) = counting_reader(Some(true));
+        let (calls_made, reader) = counting_reader(Some(Some(true)));
         let source = wayland_source(state.clone(), false, reader);
         state.lock().unwrap().lost = true;
         assert_eq!(source.snapshot(), None);
         assert_eq!(calls(&calls_made), 0);
+    }
+
+    #[test]
+    fn logind_lock_busy_slot_is_none() {
+        let slot = Mutex::new(None::<u32>);
+        let held = slot.lock().unwrap();
+        let busy = read_lock_hint(&slot, || panic!("opened"), |_| panic!("read"));
+        assert_eq!(busy, None);
+        drop(held);
+        let state = idled_3s_ago();
+        let (calls_made, reader) = counting_reader(None);
+        let source = wayland_source(state, false, reader);
+        assert_eq!(source.snapshot(), None);
+        assert_eq!(calls(&calls_made), 1);
+    }
+
+    #[test]
+    fn logind_lock_failed_read_is_unlocked() {
+        let slot = Mutex::new(None::<u32>);
+        assert_eq!(read_lock_hint(&slot, || None, |_| Some(true)), Some(None));
+        assert_eq!(read_lock_hint(&slot, || Some(1), |_| None), Some(None));
+        assert_eq!(
+            read_lock_hint(&slot, || Some(1), |_| Some(true)),
+            Some(Some(true))
+        );
+        let state = idled_3s_ago();
+        let (_, reader) = counting_reader(Some(None));
+        let source = wayland_source(state.clone(), false, reader);
+        let inputs = mixed_snapshot(&state, &source);
+        assert!(!inputs.locked);
+        assert_eq!(activity_level(inputs), ActivityLevel::High);
     }
 }

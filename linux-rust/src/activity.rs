@@ -121,10 +121,31 @@ static LOGIND_BUS: std::sync::Mutex<Option<Connection>> = std::sync::Mutex::new(
 
 impl LogindActivity {
     /// LockedHint alone on the shared bus, for a Wayland source with no
-    /// lock notifier (#526).
-    pub(crate) fn locked(&self) -> Option<bool> {
-        crate::a2dp_resume::read_shared_any(&LOGIND_BUS, open_bus, |bus| hint(bus, "LockedHint"))
+    /// lock notifier (#526); see `read_lock_hint`.
+    pub(crate) fn locked(&self) -> Option<Option<bool>> {
+        read_lock_hint(&LOGIND_BUS, open_bus, |bus| hint(bus, "LockedHint"))
     }
+}
+
+/// `read_shared_any` that tells a busy `slot` from a failed read: None when
+/// another read holds it (neither `open` nor `read` ran), Some(None) when
+/// the open or read failed, else the hint (#526).
+pub(crate) fn read_lock_hint<B>(
+    slot: &std::sync::Mutex<Option<B>>,
+    open: impl FnOnce() -> Option<B>,
+    read: impl FnOnce(&B) -> Option<bool>,
+) -> Option<Option<bool>> {
+    // A taken slot always runs `open` or `read`.
+    let ran = std::cell::Cell::new(false);
+    let opened = || {
+        ran.set(true);
+        open()
+    };
+    let hint = crate::a2dp_resume::read_shared_any(slot, opened, |bus| {
+        ran.set(true);
+        read(bus)
+    });
+    ran.get().then_some(hint)
 }
 
 impl ActivitySource for LogindActivity {
