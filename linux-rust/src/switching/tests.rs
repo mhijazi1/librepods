@@ -1254,7 +1254,10 @@ mod sleep {
         let t0 = tokio::time::Instant::now();
         let (slept, sleep) = shell.sleepers.start_sleep();
         let notice = sleep_rx.recv().await.unwrap();
-        assert!(!on_sleep(&mut core, &mut shell, notice).await);
+        // Bounded, so an unbounded hung pause fails instead of hanging.
+        let sleep_step = on_sleep(&mut core, &mut shell, notice);
+        let ended = tokio::time::timeout(SLEEP_PREPARE_TIMEOUT * 2, sleep_step).await;
+        assert_eq!(ended, Ok(false));
         let cut = t0 + SLEEP_PREPARE_TIMEOUT - SLEEP_DISCONNECT_RESERVE;
         assert_eq!(*calls.lock().unwrap(), [(mac.to_string(), cut)]);
         assert_eq!(pauses(&records), 1);
