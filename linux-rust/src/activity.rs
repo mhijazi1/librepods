@@ -115,20 +115,37 @@ pub(crate) async fn current_level(source: &Arc<dyn ActivitySource>) -> Option<Ac
 /// display session.
 pub(crate) struct LogindActivity;
 
+/// The logind reads' one system bus connection, so the 1 s poll doesn't
+/// open a bus per snapshot (#525).
+static LOGIND_BUS: std::sync::Mutex<Option<Connection>> = std::sync::Mutex::new(None);
+
 impl ActivitySource for LogindActivity {
     fn snapshot(&self) -> Option<ActivityInputs> {
-        let bus = Connection::new_system().ok()?;
-        let session = bus.with_proxy(
-            "org.freedesktop.login1",
-            "/org/freedesktop/login1/session/auto",
-            LOGIND_CALL_TIMEOUT,
-        );
-        let hint = |name| session.get::<bool>("org.freedesktop.login1.Session", name);
-        Some(logind_inputs(
-            hint("LockedHint").ok()?,
-            hint("IdleHint").ok()?,
-        ))
+        logind_snapshot(&LOGIND_BUS, || Connection::new_system().ok(), read_hints)
     }
+}
+
+/// `session/auto`'s (LockedHint, IdleHint) on `bus`.
+fn read_hints(bus: &Connection) -> Option<(bool, bool)> {
+    let session = bus.with_proxy(
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1/session/auto",
+        LOGIND_CALL_TIMEOUT,
+    );
+    let hint = |name| session.get::<bool>("org.freedesktop.login1.Session", name);
+    Some((hint("LockedHint").ok()?, hint("IdleHint").ok()?))
+}
+
+/// logind's inputs from `hints` on the bus in `slot`, shared as
+/// `read_shared_any` does: opened once, reopened after a failed read, and
+/// None at once while another snapshot holds the bus (LEGACY is sent).
+fn logind_snapshot<B>(
+    slot: &std::sync::Mutex<Option<B>>,
+    open: impl FnOnce() -> Option<B>,
+    hints: impl FnOnce(&B) -> Option<(bool, bool)>,
+) -> Option<ActivityInputs> {
+    let (locked, idle) = crate::a2dp_resume::read_shared_any(slot, open, hints)?;
+    Some(logind_inputs(locked, idle))
 }
 
 /// logind gives no input time, so an unlocked, non-idle session is High.
@@ -313,6 +330,64 @@ mod tests {
     fn logind_hints_locked_is_idle() {
         let fields = tipi_fields(activity_level(logind_inputs(true, false)));
         assert_eq!(fields.nearby_audio_score, 1);
+    }
+
+    /// A `logind_snapshot` opener that counts its calls and opens bus `n`.
+    fn logind_opener(opens: &std::cell::Cell<usize>, n: u32) -> impl FnOnce() -> Option<u32> {
+        move || {
+            opens.set(opens.get() + 1);
+            Some(n)
+        }
+    }
+
+    /// Fake hints: locked only on bus `n`, so a result shows which bus read.
+    fn locked_on(n: u32) -> impl Fn(&u32) -> Option<(bool, bool)> {
+        move |bus| Some((*bus == n, true))
+    }
+
+    #[test]
+    fn logind_bus_opens_once() {
+        let (slot, opens) = (std::sync::Mutex::new(None), std::cell::Cell::new(0));
+        for n in 1..=3 {
+            assert_eq!(
+                logind_snapshot(&slot, logind_opener(&opens, n), locked_on(1)),
+                Some(logind_inputs(true, true)),
+                "snapshot {n}"
+            );
+        }
+        assert_eq!(opens.get(), 1);
+    }
+
+    #[test]
+    fn logind_bus_reopens_after_failed_read() {
+        let (slot, opens) = (std::sync::Mutex::new(None), std::cell::Cell::new(0));
+        assert_eq!(
+            logind_snapshot(&slot, logind_opener(&opens, 1), |_| None),
+            None
+        );
+        assert_eq!(opens.get(), 1);
+        for n in [2, 3] {
+            assert_eq!(
+                logind_snapshot(&slot, logind_opener(&opens, n), locked_on(2)),
+                Some(logind_inputs(true, true)),
+                "snapshot after the failed read on bus {n}"
+            );
+        }
+        assert_eq!(opens.get(), 2);
+    }
+
+    /// Another snapshot holding the bus (a stalled read) gives None at
+    /// once, without opening a second bus.
+    #[test]
+    fn logind_busy_bus_is_none() {
+        let (slot, opens) = (std::sync::Mutex::new(None), std::cell::Cell::new(0));
+        let held = slot.lock().unwrap();
+        assert_eq!(
+            logind_snapshot(&slot, logind_opener(&opens, 1), locked_on(1)),
+            None
+        );
+        assert_eq!(opens.get(), 0);
+        drop(held);
     }
 
     /// A source stuck in its blocking read (a stalled system bus) gives
