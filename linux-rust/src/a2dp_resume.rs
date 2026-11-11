@@ -679,6 +679,15 @@ fn read_shared<B>(
     open: impl FnOnce() -> Option<B>,
     read: impl FnOnce(&B) -> Option<bool>,
 ) -> Option<bool> {
+    read_shared_any(slot, open, read)
+}
+
+/// `read_shared` for a read of any type (logind's hints, #525).
+pub(crate) fn read_shared_any<B, T>(
+    slot: &Mutex<Option<B>>,
+    open: impl FnOnce() -> Option<B>,
+    read: impl FnOnce(&B) -> Option<T>,
+) -> Option<T> {
     let mut bus = match slot.try_lock() {
         Ok(bus) => bus,
         Err(TryLockError::WouldBlock) => return None,

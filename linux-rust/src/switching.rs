@@ -24,7 +24,7 @@
 //! the handoff task can still drain every event the manager emitted.
 
 use crate::a2dp_resume;
-use crate::activity::{ActivitySource, LogindActivity};
+use crate::activity::{self, ActivitySource};
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers, TipiFields};
 use crate::handoff_log;
 use crate::media_controller::{self, MediaController};
@@ -149,7 +149,7 @@ impl Switching {
             Self::start_with_calls(setup, media, playback, stream_monitor::spawn_call_poller)
                 .await
                 .with_connect_mode(utils::load_connect_mode(&mac))
-                .with_activity(Arc::new(LogindActivity));
+                .with_activity(activity::session_source());
         switching.a2dp = handoff.then(|| a2dp_resume::spawn_transport_poller(&mac));
         switching.relay_category = true;
         let (undo, undo_rx) = mpsc::unbounded_channel();
