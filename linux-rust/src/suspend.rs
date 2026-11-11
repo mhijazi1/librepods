@@ -515,11 +515,11 @@ async fn wake_reconnect(bluez: Arc<impl BluezLink>, mac: String) -> bool {
     false
 }
 
-/// Park new playback while `mac` reconnects: once the first sample with
-/// the streams known shows Linux idle and no baseline stream live (one
-/// already playing stays where it is). Unless a handoff task claims the
-/// park first, it ends `WAKE_PARK_TIMEOUT` after the first play edge, or
-/// when this is dropped.
+/// Park new playback while `mac` reconnects: at the first sample with the
+/// streams known that shows Linux idle and no baseline stream live. Unless
+/// a handoff task claims the park first, it ends `WAKE_PARK_TIMEOUT` after
+/// the first play edge, at a sample with the streams unknown, or when this
+/// is dropped.
 async fn wake_park(mac: &str, audio: &impl WakeAudio, bluez: &impl BluezLink) {
     struct Registered<'a>(&'a str);
     impl Drop for Registered<'_> {
@@ -548,15 +548,9 @@ async fn park_until_timeout(
         on_wake_park(mac, |_| ())?;
         samples.next().await
     };
-    let (category, baseline) = loop {
-        if let (category, true, baseline) = next().await? {
-            break (category, baseline);
-        }
-    };
-    if category > AUDIO_CATEGORY_IDLE || baseline {
-        info!("Wake: Linux plays; not parking new playback for {mac}");
-        return None;
-    }
+    // A baseline stream (even a silent one, until SILENCE_HOLD) or a play
+    // only delays the park, to the first known idle sample.
+    while !matches!(next().await?, (category, true, false) if category <= AUDIO_CATEGORY_IDLE) {}
     // Back already, or never gone (a failed sleep disconnect, #535): its
     // handoff task routes, and one already running claims nothing.
     if bluez.connected(mac).await {
@@ -1050,6 +1044,8 @@ mod tests {
     const Q2: &str = "05:29:00:00:00:09";
     const P8: &str = "05:29:00:00:00:0A";
     const P9: &str = "05:29:00:00:00:0B";
+    const P10: &str = "05:29:00:00:00:0C";
+    const P11: &str = "05:29:00:00:00:0D";
 
     /// Linux's category, the streams known, a baseline stream live.
     type Sample = (u32, bool, bool);
@@ -1136,15 +1132,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wake_park_skips_a_live_baseline() {
-        // A live baseline stream, or a playing first known sample: the
-        // first known sample decides.
+        // No park while a live baseline stream or a play is the latest
+        // known sample.
         let baseline = (AUDIO_CATEGORY_IDLE, true, true);
-        for (mac, first) in [(P2, baseline), (P3, PLAY)] {
+        for (mac, latest) in [(P2, baseline), (P3, PLAY)] {
             let (audio, samples, sinks) = fake_audio();
             let _prepare = wake(mac, FakeLink::default(), audio).await;
             samples.send((AUDIO_CATEGORY_IDLE, false, false)).unwrap();
-            samples.send(first).unwrap();
-            let _ = samples.send(IDLE);
+            samples.send(latest).unwrap();
             settle().await;
             assert!(sinks.sets().is_empty(), "{mac}");
             assert_eq!(default(&sinks), DAC);
@@ -1170,6 +1165,25 @@ mod tests {
         samples.send(IDLE).unwrap();
         settle().await;
         assert!(sinks.sets().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_park_waits_out_a_live_baseline() {
+        // A silent app in the baseline, or a play, only delays the park to
+        // the first known idle sample.
+        let baseline = (AUDIO_CATEGORY_IDLE, true, true);
+        for (mac, busy) in [(P10, baseline), (P11, PLAY)] {
+            let (audio, samples, sinks) = fake_audio();
+            let _prepare = wake(mac, FakeLink::default(), audio).await;
+            samples.send(busy).unwrap();
+            samples.send(busy).unwrap();
+            settle().await;
+            assert!(sinks.sets().is_empty(), "{mac}");
+            samples.send(IDLE).unwrap();
+            settle().await;
+            assert_eq!(sinks.sets(), ["load", PARK_SINK], "{mac}");
+            assert_eq!(default(&sinks), PARK_SINK);
+        }
     }
 
     #[tokio::test(start_paused = true)]
