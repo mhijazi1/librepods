@@ -381,13 +381,12 @@ mod tests {
     #[test]
     fn logind_busy_bus_is_none() {
         let (slot, opens) = (std::sync::Mutex::new(None), std::cell::Cell::new(0));
-        let held = slot.lock().unwrap();
+        let _held = slot.lock().unwrap();
         assert_eq!(
             logind_snapshot(&slot, logind_opener(&opens, 1), locked_on(1)),
             None
         );
         assert_eq!(opens.get(), 0);
-        drop(held);
     }
 
     /// A source stuck in its blocking read (a stalled system bus) gives
