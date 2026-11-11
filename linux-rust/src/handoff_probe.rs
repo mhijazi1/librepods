@@ -295,6 +295,8 @@ impl Io {
                     self.events.close();
                     while self.events.try_recv().is_ok() {}
                 }
+                // The probe feeds no Sleep, so the core never asks.
+                Command::Disconnect => println!("the sleep disconnect is not run by the probe"),
                 Command::Reconnect { audio } => {
                     let adapter = self.adapter.clone();
                     let address = self.address;

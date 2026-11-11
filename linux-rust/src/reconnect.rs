@@ -495,7 +495,8 @@ pub(crate) trait Connector: Send + Sync + 'static {
     fn log(&self, mac: &str, line: &str);
 }
 
-struct Bluez;
+/// BlueZ and bluetoothctl; also suspend.rs's `BluezLink`.
+pub(crate) struct Bluez;
 
 impl Connector for Bluez {
     async fn connected(&self, mac: &str) -> bool {

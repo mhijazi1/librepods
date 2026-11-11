@@ -15,6 +15,7 @@ use crate::handoff::{Command, Handoff, Input, Park, local_inputs};
 use crate::notifications::{self, Notice, Notifier};
 use crate::reconnect;
 use crate::stream_monitor::CallSamples;
+use crate::suspend::{self, SleepNotice};
 use crate::utils::ConnectMode;
 use futures::future::BoxFuture;
 use log::{error, info};
@@ -159,14 +160,22 @@ impl Shell {
                     }
                 }
                 Command::RelayCategory(category) => {
-                    if let Err(e) = relay_category(&self.manager, &self.local, category).await {
+                    let relayed = suspend::sleep_bounded(relay_category(
+                        &self.manager,
+                        &self.local,
+                        category,
+                    ))
+                    .await;
+                    if let Some(Err(e)) = relayed {
                         error!("Handoff: failed to relay audio category {category}: {e}");
                     }
                 }
                 Command::PauseMedia => {
                     // Before the pause, so the chain plays nothing after it.
                     self.resume = None;
-                    if !self.media.pause(self.play_rx.streams()).await {
+                    let paused =
+                        suspend::sleep_bounded(self.media.pause(self.play_rx.streams())).await;
+                    if paused == Some(false) {
                         // Remote controls only, if anything (#302, #329).
                         self.log(NOT_PAUSING);
                     }
@@ -221,6 +230,8 @@ impl Shell {
                     );
                     end = true;
                 }
+                // Bounded by the sleep's deadline; nothing once it is released.
+                Command::Disconnect => suspend::disconnect(&self.mac).await,
                 // Reconnection belongs to the app lifecycle (main.rs, BlueZ,
                 // le.rs auto-connect), which starts a new device and task.
                 Command::Reconnect { audio } => {
@@ -359,12 +370,38 @@ async fn end_stream(core: &mut Handoff, shell: &mut Shell) {
     }
 }
 
+/// The system is about to sleep (#15): step `Sleep`, then ack. A live
+/// session's MAC is reconnected on wake. A notice the sleep no longer waits
+/// for is dropped: stepped after the wake, it would disconnect the AirPods
+/// again.
+async fn on_sleep(core: &mut Handoff, shell: &mut Shell, notice: SleepNotice) -> bool {
+    if notice.stale() {
+        return false;
+    }
+    // A session already gone ends the task; the dropped notice acks.
+    if sync_session(core, shell).await {
+        return true;
+    }
+    // The sync may wait on the session's lock past the release.
+    if notice.stale() {
+        return false;
+    }
+    if core.live() {
+        notice.slept(&shell.mac);
+    }
+    let end = step(core, shell, Input::Sleep).await;
+    notice.ack();
+    end
+}
+
 pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     // A reconnect the watcher made for new playback takes for it once the
     // session reports its routing (#307); otherwise the normal start. Claimed
     // first, so the watcher still clears it on a stop during the wait; its
     // age is judged there only, so the wait can't expire it.
     let marked = reconnect::claim_marker(&shell.mac);
+    // Before the waits below, so a sleep during them waits for this task.
+    let mut sleep_rx = suspend::SLEEPERS.subscribe();
     // The stopped tasks' card writes must not land after this session's
     // first hold (#294).
     if let Some(previous) = previous {
@@ -465,6 +502,7 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
                 apply_connect_mode(&mut core, &mut shell);
                 false
             }
+            Some(notice) = sleep_rx.recv() => on_sleep(&mut core, &mut shell, notice).await,
             event = shell.events.recv() => match event {
                 // Check the session before stepping the event, but keep the
                 // rest of the queue for the next sync.

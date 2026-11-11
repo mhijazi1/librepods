@@ -15,6 +15,7 @@ mod pulse;
 mod reconnect;
 mod settings_file;
 mod stream_monitor;
+mod suspend;
 mod switching;
 mod ui;
 mod utils;
@@ -366,6 +367,8 @@ async fn async_main(
         }
     }
 
+    // Disconnect the AirPods before sleep and reconnect on wake (#15).
+    suspend::start();
     let conn = Connection::new_system()?;
     let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
     conn.add_match(rule, move |_: (), conn, msg| {

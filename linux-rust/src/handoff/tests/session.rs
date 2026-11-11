@@ -1343,3 +1343,80 @@ fn with_requested_category_takes_at_the_request() {
     let out = p.play_source(200, AUDIO_CATEGORY_MEDIA, None);
     assert!(!out.contains(&SendOwnership(true)), "{out:?}");
 }
+
+// #15: sleep, and the link-loss pause.
+
+/// `relaying`, its take for a 201 play acked at 600 ms; Linux owns and
+/// plays.
+fn relaying_owner() -> Probe {
+    let mut p = relaying();
+    assert_eq!(
+        p.play(500, true),
+        [RelayCategory(STREAM), SendOwnership(true)]
+    );
+    assert_eq!(p.feed(600, Input::Ownership(vec![1])), []);
+    p
+}
+
+/// From the sleep on: a play edge sends nothing and the drop pauses
+/// nothing more.
+fn sleep_drop(p: &mut Probe, sleep: Vec<Command>) {
+    let mut all = sleep;
+    all.extend(p.play(1100, false));
+    all.extend(p.play(1200, true));
+    let drop = p.feed(1300, Input::Disconnected);
+    assert!(!all.contains(&SendOwnership(false)), "{all:?}");
+    assert_eq!(drop, [DropSession]);
+    assert_eq!(&all[all.len() - 1..], [Disconnect]);
+}
+
+#[test]
+fn sleep_while_playing_pauses_relays_idle_then_disconnects() {
+    let mut p = relaying_owner();
+    let sleep = p.feed(1000, Input::Sleep);
+    assert_eq!(sleep, [PauseMedia, RelayCategory(IDLE), Disconnect]);
+    sleep_drop(&mut p, sleep);
+}
+
+#[test]
+fn sleep_while_idle_only_disconnects() {
+    let mut p = relaying_owner();
+    assert_eq!(p.play(800, false), [RelayCategory(IDLE)]);
+    let sleep = p.feed(1000, Input::Sleep);
+    assert_eq!(sleep, [Disconnect]);
+    sleep_drop(&mut p, sleep);
+    // No session: nothing to put to sleep.
+    assert_eq!(p.feed(1400, Input::Sleep), []);
+}
+
+#[test]
+fn eviction_while_playing_pauses_before_the_drop() {
+    // A 0x14 eviction: the session dies with no wear or ownership report.
+    let mut p = acked_auto_take();
+    assert_eq!(p.feed(1100, Input::SessionLost), []);
+    assert_eq!(p.feed(1200, Input::Disconnected), [PauseMedia, DropSession]);
+}
+
+#[test]
+fn case_close_drop_while_playing_pauses() {
+    let mut p = acked_auto_take();
+    let mut all = p.feed(1100, Input::EarState(vec![InCase, InCase]));
+    all.extend(p.feed(1200, Input::Disconnected));
+    assert_eq!(all, [PauseMedia, DropSession]);
+}
+
+#[test]
+fn reconnect_after_a_loss_pause_takes_without_resume() {
+    let mut p = acked_auto_take();
+    assert_eq!(p.feed(1050, idle_transport()), []);
+    assert_eq!(p.feed(1100, Input::SessionLost), []);
+    assert_eq!(p.feed(1200, Input::Disconnected), [PauseMedia, DropSession]);
+    assert_eq!(p.feed(2200, Input::Tick), [Reconnect { audio: true }]);
+    assert_eq!(
+        p.feed(2300, Input::Reconnected(ready_facts())),
+        [AdoptSession, Announce, SendOwnership(true), DrainPlayback]
+    );
+    assert_eq!(count_lines(&p.core.take_lines(), CONNECT_TAKE), 1);
+    // The idle take's ACK resumes nothing.
+    assert_eq!(p.feed(2400, Input::Ownership(vec![1])), []);
+}
