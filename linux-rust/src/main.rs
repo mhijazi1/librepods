@@ -370,8 +370,12 @@ async fn async_main(
     // Disconnect the AirPods before sleep and reconnect on wake (#15).
     suspend::start();
     let conn = Connection::new_system()?;
-    let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
+    let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged")
+        .with_sender("org.bluez");
     conn.add_match(rule, move |_: (), conn, msg| {
+        if !suspend::is_broadcast(msg) {
+            return true;
+        }
         let Some(path) = msg.path() else {
             return true;
         };
@@ -500,8 +504,12 @@ async fn async_main(
 
     // Why a device dropped, before or after its Connected=false (#307).
     // Older BlueZ never sends it, and a drop with no reason never reconnects.
-    let reasons = MatchRule::new_signal("org.bluez.Device1", "Disconnected");
+    let reasons =
+        MatchRule::new_signal("org.bluez.Device1", "Disconnected").with_sender("org.bluez");
     conn.add_match(reasons, |_: (), _, msg| {
+        if !suspend::is_broadcast(msg) {
+            return true;
+        }
         if let Some(mac) = msg.path().and_then(|path| reconnect::mac_from_path(&path)) {
             reconnect::disconnect_reason(&mac, msg.get1::<String>().as_deref());
         }
