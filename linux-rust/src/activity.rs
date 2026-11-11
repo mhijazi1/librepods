@@ -69,6 +69,16 @@ pub(crate) fn tipi_fields(level: ActivityLevel) -> TipiFields {
     }
 }
 
+/// Whether the Mac re-sends its tipi on this change (spike #258): its
+/// Activity State group, Idle, Low or {High, Max}, changed.
+pub(crate) fn resend_tipi(prev: ActivityLevel, next: ActivityLevel) -> bool {
+    let group = |level| match level {
+        ActivityLevel::Max => ActivityLevel::High,
+        level => level,
+    };
+    group(prev) != group(next)
+}
+
 /// Where the activity level's inputs come from. None when they can't be
 /// read; the announcement then sends `TipiFields::LEGACY`.
 pub(crate) trait ActivitySource: Send + Sync {
@@ -85,16 +95,19 @@ impl<F: Fn() -> Option<ActivityInputs> + Send + Sync> ActivitySource for F {
 /// The tipi values for `source`'s snapshot, or LEGACY when it fails or
 /// takes longer than `SNAPSHOT_TIMEOUT`. The caller holds no lock.
 pub(crate) async fn current_tipi(source: &Arc<dyn ActivitySource>) -> TipiFields {
+    tokio::time::timeout(SNAPSHOT_TIMEOUT, current_level(source))
+        .await
+        .ok()
+        .flatten()
+        .map_or(TipiFields::LEGACY, tipi_fields)
+}
+
+/// `source`'s level, or None when its snapshot fails. Waits as long as the
+/// snapshot blocks, so a caller that awaits it never overlaps two.
+pub(crate) async fn current_level(source: &Arc<dyn ActivitySource>) -> Option<ActivityLevel> {
     let source = source.clone();
-    let snapshot = tokio::time::timeout(
-        SNAPSHOT_TIMEOUT,
-        tokio::task::spawn_blocking(move || source.snapshot()),
-    )
-    .await;
-    match snapshot {
-        Ok(Ok(Some(inputs))) => tipi_fields(activity_level(inputs)),
-        _ => TipiFields::LEGACY,
-    }
+    let snapshot = tokio::task::spawn_blocking(move || source.snapshot()).await;
+    snapshot.ok().flatten().map(activity_level)
 }
 
 /// logind's session hints. A user service has no session of its own
@@ -254,6 +267,24 @@ mod tests {
             .map(|level| tipi_fields(level).nearby_audio_score)
             .collect();
         assert!(scores.windows(2).all(|w| w[0] < w[1]), "{scores:?}");
+    }
+
+    #[test]
+    fn resend_tipi_all_pairs() {
+        use ActivityLevel::*;
+        let levels = [Idle, Low, High, Max];
+        // Rows: prev; columns: next, in `levels` order.
+        let table = [
+            [false, true, true, true],
+            [true, false, true, true],
+            [true, true, false, false],
+            [true, true, false, false],
+        ];
+        for (prev, row) in levels.into_iter().zip(table) {
+            for (next, resend) in levels.into_iter().zip(row) {
+                assert_eq!(resend_tipi(prev, next), resend, "{prev:?} -> {next:?}");
+            }
+        }
     }
 
     #[test]
