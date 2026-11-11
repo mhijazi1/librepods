@@ -91,18 +91,12 @@ impl Logind for SystemLogind {
             )?;
             Ok::<_, dbus::Error>(fd)
         })
-        .await;
-        match taken {
-            Ok(Ok(fd)) => Some(fd),
-            Ok(Err(e)) => {
-                warn!("Sleep: no logind sleep inhibitor: {e}");
-                None
-            }
-            Err(e) => {
-                warn!("Sleep: no logind sleep inhibitor: {e}");
-                None
-            }
-        }
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|taken| taken.map_err(|e| e.to_string()));
+        taken
+            .inspect_err(|e| warn!("Sleep: no logind sleep inhibitor: {e}"))
+            .ok()
     }
 }
 
@@ -248,7 +242,8 @@ async fn run<L: Logind, B: BluezLink>(
     let mut reconnects = JoinSet::new();
     while let Some(start) = prepare.recv().await {
         if start {
-            reconnects.abort_all();
+            // Also forgets the finished ones.
+            reconnects.shutdown().await;
             sleepers.sleep(&slept).await;
             drop(inhibitor.take());
             info!("Sleep: ready; disconnected {:?}", lock(&slept));
