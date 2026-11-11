@@ -115,19 +115,32 @@ pub(crate) async fn current_level(source: &Arc<dyn ActivitySource>) -> Option<Ac
 /// display session.
 pub(crate) struct LogindActivity;
 
-impl ActivitySource for LogindActivity {
-    fn snapshot(&self) -> Option<ActivityInputs> {
+impl LogindActivity {
+    /// The named hints, read in order; None when any read fails.
+    fn hints<const N: usize>(&self, names: [&str; N]) -> Option<[bool; N]> {
         let bus = Connection::new_system().ok()?;
         let session = bus.with_proxy(
             "org.freedesktop.login1",
             "/org/freedesktop/login1/session/auto",
             LOGIND_CALL_TIMEOUT,
         );
-        let hint = |name| session.get::<bool>("org.freedesktop.login1.Session", name);
-        Some(logind_inputs(
-            hint("LockedHint").ok()?,
-            hint("IdleHint").ok()?,
-        ))
+        let mut hints = [false; N];
+        for (hint, name) in hints.iter_mut().zip(names) {
+            *hint = session.get("org.freedesktop.login1.Session", name).ok()?;
+        }
+        Some(hints)
+    }
+
+    /// LockedHint alone, for a Wayland source with no lock notifier (#526).
+    pub(crate) fn locked(&self) -> Option<bool> {
+        self.hints(["LockedHint"]).map(|[locked]| locked)
+    }
+}
+
+impl ActivitySource for LogindActivity {
+    fn snapshot(&self) -> Option<ActivityInputs> {
+        let [locked, idle] = self.hints(["LockedHint", "IdleHint"])?;
+        Some(logind_inputs(locked, idle))
     }
 }
 
