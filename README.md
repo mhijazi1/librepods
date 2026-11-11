@@ -79,6 +79,136 @@ Spatializing stereo sound is beyond this project's scope and will never be avail
 
 ## Heart Rate Monitoring
 
+#### Automatic switching
+
+Linux takes the AirPods from an iPhone or Mac the way macOS does, by audio
+category ([#272](https://github.com/mhijazi1/librepods/issues/272)). A player
+that reports playback over MPRIS (most browsers, Spotify, mpv with an MPRIS
+plugin, ...) takes them from an idle owner or from one playing media. A player
+without MPRIS (games, plain mpv, many Electron apps) takes them from an idle
+owner, but not from one playing media: it plays on the next sink instead.
+Neither takes them from an owner in a call.
+
+#### Desktop battery (BlueZ BatteryProvider)
+
+LibrePods exports the AirPods battery to BlueZ as a battery provider, so it
+shows up in BlueZ's `org.bluez.Battery1`, in UPower (`upower -d`) and in
+desktop bars and battery widgets. BlueZ holds one percentage per device, so
+LibrePods exports a single value:
+
+- both buds worn (or both in the case): the lower bud;
+- one bud charging in the case: the bud you are wearing;
+- only one bud connected: that bud;
+- single-battery devices (headphones): the headset level.
+
+The case level is not exported. The per-bud and case levels stay in the tray
+and the LibrePods window.
+
+Depending on the BlueZ version, the battery provider API
+(`org.bluez.BatteryProviderManager1`) may only be available with experimental
+features on. If the desktop shows no AirPods battery, set
+`Experimental = true` in the `[General]` section of `/etc/bluetooth/main.conf`
+(NixOS: `hardware.bluetooth.settings.General.Experimental = true;`) and restart
+Bluetooth. Without it, LibrePods logs one warning and carries on without the
+export.
+
+The LE features (auto-connect when the AirPods leave the case, the case-open
+popup, battery from advertisements) need `org.bluez.AdvertisementMonitorManager1`,
+which BlueZ also marks experimental. Turn it on the same way: `Experimental = true`
+in the `[General]` section of `/etc/bluetooth/main.conf` (NixOS:
+`hardware.bluetooth.settings.General.Experimental = true;`), then restart
+Bluetooth. Without it, LibrePods logs one warning and runs without the LE
+features.
+
+PipeWire's bluez5 plugin also registers a battery with BlueZ for HFP headsets,
+from the headset's own battery reports. BlueZ keeps the first battery provided
+for a device and ignores later ones, so the desktop may show PipeWire's HFP
+level instead of LibrePods' value. To check which one BlueZ shows, read the
+`Source` of the AirPods' `org.bluez.Battery1` (use your adapter and the AirPods'
+address):
+
+```sh
+busctl get-property org.bluez /org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX org.bluez.Battery1 Source
+```
+
+`s "LibrePods"` means LibrePods' value is shown. When LibrePods sees another
+`Source` there (or none), it logs one info line per connection saying that its
+level is not shown.
+
+To turn the export off, add `"exportBattery": false` at the top level of
+`~/.config/librepods/preferences.json`:
+
+```json
+{
+  "exportBattery": false
+}
+```
+
+#### NixOS and Home Manager
+
+The flake provides a NixOS module (`nixosModules.default`) and a Home Manager
+module (`homeManagerModules.default`, also exported as `homeModules.default`).
+Add the flake as an input:
+
+```nix
+{
+  inputs.librepods.url = "github:kavishdevar/librepods";
+  # Optional: reuse your own nixpkgs.
+  # inputs.librepods.inputs.nixpkgs.follows = "nixpkgs";
+}
+```
+
+NixOS configuration (installs the package and sets the BlueZ Device ID):
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.librepods.nixosModules.default ];
+  programs.librepods.enable = true;
+}
+```
+
+Home Manager configuration (runs LibrePods as a systemd user service with the
+graphical session):
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.librepods.homeManagerModules.default ];
+  services.librepods.enable = true;
+}
+```
+
+NixOS options (`programs.librepods`):
+
+| Option          | Default                     | Description                                                                                               |
+| --------------- | --------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `enable`        | `false`                     | Install LibrePods and apply the settings below.                                                           |
+| `package`       | this flake's `librepods`    | Package added to `environment.systemPackages`.                                                            |
+| `appleDeviceId` | `true`                      | Set `hardware.bluetooth.settings.General.DeviceID = "bluetooth:004C:0000:0000"` (Apple's vendor ID).      |
+
+Home Manager options (`services.librepods`):
+
+| Option                          | Default                  | Description                                                                                                                   |
+| ------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `enable`                        | `false`                  | Install LibrePods and start it as a user service with `graphical-session.target`, after `pipewire.service` and `wireplumber.service`. |
+| `package`                       | this flake's `librepods` | Package to install and run.                                                                                                   |
+| `extraArgs`                     | `[ ]`                    | Extra arguments for `librepods`, for example `[ "--no-tray" ]` or `[ "--start-minimized" ]`.                                  |
+| `wireplumber.dummyAvrcpPlayer`  | `true`                   | Add a WirePlumber drop-in that sets `bluez5.dummy-avrcp-player = true` in `monitor.bluez.properties`.                         |
+
+About `appleDeviceId`: AirPods only enable some features (such as multi-device
+connectivity and the hearing aid settings) when the host reports Apple's Device
+ID. The DeviceID is a property of the Bluetooth adapter, so with this option the
+adapter identifies as an Apple device to every device it talks to, not only to
+your AirPods. Set `programs.librepods.appleDeviceId = false;` if you don't want
+that. After changing the DeviceID (in either direction), rebuild, restart
+Bluetooth, then remove and re-pair your AirPods so they pick up the new
+identity.
+
+> [!NOTE]
+> These modules are checked by `nix flake check` at evaluation level only; they
+> have not yet been verified on real hardware.
+
 ### Android
 
 Available in the `android/rewrite` branch. [builds](https://github.com/librepods-org/librepods/actions/workflows/ci-android.yml?query=branch%3Aandroid%2Frewrite)
