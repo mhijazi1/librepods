@@ -22,14 +22,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 /// How long the sleep waits for the handoff tasks' acks.
 pub(crate) const SLEEP_PREPARE_TIMEOUT: Duration = Duration::from_secs(4);
 // Below logind's default InhibitDelayMaxSec (5 s), past which it sleeps anyway.
 const _: () = assert!(SLEEP_PREPARE_TIMEOUT.as_millis() < 5000);
-/// Bounds a task's sleep disconnect, so it acks within the prepare timeout.
-pub(crate) const SLEEP_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const _: () = assert!(SLEEP_DISCONNECT_TIMEOUT.as_millis() < SLEEP_PREPARE_TIMEOUT.as_millis());
+/// While a sleep is pending, the pause and the relay before the sleep
+/// disconnect stop waiting this long before its deadline, leaving the
+/// disconnect this long before the release.
+pub(crate) const SLEEP_DISCONNECT_RESERVE: Duration = Duration::from_millis(1500);
+const _: () = assert!(SLEEP_DISCONNECT_RESERVE.as_millis() < SLEEP_PREPARE_TIMEOUT.as_millis());
 /// The wait before the first wake reconnect attempt; each later one waits
 /// twice the one before, up to `WAKE_RECONNECT_MAX`.
 /// Engineering defaults; #177's hardware run may retune them.
@@ -130,15 +133,17 @@ impl BluezLink for Bluez {
     }
 }
 
-/// The handoff task's `Command::Disconnect`, bounded by
-/// `SLEEP_DISCONNECT_TIMEOUT`.
+/// The handoff task's `Command::Disconnect`, bounded by the pending
+/// sleep's deadline.
 pub(crate) async fn disconnect(mac: &str) {
-    match tokio::time::timeout(SLEEP_DISCONNECT_TIMEOUT, BluezLink::disconnect(&Bluez, mac)).await {
-        Ok(Ok(())) => info!("Sleep: disconnected {mac}"),
-        // shortcut: on a failed or timed-out disconnect the core stays lost (no take) until the session drops (#535)
-        Ok(Err(e)) => warn!("Sleep: failed to disconnect {mac}: {e}"),
-        Err(_) => warn!("Sleep: disconnecting {mac} timed out"),
-    }
+    SLEEPERS.disconnect(&Bluez, mac).await
+}
+
+/// Await `work`, but while a sleep is pending stop at its deadline minus
+/// `SLEEP_DISCONNECT_RESERVE`, so the disconnect after it still starts
+/// before the release. None if cut short.
+pub(crate) async fn sleep_bounded<T>(work: impl Future<Output = T>) -> Option<T> {
+    SLEEPERS.bounded(work).await
 }
 
 /// The MACs the handoff tasks disconnected for sleep, for the wake.
@@ -160,7 +165,10 @@ impl SleepNotice {
     /// The task disconnects `mac`: the wake reconnects it, even if the ack
     /// comes after `SLEEP_PREPARE_TIMEOUT`.
     pub(crate) fn slept(&self, mac: &str) {
-        lock(&self.slept).push(mac.to_string());
+        let mut slept = lock(&self.slept);
+        if !slept.iter().any(|m| m == mac) {
+            slept.push(mac.to_string());
+        }
     }
 
     /// Done with the sleep.
@@ -173,18 +181,26 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The running handoff tasks' sleep subscriptions.
+/// The running handoff tasks' sleep subscriptions, and the pending sleep's
+/// deadline.
 #[derive(Default)]
-pub(crate) struct Sleepers(Mutex<Vec<mpsc::UnboundedSender<SleepNotice>>>);
+pub(crate) struct Sleepers {
+    senders: Mutex<Vec<mpsc::UnboundedSender<SleepNotice>>>,
+    /// Now + `SLEEP_PREPARE_TIMEOUT` while `sleep` waits; None otherwise.
+    deadline: Mutex<Option<Instant>>,
+}
 
 /// The app's subscriptions; tests use their own.
-pub(crate) static SLEEPERS: Sleepers = Sleepers(Mutex::new(Vec::new()));
+pub(crate) static SLEEPERS: Sleepers = Sleepers {
+    senders: Mutex::new(Vec::new()),
+    deadline: Mutex::new(None),
+};
 
 impl Sleepers {
     /// A handoff task's subscription; dropping it unsubscribes.
     pub(crate) fn subscribe(&self) -> mpsc::UnboundedReceiver<SleepNotice> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut senders = lock(&self.0);
+        let mut senders = lock(&self.senders);
         senders.retain(|s| !s.is_closed());
         senders.push(tx);
         rx
@@ -194,8 +210,19 @@ impl Sleepers {
     /// `SLEEP_PREPARE_TIMEOUT`. A task that ends without acking drops its
     /// notice, which counts as its ack.
     async fn sleep(&self, slept: &Slept) {
+        let deadline = Instant::now() + SLEEP_PREPARE_TIMEOUT;
+        *lock(&self.deadline) = Some(deadline);
+        // Cleared on return, and if the sleep is dropped: a stale deadline
+        // would cut every later pause short.
+        struct Pending<'a>(&'a Mutex<Option<Instant>>);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                *lock(self.0) = None;
+            }
+        }
+        let _pending = Pending(&self.deadline);
         let mut acks: FuturesUnordered<_> = {
-            let mut senders = lock(&self.0);
+            let mut senders = lock(&self.senders);
             senders.retain(|s| !s.is_closed());
             senders
                 .iter()
@@ -207,11 +234,39 @@ impl Sleepers {
                 .collect()
         };
         let all = async { while acks.next().await.is_some() {} };
-        if tokio::time::timeout(SLEEP_PREPARE_TIMEOUT, all)
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout_at(deadline, all).await.is_err() {
             warn!("Sleep: a handoff task didn't ack within {SLEEP_PREPARE_TIMEOUT:?}");
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        *lock(&self.deadline)
+    }
+
+    /// `sleep_bounded` on these subscriptions.
+    async fn bounded<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+        let Some(deadline) = self.deadline() else {
+            return Some(work.await);
+        };
+        let done = tokio::time::timeout_at(deadline - SLEEP_DISCONNECT_RESERVE, work).await;
+        if done.is_err() {
+            warn!("Sleep: stopped waiting to leave time for the disconnect");
+        }
+        done.ok()
+    }
+
+    /// The sleep disconnect, bounded by the pending sleep's deadline; with
+    /// none pending (released, or woken) BlueZ isn't called.
+    async fn disconnect(&self, link: &impl BluezLink, mac: &str) {
+        let Some(deadline) = self.deadline() else {
+            warn!("Sleep: not disconnecting {mac}: the sleep no longer waits");
+            return;
+        };
+        match tokio::time::timeout_at(deadline, link.disconnect(mac)).await {
+            Ok(Ok(())) => info!("Sleep: disconnected {mac}"),
+            // shortcut: on a failed or timed-out disconnect the core stays lost (no take) until the session drops (#535)
+            Ok(Err(e)) => warn!("Sleep: failed to disconnect {mac}: {e}"),
+            Err(_) => warn!("Sleep: disconnecting {mac} timed out"),
         }
     }
 }
@@ -247,13 +302,14 @@ async fn run<L: Logind, B: BluezLink>(
     mut prepare: mpsc::UnboundedReceiver<bool>,
 ) {
     let mut inhibitor = logind.inhibit().await;
-    // Kept across a sleep with no wake in between.
+    // Until its wake reconnect ends, so a sleep that aborts it keeps it.
     let slept = Slept::default();
     let mut reconnects = JoinSet::new();
     while let Some(start) = prepare.recv().await {
+        // Aborts the running reconnects (their MACs stay in `slept`) and
+        // forgets the finished ones.
+        reconnects.shutdown().await;
         if start {
-            // Also forgets the finished ones.
-            reconnects.shutdown().await;
             sleepers.sleep(&slept).await;
             drop(inhibitor.take());
             info!("Sleep: ready; disconnected {:?}", lock(&slept));
@@ -262,13 +318,18 @@ async fn run<L: Logind, B: BluezLink>(
         if inhibitor.is_none() {
             inhibitor = logind.inhibit().await;
         }
-        let macs = std::mem::take(&mut *lock(&slept));
+        let macs = lock(&slept).clone();
         for mac in macs {
-            if bluez.auto_connect(&mac) {
-                reconnects.spawn(wake_reconnect(bluez.clone(), mac));
-            } else {
+            if !bluez.auto_connect(&mac) {
                 info!("Wake: autoConnect is off for {mac}; not reconnecting");
+                lock(&slept).retain(|m| *m != mac);
+                continue;
             }
+            let (bluez, slept) = (bluez.clone(), slept.clone());
+            reconnects.spawn(async move {
+                wake_reconnect(bluez, mac.clone()).await;
+                lock(&slept).retain(|m| *m != mac);
+            });
         }
     }
 }
@@ -310,7 +371,6 @@ mod tests {
     // From the issue number, so other tests' connect guards never collide;
     // one MAC per test, as the guard is process-wide.
     const A: &str = "15:00:00:00:00:0A";
-    const B: &str = "15:00:00:00:00:0B";
     const C: &str = "15:00:00:00:00:0C";
     const D: &str = "15:00:00:00:00:0D";
     const E: &str = "15:00:00:00:00:0E";
@@ -318,6 +378,9 @@ mod tests {
     const G: &str = "15:00:00:00:00:10";
     const H: &str = "15:00:00:00:00:11";
     const I: &str = "15:00:00:00:00:12";
+    const J: &str = "15:00:00:00:00:13";
+    const K: &str = "15:00:00:00:00:14";
+    const M: &str = "15:00:00:00:00:15";
 
     /// Counts inhibitors taken and still held.
     #[derive(Clone, Default)]
@@ -360,6 +423,9 @@ mod tests {
         /// Each connect's MAC and time.
         connects: Mutex<Vec<(String, Instant)>>,
         auto_off: Vec<&'static str>,
+        disconnects: AtomicUsize,
+        /// `disconnect` never returns.
+        hung_disconnect: bool,
     }
 
     impl BluezLink for FakeLink {
@@ -383,6 +449,10 @@ mod tests {
         }
 
         async fn disconnect(&self, _: &str) -> Result<(), String> {
+            self.disconnects.fetch_add(1, Ordering::SeqCst);
+            if self.hung_disconnect {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
@@ -608,5 +678,120 @@ mod tests {
         settle().await;
         let macs: Vec<_> = link.connects().into_iter().map(|(mac, _)| mac).collect();
         assert_eq!(macs, [A]);
+    }
+
+    /// A sleep pending on fresh `Sleepers`, its one task's notice held.
+    async fn pending_sleep() -> (&'static Sleepers, SleepNotice, tokio::task::JoinHandle<()>) {
+        let sleepers = sleepers();
+        let mut task = sleepers.subscribe();
+        let sleep = tokio::spawn(async move { sleepers.sleep(&Slept::default()).await });
+        let notice = task.recv().await.unwrap();
+        (sleepers, notice, sleep)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleep_disconnect_after_the_release_does_nothing() {
+        let link = FakeLink::default();
+        let disconnects = || link.disconnects.load(Ordering::SeqCst);
+        // No sleep pending: BlueZ isn't called.
+        sleepers().disconnect(&link, M).await;
+        assert_eq!(disconnects(), 0);
+        let (sleepers, notice, sleep) = pending_sleep().await;
+        sleepers.disconnect(&link, M).await;
+        assert_eq!(disconnects(), 1);
+        notice.ack();
+        sleep.await.unwrap();
+        // Released (or woken): a late step disconnects nothing.
+        sleepers.disconnect(&link, M).await;
+        assert_eq!(disconnects(), 1);
+
+        // A hung disconnect ends at the deadline, and the release with it.
+        let hung = FakeLink {
+            hung_disconnect: true,
+            ..FakeLink::default()
+        };
+        let start = Instant::now();
+        let (sleepers, _notice, sleep) = pending_sleep().await;
+        sleepers.disconnect(&hung, M).await;
+        assert_eq!(Instant::now(), start + SLEEP_PREPARE_TIMEOUT);
+        sleep.await.unwrap();
+        sleepers.disconnect(&hung, M).await;
+        assert_eq!(hung.disconnects.load(Ordering::SeqCst), 1);
+
+        // A sleep dropped while pending leaves no deadline behind.
+        let (sleepers, _notice, sleep) = pending_sleep().await;
+        sleep.abort();
+        assert!(sleep.await.unwrap_err().is_cancelled());
+        sleepers.disconnect(&link, M).await;
+        assert_eq!(disconnects(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleep_bounded_cuts_hung_work_before_the_deadline() {
+        // No sleep pending: awaited unchanged, however long.
+        let start = Instant::now();
+        let long = SLEEP_PREPARE_TIMEOUT * 3;
+        let slow = async {
+            tokio::time::sleep(long).await;
+            7
+        };
+        assert_eq!(sleepers().bounded(slow).await, Some(7));
+        assert_eq!(Instant::now(), start + long);
+
+        let start = Instant::now();
+        let (sleepers, _notice, _sleep) = pending_sleep().await;
+        assert_eq!(sleepers.bounded(async { 7 }).await, Some(7));
+        // A hung pause stops waiting the reserve before the deadline...
+        let hung = std::future::pending::<()>();
+        assert_eq!(sleepers.bounded(hung).await, None);
+        assert_eq!(
+            Instant::now(),
+            start + SLEEP_PREPARE_TIMEOUT - SLEEP_DISCONNECT_RESERVE
+        );
+        // ...so the disconnect still runs before the release.
+        let link = FakeLink::default();
+        sleepers.disconnect(&link, M).await;
+        assert_eq!(link.disconnects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resleep_keeps_unfinished_wake_reconnects() {
+        let link = Arc::new(FakeLink {
+            results: Mutex::new([Ok(()), Ok(())].into()),
+            ..FakeLink::default()
+        });
+        let (_, sleepers, prepare) = start_run(link.clone()).await;
+        let mut task = sleepers.subscribe();
+        let sleep = async |task: Option<(&mut mpsc::UnboundedReceiver<SleepNotice>, &str)>| {
+            prepare.send(true).unwrap();
+            if let Some((task, mac)) = task {
+                let notice = task.recv().await.unwrap();
+                notice.slept(mac);
+                notice.ack();
+            }
+            settle().await;
+            prepare.send(false).unwrap();
+            settle().await;
+        };
+        // J sleeps and the wake reconnects it.
+        sleep(Some((&mut task, J))).await;
+        tokio::time::advance(WAKE_RECONNECT_FIRST).await;
+        settle().await;
+        // K sleeps, and its task ends.
+        sleep(Some((&mut task, K))).await;
+        drop(task);
+        // A second sleep before K's first attempt; nothing records it again.
+        sleep(None).await;
+        // K once, on the schedule from the last wake; J not again.
+        let macs = || -> Vec<String> { link.connects().into_iter().map(|(m, _)| m).collect() };
+        tokio::time::advance(WAKE_RECONNECT_FIRST - Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(macs(), [J]);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(macs(), [J, K]);
+        tokio::time::advance(WAKE_RECONNECT_MAX * WAKE_RECONNECT_ATTEMPTS).await;
+        settle().await;
+        assert_eq!(macs(), [J, K]);
     }
 }

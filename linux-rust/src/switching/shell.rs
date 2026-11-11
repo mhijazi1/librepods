@@ -160,14 +160,22 @@ impl Shell {
                     }
                 }
                 Command::RelayCategory(category) => {
-                    if let Err(e) = relay_category(&self.manager, &self.local, category).await {
+                    let relayed = suspend::sleep_bounded(relay_category(
+                        &self.manager,
+                        &self.local,
+                        category,
+                    ))
+                    .await;
+                    if let Some(Err(e)) = relayed {
                         error!("Handoff: failed to relay audio category {category}: {e}");
                     }
                 }
                 Command::PauseMedia => {
                     // Before the pause, so the chain plays nothing after it.
                     self.resume = None;
-                    if !self.media.pause(self.play_rx.streams()).await {
+                    let paused =
+                        suspend::sleep_bounded(self.media.pause(self.play_rx.streams())).await;
+                    if paused == Some(false) {
                         // Remote controls only, if anything (#302, #329).
                         self.log(NOT_PAUSING);
                     }
@@ -222,7 +230,7 @@ impl Shell {
                     );
                     end = true;
                 }
-                // Bounded, so the sleep's ack comes within logind's delay.
+                // Bounded by the sleep's deadline; nothing once it is released.
                 Command::Disconnect => suspend::disconnect(&self.mac).await,
                 // Reconnection belongs to the app lifecycle (main.rs, BlueZ,
                 // le.rs auto-connect), which starts a new device and task.
