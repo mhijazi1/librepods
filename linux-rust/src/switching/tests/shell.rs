@@ -928,3 +928,104 @@ async fn tipi_poll_ends_with_task() {
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(source.calls(), calls);
 }
+
+// #528: the poll's first level after an announcement.
+
+/// The first snapshot (the startup announcement's) sleeps `delay` and
+/// reads `first`; every later one (the poll's) reads `poll`.
+struct AnnouncedActivity {
+    first: Option<ActivityInputs>,
+    delay: Duration,
+    announced: AtomicBool,
+    poll: Arc<SwitchedActivity>,
+}
+
+impl ActivitySource for AnnouncedActivity {
+    fn snapshot(&self) -> Option<ActivityInputs> {
+        if self.announced.swap(true, Ordering::SeqCst) {
+            return self.poll.snapshot();
+        }
+        std::thread::sleep(self.delay);
+        self.first
+    }
+}
+
+/// A `tipi_task` with two remotes whose source announces `first` after
+/// `delay`, then polls `poll`; returns once each remote got the
+/// announcement, with the poll's source last.
+async fn announced_task(
+    mac: &str,
+    first: Option<ActivityInputs>,
+    delay: Duration,
+    poll: Option<ActivityInputs>,
+) -> (
+    Harness,
+    mpsc::Receiver<Vec<u8>>,
+    mpsc::Sender<Vec<u8>>,
+    Arc<SwitchedActivity>,
+) {
+    let poll = SwitchedActivity::new(poll);
+    let source = Arc::new(AnnouncedActivity {
+        first,
+        delay,
+        announced: AtomicBool::new(false),
+        poll: poll.clone(),
+    });
+    let hosts = [LOCAL, REMOTE, SECOND_REMOTE];
+    let (h, mut rx, tx) = tipi_task(mac, &hosts, source).await;
+    assert_eq!(next_packet(&mut rx).await, expected_owns(0).await);
+    for remote in [REMOTE, SECOND_REMOTE] {
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(remote).await
+        );
+        // LEGACY, or High's identical fields.
+        assert_eq!(next_packet(&mut rx).await, expected_tipi(remote).await);
+    }
+    (h, rx, tx, poll)
+}
+
+#[tokio::test]
+async fn tipi_update_after_legacy_resends_once() {
+    let mac = "5A:00:00:05:28:01";
+    // Past SNAPSHOT_TIMEOUT: the announcement sends LEGACY.
+    let (_h, mut rx, _tx, poll) = announced_task(mac, HIGH, Duration::from_secs(1), IDLE).await;
+    for remote in [REMOTE, SECOND_REMOTE] {
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_update(remote, crate::activity::ActivityLevel::Idle).await
+        );
+    }
+    poll.polls(2).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    stop_handoff_task(mac);
+}
+
+#[tokio::test]
+async fn tipi_update_after_announce_other_group_resends() {
+    let mac = "5A:00:00:05:28:02";
+    let (_h, mut rx, _tx, poll) =
+        announced_task(mac, HIGH, Duration::ZERO, unlocked_since(40)).await;
+    for remote in [REMOTE, SECOND_REMOTE] {
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_update(remote, crate::activity::ActivityLevel::Low).await
+        );
+    }
+    poll.polls(2).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    stop_handoff_task(mac);
+}
+
+#[tokio::test]
+async fn tipi_update_after_announce_same_group_sends_nothing() {
+    for (mac, later) in [
+        ("5A:00:00:05:28:03", HIGH),
+        ("5A:00:00:05:28:04", unlocked_since(1)),
+    ] {
+        let (_h, mut rx, _tx, poll) = announced_task(mac, HIGH, Duration::ZERO, later).await;
+        poll.polls(2).await;
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        stop_handoff_task(mac);
+    }
+}
