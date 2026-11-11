@@ -209,7 +209,7 @@ fn take_wake_park(mac: &str) -> Option<WakePark> {
 }
 
 /// `f` on `mac`'s wake park; None once it was claimed or ended.
-fn with_wake_park<T>(mac: &str, f: impl FnOnce(&mut WakePark) -> T) -> Option<T> {
+fn on_wake_park<T>(mac: &str, f: impl FnOnce(&mut WakePark) -> T) -> Option<T> {
     lock(&WAKE_PARKS).iter_mut().find(|p| p.mac == mac).map(f)
 }
 
@@ -545,7 +545,7 @@ async fn park_until_timeout(
 ) -> Option<()> {
     let mut samples = audio.samples();
     let mut next = async move || {
-        with_wake_park(mac, |_| ())?;
+        on_wake_park(mac, |_| ())?;
         samples.next().await
     };
     let (category, baseline) = loop {
@@ -563,7 +563,7 @@ async fn park_until_timeout(
         info!("Wake: {mac} is connected; not parking new playback");
         return None;
     }
-    with_wake_park(mac, |park| {
+    on_wake_park(mac, |park| {
         let router = audio.router();
         router.route(SinkEvent::Park);
         park.router = Some(router);
@@ -572,10 +572,10 @@ async fn park_until_timeout(
     while next().await?.0 <= AUDIO_CATEGORY_IDLE {}
     drop(next);
     let until = Instant::now() + WAKE_PARK_TIMEOUT;
-    with_wake_park(mac, |park| park.until = Some(until))?;
+    on_wake_park(mac, |park| park.until = Some(until))?;
     tokio::time::sleep_until(until).await;
     // A claim since leaves nothing to end.
-    if with_wake_park(mac, |_| ()).is_some() {
+    if on_wake_park(mac, |_| ()).is_some() {
         info!(
             "Wake: {mac} not back {WAKE_PARK_TIMEOUT:?} after the play; new playback goes to the local output"
         );

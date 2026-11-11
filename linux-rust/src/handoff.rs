@@ -434,13 +434,16 @@ pub(crate) struct Handoff {
     park: Park,
     /// While parked: `PARK_TIMEOUT` after the last play edge.
     park_until: Option<Instant>,
-    /// Parked on a wake park this task claimed (#529): until the take's
-    /// ACK, `wake_until`, or a connect decision that neither takes nor
-    /// holds.
+    /// Parked on a wake park this task claimed (#529): exempt from the #311
+    /// rules until the connect decision, then while a take is pending, and
+    /// until the take's ACK or `wake_until`.
     wake_park: bool,
     /// The wake park's deadline: the first play edge's, which later ones
     /// don't push out.
     wake_until: Option<Instant>,
+    /// `Auto`'s or `Reconnected`'s ownership decision was made: a claimed
+    /// wake park then waits only for a pending take (#529).
+    wake_decided: bool,
     /// A worthy stream of the stream monitor's baseline is live (#311):
     /// playing for the park, never for a take.
     baseline_playing: bool,
@@ -539,6 +542,7 @@ impl Handoff {
             park_until: None,
             wake_park: false,
             wake_until: None,
+            wake_decided: false,
             baseline_playing: false,
             streams_known: false,
             sampled_known: false,
@@ -738,20 +742,23 @@ impl Handoff {
     /// the hold ends (#311). A take's ACK has already unparked to the
     /// AirPods. A baseline stream, which can't take, or a dead stream
     /// monitor, which can't see one, falls a park back to the local output.
-    /// A claimed wake park (#529) is exempt until `decided` makes no take
-    /// and no hold.
+    /// A claimed wake park (#529) is exempt until the connect decision, and
+    /// after it only while a take is pending; with no sample yet, only a
+    /// dead monitor falls it back.
     fn update_park(&mut self, now: Instant, decided: bool) {
+        self.wake_decided |= decided;
+        if self.wake_decided && !self.pending.is_some_and(|p| p.desired) {
+            self.wake_park = false;
+            self.wake_until = None;
+        }
         let held = self.held == Some(true);
         let known = self.streams_known && self.sampled_known;
         let idle = known && self.category <= AUDIO_CATEGORY_IDLE && !self.call_or_mic();
         self.park = match self.park {
-            Park::Parked if self.wake_park && decided && !self.requested_take && !held => {
-                self.say("PARK no take and no hold after the wake; new playback goes to the local output");
-                Park::Local
-            }
             Park::Parked if self.wake_park => Park::Parked,
             Park::Parked | Park::FallenBack if !held => Park::Local,
-            Park::Parked if self.baseline_playing || !known => {
+            // Only a park made on a known sample has one: no `sampled_known`.
+            Park::Parked if self.baseline_playing || !self.streams_known => {
                 self.say("PARK a stream playing since the baseline, or no stream monitor; new playback goes to the local output");
                 Park::FallenBack
             }
@@ -766,6 +773,7 @@ impl Handoff {
         if self.park != Park::Parked {
             self.park_until = None;
             self.wake_park = false;
+            self.wake_until = None;
         } else if self.wake_park {
             // A baseline stream, which this task's poller never counts, is
             // the parked play: its deadline runs from now.
