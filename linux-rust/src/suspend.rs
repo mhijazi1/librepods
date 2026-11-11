@@ -282,13 +282,13 @@ pub(crate) fn start() {
     tokio::spawn(run(SystemLogind, Arc::new(Bluez), &SLEEPERS, prepared));
     let watch = move || -> Result<(), dbus::Error> {
         let conn = Connection::new_system()?;
-        // The bus routes only logind's broadcasts to this rule;
-        // `from_logind` drops a unicast one, which any sender can address
-        // to us.
+        // The bus routes only logind's broadcasts to this rule; the shared
+        // system-service check `is_broadcast` drops a unicast one, which any
+        // sender can address to us.
         let rule = MatchRule::new_signal("org.freedesktop.login1.Manager", "PrepareForSleep")
             .with_sender("org.freedesktop.login1");
         conn.add_match(rule, move |(start,): (bool,), _, msg| {
-            if from_logind(msg) {
+            if is_broadcast(msg) {
                 // Stamped here: `run` may get to it only after an inhibit.
                 let _ = prepare.send((start, Instant::now()));
             }
@@ -310,9 +310,10 @@ pub(crate) fn start() {
     }
 }
 
-/// logind broadcasts `PrepareForSleep`: a signal addressed to us is not
-/// its, as dbus-rs's non-strict sender match lets a unique name through.
-fn from_logind(msg: &Message) -> bool {
+/// System services (logind, BlueZ) broadcast the signals we follow: one
+/// addressed to us is not theirs, as dbus-rs's non-strict sender match lets
+/// any unique name through.
+pub(crate) fn is_broadcast(msg: &Message) -> bool {
     msg.destination().is_none()
 }
 
@@ -533,11 +534,34 @@ mod tests {
             .unwrap()
             .append1(true)
         };
-        assert!(from_logind(&signal()));
+        assert!(is_broadcast(&signal()));
         // A unicast one, which any sender can address to us.
         let mut unicast = signal();
         unicast.set_destination(Some(":1.15".into()));
-        assert!(!from_logind(&unicast));
+        assert!(!is_broadcast(&unicast));
+    }
+
+    #[test]
+    fn bluez_signals_only_from_a_broadcast() {
+        let path = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF";
+        let changed =
+            Message::new_signal(path, "org.freedesktop.DBus.Properties", "PropertiesChanged")
+                .unwrap()
+                .append3(
+                    "org.bluez.Device1",
+                    std::collections::HashMap::from([("Connected", dbus::arg::Variant(false))]),
+                    Vec::<String>::new(),
+                );
+        let disconnected = Message::new_signal(path, "org.bluez.Device1", "Disconnected")
+            .unwrap()
+            .append1("org.bluez.Reason.Remote");
+        for signal in [changed, disconnected] {
+            assert!(is_broadcast(&signal));
+            // A unicast one, which any sender can address to us.
+            let mut unicast = signal;
+            unicast.set_destination(Some(":1.15".into()));
+            assert!(!is_broadcast(&unicast));
+        }
     }
 
     #[tokio::test(start_paused = true)]
