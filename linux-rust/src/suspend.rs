@@ -131,13 +131,6 @@ pub(crate) async fn disconnect(mac: &str) -> bool {
     SLEEPERS.disconnect(&Bluez, mac).await
 }
 
-/// Await `work`, but while a sleep is pending stop at its deadline minus
-/// `SLEEP_DISCONNECT_RESERVE`, so the disconnect after it still starts
-/// before the release. None if cut short.
-pub(crate) async fn sleep_bounded<T>(work: impl Future<Output = T>) -> Option<T> {
-    SLEEPERS.bounded(work).await
-}
-
 /// The MACs the handoff tasks disconnected for sleep, for the wake.
 type Slept = Arc<Mutex<Vec<String>>>;
 
@@ -237,8 +230,10 @@ impl Sleepers {
         *lock(&self.deadline)
     }
 
-    /// `sleep_bounded` on these subscriptions.
-    async fn bounded<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+    /// Await `work`, but while a sleep is pending stop at its deadline minus
+    /// `SLEEP_DISCONNECT_RESERVE`, so the disconnect after it still starts
+    /// before the release. None if cut short.
+    pub(crate) async fn bounded<T>(&self, work: impl Future<Output = T>) -> Option<T> {
         let Some(deadline) = self.deadline() else {
             return Some(work.await);
         };
@@ -378,6 +373,33 @@ async fn wake_reconnect(bluez: Arc<impl BluezLink>, mac: String) {
         }
     }
     info!("Wake: gave up reconnecting {mac}");
+}
+
+/// The handoff task's sleep fixtures (#534).
+#[cfg(test)]
+impl SleepNotice {
+    /// A notice with no sleep behind it, its ack's receiver and slept list.
+    pub(crate) fn detached() -> (Self, oneshot::Receiver<()>, Slept) {
+        let (ack, acked) = oneshot::channel();
+        let slept = Slept::default();
+        let notice = SleepNotice {
+            ack,
+            slept: slept.clone(),
+        };
+        (notice, acked, slept)
+    }
+}
+
+#[cfg(test)]
+impl Sleepers {
+    /// A sleep received now pending on these subscriptions, and its slept
+    /// list; the task ends at the acks or the deadline.
+    pub(crate) fn start_sleep(&'static self) -> (Slept, tokio::task::JoinHandle<()>) {
+        let (slept, received) = (Slept::default(), Instant::now());
+        let list = slept.clone();
+        let sleep = tokio::spawn(async move { self.sleep(&slept, received).await });
+        (list, sleep)
+    }
 }
 
 #[cfg(test)]

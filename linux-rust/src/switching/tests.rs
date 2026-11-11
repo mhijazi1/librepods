@@ -89,6 +89,8 @@ struct Records {
     parks: AtomicBool,
     /// Panic right after recording a `Take` route (#311).
     panic_at_take: AtomicBool,
+    /// `pause` never completes (#534).
+    hung_pause: AtomicBool,
 }
 
 /// Records the media actions instead of touching D-Bus or PipeWire. The
@@ -102,6 +104,9 @@ impl MediaActions for FakeMedia {
     fn pause(&self, _: PlaybackState) -> BoxFuture<'static, bool> {
         self.records.pauses.fetch_add(1, Ordering::SeqCst);
         trace(&self.mac, "PauseMedia".to_string());
+        if self.records.hung_pause.load(Ordering::SeqCst) {
+            return Box::pin(std::future::pending());
+        }
         Box::pin(async { true })
     }
 
@@ -746,6 +751,9 @@ fn bare_shell(mac: &str, manager: AACPManager, events: Events) -> Shell {
         undo_rx: mpsc::unbounded_channel().1,
         activity: Arc::new(|| None),
         sleep_disconnected: None,
+        // No BlueZ in tests.
+        sleep_disconnect: Arc::new(|_| Box::pin(async { false })),
+        sleepers: Box::leak(Box::default()),
     }
 }
 
@@ -1102,4 +1110,160 @@ async fn announce_tipi_long_idle_sends_low() {
 async fn announce_tipi_failed_snapshot_sends_legacy() {
     let tipi = announced_tipi("5A:00:00:00:13:04", None).await;
     assert_eq!(tipi, expected_tipi(REMOTE).await);
+}
+
+/// #534: `on_sleep`'s glue on fake media, a fake disconnect and the
+/// shell's own `Sleepers`, never BlueZ or the app's subscriptions.
+mod sleep {
+    use super::*;
+    use crate::suspend::{SLEEP_DISCONNECT_RESERVE, SLEEP_PREPARE_TIMEOUT, SleepNotice};
+
+    /// Each sleep disconnect's MAC and (paused) time.
+    type Disconnects = Arc<StdMutex<Vec<(String, tokio::time::Instant)>>>;
+
+    /// `bare_shell` on a ready session, its pauses and sleep disconnects
+    /// recorded; each disconnect returns `disconnects`.
+    async fn sleep_shell(mac: &str, disconnects: bool) -> (Shell, Arc<Records>, Disconnects) {
+        let (manager, _rx, _tx) = ready_session().await;
+        let mut shell = bare_shell(mac, manager, mpsc::unbounded_channel().1);
+        let (records, (_, media)) = Harness::fake_media(mac);
+        shell.media = media;
+        let calls = Disconnects::default();
+        let record = calls.clone();
+        shell.sleep_disconnect = Arc::new(move |mac| {
+            let now = tokio::time::Instant::now();
+            record.lock().unwrap().push((mac, now));
+            Box::pin(async move { disconnects })
+        });
+        (shell, records, calls)
+    }
+
+    fn macs(calls: &Disconnects) -> Vec<String> {
+        let calls = calls.lock().unwrap();
+        calls.iter().map(|(mac, _)| mac.clone()).collect()
+    }
+
+    fn pauses(records: &Records) -> usize {
+        records.pauses.load(Ordering::SeqCst)
+    }
+
+    /// A live core with Linux playing media: `Sleep` pauses, then
+    /// disconnects.
+    fn playing_core() -> Handoff {
+        let mut core = Handoff::new(LOCAL.to_string(), Instant::now(), false, true);
+        let play = Input::Playback {
+            sampled_at: Instant::now(),
+            category: AUDIO_CATEGORY_MEDIA,
+            new_source: None,
+        };
+        assert_eq!(core.handle(Instant::now(), play), []);
+        core
+    }
+
+    #[tokio::test]
+    async fn stale_notice_does_nothing() {
+        let (mut shell, records, calls) = sleep_shell("5A:00:00:05:34:01", true).await;
+        let mut core = playing_core();
+        let (notice, acked, slept) = SleepNotice::detached();
+        drop(acked);
+        assert!(!on_sleep(&mut core, &mut shell, notice).await);
+        assert_eq!(macs(&calls), Vec::<String>::new());
+        assert_eq!(*slept.lock().unwrap(), Vec::<String>::new());
+        assert_eq!(pauses(&records), 0);
+        assert!(core.live());
+    }
+
+    #[tokio::test]
+    async fn live_session_sleeps_disconnects_and_acks() {
+        let mac = "5A:00:00:05:34:02";
+        let (mut shell, records, calls) = sleep_shell(mac, true).await;
+        let mut core = playing_core();
+        let (notice, acked, slept) = SleepNotice::detached();
+        assert!(!on_sleep(&mut core, &mut shell, notice).await);
+        assert_eq!(*slept.lock().unwrap(), [mac]);
+        assert_eq!(macs(&calls), [mac]);
+        assert_eq!(acked.await, Ok(()));
+        assert_eq!(pauses(&records), 1);
+        // Sleeping: no SleepDisconnectFailed made it live again.
+        assert!(!core.live());
+    }
+
+    #[tokio::test]
+    async fn session_not_live_records_nothing_and_acks() {
+        let (mut shell, records, calls) = sleep_shell("5A:00:00:05:34:03", true).await;
+        let mut core = playing_core();
+        // Found dead, though the manager still has the session.
+        core.handle(Instant::now(), Input::SessionLost);
+        assert!(!core.live());
+        let (notice, acked, slept) = SleepNotice::detached();
+        assert!(!on_sleep(&mut core, &mut shell, notice).await);
+        assert_eq!(*slept.lock().unwrap(), Vec::<String>::new());
+        assert_eq!(macs(&calls), Vec::<String>::new());
+        assert_eq!(pauses(&records), 0);
+        assert_eq!(acked.await, Ok(()));
+    }
+
+    /// #535's case.
+    #[tokio::test]
+    async fn failed_disconnect_makes_the_session_live_again() {
+        let mac = "5A:00:00:05:34:04";
+        let (mut shell, _records, calls) = sleep_shell(mac, false).await;
+        let mut core = playing_core();
+        let (notice, acked, slept) = SleepNotice::detached();
+        assert!(!on_sleep(&mut core, &mut shell, notice).await);
+        assert_eq!(macs(&calls), [mac]);
+        // Still registered: the wake reconnects it if it did drop.
+        assert_eq!(*slept.lock().unwrap(), [mac]);
+        assert!(core.live());
+        assert_eq!(acked.await, Ok(()));
+    }
+
+    /// The sleep is released while `sync_session` waits on the session's
+    /// lock (#532).
+    #[tokio::test]
+    async fn notice_stale_after_the_session_lock_does_nothing() {
+        let (mut shell, records, calls) = sleep_shell("5A:00:00:05:34:05", true).await;
+        let mut core = playing_core();
+        let manager = shell.manager.clone();
+        let (notice, acked, slept) = SleepNotice::detached();
+        let state = manager.state.lock().await;
+        let ended = {
+            let mut sleep = std::pin::pin!(on_sleep(&mut core, &mut shell, notice));
+            // Past the first stale check, waiting on the lock.
+            assert!(futures::poll!(sleep.as_mut()).is_pending());
+            drop(acked);
+            drop(state);
+            sleep.await
+        };
+        assert!(!ended);
+        assert_eq!(*slept.lock().unwrap(), Vec::<String>::new());
+        assert_eq!(pauses(&records), 0);
+        assert_eq!(macs(&calls), Vec::<String>::new());
+        assert!(core.live());
+    }
+
+    /// #532: a hung pause is cut the reserve before the sleep's deadline,
+    /// so the disconnect still runs before the release.
+    #[tokio::test(start_paused = true)]
+    async fn hung_pause_leaves_time_for_the_disconnect() {
+        let mac = "5A:00:00:05:34:06";
+        let (mut shell, records, calls) = sleep_shell(mac, true).await;
+        records.hung_pause.store(true, Ordering::SeqCst);
+        let mut core = playing_core();
+        let mut sleep_rx = shell.sleepers.subscribe();
+        let t0 = tokio::time::Instant::now();
+        let (slept, sleep) = shell.sleepers.start_sleep();
+        let notice = sleep_rx.recv().await.unwrap();
+        // Bounded, so an unbounded hung pause fails instead of hanging.
+        let sleep_step = on_sleep(&mut core, &mut shell, notice);
+        let ended = tokio::time::timeout(SLEEP_PREPARE_TIMEOUT * 2, sleep_step).await;
+        assert_eq!(ended, Ok(false));
+        let cut = t0 + SLEEP_PREPARE_TIMEOUT - SLEEP_DISCONNECT_RESERVE;
+        assert_eq!(*calls.lock().unwrap(), [(mac.to_string(), cut)]);
+        assert_eq!(pauses(&records), 1);
+        assert_eq!(*slept.lock().unwrap(), [mac]);
+        // Acked: the sleep ends now, not at its deadline.
+        sleep.await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), cut);
+    }
 }

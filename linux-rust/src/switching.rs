@@ -30,7 +30,9 @@ use crate::handoff_log;
 use crate::media_controller::{self, MediaController};
 use crate::notifications::{self, Notice, Notifier};
 use crate::stream_monitor::{self, CallSamples};
+use crate::suspend;
 use crate::utils::{self, ConnectMode, SwitchingMode};
+use futures::future::BoxFuture;
 use log::{error, info};
 use std::future::Future;
 use std::sync::Arc;
@@ -301,6 +303,10 @@ impl Switching {
                     undo_rx: self.undo.unwrap_or_else(|| mpsc::unbounded_channel().1),
                     activity: self.activity,
                     sleep_disconnected: None,
+                    sleep_disconnect: Arc::new(|mac: String| -> BoxFuture<'static, bool> {
+                        Box::pin(async move { suspend::disconnect(&mac).await })
+                    }),
+                    sleepers: &suspend::SLEEPERS,
                 };
                 spawn_handoff_task(&HANDOFF_TASKS, self.airpods_mac, shell);
                 (Some(events_tx), Some(flush_rx))
