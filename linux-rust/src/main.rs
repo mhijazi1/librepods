@@ -367,9 +367,9 @@ async fn async_main(
         }
     }
 
-    let conn = Connection::new_system()?;
     // Disconnect the AirPods before sleep and reconnect on wake (#15).
-    suspend::start(&conn)?;
+    suspend::start();
+    let conn = Connection::new_system()?;
     let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
     conn.add_match(rule, move |_: (), conn, msg| {
         let Some(path) = msg.path() else {

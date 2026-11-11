@@ -259,6 +259,7 @@ impl Sleepers {
     /// none pending (released, or woken) BlueZ isn't called.
     async fn disconnect(&self, link: &impl BluezLink, mac: &str) {
         let Some(deadline) = self.deadline() else {
+            // shortcut: a task that steps Sleep after the release leaves the core lost without a disconnect (#535)
             warn!("Sleep: not disconnecting {mac}: the sleep no longer waits");
             return;
         };
@@ -271,21 +272,39 @@ impl Sleepers {
     }
 }
 
-/// Take the sleep inhibitor and follow logind's `PrepareForSleep` on `conn`.
-pub(crate) fn start(conn: &Connection) -> Result<(), dbus::Error> {
+/// Take the sleep inhibitor and follow logind's `PrepareForSleep` on a
+/// system-bus connection of its own, on its own thread: the app's shared one
+/// blocks seconds in BlueZ reads, which would eat logind's delay.
+pub(crate) fn start() {
     let (prepare, prepared) = mpsc::unbounded_channel();
     tokio::spawn(run(SystemLogind, Arc::new(Bluez), &SLEEPERS, prepared));
-    // The bus routes only logind's broadcasts to this rule; `from_logind`
-    // drops a unicast one, which any sender can address to us.
-    let rule = MatchRule::new_signal("org.freedesktop.login1.Manager", "PrepareForSleep")
-        .with_sender("org.freedesktop.login1");
-    conn.add_match(rule, move |(start,): (bool,), _, msg| {
-        if from_logind(msg) {
-            let _ = prepare.send(start);
+    let watch = move || -> Result<(), dbus::Error> {
+        let conn = Connection::new_system()?;
+        // The bus routes only logind's broadcasts to this rule;
+        // `from_logind` drops a unicast one, which any sender can address
+        // to us.
+        let rule = MatchRule::new_signal("org.freedesktop.login1.Manager", "PrepareForSleep")
+            .with_sender("org.freedesktop.login1");
+        conn.add_match(rule, move |(start,): (bool,), _, msg| {
+            if from_logind(msg) {
+                let _ = prepare.send(start);
+            }
+            true
+        })?;
+        loop {
+            conn.process(Duration::from_secs(60))?;
         }
-        true
-    })?;
-    Ok(())
+    };
+    let spawned = std::thread::Builder::new()
+        .name("prepare-for-sleep".into())
+        .spawn(move || {
+            if let Err(e) = watch() {
+                warn!("Sleep: not following logind's PrepareForSleep: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        warn!("Sleep: not following logind's PrepareForSleep: {e}");
+    }
 }
 
 /// logind broadcasts `PrepareForSleep`: a signal addressed to us is not

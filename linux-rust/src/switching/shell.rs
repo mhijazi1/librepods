@@ -382,6 +382,10 @@ async fn on_sleep(core: &mut Handoff, shell: &mut Shell, notice: SleepNotice) ->
     if sync_session(core, shell).await {
         return true;
     }
+    // The sync may wait on the session's lock past the release.
+    if notice.stale() {
+        return false;
+    }
     if core.live() {
         notice.slept(&shell.mac);
     }
