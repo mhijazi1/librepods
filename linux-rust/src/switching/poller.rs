@@ -15,6 +15,7 @@ use crate::stream_monitor::{
 use futures::future::BoxFuture;
 use log::error;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -156,8 +157,21 @@ pub(crate) async fn pause_own_players(
     if streams.live.as_ref().is_some_and(|pids| pids.is_empty()) {
         return false;
     }
+    // Set when this future is dropped (a sleep_bounded cut or an abort,
+    // #537): the scan, still running on its blocking thread, sends no
+    // further Pause.
+    struct Cut(Arc<AtomicBool>);
+    impl Drop for Cut {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let cut = Cut(Arc::default());
+    let stop = cut.0.clone();
     let outcome = controller
-        .pause_all_media_with(move || pause_players(&|owner| streams.live_or_unknown(owner)))
+        .pause_all_media_with(move || {
+            pause_players(&|owner| !stop.load(Ordering::SeqCst) && streams.live_or_unknown(owner))
+        })
         .await;
     if outcome.bus_unavailable {
         error!("Handoff: session bus unavailable; could not pause local players");
