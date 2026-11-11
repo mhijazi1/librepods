@@ -10,6 +10,7 @@
 
 use crate::reconnect::{Bluez, ConnectGuard, Connector};
 use crate::utils;
+use dbus::Message;
 use dbus::arg::OwnedFd;
 use dbus::blocking::Connection;
 use dbus::message::MatchRule;
@@ -134,7 +135,7 @@ impl BluezLink for Bluez {
 pub(crate) async fn disconnect(mac: &str) {
     match tokio::time::timeout(SLEEP_DISCONNECT_TIMEOUT, BluezLink::disconnect(&Bluez, mac)).await {
         Ok(Ok(())) => info!("Sleep: disconnected {mac}"),
-        // shortcut: on a failed or timed-out disconnect the core stays lost (no take) until the session drops (#TBD)
+        // shortcut: on a failed or timed-out disconnect the core stays lost (no take) until the session drops (#535)
         Ok(Err(e)) => warn!("Sleep: failed to disconnect {mac}: {e}"),
         Err(_) => warn!("Sleep: disconnecting {mac} timed out"),
     }
@@ -219,14 +220,23 @@ impl Sleepers {
 pub(crate) fn start(conn: &Connection) -> Result<(), dbus::Error> {
     let (prepare, prepared) = mpsc::unbounded_channel();
     tokio::spawn(run(SystemLogind, Arc::new(Bluez), &SLEEPERS, prepared));
-    // Only logind's: the bus routes no other sender's signal to this rule.
+    // The bus routes only logind's broadcasts to this rule; `from_logind`
+    // drops a unicast one, which any sender can address to us.
     let rule = MatchRule::new_signal("org.freedesktop.login1.Manager", "PrepareForSleep")
         .with_sender("org.freedesktop.login1");
-    conn.add_match(rule, move |(start,): (bool,), _, _| {
-        let _ = prepare.send(start);
+    conn.add_match(rule, move |(start,): (bool,), _, msg| {
+        if from_logind(msg) {
+            let _ = prepare.send(start);
+        }
         true
     })?;
     Ok(())
+}
+
+/// logind broadcasts `PrepareForSleep`: a signal addressed to us is not
+/// its, as dbus-rs's non-strict sender match lets a unique name through.
+fn from_logind(msg: &Message) -> bool {
+    msg.destination().is_none()
 }
 
 /// Follow `PrepareForSleep` (true: about to sleep, false: woke up).
@@ -409,6 +419,24 @@ mod tests {
         settle().await;
         assert_eq!(logind.held(), 1);
         (logind, sleepers, prepare)
+    }
+
+    #[test]
+    fn prepare_for_sleep_only_from_a_broadcast() {
+        let signal = || {
+            Message::new_signal(
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "PrepareForSleep",
+            )
+            .unwrap()
+            .append1(true)
+        };
+        assert!(from_logind(&signal()));
+        // A unicast one, which any sender can address to us.
+        let mut unicast = signal();
+        unicast.set_destination(Some(":1.15".into()));
+        assert!(!from_logind(&unicast));
     }
 
     #[tokio::test(start_paused = true)]
