@@ -1179,7 +1179,8 @@ mod tests {
             samples.send(busy).unwrap();
             settle().await;
             assert!(sinks.sets().is_empty(), "{mac}");
-            samples.send(IDLE).unwrap();
+            // Unchecked, so a wake park that gave up fails the Park check.
+            let _ = samples.send(IDLE);
             settle().await;
             assert_eq!(sinks.sets(), ["load", PARK_SINK], "{mac}");
             assert_eq!(default(&sinks), PARK_SINK);
