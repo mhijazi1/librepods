@@ -1236,11 +1236,11 @@ mod tests {
         // The reconnect connects at its first attempt; nothing claims.
         tokio::time::sleep(WAKE_RECONNECT_FIRST).await;
         settle().await;
-        assert!(claim_wake_park(P12).is_none());
         // A later idle sample, BlueZ reporting the AirPods gone again.
         let _ = samples.send(IDLE);
         settle().await;
         assert!(sinks.sets().is_empty());
+        assert!(claim_wake_park(P12).is_none());
     }
 
     #[tokio::test(start_paused = true)]
