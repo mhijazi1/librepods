@@ -140,6 +140,11 @@ pub(crate) enum Input {
     /// but the session is not dropped: the queued events (a case-closed wear
     /// report, an ownership ACK) are still fed, then `Disconnected`.
     SessionLost,
+    /// The system is about to sleep (logind `PrepareForSleep(true)`). As
+    /// the Mac does (spike #261): pause if Linux plays, relay idle, then
+    /// disconnect without releasing. Until the drop the session is lost,
+    /// and the drop pauses nothing more.
+    Sleep,
     /// The control session dropped.
     Disconnected,
     /// A reconnect attempt made a new control session (not yet adopted).
@@ -236,6 +241,8 @@ pub(crate) enum Command {
     ConnectA2dp,
     /// Tear down the dead control session and drop its queued events.
     DropSession,
+    /// Disconnect the AirPods through BlueZ (`Input::Sleep`).
+    Disconnect,
     /// Start a reconnect attempt; `audio` also connects A2DP and reports
     /// Linux as not owning.
     Reconnect { audio: bool },
@@ -329,6 +336,8 @@ pub(crate) struct Handoff {
     /// The connected session died; it is torn down at the next
     /// `Disconnected`.
     session_lost: bool,
+    /// `Input::Sleep` disconnected the session: its drop doesn't pause.
+    sleeping: bool,
     quitting: bool,
     /// Ownership request awaiting its acknowledgement.
     pending: Option<Pending>,
@@ -478,6 +487,7 @@ impl Handoff {
             last_owner_linux: false,
             connected,
             session_lost: false,
+            sleeping: false,
             quitting: false,
             pending: None,
             requested_take: false,
@@ -894,6 +904,7 @@ impl Handoff {
                     self.say("SESSION lost; finishing its queued events before disconnecting");
                 }
             }
+            Input::Sleep => self.sleep(out),
             Input::Disconnected => {
                 self.take_back.clear();
                 self.disconnected(now, out);

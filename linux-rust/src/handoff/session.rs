@@ -3,12 +3,33 @@
 use super::*;
 
 impl Handoff {
+    /// The system is about to sleep: what the Mac does (spike #261). Pause
+    /// what Linux plays, relay idle, disconnect, and never release. The
+    /// session counts as lost until its drop, so no play edge takes.
+    pub(super) fn sleep(&mut self, out: &mut Vec<Command>) {
+        if !self.live() {
+            return;
+        }
+        if self.category > AUDIO_CATEGORY_IDLE {
+            out.push(Command::PauseMedia);
+        }
+        if self.category_relay && self.relayed(self.category) > AUDIO_CATEGORY_IDLE {
+            out.push(Command::RelayCategory(AUDIO_CATEGORY_IDLE));
+        }
+        out.push(Command::Disconnect);
+        self.sleeping = true;
+        self.session_lost = true;
+        self.say("SLEEP paused, relayed idle and disconnecting; ownership kept");
+    }
+
     pub(super) fn disconnected(&mut self, now: Instant, out: &mut Vec<Command>) {
         if !self.connected {
             return;
         }
         self.say("DISCONNECTED clearing ownership and playback baseline");
-        if self.requested_take && self.automatic {
+        // A sleep's drop: `sleep` already paused what played.
+        let slept = std::mem::take(&mut self.sleeping);
+        if self.requested_take && self.automatic && !slept {
             out.push(Command::PauseMedia);
         }
         // The next session start emits the hold again.
