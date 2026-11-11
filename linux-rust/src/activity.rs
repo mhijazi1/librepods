@@ -119,21 +119,58 @@ pub(crate) struct LogindActivity;
 /// open a bus per snapshot (#525).
 static LOGIND_BUS: std::sync::Mutex<Option<Connection>> = std::sync::Mutex::new(None);
 
-impl ActivitySource for LogindActivity {
-    fn snapshot(&self) -> Option<ActivityInputs> {
-        logind_snapshot(&LOGIND_BUS, || Connection::new_system().ok(), read_hints)
+impl LogindActivity {
+    /// LockedHint alone on the shared bus, for a Wayland source with no
+    /// lock notifier (#526); see `read_lock_hint`.
+    pub(crate) fn locked(&self) -> Option<Option<bool>> {
+        read_lock_hint(&LOGIND_BUS, open_bus, |bus| hint(bus, "LockedHint"))
     }
 }
 
-/// `session/auto`'s (LockedHint, IdleHint) on `bus`.
-fn read_hints(bus: &Connection) -> Option<(bool, bool)> {
+/// `read_shared_any` that tells a busy `slot` from a failed read: None when
+/// another read holds it (neither `open` nor `read` ran), Some(None) when
+/// the open or read failed, else the hint (#526).
+pub(crate) fn read_lock_hint<B>(
+    slot: &std::sync::Mutex<Option<B>>,
+    open: impl FnOnce() -> Option<B>,
+    read: impl FnOnce(&B) -> Option<bool>,
+) -> Option<Option<bool>> {
+    // A taken slot always runs `open` or `read`.
+    let ran = std::cell::Cell::new(false);
+    let opened = || {
+        ran.set(true);
+        open()
+    };
+    let hint = crate::a2dp_resume::read_shared_any(slot, opened, |bus| {
+        ran.set(true);
+        read(bus)
+    });
+    ran.get().then_some(hint)
+}
+
+impl ActivitySource for LogindActivity {
+    fn snapshot(&self) -> Option<ActivityInputs> {
+        logind_snapshot(&LOGIND_BUS, open_bus, read_hints)
+    }
+}
+
+fn open_bus() -> Option<Connection> {
+    Connection::new_system().ok()
+}
+
+/// `session/auto`'s hint `name` on `bus`.
+fn hint(bus: &Connection, name: &str) -> Option<bool> {
     let session = bus.with_proxy(
         "org.freedesktop.login1",
         "/org/freedesktop/login1/session/auto",
         LOGIND_CALL_TIMEOUT,
     );
-    let hint = |name| session.get::<bool>("org.freedesktop.login1.Session", name);
-    Some((hint("LockedHint").ok()?, hint("IdleHint").ok()?))
+    session.get("org.freedesktop.login1.Session", name).ok()
+}
+
+/// `session/auto`'s (LockedHint, IdleHint) on `bus`.
+fn read_hints(bus: &Connection) -> Option<(bool, bool)> {
+    Some((hint(bus, "LockedHint")?, hint(bus, "IdleHint")?))
 }
 
 /// logind's inputs from `hints` on the bus in `slot`, shared as
