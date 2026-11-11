@@ -9,7 +9,9 @@ use super::registry::{Pending, last_owner_linux, remember_last_owner_linux};
 use super::{Events, FlushRequest, TICK};
 use crate::a2dp_resume;
 use crate::activity::{self, ActivityLevel, ActivitySource};
-use crate::bluetooth::aacp::{AACPEvent, AACPManager, ControlCommandIdentifiers as Control};
+use crate::bluetooth::aacp::{
+    AACPEvent, AACPManager, ControlCommandIdentifiers as Control, TipiFields,
+};
 use crate::default_sink::{SinkEvent, UnparkTo};
 use crate::handoff::{Command, Handoff, Input, Park, local_inputs};
 use crate::notifications::{self, Notice, Notifier};
@@ -67,6 +69,9 @@ pub(super) struct Shell {
     pub(super) undo_rx: mpsc::UnboundedReceiver<u64>,
     /// Linux's activity level for the announced tipi (#13).
     pub(super) activity: Arc<dyn ActivitySource>,
+    /// The last announcement's level not yet seen by the activity poll:
+    /// Some(None) when it sent LEGACY (#528).
+    pub(super) announced: Option<Option<ActivityLevel>>,
     /// Whether the last `Command::Disconnect` disconnected; `on_sleep` takes it.
     pub(super) sleep_disconnected: Option<bool>,
     /// The sleep's disconnect of a MAC: true only if it disconnected.
@@ -155,7 +160,9 @@ impl Shell {
                     }
                 }
                 Command::Announce => {
-                    let fields = activity::current_tipi(&self.activity).await;
+                    let level = activity::tipi_level(&self.activity).await;
+                    self.announced = Some(level);
+                    let fields = level.map_or(TipiFields::LEGACY, activity::tipi_fields);
                     info!("Handoff: announcing Linux with {fields:?}");
                     if let Err(e) = announce(&self.manager, &self.local, fields).await {
                         error!("Handoff: failed to announce Linux to remote hosts: {e}");
@@ -512,7 +519,8 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
     }
     let mut tick = tokio::time::interval(TICK);
     // The Mac re-sends its tipi on each Activity State change (#509). The
-    // first level is the baseline; a failed snapshot keeps the last one.
+    // first level is the baseline unless an announcement set it; a failed
+    // snapshot keeps the last one.
     let (level_tx, mut levels) = mpsc::channel(1);
     tokio::spawn(poll_activity(shell.activity.clone(), level_tx));
     let mut prev = None;
@@ -563,7 +571,16 @@ pub(super) async fn run_handoff(mut shell: Shell, previous: Option<Pending>) {
                     || step(&mut core, &mut shell, Input::Undo(id)).await
             }
             Some(next) = levels.recv() => {
-                if prev.is_some_and(|prev| activity::resend_tipi(prev, next)) && core.live() {
+                // The hosts hold the last announcement's level, or LEGACY,
+                // which this sample replaces once (#528).
+                let announced = shell.announced.take();
+                if let Some(Some(level)) = announced {
+                    prev = Some(level);
+                }
+                let legacy = announced == Some(None);
+                if (legacy || prev.is_some_and(|prev| activity::resend_tipi(prev, next)))
+                    && core.live()
+                {
                     let fields = activity::tipi_fields(next);
                     info!("Handoff: activity now {next:?}; re-sending the tipi with {fields:?}");
                     send_tipi_updates(&shell.manager, &shell.local, fields).await;

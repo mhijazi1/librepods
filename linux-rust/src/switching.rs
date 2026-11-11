@@ -302,6 +302,7 @@ impl Switching {
                     // No notifier clicks: a closed channel.
                     undo_rx: self.undo.unwrap_or_else(|| mpsc::unbounded_channel().1),
                     activity: self.activity,
+                    announced: None,
                     sleep_disconnected: None,
                     sleep_disconnect: Arc::new(|mac: String| -> BoxFuture<'static, bool> {
                         Box::pin(async move { suspend::disconnect(&mac).await })

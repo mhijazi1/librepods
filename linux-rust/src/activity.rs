@@ -95,11 +95,17 @@ impl<F: Fn() -> Option<ActivityInputs> + Send + Sync> ActivitySource for F {
 /// The tipi values for `source`'s snapshot, or LEGACY when it fails or
 /// takes longer than `SNAPSHOT_TIMEOUT`. The caller holds no lock.
 pub(crate) async fn current_tipi(source: &Arc<dyn ActivitySource>) -> TipiFields {
+    tipi_level(source)
+        .await
+        .map_or(TipiFields::LEGACY, tipi_fields)
+}
+
+/// `current_tipi`'s level: None when it would send LEGACY.
+pub(crate) async fn tipi_level(source: &Arc<dyn ActivitySource>) -> Option<ActivityLevel> {
     tokio::time::timeout(SNAPSHOT_TIMEOUT, current_level(source))
         .await
         .ok()
         .flatten()
-        .map_or(TipiFields::LEGACY, tipi_fields)
 }
 
 /// `source`'s level, or None when its snapshot fails. Waits as long as the
