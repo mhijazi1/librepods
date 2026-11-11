@@ -569,7 +569,17 @@ async fn park_until_timeout(
         park.router = Some(router);
     })?;
     info!("Wake: new playback waits on the park sink while {mac} reconnects");
-    while next().await?.0 <= AUDIO_CATEGORY_IDLE {}
+    loop {
+        let (category, known, _) = next().await?;
+        // A dead stream monitor can't see a stream start, as #311's fallback.
+        if !known {
+            info!("Wake: streams unknown; new playback goes to the local output");
+            return None;
+        }
+        if category > AUDIO_CATEGORY_IDLE {
+            break;
+        }
+    }
     drop(next);
     let until = Instant::now() + WAKE_PARK_TIMEOUT;
     on_wake_park(mac, |park| park.until = Some(until))?;
@@ -1039,6 +1049,7 @@ mod tests {
     const Q1: &str = "05:29:00:00:00:08";
     const Q2: &str = "05:29:00:00:00:09";
     const P8: &str = "05:29:00:00:00:0A";
+    const P9: &str = "05:29:00:00:00:0B";
 
     /// Linux's category, the streams known, a baseline stream live.
     type Sample = (u32, bool, bool);
@@ -1229,6 +1240,21 @@ mod tests {
         samples.send(IDLE).unwrap();
         settle().await;
         assert!(sinks.sets().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_park_ends_when_the_streams_go_unknown() {
+        let (audio, samples, sinks) = fake_audio();
+        let _prepare = wake(P9, FakeLink::default(), audio).await;
+        samples.send(IDLE).unwrap();
+        settle().await;
+        assert_eq!(default(&sinks), PARK_SINK);
+        // The stream monitor dies: it can't see a stream start on the park.
+        samples.send((AUDIO_CATEGORY_IDLE, false, false)).unwrap();
+        settle().await;
+        assert_eq!(sinks.sets(), ENDED);
+        assert_eq!(default(&sinks), DAC);
+        assert!(claim_wake_park(P9).is_none());
     }
 
     #[tokio::test(start_paused = true)]
