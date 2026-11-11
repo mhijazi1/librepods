@@ -532,7 +532,6 @@ async fn wake_park(mac: &str, audio: &impl WakeAudio, bluez: &impl BluezLink) {
             drop(take_wake_park(self.0));
         }
     }
-    drop(take_wake_park(mac));
     lock(&WAKE_PARKS).push(WakePark {
         mac: mac.to_string(),
         router: None,
