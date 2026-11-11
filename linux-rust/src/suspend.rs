@@ -206,11 +206,13 @@ impl Sleepers {
         rx
     }
 
-    /// Notify every subscribed task and wait for its ack, at most
-    /// `SLEEP_PREPARE_TIMEOUT`. A task that ends without acking drops its
-    /// notice, which counts as its ack.
-    async fn sleep(&self, slept: &Slept) {
-        let deadline = Instant::now() + SLEEP_PREPARE_TIMEOUT;
+    /// Notify every subscribed task and wait for its ack, at most until
+    /// `SLEEP_PREPARE_TIMEOUT` after the signal was `received`: logind's
+    /// delay runs from then, however long the signal waited in the queue.
+    /// A task that ends without acking drops its notice, which counts as
+    /// its ack.
+    async fn sleep(&self, slept: &Slept, received: Instant) {
+        let deadline = received + SLEEP_PREPARE_TIMEOUT;
         *lock(&self.deadline) = Some(deadline);
         // Cleared on return, and if the sleep is dropped: a stale deadline
         // would cut every later pause short.
@@ -287,7 +289,8 @@ pub(crate) fn start() {
             .with_sender("org.freedesktop.login1");
         conn.add_match(rule, move |(start,): (bool,), _, msg| {
             if from_logind(msg) {
-                let _ = prepare.send(start);
+                // Stamped here: `run` may get to it only after an inhibit.
+                let _ = prepare.send((start, Instant::now()));
             }
             true
         })?;
@@ -313,23 +316,24 @@ fn from_logind(msg: &Message) -> bool {
     msg.destination().is_none()
 }
 
-/// Follow `PrepareForSleep` (true: about to sleep, false: woke up).
+/// Follow `PrepareForSleep` (true: about to sleep, false: woke up), each
+/// with the time the bus thread received it.
 async fn run<L: Logind, B: BluezLink>(
     logind: L,
     bluez: Arc<B>,
     sleepers: &'static Sleepers,
-    mut prepare: mpsc::UnboundedReceiver<bool>,
+    mut prepare: mpsc::UnboundedReceiver<(bool, Instant)>,
 ) {
     let mut inhibitor = logind.inhibit().await;
     // Until its wake reconnect ends, so a sleep that aborts it keeps it.
     let slept = Slept::default();
     let mut reconnects = JoinSet::new();
-    while let Some(start) = prepare.recv().await {
+    while let Some((start, received)) = prepare.recv().await {
         // Aborts the running reconnects (their MACs stay in `slept`) and
         // forgets the finished ones.
         reconnects.shutdown().await;
         if start {
-            sleepers.sleep(&slept).await;
+            sleepers.sleep(&slept, received).await;
             drop(inhibitor.take());
             info!("Sleep: ready; disconnected {:?}", lock(&slept));
             continue;
@@ -406,6 +410,8 @@ mod tests {
     struct FakeLogind {
         taken: Arc<AtomicUsize>,
         held: Arc<AtomicUsize>,
+        /// How long each next inhibit takes; none: at once.
+        delays: Arc<Mutex<VecDeque<Duration>>>,
     }
 
     struct Held(Arc<AtomicUsize>);
@@ -420,6 +426,8 @@ mod tests {
         type Inhibitor = Held;
 
         async fn inhibit(&self) -> Option<Held> {
+            let delay = self.delays.lock().unwrap().pop_front();
+            tokio::time::sleep(delay.unwrap_or_default()).await;
             self.taken.fetch_add(1, Ordering::SeqCst);
             self.held.fetch_add(1, Ordering::SeqCst);
             Some(Held(self.held.clone()))
@@ -500,7 +508,11 @@ mod tests {
     /// `run` with a fresh `Sleepers`, its inhibitor taken.
     async fn start_run(
         link: Arc<FakeLink>,
-    ) -> (FakeLogind, &'static Sleepers, mpsc::UnboundedSender<bool>) {
+    ) -> (
+        FakeLogind,
+        &'static Sleepers,
+        mpsc::UnboundedSender<(bool, Instant)>,
+    ) {
         let logind = FakeLogind::default();
         let sleepers = sleepers();
         let (prepare, prepared) = mpsc::unbounded_channel();
@@ -533,7 +545,7 @@ mod tests {
         let start = Instant::now();
         // No task: released at once.
         let (logind, _, prepare) = start_run(Arc::default()).await;
-        prepare.send(true).unwrap();
+        prepare.send((true, Instant::now())).unwrap();
         settle().await;
         assert_eq!(logind.held(), 0);
 
@@ -543,7 +555,7 @@ mod tests {
         let mut b = sleepers.subscribe();
         // An ended task's subscription counts for nothing.
         drop(sleepers.subscribe());
-        prepare.send(true).unwrap();
+        prepare.send((true, Instant::now())).unwrap();
         let notice_a = a.recv().await.unwrap();
         let notice_b = b.recv().await.unwrap();
         settle().await;
@@ -568,7 +580,7 @@ mod tests {
         let (logind, sleepers, prepare) = start_run(link.clone()).await;
         let mut a = sleepers.subscribe();
         let mut b = sleepers.subscribe();
-        prepare.send(true).unwrap();
+        prepare.send((true, Instant::now())).unwrap();
         a.recv().await.unwrap().ack();
         // B disconnects, but never acks.
         let notice_b = b.recv().await.unwrap();
@@ -584,11 +596,47 @@ mod tests {
         // Stepped after the wake, it would disconnect again.
         assert!(notice_b.stale());
         // Its AirPods are still reconnected on wake.
-        prepare.send(false).unwrap();
+        prepare.send((false, Instant::now())).unwrap();
         settle().await;
         tokio::time::advance(WAKE_RECONNECT_FIRST).await;
         settle().await;
         assert_eq!(link.connects().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_sleep_keeps_the_signal_deadline() {
+        let (logind, sleepers, prepare) = start_run(Arc::default()).await;
+        // A first sleep releases the startup inhibitor.
+        prepare.send((true, Instant::now())).unwrap();
+        settle().await;
+        assert_eq!(logind.held(), 0);
+        // One task that never acks.
+        let _task = sleepers.subscribe();
+        // The wake at t0: its inhibit takes 2 s.
+        logind
+            .delays
+            .lock()
+            .unwrap()
+            .push_back(Duration::from_secs(2));
+        let t0 = Instant::now();
+        prepare.send((false, t0)).unwrap();
+        settle().await;
+        // A sleep received at t0 + 0.5 s waits behind it.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let received = Instant::now();
+        prepare.send((true, received)).unwrap();
+        settle().await;
+        let release = received + SLEEP_PREPARE_TIMEOUT;
+        tokio::time::advance(release - Duration::from_millis(1) - Instant::now()).await;
+        settle().await;
+        assert_eq!(logind.taken.load(Ordering::SeqCst), 2);
+        assert_eq!(logind.held(), 1);
+        // The c7 bounds use the same deadline.
+        assert_eq!(sleepers.deadline(), Some(release));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(logind.held(), 0);
+        assert_eq!(Instant::now(), t0 + Duration::from_millis(4500));
     }
 
     /// Run `wake_reconnect` for `mac` to its end; the connect times, from
@@ -679,7 +727,7 @@ mod tests {
         let (logind, sleepers, prepare) = start_run(link.clone()).await;
         // A and C disconnected, B's session was already gone, D has no task.
         let tasks = [Some(A), None, Some(C)].map(|slept| (sleepers.subscribe(), slept));
-        prepare.send(true).unwrap();
+        prepare.send((true, Instant::now())).unwrap();
         for (mut rx, slept) in tasks {
             let notice = rx.recv().await.unwrap();
             if let Some(mac) = slept {
@@ -689,7 +737,7 @@ mod tests {
         }
         settle().await;
         assert_eq!(logind.held(), 0);
-        prepare.send(false).unwrap();
+        prepare.send((false, Instant::now())).unwrap();
         settle().await;
         assert_eq!(logind.taken.load(Ordering::SeqCst), 2);
         assert_eq!(logind.held(), 1);
@@ -703,7 +751,8 @@ mod tests {
     async fn pending_sleep() -> (&'static Sleepers, SleepNotice, tokio::task::JoinHandle<()>) {
         let sleepers = sleepers();
         let mut task = sleepers.subscribe();
-        let sleep = tokio::spawn(async move { sleepers.sleep(&Slept::default()).await });
+        let sleep =
+            tokio::spawn(async move { sleepers.sleep(&Slept::default(), Instant::now()).await });
         let notice = task.recv().await.unwrap();
         (sleepers, notice, sleep)
     }
@@ -782,14 +831,14 @@ mod tests {
         let (_, sleepers, prepare) = start_run(link.clone()).await;
         let mut task = sleepers.subscribe();
         let sleep = async |task: Option<(&mut mpsc::UnboundedReceiver<SleepNotice>, &str)>| {
-            prepare.send(true).unwrap();
+            prepare.send((true, Instant::now())).unwrap();
             if let Some((task, mac)) = task {
                 let notice = task.recv().await.unwrap();
                 notice.slept(mac);
                 notice.ack();
             }
             settle().await;
-            prepare.send(false).unwrap();
+            prepare.send((false, Instant::now())).unwrap();
             settle().await;
         };
         // J sleeps and the wake reconnects it.
