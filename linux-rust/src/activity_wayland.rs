@@ -2,8 +2,9 @@
 //! Hyprland, logind's IdleHint/LockedHint never change (spike #160).
 //!
 //! ext-idle-notify-v1 at `ACTIVITY_MAX` and `ACTIVITY_HIGH` gives input
-//! recency and hyprland-lock-notify-v1 the lock state. One named thread does
-//! all Wayland I/O; `snapshot()` only reads the state it keeps.
+//! recency and hyprland-lock-notify-v1 the lock state (logind's LockedHint
+//! where the compositor lacks it, #526). One named thread does all Wayland
+//! I/O; `snapshot()` only reads the state it keeps.
 
 use crate::activity::{
     ACTIVITY_HIGH, ACTIVITY_MAX, ActivityInputs, ActivitySource, LogindActivity,
@@ -92,6 +93,28 @@ impl ActivitySource for WaylandActivity {
     }
 }
 
+/// `state`'s source. Without hyprland-lock-notify-v1, `locked` comes from
+/// `logind_locked` (`read_lock_hint`'s result: busy is no snapshot, a failed
+/// read is unlocked), read after the state mutex is released so a slow bus
+/// never stalls the Wayland thread (#526).
+fn wayland_source(
+    state: Arc<Mutex<WaylandState>>,
+    lock_notify: bool,
+    logind_locked: impl Fn() -> Option<Option<bool>> + Send + Sync + 'static,
+) -> Arc<dyn ActivitySource> {
+    let wayland = WaylandActivity(state);
+    if lock_notify {
+        return Arc::new(wayland);
+    }
+    Arc::new(move || {
+        let inputs = wayland.snapshot()?;
+        Some(ActivityInputs {
+            locked: logind_locked()?.unwrap_or(false),
+            ..inputs
+        })
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selection {
     /// Use logind; the reason goes in the log.
@@ -156,10 +179,11 @@ pub(crate) fn start() -> Arc<dyn ActivitySource> {
             }
             if !lock_notify {
                 warn!(
-                    "Activity: the compositor has no hyprland_lock_notifier_v1; locked stays false"
+                    "Activity: the compositor has no hyprland_lock_notifier_v1; the lock state comes from logind's LockedHint"
                 );
             }
-            Arc::new(WaylandActivity(state))
+            let logind = LogindActivity;
+            wayland_source(state, lock_notify, move || logind.locked())
         }
     }
 }
@@ -446,5 +470,152 @@ mod tests {
             activity_level(source.snapshot().unwrap()),
             ActivityLevel::Idle
         );
+    }
+
+    use crate::activity::read_lock_hint;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    /// A logind lock reader giving `locked` that counts its calls.
+    fn counting_reader(
+        locked: Option<Option<bool>>,
+    ) -> (
+        Arc<AtomicUsize>,
+        impl Fn() -> Option<Option<bool>> + Send + Sync + 'static,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let reader = move || {
+            counter.fetch_add(1, SeqCst);
+            locked
+        };
+        (calls, reader)
+    }
+
+    fn calls(calls: &AtomicUsize) -> usize {
+        calls.load(SeqCst)
+    }
+
+    /// A state whose 5 s notification idled 3 s ago: High while unlocked.
+    fn idled_3s_ago() -> Arc<Mutex<WaylandState>> {
+        let mut state = WaylandState::default();
+        state.idled(0, Instant::now() - 3 * SEC);
+        Arc::new(Mutex::new(state))
+    }
+
+    /// The source's snapshot, checking its `since_input` is the state's.
+    fn mixed_snapshot(
+        state: &Arc<Mutex<WaylandState>>,
+        source: &Arc<dyn ActivitySource>,
+    ) -> ActivityInputs {
+        let before = state.lock().unwrap().inputs(Instant::now()).since_input;
+        let inputs = source.snapshot().unwrap();
+        let after = state.lock().unwrap().inputs(Instant::now()).since_input;
+        assert!(before <= inputs.since_input && inputs.since_input <= after);
+        inputs
+    }
+
+    #[test]
+    fn logind_lock_locked_is_idle() {
+        let state = idled_3s_ago();
+        let (calls_made, reader) = counting_reader(Some(Some(true)));
+        let source = wayland_source(state.clone(), false, reader);
+        let inputs = mixed_snapshot(&state, &source);
+        assert!(inputs.locked);
+        assert!(inputs.since_input.unwrap() >= 8 * SEC, "{inputs:?}");
+        assert_eq!(activity_level(inputs), ActivityLevel::Idle);
+        assert_eq!(calls(&calls_made), 1);
+    }
+
+    #[test]
+    fn logind_lock_unlocked_keeps_input_level() {
+        let state = idled_3s_ago();
+        let (_, reader) = counting_reader(Some(Some(false)));
+        let source = wayland_source(state.clone(), false, reader);
+        let inputs = mixed_snapshot(&state, &source);
+        assert!(!inputs.locked);
+        assert_eq!(activity_level(inputs), ActivityLevel::High);
+    }
+
+    #[test]
+    fn lock_notify_never_reads_logind() {
+        let state = idled_3s_ago();
+        let (calls_made, reader) = counting_reader(Some(Some(true)));
+        let source = wayland_source(state.clone(), true, reader);
+        for locked in [false, true, false, true] {
+            state.lock().unwrap().locked = locked;
+            assert_eq!(source.snapshot().unwrap().locked, locked);
+        }
+        assert_eq!(calls(&calls_made), 0);
+    }
+
+    #[tokio::test]
+    async fn logind_lock_failed_read_keeps_input() {
+        // No events yet is Max (7), so a LEGACY (6) tipi would show.
+        let state = Arc::new(Mutex::new(WaylandState::default()));
+        let (calls_made, reader) = counting_reader(Some(None));
+        let source = wayland_source(state.clone(), false, reader);
+        let inputs = mixed_snapshot(&state, &source);
+        assert!(!inputs.locked);
+        assert_eq!(inputs.since_input, Some(Duration::ZERO));
+        assert_eq!(activity_level(inputs), ActivityLevel::Max);
+        assert_eq!(calls(&calls_made), 1);
+        assert_ne!(current_tipi(&source).await, TipiFields::LEGACY);
+    }
+
+    #[test]
+    fn logind_lock_read_outside_state_lock() {
+        let state = idled_3s_ago();
+        let shared = state.clone();
+        let source = wayland_source(state, false, move || {
+            assert!(
+                shared.try_lock().is_ok(),
+                "logind read under the state lock"
+            );
+            Some(Some(true))
+        });
+        assert!(source.snapshot().unwrap().locked);
+    }
+
+    #[test]
+    fn logind_lock_lost_connection_is_none() {
+        let state = idled_3s_ago();
+        let (calls_made, reader) = counting_reader(Some(Some(true)));
+        let source = wayland_source(state.clone(), false, reader);
+        state.lock().unwrap().lost = true;
+        assert_eq!(source.snapshot(), None);
+        assert_eq!(calls(&calls_made), 0);
+    }
+
+    #[test]
+    fn logind_lock_busy_slot_is_none() {
+        let slot = Mutex::new(None::<u32>);
+        let held = slot.lock().unwrap();
+        let busy = read_lock_hint(&slot, || panic!("opened"), |_| panic!("read"));
+        assert_eq!(busy, None);
+        drop(held);
+        let state = idled_3s_ago();
+        let (calls_made, reader) = counting_reader(None);
+        let source = wayland_source(state, false, reader);
+        assert_eq!(source.snapshot(), None);
+        assert_eq!(calls(&calls_made), 1);
+    }
+
+    #[test]
+    fn logind_lock_failed_read_is_unlocked() {
+        let empty = Mutex::new(None::<u32>);
+        let failed_open = read_lock_hint(&empty, || None, |_| panic!("read"));
+        assert_eq!(failed_open, Some(None));
+        // A bus already open: only `read` runs.
+        let open = Mutex::new(Some(1u32));
+        let hint = read_lock_hint(&open, || panic!("opened"), |_| Some(true));
+        assert_eq!(hint, Some(Some(true)));
+        let failed_read = read_lock_hint(&open, || panic!("opened"), |_| None);
+        assert_eq!(failed_read, Some(None));
+        let state = idled_3s_ago();
+        let (_, reader) = counting_reader(Some(None));
+        let source = wayland_source(state.clone(), false, reader);
+        let inputs = mixed_snapshot(&state, &source);
+        assert!(!inputs.locked);
+        assert_eq!(activity_level(inputs), ActivityLevel::High);
     }
 }
