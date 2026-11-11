@@ -1298,7 +1298,7 @@ mod wake_park {
 
     /// `mac`'s task on a ready session, routing to a real router over its
     /// wake park's sinks, past its startup's connect take; the park kept.
-    async fn claimed(mac: &str) -> (Harness, FakeSinks, mpsc::Receiver<Vec<u8>>) {
+    async fn claimed(mac: &str) -> (Harness, FakeSinks) {
         let sinks = parked(mac).await;
         let (manager, mut rx, _tx) = ready_session().await;
         let records = Arc::new(Records::default());
@@ -1334,15 +1334,16 @@ mod wake_park {
         assert_eq!(loads(&sinks), 1, "{:?}", sinks.sets());
         assert!(!unloaded(&sinks), "{:?}", sinks.sets());
         assert_eq!(h.routes(), [SinkEvent::Park]);
-        (h, sinks, rx)
+        (h, sinks)
     }
 
     #[tokio::test]
     async fn claim_keeps_the_park_through_startup() {
         let mac = "5A:00:00:05:44:01";
-        let (h, _sinks, _rx) = claimed(mac).await;
+        let (h, _sinks) = claimed(mac).await;
         // The join was routed before the settle suspend.rs's release awaits.
-        assert_eq!(h.records.settles.lock().unwrap().first(), Some(&1));
+        let first_settle = h.records.settles.lock().unwrap().first().copied();
+        assert_eq!(first_settle, Some(1));
         assert!(claim_wake_park(mac).is_none());
         stop_handoff_task(mac);
     }
@@ -1350,7 +1351,7 @@ mod wake_park {
     #[tokio::test]
     async fn stopped_task_unparks_the_claimed_park() {
         let mac = "5A:00:00:05:44:02";
-        let (h, sinks, _rx) = claimed(mac).await;
+        let (h, sinks) = claimed(mac).await;
         stop_handoff_task(mac);
         let local = SinkEvent::Unpark(UnparkTo::Local);
         wait_until("the drop's unpark", || h.routes().last() == Some(&local)).await;
