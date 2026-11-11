@@ -91,6 +91,8 @@ struct Records {
     panic_at_take: AtomicBool,
     /// `pause` never completes (#534).
     hung_pause: AtomicBool,
+    /// `routes.len()` at each `RouterMedia::hold_settled` (#544).
+    settles: StdMutex<Vec<usize>>,
 }
 
 /// Records the media actions instead of touching D-Bus or PipeWire. The
@@ -935,6 +937,9 @@ impl MediaActions for RouterMedia {
     }
 
     fn hold_settled(&self) -> BoxFuture<'static, ()> {
+        let records = &self.fake.records;
+        let routed = records.routes.lock().unwrap().len();
+        records.settles.lock().unwrap().push(routed);
         Box::pin(self.sinks.settled())
     }
 }
@@ -1265,5 +1270,108 @@ mod sleep {
         // Acked: the sleep ends now, not at its deadline.
         sleep.await.unwrap();
         assert_eq!(tokio::time::Instant::now(), cut);
+    }
+}
+
+/// #544: `run_handoff` claims a wake park (#529): its own Park joins the
+/// park before suspend.rs lets go, and the core starts parked.
+mod wake_park {
+    use super::*;
+    use crate::suspend::{claim_wake_park, register_parked_wake_park};
+
+    /// A wake park parked for `mac`, its deadline far past the test.
+    async fn parked(mac: &str) -> FakeSinks {
+        let sinks = FakeSinks::new(false);
+        let until = tokio::time::Instant::now() + Duration::from_secs(60);
+        register_parked_wake_park(mac, sinks.clone(), Some(until));
+        wait_until("the wake park", || default_sink(&sinks) == PARK_SINK).await;
+        sinks
+    }
+
+    fn loads(sinks: &FakeSinks) -> usize {
+        sinks.sets().iter().filter(|s| *s == "load").count()
+    }
+
+    fn unloaded(sinks: &FakeSinks) -> bool {
+        sinks.sets().iter().any(|s| s.starts_with("unload"))
+    }
+
+    /// `mac`'s task on a ready session, routing to a real router over its
+    /// wake park's sinks, past its startup's connect take; the park kept.
+    async fn claimed(mac: &str) -> (Harness, FakeSinks, mpsc::Receiver<Vec<u8>>) {
+        let sinks = parked(mac).await;
+        let (manager, mut rx, _tx) = ready_session().await;
+        let records = Arc::new(Records::default());
+        records.parks.store(true, Ordering::SeqCst);
+        let fake = FakeMedia {
+            records: records.clone(),
+            mac: mac.to_string(),
+        };
+        let media: Arc<dyn MediaActions> = Arc::new(RouterMedia {
+            fake,
+            sinks: DefaultSinkRouter::spawn(sinks.clone()),
+        });
+        let controller = MediaController::new(mac.to_string(), LOCAL.to_string());
+        let h = Harness::start_playback(
+            SwitchingMode::Handoff,
+            mac,
+            &manager,
+            (Arc::new(Mutex::new(controller)), media),
+            records,
+            Arc::new(DeviceHandler::default()),
+            known_play_channel(),
+            ConnectMode::default(),
+        )
+        .await;
+        assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+        assert_eq!(
+            next_packet(&mut rx).await,
+            expected_new_device(REMOTE).await
+        );
+        assert_eq!(next_packet(&mut rx).await, expected_tipi(REMOTE).await);
+        assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+        assert_eq!(default_sink(&sinks), PARK_SINK);
+        assert_eq!(loads(&sinks), 1, "{:?}", sinks.sets());
+        assert!(!unloaded(&sinks), "{:?}", sinks.sets());
+        assert_eq!(h.routes(), [SinkEvent::Park]);
+        (h, sinks, rx)
+    }
+
+    #[tokio::test]
+    async fn claim_keeps_the_park_through_startup() {
+        let mac = "5A:00:00:05:44:01";
+        let (h, _sinks, _rx) = claimed(mac).await;
+        // The join was routed before the settle suspend.rs's release awaits.
+        assert_eq!(h.records.settles.lock().unwrap().first(), Some(&1));
+        assert!(claim_wake_park(mac).is_none());
+        stop_handoff_task(mac);
+    }
+
+    #[tokio::test]
+    async fn stopped_task_unparks_the_claimed_park() {
+        let mac = "5A:00:00:05:44:02";
+        let (h, sinks, _rx) = claimed(mac).await;
+        stop_handoff_task(mac);
+        let local = SinkEvent::Unpark(UnparkTo::Local);
+        wait_until("the drop's unpark", || h.routes().last() == Some(&local)).await;
+        // The unload comes last, after the local sink is the default.
+        wait_until("the park sink's unload", || unloaded(&sinks)).await;
+        assert_eq!(default_sink(&sinks), DAC);
+        assert_eq!(h.routes(), [SinkEvent::Park, local]);
+    }
+
+    #[tokio::test]
+    async fn no_session_leaves_the_wake_park_unclaimed() {
+        let mac = "5A:00:00:05:44:03";
+        let sinks = parked(mac).await;
+        let mut shell = bare_shell(mac, AACPManager::new(), mpsc::unbounded_channel().1);
+        let (records, (_, media)) = Harness::fake_media(mac);
+        records.parks.store(true, Ordering::SeqCst);
+        shell.media = media;
+        run_handoff(shell, None).await;
+        assert_eq!(*records.routes.lock().unwrap(), []);
+        assert_eq!(default_sink(&sinks), PARK_SINK);
+        assert!(!unloaded(&sinks), "{:?}", sinks.sets());
+        assert!(claim_wake_park(mac).is_some());
     }
 }

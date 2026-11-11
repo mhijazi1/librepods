@@ -636,6 +636,23 @@ impl Sleepers {
     }
 }
 
+/// A wake park for `mac` parked on a router over `io`, as a wake leaves
+/// one for its handoff task to claim (#544).
+#[cfg(test)]
+pub(crate) fn register_parked_wake_park(
+    mac: &str,
+    io: impl crate::default_sink::DefaultSinkIo,
+    until: Option<Instant>,
+) {
+    let router = DefaultSinkRouter::spawn(io);
+    router.route(SinkEvent::Park);
+    lock(&WAKE_PARKS).push(WakePark {
+        mac: mac.to_string(),
+        router: Some(router),
+        until,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
