@@ -1351,3 +1351,156 @@ fn park_waits_for_a_sample_with_the_streams_known() {
         assert_eq!(p.core.park(), Park::Local, "{ms}");
     }
 }
+
+// #529: a wake park the handoff task claimed.
+
+/// A session start's core on a claimed wake park whose deadline is at
+/// `until` ms, with the hold and routing on and the streams already known,
+/// the parked stream in their baseline if `baseline`; nothing stepped yet.
+fn wake_parked(until: Option<u64>, baseline: bool) -> Probe {
+    let mut p = Probe::new(false, true);
+    let until = until.map(|ms| p.at(ms));
+    p.core = Handoff::new(LOCAL.to_string(), p.t0, false, true)
+        .with_a2dp_hold(true)
+        .with_default_sink_routing(true)
+        .with_park_sink(true)
+        .with_wake_park(until);
+    p.core.set_streams(true, baseline);
+    assert_eq!(p.core.park(), Park::Parked);
+    p
+}
+
+/// `wake_parked` with the parked stream in the baseline, seeded with
+/// `facts`: parked through every seed step.
+fn wake_seeded(until: Option<u64>, facts: SessionFacts) -> Probe {
+    seeded(wake_parked(until, true), facts)
+}
+
+/// `p` seeded with `facts`: parked through every seed step.
+fn seeded(mut p: Probe, facts: SessionFacts) -> Probe {
+    let mut seed = vec![
+        Input::ConnectedDevices {
+            old: Vec::new(),
+            new: facts.hosts,
+        },
+        Input::EarState(facts.ears),
+    ];
+    seed.extend(facts.audio.map(Input::AudioSource));
+    seed.extend(facts.owner.map(Input::Ownership));
+    for input in seed {
+        assert_eq!(p.feed(0, input), []);
+        assert_eq!(p.core.park(), Park::Parked);
+    }
+    p
+}
+
+/// `wake_seeded`'s fallback at `ms` with the hold off: Local, so the shell
+/// unparks to the local sink.
+fn wake_park_falls_back_at(p: &mut Probe, ms: u64) {
+    assert_eq!(p.feed(ms - 1, Input::Tick), []);
+    assert_eq!(p.core.park(), Park::Parked);
+    assert_eq!(p.feed(ms, Input::Tick), []);
+    assert_eq!(p.core.park(), Park::Local);
+}
+
+#[test]
+fn wake_park_claim_follows_the_take_ack() {
+    // An idle other host: the hold stays off, and Auto's connect take
+    // keeps the park.
+    let mut p = wake_seeded(Some(2000), ready_facts());
+    assert_eq!(
+        p.feed(100, Input::Auto),
+        [
+            HoldA2dp(false),
+            ConnectA2dp,
+            SendOwnership(true),
+            Announce,
+            DrainPlayback
+        ]
+    );
+    assert_eq!(p.core.park(), Park::Parked);
+    // The parked stream's first sample.
+    assert_eq!(p.play_category(200, MEDIA), []);
+    assert_eq!(p.feed(300, Input::Tick), []);
+    assert_eq!(p.core.park(), Park::Parked);
+    assert_eq!(p.feed(500, Input::Ownership(vec![1])), [RouteToAirPods]);
+    assert_eq!(p.core.park(), Park::AirPods);
+}
+
+#[test]
+fn wake_park_claim_falls_back_at_the_carried_deadline() {
+    let mut p = wake_seeded(Some(2000), ready_facts());
+    assert!(p.feed(100, Input::Auto).contains(&SendOwnership(true)));
+    // The parked stream's first sample doesn't push it out to 3500.
+    assert_eq!(p.play_category(1500, MEDIA), []);
+    wake_park_falls_back_at(&mut p, 2000);
+}
+
+#[test]
+fn wake_park_claim_without_a_take_unparks_to_local() {
+    // Buds out: no connect take, and an idle other host gets no hold.
+    let mut p = wake_seeded(None, unworn_facts());
+    p.feed(100, Input::Auto);
+    assert_eq!(p.core.park(), Park::Local);
+}
+
+/// A claimed wake park, idle, no deadline: another host plays, so Auto's
+/// decision makes no take and holds, and the park stays.
+fn held_decision() -> Probe {
+    let facts = SessionFacts {
+        audio: Some(source(REMOTE, AudioSourceType::Media)),
+        ..unworn_facts()
+    };
+    let mut p = seeded(wake_parked(None, false), facts);
+    assert_eq!(p.feed(50, relay(REMOTE, MEDIA)), []);
+    assert!(p.feed(100, Input::Auto).contains(&HoldA2dp(true)));
+    assert_eq!(p.core.park(), Park::Parked);
+    p
+}
+
+#[test]
+fn wake_park_claim_after_a_held_decision_follows_the_park_rules() {
+    // The hold ends: Local at that step.
+    let mut p = held_decision();
+    let only_linux = Input::ConnectedDevices {
+        old: two_hosts(),
+        new: vec![host(LOCAL)],
+    };
+    assert_eq!(p.feed(200, only_linux), [HoldA2dp(false)]);
+    assert_eq!(p.core.park(), Park::Local);
+
+    // The stream monitor dies while held: FallenBack.
+    let mut p = held_decision();
+    p.core.set_streams(false, false);
+    assert_eq!(p.play(200, false), []);
+    assert_eq!(p.core.park(), Park::FallenBack);
+}
+
+#[test]
+fn wake_park_claim_ends_after_an_auto_wait_without_a_take() {
+    // No audio source reported: Auto waits for it (#452), then decides at
+    // its deadline with no take and no hold.
+    let facts = SessionFacts {
+        audio: None,
+        ..ready_facts()
+    };
+    let mut p = seeded(wake_parked(None, false), facts);
+    assert_eq!(
+        p.feed(100, Input::Auto),
+        [HoldA2dp(false), ConnectA2dp, Announce, DrainPlayback]
+    );
+    let end = 100 + CONNECT_TAKE_WINDOW.as_millis() as u64;
+    assert_eq!(p.feed(end - 1, Input::Tick), []);
+    assert_eq!(p.core.park(), Park::Parked);
+    p.feed(end, Input::Tick);
+    assert_eq!(p.core.park(), Park::Local);
+}
+
+#[test]
+fn wake_park_claim_without_a_deadline_times_a_baseline_stream() {
+    // No play edge before the claim: the parked stream, in this task's
+    // baseline, starts the deadline at the first step.
+    let mut p = wake_seeded(None, ready_facts());
+    assert!(p.feed(100, Input::Auto).contains(&SendOwnership(true)));
+    wake_park_falls_back_at(&mut p, 2000);
+}
