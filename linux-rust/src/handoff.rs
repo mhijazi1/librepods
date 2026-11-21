@@ -596,6 +596,11 @@ impl Handoff {
         self.park
     }
 
+    /// While parked, when a `Tick` falls the park back without an ACK.
+    pub(crate) fn park_deadline(&self) -> Option<Instant> {
+        self.park_until.filter(|_| self.park == Park::Parked)
+    }
+
     /// Start parked on the wake park this task claimed (#529), with the
     /// deadline its first play edge started, if any.
     pub(crate) fn with_wake_park(mut self, until: Option<Instant>) -> Self {
