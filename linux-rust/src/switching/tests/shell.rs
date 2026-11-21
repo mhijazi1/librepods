@@ -728,6 +728,125 @@ async fn park_shutdown_unparks_before_a_slow_watch_stops() {
     drop(connected);
 }
 
+/// #545: fill the injected send channel through `tx`, so the next send
+/// waits until the test drains it.
+fn fill(tx: &mpsc::Sender<Vec<u8>>) {
+    while tx.try_send(Vec::new()).is_ok() {}
+}
+
+/// #545: drain what `fill` queued, and nothing else.
+fn drain_fill(rx: &mut mpsc::Receiver<Vec<u8>>) {
+    let drained: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(drained.iter().all(Vec::is_empty), "{drained:?}");
+}
+
+/// #545: the park falls back to the local output on time while the take's
+/// send waits on a full channel; that unpark is the park's only one, and
+/// the late ACK takes as after a Tick's fallback.
+#[tokio::test]
+async fn park_deadline_holds_while_a_send_blocks() {
+    let mac = "5A:00:00:05:45:01";
+    let (manager, mut rx, tx) = no_source_session().await;
+    let h = park_task(mac, &mut rx, &manager).await;
+    park_after_remote_request(&h, &mut rx).await;
+    h.play(false).await;
+    fill(&tx);
+    let sent = Instant::now();
+    h.play(true).await;
+    let local = SinkEvent::Unpark(UnparkTo::Local);
+    wait_until("the fallback while the send blocks", || {
+        h.sink_events().contains(&local)
+    })
+    .await;
+    let elapsed = sent.elapsed();
+    let timeout = crate::handoff::PARK_TIMEOUT;
+    assert!(
+        elapsed >= timeout && elapsed <= timeout + 2 * TICK,
+        "{elapsed:?}"
+    );
+    // The take's send was still waiting behind the filler.
+    drain_fill(&mut rx);
+    assert_eq!(next_packet(&mut rx).await, expected_owns(1).await);
+    tokio::time::sleep(2 * TICK).await;
+    let unparks = h.sink_events().iter().filter(|&&e| e == local).count();
+    assert_eq!(unparks, 1, "{:?}", h.sink_events());
+    let fallbacks = traced(mac)
+        .iter()
+        .filter(|l| l.starts_with("PARK no ACK within the park timeout"))
+        .count();
+    assert_eq!(fallbacks, 1, "{:#?}", traced(mac));
+    h.emit(owns(1));
+    wait_until("the take's route", || h.sink_events().len() == 6).await;
+    assert_eq!(rest(&mut rx).await, Vec::<Vec<u8>>::new());
+    use SinkEvent::{Hold, Park, Take, Unpark};
+    assert_eq!(
+        h.sink_events(),
+        [
+            Hold(false),
+            Hold(true),
+            Park,
+            Unpark(UnparkTo::Local),
+            Hold(false),
+            Take
+        ]
+    );
+    stop_handoff_task(mac);
+}
+
+/// #545: a claimed wake park (#529) falls back to the local output on
+/// time while the Auto step's ownership send waits on a full channel.
+#[tokio::test]
+async fn wake_park_deadline_holds_while_a_send_blocks() {
+    let mac = "5A:00:00:05:45:02";
+    let (manager, mut rx, tx) = ready_session().await;
+    let facts = session_facts(&*manager.state.lock().await);
+    let mut shell = bare_shell(mac, manager, mpsc::unbounded_channel().1);
+    let (records, (_, media)) = Harness::fake_media(mac);
+    records.parks.store(true, Ordering::SeqCst);
+    shell.media = media;
+    shell.parked = true;
+    let until = Instant::now() + Duration::from_millis(1500);
+    let mut core = Handoff::new(LOCAL.to_string(), Instant::now(), false, true)
+        .with_park_sink(true)
+        .with_a2dp_hold(true)
+        .with_default_sink_routing(true)
+        .with_wake_park(Some(until));
+    for input in seed_inputs(facts) {
+        assert!(!step(&mut core, &mut shell, input).await);
+    }
+    fill(&tx);
+    let local = SinkEvent::Unpark(UnparkTo::Local);
+    let unparks = || {
+        records
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&e| e == local)
+            .count()
+    };
+    let done = AtomicBool::new(false);
+    let auto = async {
+        let end = step(&mut core, &mut shell, Input::Auto).await;
+        done.store(true, Ordering::SeqCst);
+        end
+    };
+    let checker = async {
+        wait_until("the wake park's fallback while the send blocks", || {
+            unparks() > 0
+        })
+        .await;
+        let seen = Instant::now();
+        assert!(!done.load(Ordering::SeqCst), "the send no longer blocks");
+        let late = seen.saturating_duration_since(until);
+        assert!(seen >= until && late <= 2 * TICK, "{late:?}");
+        drain_fill(&mut rx);
+    };
+    let (end, ()) = tokio::join!(auto, checker);
+    assert!(!end);
+    assert_eq!(unparks(), 1);
+}
+
 // #509: the tipi re-sent on each Activity State change.
 
 /// An activity source the test switches, counting its snapshots.

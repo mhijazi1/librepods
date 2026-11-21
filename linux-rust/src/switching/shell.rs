@@ -120,13 +120,17 @@ async fn poll_activity(source: Arc<dyn ActivitySource>, levels: mpsc::Sender<Act
 /// logged and before the step's commands run.
 pub(crate) type LineSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+fn log_line(mac: &str, lines: Option<&LineSink>, line: &str) {
+    info!("Handoff {mac}: {line}");
+    if let Some(sink) = lines {
+        sink(line);
+    }
+}
+
 impl Shell {
     /// Log a line of the handoff task and hand it to the line sink.
     fn log(&self, line: &str) {
-        info!("Handoff {}: {line}", self.mac);
-        if let Some(sink) = &self.lines {
-            sink(line);
-        }
+        log_line(&self.mac, self.lines.as_ref(), line);
     }
 
     /// Wait until the router has forwarded every event still in the primary
@@ -300,24 +304,68 @@ pub(super) async fn step(core: &mut Handoff, shell: &mut Shell, input: Input) ->
     // a park after its hold, an unpark to the AirPods after the ACK's route.
     // `parked` changes only once its route is queued, so a drop in between
     // still unparks.
+    let local = SinkEvent::Unpark(UnparkTo::Local);
+    if park_route(core, shell) == Some(local) {
+        shell.media.route_default_sink(local);
+        shell.parked = false;
+    }
+    let end = match core.park_deadline() {
+        Some(deadline) => execute_parked(core, shell, deadline, now, commands).await,
+        None => shell.execute(now, commands).await,
+    };
+    // From the park now: an early fallback has already unparked.
+    if let Some(route) = park_route(core, shell) {
+        shell.media.route_default_sink(route);
+        shell.parked = route == SinkEvent::Park;
+    }
+    end
+}
+
+/// The default sink route to the core's park, if the shell isn't there.
+fn park_route(core: &Handoff, shell: &Shell) -> Option<SinkEvent> {
     let park = core.park();
-    let parked = park == Park::Parked;
-    let route = (parked != shell.parked).then(|| match park {
+    ((park == Park::Parked) != shell.parked).then(|| match park {
         Park::Parked => SinkEvent::Park,
         Park::AirPods => SinkEvent::Unpark(UnparkTo::AirPods),
         Park::Local | Park::FallenBack => SinkEvent::Unpark(UnparkTo::Local),
-    });
-    let local = SinkEvent::Unpark(UnparkTo::Local);
-    if route == Some(local) {
-        shell.media.route_default_sink(local);
-        shell.parked = parked;
-    }
-    let end = shell.execute(now, commands).await;
-    if let Some(route) = route.filter(|&route| route != local) {
-        shell.media.route_default_sink(route);
-        shell.parked = parked;
-    }
-    end
+    })
+}
+
+/// `shell.execute`, but a park deadline that passes while a command still
+/// waits (a send on a full channel) steps the core's `Tick` then, and a
+/// park that fell back unparks to the local output at once (#545). The
+/// Tick's commands run after this step's.
+async fn execute_parked(
+    core: &mut Handoff,
+    shell: &mut Shell,
+    deadline: Instant,
+    now: Instant,
+    commands: Vec<Command>,
+) -> bool {
+    // `execute` borrows the shell until it returns.
+    let (mac, lines, media) = (shell.mac.clone(), shell.lines.clone(), shell.media.clone());
+    let parked = shell.parked;
+    let (end, ticked, tick) = {
+        let mut run = std::pin::pin!(shell.execute(now, commands));
+        tokio::select! {
+            biased;
+            end = &mut run => return end,
+            () = tokio::time::sleep_until(deadline.into()) => {}
+        }
+        let ticked = Instant::now();
+        let tick = core.handle(ticked, Input::Tick);
+        remember_last_owner_linux(&mac, core.last_owner_linux());
+        for line in core.take_lines() {
+            log_line(&mac, lines.as_ref(), &line);
+        }
+        if parked && core.park() != Park::Parked {
+            media.route_default_sink(SinkEvent::Unpark(UnparkTo::Local));
+        }
+        (run.await, ticked, tick)
+    };
+    // That unpark was the park's only one.
+    shell.parked &= core.park() == Park::Parked;
+    shell.execute(ticked, tick).await || end
 }
 
 pub(super) async fn on_event(core: &mut Handoff, shell: &mut Shell, event: AACPEvent) -> bool {
