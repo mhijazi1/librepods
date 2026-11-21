@@ -654,3 +654,21 @@ obj/
 
 # End of https://www.toptal.com/developers/gitignore/api/qt,c++,clion,kotlin,python,android,pycharm,androidstudio,visualstudiocode,linux
 linux/.qmlls.ini
+
+# Nix
+result
+result-*
+
+# direnv
+.direnv
+.swarm/events.jsonl
+.swarm/otel/
+.swarm/tickets/
+.swarm/active
+.swarm/worktrees/
+.swarm/msg/
+.cargo-target/
+.swarm/project-cache.json
+.swarm/lane-claim
+.swarm/lane.lock
+.swarm/lane-run.pid

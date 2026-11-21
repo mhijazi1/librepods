@@ -1,0 +1,61 @@
+# Project
+Owned by the human (mo). The swarm planner reads this before every run.
+
+## End goal
+On a Linux desktop (reference machine: NixOS 26.05, BlueZ 5.86, PipeWire 1.6.6 + WirePlumber, Hyprland), AirPods behave like they do
+on a Mac in a household with an iPhone and a Mac on the same Apple Account:
+- automatic switching both ways between Linux and the Apple devices (Apple "smart routing": ownership + Hijackv2 over AACP),
+  driven by real local activity (playback, calls, idle/lock), without stealing audio on non-events;
+- "Moved to …" style notifications with Undo, calls routed to the AirPods with the mic (HFP) and back to A2DP afterwards;
+- ear detection pause/resume, battery (left/right/case) in the desktop, case-open popup;
+- a one-line NixOS / Home Manager install (package, user service, BlueZ `DeviceID = bluetooth:004C:0000:0000`).
+Background research (mo's vault): Research/Headphones/AirPods Automatic Switching.md and AirPods Switching on Linux.md.
+
+## Current milestone
+**M1 Daily-driver switching.** Milestones, in order (GitHub milestones in mhijazi1/librepods, on branch `linux-parity`):
+1. **M1 Daily-driver switching**: Peaches <-> iPhone <-> Mac switching reliable enough to install. Exit: the NixOS module is installed on Peaches and the issues' switching hardware checklist passes.
+2. **M2 Calls**: calls on Linux use the AirPods mic; iPhone calls take over cleanly and hand back. Exit: verified on hardware.
+3. **M3 Mac-like polish**: notifications with Undo, auto-resume, sleep/reconnect, per-device connect setting, protocol parity (routing score, RoutedToBluetooth). Exit: daily use feels like a Mac.
+4. **M4 Battery & desktop**: correct battery in the tray, desktop and case popup. Exit: verified on hardware.
+Put new issues in the milestone whose outcome they serve.
+
+## Constraints
+- **Behaviour questions are answered by macOS (mo, 2026-11-08).** When an issue raises an open question about how switching,
+  ownership, routing, audio or notifications should behave, the answer is "do what macOS does with the same AirPods". Don't ask mo
+  to choose between behaviours.
+  - If what macOS does is already documented (DECISIONS.md, a closed spike, or the vault research notes), use it and cite it.
+  - Otherwise, file a `hardware` spike to observe the Mac doing the same thing (steps plus `audioaccessoryd` log), map each
+    possible outcome to the change it implies, and link the issue as blocked by the spike.
+  - Ask mo only for things macOS has no counterpart for (Linux-only features, PipeWire/WirePlumber choices, costs and scope).
+- **This is a fork. All issues, PRs and merges go to `mhijazi1/librepods` only, with base `linux-parity`. Never open, comment on or
+  reference-write anything in `librepods-org/librepods` (upstream).** Upstream PR numbers (#688, #689, #724, #766, #775, #841) refer to
+  upstream; their heads are available locally as branches `pr-<n>` in the main clone, or via
+  `git fetch https://github.com/librepods-org/librepods.git pull/<n>/head`.
+- Code lives in `linux-rust/` (Rust 2024, tokio, bluer, dbus, iced, libpulse-binding, ksni). Build and test only through the check
+  command in `.swarm/config.json` (Nix dev shell). Keep `Cargo.lock` consistent (`--locked`); add a dependency only when a ticket needs it
+  and say why in the PR.
+- **Agents have no AirPods or Bluetooth hardware.** Acceptance criteria must be provable offline: unit tests of pure packet/state logic,
+  tests against mocked D-Bus / PipeWire / AACP event streams, emitted-command assertions, `nix flake check` evaluation. Real-device
+  behaviour goes in an issue/PR section titled **"Hardware validation by mo; not acceptance"** and must never be claimed as done.
+- **Behaviour that is unknown and needs hardware to confirm gets its own spike.** This covers what the AirPods, iPhone, Mac, BlueZ or
+  PipeWire actually do. Whenever a ticket depends on such behaviour (a guess, an unverified assumption, a "probably"), file a `spike`
+  issue labelled `hardware` to validate it, instead of leaving it only in the "Hardware validation" section. File it even when it can
+  only run during or after the issue that found it:
+  - Link it with `deps.sh`, in whichever direction the work needs:
+    - **The issue is blocked by the spike** when the right implementation depends on the answer, so building first risks rework. The
+      issue then waits until mo has run the spike.
+    - **The spike is blocked by the issue** when it validates that issue's code, so it can only run once the code is merged.
+    - Use neither link when the spike only confirms behaviour the code already handles either way.
+  - Every groom also checks open spikes, hardware or not, against the issue it grooms (the swarm planner's **Spikes block work**
+    rule).
+  - Its criteria are mo's exact steps, and what each possible outcome would mean for the code.
+  - `lanes.sh` never starts `hardware` issues: mo runs them with the orchestrator, and the findings come back as follow-up issues.
+- Prefer extracting pure, testable logic (parsing, encoding, policy decisions) from I/O code over adding large mocks.
+- Don't break the existing app: the tray, the window UI, Nothing devices and the non-handoff path must still build and behave as before
+  unless a ticket says otherwise.
+- The crate stays rustfmt-clean; run `cargo fmt` before committing; CI enforces it.
+- Licence: GPL-3.0 (AGPL per README); keep upstream copyright headers.
+
+## Non-goals
+Siri, iCloud/MagicPairing key sync, Find My, AirPods firmware updates, Spatial Audio / head tracking, hearing-aid and hearing-test
+features, Android/Windows code, upstreaming (mo may upstream later by hand).
