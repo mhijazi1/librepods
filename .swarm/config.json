@@ -10,6 +10,12 @@
     "max": 8,
     "dir": "../librepods-lanes",
     "cpus": "1-7,9-15",
-    "cargo_target": true
+    "cargo_target": true,
+    "sandbox": true,
+    "sandbox_hosts": [
+      "crates.io",
+      "index.crates.io",
+      "static.crates.io"
+    ]
   }
 }
